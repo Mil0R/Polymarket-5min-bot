@@ -52,6 +52,16 @@ where
         .map_err(|e| anyhow::anyhow!("{name} has invalid value {raw:?}: {e}"))
 }
 
+/// Normalize a hex private key: trim whitespace, strip a leading "0x"/"0X", lowercase.
+fn normalize_private_key(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let stripped = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .unwrap_or(trimmed);
+    stripped.to_ascii_lowercase()
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub private_key: String,
@@ -142,10 +152,10 @@ impl Config {
         };
 
         let config = Config {
-            private_key: env::var("POLYMARKET_PRIVATE_KEY")
-                .context("POLYMARKET_PRIVATE_KEY must be set")?
-                .trim()
-                .to_string(),
+            private_key: normalize_private_key(
+                &env::var("POLYMARKET_PRIVATE_KEY")
+                    .context("POLYMARKET_PRIVATE_KEY must be set")?,
+            ),
             proxy_address,
             clob_api_url: env::var("CLOB_API_URL")
                 .unwrap_or_else(|_| CLOB_API_URL_DEFAULT.to_string()),
@@ -214,6 +224,14 @@ impl Config {
     fn validate(&self) -> Result<()> {
         if self.private_key.is_empty() {
             bail!("POLYMARKET_PRIVATE_KEY cannot be empty");
+        }
+        let is_hex64 = self.private_key.len() == 64
+            && self.private_key.chars().all(|c| c.is_ascii_hexdigit());
+        if !is_hex64 {
+            bail!(
+                "POLYMARKET_PRIVATE_KEY must be a 64-character hex string without 0x prefix (got {} chars)",
+                self.private_key.len()
+            );
         }
         if self.crypto_symbols.is_empty() || self.crypto_symbols.iter().any(String::is_empty) {
             bail!("CRYPTO_SYMBOLS must contain at least one non-empty symbol");
@@ -413,5 +431,21 @@ mod tests {
         std::env::set_var("TEST_BOOL_CONFIG", "maybe");
         assert!(env_bool("TEST_BOOL_CONFIG", false).is_err());
         std::env::remove_var("TEST_BOOL_CONFIG");
+    }
+
+    #[test]
+    fn normalizes_private_key_prefix_and_case() {
+        assert_eq!(
+            normalize_private_key("0xABC123"),
+            "abc123",
+            "strips 0x and lowercases"
+        );
+        assert_eq!(
+            normalize_private_key("0XABC123"),
+            "abc123",
+            "strips uppercase 0X prefix"
+        );
+        assert_eq!(normalize_private_key("  abc123  "), "abc123");
+        assert_eq!(normalize_private_key("abc123"), "abc123");
     }
 }
