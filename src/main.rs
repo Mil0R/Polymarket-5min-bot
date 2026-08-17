@@ -778,7 +778,7 @@ async fn main() -> Result<()> {
                         info!(
                             old_window = window_session.timestamp(),
                             new_window = new_window_timestamp,
-                            "New 5min window detected, cancelling old subscriptions and switching"
+                            "New window detected, cancelling old subscriptions and switching"
                         );
                         // Drop stream to release monitor borrow, then clear old subs
                         drop(stream);
