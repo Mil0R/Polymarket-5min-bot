@@ -8,7 +8,9 @@ use alloy::sol_types::{eip712_domain, SolStruct};
 use anyhow::Result;
 use tracing::info;
 
-use crate::proxy_relay::{relayer_submit_authed, to_hex_0x, RELAYER_URL_DEFAULT};
+use crate::proxy_relay::{
+    relayer_submit_authed, to_hex_0x, RelayerCredentials, RELAYER_URL_DEFAULT,
+};
 
 /// Polygon mainnet deposit wallet factory (Polymarket docs).
 pub const DEPOSIT_WALLET_FACTORY: Address = {
@@ -114,27 +116,22 @@ pub async fn relayer_execute_deposit_wallet_calls(
     calls: &[(Address, Vec<u8>)],
     deposit_wallet: Address,
     signer: &impl alloy::signers::Signer,
-    builder_key: &str,
-    builder_secret: &str,
-    builder_passphrase: &str,
-    relayer_url: &str,
+    credentials: RelayerCredentials<'_>,
     metadata: &str,
 ) -> Result<String> {
     if calls.is_empty() {
         anyhow::bail!("relayer_execute_deposit_wallet_calls: empty calls");
     }
-    let relayer_url = if relayer_url.is_empty() {
+    let relayer_url = if credentials.relayer_url.is_empty() {
         RELAYER_URL_DEFAULT
     } else {
-        relayer_url
+        credentials.relayer_url
     };
     let owner = signer.address();
     let chain_id = signer.chain_id().unwrap_or(137);
     let nonce = get_wallet_nonce(relayer_url, owner).await?;
-    let deadline = SystemTime::now()
-        .duration_since(UNIX_EPOCH)?
-        .as_secs()
-        + WALLET_BATCH_DEADLINE_SECS;
+    let deadline =
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() + WALLET_BATCH_DEADLINE_SECS;
 
     let typed_calls: Vec<(Address, U256, Vec<u8>)> = calls
         .iter()
@@ -184,9 +181,9 @@ pub async fn relayer_execute_deposit_wallet_calls(
 
     relayer_submit_authed(
         body,
-        builder_key,
-        builder_secret,
-        builder_passphrase,
+        credentials.builder_key,
+        credentials.builder_secret,
+        credentials.builder_passphrase,
         relayer_url,
     )
     .await
@@ -197,20 +194,14 @@ pub async fn relayer_execute_deposit_wallet_calldata(
     target: Address,
     deposit_wallet: Address,
     signer: &impl alloy::signers::Signer,
-    builder_key: &str,
-    builder_secret: &str,
-    builder_passphrase: &str,
-    relayer_url: &str,
+    credentials: RelayerCredentials<'_>,
     metadata: &str,
 ) -> Result<String> {
     relayer_execute_deposit_wallet_calls(
         &[(target, calldata.to_vec())],
         deposit_wallet,
         signer,
-        builder_key,
-        builder_secret,
-        builder_passphrase,
-        relayer_url,
+        credentials,
         metadata,
     )
     .await

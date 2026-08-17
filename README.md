@@ -24,7 +24,7 @@ The bot roughly follows these steps:
 
 1. **Market discovery** — Finds current 5-minute Up/Down markets for configured symbols (e.g. btc, eth).
 2. **Order book monitoring** — Subscribes to CLOB order books and tracks YES + NO combined price in real time.
-3. **Arbitrage execution** — Buys YES and NO when the combined price falls below your threshold; slippage, size limits, and execution spread are configurable.
+3. **Arbitrage execution** — When the combined price is below the threshold, submits the thinner best-ask leg first, freezes and reconciles its fill, then sizes the opposite leg from that confirmed fill. Slippage, size limits, and execution spread are configurable.
 4. **Merge** — When holding both YES and NO, merges on-chain into USDC/pUSD to reduce position risk.
 5. **Wind-down** — Near window end, can auto-cancel orders, merge, and market-sell remaining single-leg positions.
 
@@ -49,6 +49,12 @@ Requires [Rust](https://rustup.rs).
 ```bash
 cp .env.example .env   # fill required fields in .env, then run
 cargo run
+```
+
+Read-only online soak test (30 minutes by default; accepts seconds):
+
+```bash
+./scripts/dry_run_soak.sh 1800
 ```
 
 See `.env.example` for full options, grouped as `[1]`–`[9]`: earlier sections are more important.
@@ -91,13 +97,34 @@ Get these from Polymarket → Settings → Builder.
 |----------|---------|-------------|
 | `CRYPTO_SYMBOLS` | `btc,eth,sol,xrp` | Symbols to monitor, comma-separated |
 | `ARBITRAGE_EXECUTION_SPREAD` | `0.01` | Execute when `yes + no <= 1 - spread` |
-| `MAX_ORDER_SIZE_USDC` | `100.0` | Max order size per trade |
-| `RISK_MAX_EXPOSURE_USDC` | `1000.0` | Max exposure per round |
+| `MAX_ORDER_SIZE_USDC` | `100.0` | Maximum notional per leg, converted to shares at the final limit price |
+| `RISK_MAX_EXPOSURE_USDC` | `1000.0` | Maximum account-wide position and pending-order exposure |
+| `ARBITRAGE_FEE_BUFFER` | `0.002` | Fee/rounding buffer required after slippage |
+| `DRY_RUN` | `false` | Use live read-only data and simulated fills without account writes |
+| `CANARY_MODE` | `false` | Tiny live-money hard gate; live canary requires FOK/FAK |
+| `CANARY_MAX_PAIR_NOTIONAL_USDC` / `CANARY_MAX_TOTAL_NOTIONAL_USDC` | `3.0` / `3.0` | Per-pair and process-total planned notional limits |
+| `CANARY_MAX_LOSS_USDC` | `2.0` | Conservative downside budget; permanently pauses entries for the process when reached |
+| `CANARY_MAX_PAIRS_PER_WINDOW` / `CANARY_MAX_PAIRS_TOTAL` | `1` / `1` | Hard pair-count limits per window and process |
+| `PAPER_INITIAL_BALANCE_USDC` | `50.0` | Independent virtual cash budget for Dry-run |
+| `PAPER_LIQUIDITY_HAIRCUT` | `0.75` | Fraction of displayed depth treated as executable in paper fills |
+| `PAPER_SECOND_LEG_DELAY_MS` | `250` | Delay before fetching a fresh live book for the opposite leg |
+| `MAX_BOOK_AGE_MS` / `MAX_BOOK_SKEW_MS` | `2000` / `1000` | Reject stale or mutually skewed leg snapshots |
+| `SIGNAL_COOLDOWN_MS` | `3000` | Cooldown for identical market/price signals |
+| `STATE_JOURNAL_FILE` | `order-state.ndjson` | Append-only order-pair and recovery state journal |
 | `MERGE_INTERVAL_MINUTES` | `0` | Scheduled Merge interval (minutes); `0` = disabled |
 | `WIND_DOWN_BEFORE_WINDOW_END_MINUTES` | `0` | Wind-down before window end (minutes); `0` = disabled |
 | `RUST_LOG` | `info` | Log level |
+| `LOG_ROTATE_MAX_BYTES` | `10485760` | Startup rotation threshold; logs are appended between rotations |
+| `LOG_ROTATE_FILES` | `5` | Number of numbered log backups to retain |
+| `OBSERVABILITY_BIND` | unset | Optional `/livez`, `/readyz`, compatible `/healthz`, and Prometheus `/metrics` bind address |
 
 Other settings (CLOB URL, signature type, slippage, order type, position sync, etc.) have sensible defaults. See `.env.example` for the full list with bilingual comments.
+
+Startup reconciles cumulative CLOB fills and Data API positions, then restores manageable recovery tasks. New journal records carry a version and SHA-256 checksum. A crash-damaged final line is isolated to a `.corrupt-*` file while the valid prefix is retained; corruption in the middle still blocks startup. Legacy records without enough context block live startup by default. `ALLOW_UNRESOLVED_STATE=true` only permits the reconciliation/recovery process to run; unresolved state still blocks new live entries.
+
+For the first tiny live validation, use `DRY_RUN=false`, `CANARY_MODE=true`, and `ARBITRAGE_ORDER_TYPE=FAK`. `/readyz` returns 200 only when initialization, market/user-stream connectivity, journal writability, disk capacity, unresolved-order state, and the process-wide live safety gate are all healthy. Any ambiguous CLOB write pauses new entries across windows and requires a restart plus account/order reconciliation; it cannot be cleared in-process.
+
+With `DRY_RUN=true`, paper execution walks the real multi-level CLOB book for the harder leg, waits `PAPER_SECOND_LEG_DELAY_MS`, fetches a fresh live book for the opposite leg, and applies FOK/FAK/immediate-fill semantics to the confirmed virtual first-leg amount. It never restores real recovery tasks, syncs real positions, places/cancels orders, merges, or sells. Prometheus exposes `polypulse_paper_pairs_total`, `polypulse_paper_one_sided_total`, and `polypulse_paper_net_pnl_usd`.
 
 ## Disclaimer
 

@@ -2,9 +2,12 @@ use anyhow::Result;
 use dashmap::DashMap;
 use futures::Stream;
 use futures::StreamExt;
-use polymarket_client_sdk::clob::ws::{Client as WsClient, types::response::BookUpdate};
-use polymarket_client_sdk::types::{B256, U256};
-use std::collections::HashMap;
+use polymarket_client_sdk::clob::ws::{
+    types::response::{BookUpdate, OrderBookLevel, WsMessage},
+    Client as WsClient,
+};
+use polymarket_client_sdk::types::{Decimal, B256, U256};
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use tracing::{debug, info};
 
@@ -14,7 +17,11 @@ use crate::market::MarketInfo;
 #[inline]
 fn short_b256(b: &B256) -> String {
     let s = format!("{b}");
-    if s.len() > 12 { format!("{}..", &s[..10]) } else { s }
+    if s.len() > 12 {
+        format!("{}..", &s[..10])
+    } else {
+        s
+    }
 }
 
 /// Shorten U256 for logs: last 8 digits, e.g. ..67033653
@@ -32,12 +39,39 @@ pub struct OrderBookMonitor {
     ws_client: WsClient,
     books: DashMap<U256, BookUpdate>,
     market_map: HashMap<B256, (U256, U256)>, // market_id -> (yes_token_id, no_token_id)
+    extra_tokens: HashSet<U256>,
 }
 
 pub struct OrderBookPair {
     pub yes_book: BookUpdate,
     pub no_book: BookUpdate,
     pub market_id: B256,
+}
+
+/// Return the lowest non-empty ask without relying on wire ordering.
+pub fn best_ask(book: &BookUpdate) -> Option<&OrderBookLevel> {
+    book.asks
+        .iter()
+        .filter(|level| level.size > Decimal::ZERO)
+        .min_by_key(|level| level.price)
+}
+
+/// Return the highest non-empty bid without relying on wire ordering.
+pub fn best_bid(book: &BookUpdate) -> Option<&OrderBookLevel> {
+    book.bids
+        .iter()
+        .filter(|level| level.size > Decimal::ZERO)
+        .max_by_key(|level| level.price)
+}
+
+/// Decode a captured market WebSocket frame. Kept separate from the live stream so
+/// protocol fixtures can be replayed deterministically in tests and diagnostics.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn replay_book_frame(frame: &str) -> Result<BookUpdate> {
+    match serde_json::from_str::<WsMessage>(frame)? {
+        WsMessage::Book(book) => Ok(book),
+        _ => anyhow::bail!("WebSocket fixture is not an orderbook event"),
+    }
 }
 
 impl OrderBookMonitor {
@@ -48,19 +82,23 @@ impl OrderBookMonitor {
             ws_client: WsClient::default(),
             books: DashMap::new(),
             market_map: HashMap::new(),
+            extra_tokens: HashSet::new(),
         }
+    }
+
+    pub fn subscribe_recovery_token(&mut self, token_id: U256) {
+        self.extra_tokens.insert(token_id);
     }
 
     /// Subscribe to new market
     pub fn subscribe_market(&mut self, market: &MarketInfo) -> Result<()> {
         // Record market mapping
-        self.market_map.insert(
-            market.market_id,
-            (market.yes_token_id, market.no_token_id),
-        );
+        self.market_map
+            .insert(market.market_id, (market.yes_token_id, market.no_token_id));
 
         info!(
             market_id = short_b256(&market.market_id),
+            slug = %market.slug,
             yes = short_u256(&market.yes_token_id),
             no = short_u256(&market.no_token_id),
             "Subscribe to market orderbook"
@@ -77,17 +115,23 @@ impl OrderBookMonitor {
         &self,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<BookUpdate>> + Send + '_>>> {
         // Collect all token_ids to subscribe
-        let token_ids: Vec<U256> = self
+        let mut token_ids: Vec<U256> = self
             .market_map
             .values()
             .flat_map(|(yes, no)| [*yes, *no])
             .collect();
+        token_ids.extend(self.extra_tokens.iter().copied());
+        token_ids.sort_unstable();
+        token_ids.dedup();
 
         if token_ids.is_empty() {
             return Err(anyhow::anyhow!("No markets to subscribe"));
         }
 
-        info!(token_count = token_ids.len(), "Creating orderbook stream (unauthenticated)");
+        info!(
+            token_count = token_ids.len(),
+            "Creating orderbook stream (unauthenticated)"
+        );
 
         // subscribe_orderbook does not need auth
         let stream = self.ws_client.subscribe_orderbook(token_ids)?;
@@ -98,10 +142,11 @@ impl OrderBookMonitor {
 
     /// Handle orderbook update
     pub fn handle_book_update(&self, book: BookUpdate) -> Option<OrderBookPair> {
-
         // Print top 5 bid/ask (debug)
         if !book.bids.is_empty() {
-            let top_bids: Vec<String> = book.bids.iter()
+            let top_bids: Vec<String> = book
+                .bids
+                .iter()
                 .take(5)
                 .map(|b| format!("{}@{}", b.size, b.price))
                 .collect();
@@ -112,7 +157,9 @@ impl OrderBookMonitor {
             );
         }
         if !book.asks.is_empty() {
-            let top_asks: Vec<String> = book.asks.iter()
+            let top_asks: Vec<String> = book
+                .asks
+                .iter()
                 .take(5)
                 .map(|a| format!("{}@{}", a.size, a.price))
                 .collect();
@@ -150,14 +197,72 @@ impl OrderBookMonitor {
         None
     }
 
-    /// Get orderbook if present
-    pub fn get_book(&self, token_id: U256) -> Option<BookUpdate> {
-        self.books.get(&token_id).map(|b| b.clone())
-    }
-
     /// Clear all subscriptions
     pub fn clear(&mut self) {
         self.books.clear();
         self.market_map.clear();
+        self.extra_tokens.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+
+    #[test]
+    fn replays_captured_orderbook_frame() {
+        let frame = r#"{
+            "event_type":"book",
+            "asset_id":"42",
+            "market":"0x0000000000000000000000000000000000000000000000000000000000000007",
+            "timestamp":"1720000000123",
+            "bids":[{"price":"0.44","size":"12.5"}],
+            "asks":[{"price":"0.46","size":"9.25"}],
+            "hash":"fixture-hash"
+        }"#;
+        let book = replay_book_frame(frame).unwrap();
+        assert_eq!(book.asset_id, U256::from(42));
+        assert_eq!(book.timestamp, 1_720_000_000_123);
+        assert_eq!(book.bids[0].price, dec!(0.44));
+        assert_eq!(book.asks[0].size, dec!(9.25));
+    }
+
+    #[test]
+    fn rejects_non_book_websocket_frame() {
+        let frame = r#"{
+            "event_type":"last_trade_price",
+            "asset_id":"42",
+            "market":"0x0000000000000000000000000000000000000000000000000000000000000007",
+            "price":"0.45",
+            "side":"BUY",
+            "size":"1",
+            "fee_rate_bps":"0",
+            "timestamp":"1720000000123"
+        }"#;
+        assert!(replay_book_frame(frame).is_err());
+    }
+
+    #[test]
+    fn best_prices_ignore_wire_order_and_empty_levels() {
+        let level = |price, size| OrderBookLevel::builder().price(price).size(size).build();
+        let book = BookUpdate::builder()
+            .asset_id(U256::from(42))
+            .market(B256::ZERO)
+            .timestamp(0)
+            .bids(vec![
+                level(dec!(0.01), dec!(10)),
+                level(dec!(0.44), dec!(5)),
+                level(dec!(0.50), Decimal::ZERO),
+            ])
+            .asks(vec![
+                level(dec!(0.99), dec!(10)),
+                level(dec!(0.46), dec!(5)),
+                level(dec!(0.40), Decimal::ZERO),
+            ])
+            .build();
+
+        assert_eq!(best_bid(&book).unwrap().price, dec!(0.44));
+        assert_eq!(best_ask(&book).unwrap().price, dec!(0.46));
     }
 }

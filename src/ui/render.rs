@@ -97,7 +97,10 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &DashboardState) {
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             status,
-            Span::styled(format!("  uptime {}", app.uptime()), Style::default().fg(Color::White)),
+            Span::styled(
+                format!("  uptime {}", app.uptime()),
+                Style::default().fg(Color::White),
+            ),
         ])),
         cols[0],
     );
@@ -219,10 +222,7 @@ fn draw_hero_profit(frame: &mut Frame, area: Rect, app: &DashboardState) {
         Paragraph::new(Line::from(vec![
             Span::styled("Trades  ", label_style()),
             Span::styled(
-                format!(
-                    "{} / {} wins",
-                    app.successful_trades, app.total_trades
-                ),
+                format!("{} / {} wins", app.successful_trades, app.total_trades),
                 Style::default().fg(Color::White).bold(),
             ),
             Span::styled(
@@ -298,13 +298,30 @@ fn draw_market_table(frame: &mut Frame, area: Rect, app: &DashboardState) {
         .height(1);
 
     let table_rows: Vec<Row> = if app.markets.is_empty() {
-        vec![Row::new(vec![Cell::from("—"), Cell::from("waiting…"), Cell::from(""), Cell::from(""), Cell::from("")])]
+        vec![Row::new(vec![
+            Cell::from("—"),
+            Cell::from("waiting…"),
+            Cell::from(""),
+            Cell::from(""),
+            Cell::from(""),
+        ])]
     } else {
         app.markets
             .iter()
             .enumerate()
             .map(|(i, m)| {
-                let total = m.yes_price + m.no_price;
+                let yes_str = match m.yes_display() {
+                    Some(price) => format!("{:.3}{}", price, m.yes_dir.arrow()),
+                    None => "—".to_string(),
+                };
+                let no_str = match m.no_display() {
+                    Some(price) => format!("{:.3}{}", price, m.no_dir.arrow()),
+                    None => "—".to_string(),
+                };
+                let total_str = m
+                    .both_prices()
+                    .map(|(yes, no)| format!("{:.3}", yes + no))
+                    .unwrap_or_else(|| "—".to_string());
                 let edge = app.profit_pct(m);
                 let edge_str = if edge > 0.0 {
                     format!("+{edge:.2}%")
@@ -322,11 +339,9 @@ fn draw_market_table(frame: &mut Frame, area: Rect, app: &DashboardState) {
 
                 Row::new(vec![
                     Cell::from(m.symbol.clone()),
-                    Cell::from(format!("{:.3}{}", m.yes_price, m.yes_dir.arrow()))
-                        .style(dir_style(m.yes_dir)),
-                    Cell::from(format!("{:.3}{}", m.no_price, m.no_dir.arrow()))
-                        .style(dir_style(m.no_dir)),
-                    Cell::from(format!("{total:.3}")),
+                    Cell::from(yes_str).style(dir_style(m.yes_dir)),
+                    Cell::from(no_str).style(dir_style(m.no_dir)),
+                    Cell::from(total_str),
                     Cell::from(edge_str).style(if edge > 0.3 {
                         Style::default().fg(Color::LightGreen).bold()
                     } else {
@@ -361,13 +376,7 @@ fn draw_market_table(frame: &mut Frame, area: Rect, app: &DashboardState) {
     frame.render_widget(table, area);
 }
 
-fn draw_sparkline_block(
-    frame: &mut Frame,
-    area: Rect,
-    title: &str,
-    data: &[u64],
-    color: Color,
-) {
+fn draw_sparkline_block(frame: &mut Frame, area: Rect, title: &str, data: &[u64], color: Color) {
     let spark = Sparkline::default()
         .block(
             Block::default()
@@ -457,7 +466,11 @@ fn draw_market_edge_curves(frame: &mut Frame, area: Rect, app: &DashboardState) 
 
         let cols = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(5), Constraint::Min(8), Constraint::Length(8)])
+            .constraints([
+                Constraint::Length(5),
+                Constraint::Min(8),
+                Constraint::Length(8),
+            ])
             .split(row_area);
 
         let edge = app.profit_pct(market);
@@ -475,7 +488,10 @@ fn draw_market_edge_curves(frame: &mut Frame, area: Rect, app: &DashboardState) 
             Style::default().fg(Color::Yellow)
         };
 
-        frame.render_widget(Paragraph::new(market.symbol.as_str()).style(sym_style), cols[0]);
+        frame.render_widget(
+            Paragraph::new(market.symbol.as_str()).style(sym_style),
+            cols[0],
+        );
 
         let curve_color = if market.is_arb {
             Color::LightGreen
@@ -533,7 +549,11 @@ fn draw_risk(frame: &mut Frame, area: Rect, app: &DashboardState) {
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(2), Constraint::Length(3), Constraint::Min(2)])
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Length(3),
+            Constraint::Min(2),
+        ])
         .split(inner);
 
     frame.render_widget(
@@ -581,7 +601,10 @@ fn draw_system(frame: &mut Frame, area: Rect, app: &DashboardState) {
                     format!("{} ", svc.status.dot()),
                     Style::default().fg(health_color(svc.status)),
                 ),
-                Span::styled(format!("{:<10}", svc.name), Style::default().fg(Color::White)),
+                Span::styled(
+                    format!("{:<10}", svc.name),
+                    Style::default().fg(Color::White),
+                ),
                 Span::styled(
                     if svc.latency_ms > 0 {
                         format!("{}ms", svc.latency_ms)
@@ -672,7 +695,10 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &DashboardState) {
             ]),
             Line::from(vec![
                 Span::styled("ends ", label_style()),
-                Span::styled(app.window_countdown(), Style::default().fg(Color::Yellow).bold()),
+                Span::styled(
+                    app.window_countdown(),
+                    Style::default().fg(Color::Yellow).bold(),
+                ),
             ]),
         ]),
         cols[0],
@@ -682,7 +708,10 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &DashboardState) {
         Paragraph::new(vec![
             Line::from(vec![
                 Span::styled("scans ", label_style()),
-                Span::styled(format!("{}", app.arb_scans), Style::default().fg(Color::White).bold()),
+                Span::styled(
+                    format!("{}", app.arb_scans),
+                    Style::default().fg(Color::White).bold(),
+                ),
             ]),
             Line::from(vec![
                 Span::styled("mode ", label_style()),

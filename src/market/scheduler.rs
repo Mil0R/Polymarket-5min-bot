@@ -19,11 +19,15 @@ impl MarketScheduler {
         }
     }
 
-    /// Calculate wait time until next 5-minute window
+    /// Current window start timestamp, delegated to the discoverer's period.
+    pub fn calculate_current_window_timestamp(&self, now: DateTime<Utc>) -> i64 {
+        self.discoverer.calculate_current_window_timestamp(now)
+    }
+
+    /// Calculate wait time until next window
     pub fn calculate_wait_time(&self, now: DateTime<Utc>) -> Duration {
-        let next_window_ts = MarketDiscoverer::calculate_next_window_timestamp(now);
-        let next_window = DateTime::from_timestamp(next_window_ts, 0)
-            .expect("Invalid timestamp");
+        let next_window_ts = self.discoverer.calculate_next_window_timestamp(now);
+        let next_window = DateTime::from_timestamp(next_window_ts, 0).expect("Invalid timestamp");
 
         // Query a few seconds early so markets are created
         let wait_duration = next_window
@@ -39,8 +43,8 @@ impl MarketScheduler {
     pub async fn get_markets_immediately_or_wait(&self) -> Result<Vec<MarketInfo>> {
         // Try to fetch current window markets first
         let now = Utc::now();
-        let current_timestamp = MarketDiscoverer::calculate_current_window_timestamp(now);
-        let next_timestamp = MarketDiscoverer::calculate_next_window_timestamp(now);
+        let current_timestamp = self.discoverer.calculate_current_window_timestamp(now);
+        let next_timestamp = self.discoverer.calculate_next_window_timestamp(now);
 
         // If current and next window same (shouldn't happen for 5m), use wait logic
         if current_timestamp == next_timestamp {
@@ -48,7 +52,11 @@ impl MarketScheduler {
         }
 
         info!("Fetching markets for current window");
-        match self.discoverer.get_markets_for_timestamp(current_timestamp).await {
+        match self
+            .discoverer
+            .get_markets_for_timestamp(current_timestamp)
+            .await
+        {
             Ok(markets) => {
                 if !markets.is_empty() {
                     info!(count = markets.len(), "Found markets for current window");
@@ -60,10 +68,17 @@ impl MarketScheduler {
                 const MAX_RETRY_SECS: u64 = 90; // Max retry ~90s
                 let mut elapsed = 0u64;
                 while elapsed < MAX_RETRY_SECS {
-                    info!("Current window empty, retrying in {}s (waited {}s)", RETRY_SECS, elapsed);
+                    info!(
+                        "Current window empty, retrying in {}s (waited {}s)",
+                        RETRY_SECS, elapsed
+                    );
                     sleep(Duration::from_secs(RETRY_SECS)).await;
                     elapsed += RETRY_SECS;
-                    match self.discoverer.get_markets_for_timestamp(current_timestamp).await {
+                    match self
+                        .discoverer
+                        .get_markets_for_timestamp(current_timestamp)
+                        .await
+                    {
                         Ok(markets) if !markets.is_empty() => {
                             info!(count = markets.len(), "Retry succeeded, found markets");
                             return Ok(markets);
@@ -72,7 +87,10 @@ impl MarketScheduler {
                     }
                 }
                 // Retry timed out, wait for next window
-                warn!("No markets after {}s retry, waiting for next window", MAX_RETRY_SECS);
+                warn!(
+                    "No markets after {}s retry, waiting for next window",
+                    MAX_RETRY_SECS
+                );
                 self.wait_for_next_window().await
             }
             Err(e) => {
@@ -89,14 +107,14 @@ impl MarketScheduler {
             if wait_time > Duration::ZERO {
                 info!(
                     wait_secs = wait_time.as_secs(),
-                    "Waiting for next 5-minute window"
+                    "Waiting for next window"
                 );
                 sleep(wait_time).await;
             }
 
             // Query current window markets
             let now = Utc::now();
-            let timestamp = MarketDiscoverer::calculate_current_window_timestamp(now);
+            let timestamp = self.discoverer.calculate_current_window_timestamp(now);
             match self.discoverer.get_markets_for_timestamp(timestamp).await {
                 Ok(markets) => {
                     if !markets.is_empty() {

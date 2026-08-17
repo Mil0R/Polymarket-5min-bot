@@ -50,6 +50,9 @@ impl PriceDir {
     }
 }
 
+/// Seconds without an orderbook update after which a market row is treated as stale.
+pub const MARKET_PRICE_STALE_SECS: u64 = 90;
+
 #[derive(Clone)]
 pub struct MarketRow {
     pub symbol: String,
@@ -59,6 +62,42 @@ pub struct MarketRow {
     pub no_dir: PriceDir,
     pub is_arb: bool,
     pub sparkline: Vec<u64>,
+    /// When the last (partial or full) orderbook update arrived; None = never.
+    pub last_update: Option<Instant>,
+}
+
+impl MarketRow {
+    /// Whether the last orderbook update for this market is still fresh.
+    pub fn market_fresh(&self) -> bool {
+        self.last_update
+            .map_or(false, |t| t.elapsed().as_secs() < MARKET_PRICE_STALE_SECS)
+    }
+
+    /// Best ask to display for the YES side, if it exists and is fresh.
+    pub fn yes_display(&self) -> Option<f64> {
+        if self.market_fresh() && self.yes_price > 0.0 {
+            Some(self.yes_price)
+        } else {
+            None
+        }
+    }
+
+    /// Best ask to display for the NO side, if it exists and is fresh.
+    pub fn no_display(&self) -> Option<f64> {
+        if self.market_fresh() && self.no_price > 0.0 {
+            Some(self.no_price)
+        } else {
+            None
+        }
+    }
+
+    /// Both sides available and fresh — used for the Σ and EDGE columns.
+    pub fn both_prices(&self) -> Option<(f64, f64)> {
+        match (self.yes_display(), self.no_display()) {
+            (Some(yes), Some(no)) => Some((yes, no)),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -217,8 +256,7 @@ impl DashboardState {
 
         let pnl_end = ((session_pnl / 4.0).clamp(2.0, 20.0)) as u64;
         s.pnl_sparkline = random_sparkline(&mut rng, SPARKLINE_LEN, pnl_end.saturating_sub(8), 1);
-        s.window_pnl_sparkline =
-            random_sparkline(&mut rng, SPARKLINE_LEN, (pnl_end / 2).max(2), 1);
+        s.window_pnl_sparkline = random_sparkline(&mut rng, SPARKLINE_LEN, (pnl_end / 2).max(2), 1);
         s.exposure_sparkline = random_sparkline(
             &mut rng,
             SPARKLINE_LEN,
@@ -239,6 +277,7 @@ impl DashboardState {
                 no_dir: PriceDir::Down,
                 is_arb: true,
                 sparkline: random_sparkline(&mut rng, SPARKLINE_LEN / 2, 6, 1),
+                last_update: Some(Instant::now()),
             },
             MarketRow {
                 symbol: "ETH".into(),
@@ -248,6 +287,7 @@ impl DashboardState {
                 no_dir: PriceDir::Up,
                 is_arb: false,
                 sparkline: random_sparkline(&mut rng, SPARKLINE_LEN / 2, 4, 0),
+                last_update: Some(Instant::now()),
             },
             MarketRow {
                 symbol: "SOL".into(),
@@ -257,6 +297,7 @@ impl DashboardState {
                 no_dir: PriceDir::Up,
                 is_arb: true,
                 sparkline: random_sparkline(&mut rng, SPARKLINE_LEN / 2, 7, 1),
+                last_update: Some(Instant::now()),
             },
             MarketRow {
                 symbol: "XRP".into(),
@@ -266,6 +307,7 @@ impl DashboardState {
                 no_dir: PriceDir::Flat,
                 is_arb: false,
                 sparkline: random_sparkline(&mut rng, SPARKLINE_LEN / 2, 4, 0),
+                last_update: Some(Instant::now()),
             },
         ];
 
@@ -297,9 +339,7 @@ impl DashboardState {
         let mut events = vec![
             format!("🚀 Session started — running for a while already"),
             format!("📡 Subscribed 8 orderbook tokens (4 markets)"),
-            format!(
-                "💰 Window PnL +${window_pnl:.2} | session +${session_pnl:.2}"
-            ),
+            format!("💰 Window PnL +${window_pnl:.2} | session +${session_pnl:.2}"),
         ];
         for _ in 0..rng.gen_range(2..5) {
             let sym = symbols[rng.gen_range(0..symbols.len())];
@@ -317,7 +357,7 @@ impl DashboardState {
     fn warmup_demo(&mut self, ticks: u64) {
         for _ in 0..ticks {
             self.frame = self.frame.wrapping_add(1);
-            if self.frame % 2 == 0 {
+            if self.frame.is_multiple_of(2) {
                 self.tick_sparklines();
             }
             self.on_demo_tick(false);
@@ -334,7 +374,12 @@ impl DashboardState {
 
     pub fn uptime(&self) -> String {
         let secs = self.started_at.elapsed().as_secs();
-        format!("{:02}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60)
+        format!(
+            "{:02}:{:02}:{:02}",
+            secs / 3600,
+            (secs % 3600) / 60,
+            secs % 60
+        )
     }
 
     pub fn utc_now(&self) -> DateTime<Utc> {
@@ -356,7 +401,10 @@ impl DashboardState {
     }
 
     pub fn profit_pct(&self, market: &MarketRow) -> f64 {
-        let t = market.yes_price + market.no_price;
+        let Some((yes, no)) = market.both_prices() else {
+            return 0.0;
+        };
+        let t = yes + no;
         if t < 1.0 {
             (1.0 - t) * 100.0
         } else {
@@ -409,37 +457,45 @@ impl DashboardState {
                 no_dir: PriceDir::Flat,
                 is_arb: false,
                 sparkline: vec![1],
+                last_update: None,
             });
         }
     }
 
+    /// Update one or both sides of a market's displayed best-ask price.
+    /// `None` means that side has no best ask (no liquidity) and the TUI shows "—".
     pub fn update_market(
         &mut self,
         symbol: &str,
-        yes: f64,
-        no: f64,
+        yes: Option<f64>,
+        no: Option<f64>,
         is_arb: bool,
     ) {
         self.ensure_market(symbol);
         if let Some(row) = self.markets.iter_mut().find(|m| m.symbol == symbol) {
-            let yes_dir = PriceDir::from_delta(yes - row.yes_price);
-            let no_dir = PriceDir::from_delta(no - row.no_price);
-            if row.yes_price > 0.0 {
+            if let Some(yes) = yes {
+                row.yes_dir = PriceDir::from_delta(yes - row.yes_price);
+                row.yes_price = yes;
+            }
+            if let Some(no) = no {
+                row.no_dir = PriceDir::from_delta(no - row.no_price);
+                row.no_price = no;
+            }
+            if let (Some(yes), Some(no)) = (yes, no) {
                 let edge = ((1.0 - yes - no).max(0.0) * 100.0 * 10.0) as u64;
                 push_sparkline(&mut row.sparkline, edge);
             }
-            row.yes_price = yes;
-            row.no_price = no;
-            row.yes_dir = yes_dir;
-            row.no_dir = no_dir;
             row.is_arb = is_arb;
+            row.last_update = Some(Instant::now());
         }
         self.arb_scans = self.arb_scans.saturating_add(1);
         self.connected = true;
-        self.spread = (yes - no).abs();
-        self.bid_depth = 0.4 + (yes * 0.3);
-        self.ask_depth = 0.4 + (no * 0.3);
-        self.depth_k = yes + no;
+        if let (Some(yes), Some(no)) = (yes, no) {
+            self.spread = (yes - no).abs();
+            self.bid_depth = 0.4 + (yes * 0.3);
+            self.ask_depth = 0.4 + (no * 0.3);
+            self.depth_k = yes + no;
+        }
     }
 
     pub fn record_trade_attempt(&mut self, symbol: &str, profit_pct: f64, size: f64, cost: f64) {
@@ -490,7 +546,7 @@ impl DashboardState {
             self.profit_pulse -= 1;
         }
 
-        if self.frame % 2 == 0 {
+        if self.frame.is_multiple_of(2) {
             self.tick_sparklines();
         }
 
@@ -529,7 +585,7 @@ impl DashboardState {
 
     fn on_demo_tick(&mut self, grow_pnl: bool) {
         let mut rng = rand::thread_rng();
-        if grow_pnl && self.frame % 5 == 0 && self.window_secs_left > 0 {
+        if grow_pnl && self.frame.is_multiple_of(5) && self.window_secs_left > 0 {
             self.window_secs_left = self.window_secs_left.saturating_sub(1);
         }
         if grow_pnl {
@@ -538,6 +594,7 @@ impl DashboardState {
             self.arb_scans = self.arb_scans.wrapping_add(rng.gen_range(1..=4));
         }
         for market in &mut self.markets {
+            market.last_update = Some(Instant::now());
             let j: f64 = rng.gen_range(-0.002..0.002);
             market.yes_price = (market.yes_price + j).clamp(0.01, 0.99);
             market.no_price = (market.no_price - j * 0.5).clamp(0.01, 0.99);
@@ -616,4 +673,55 @@ pub fn symbol_short(crypto_symbol: &str) -> String {
 
 pub fn decimal_to_f64(d: rust_decimal::Decimal) -> f64 {
     d.to_string().parse().unwrap_or(0.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fresh_market_without_data_displays_dash() {
+        let mut state = DashboardState::new_live(String::from("GTD"), 1000.0);
+        state.ensure_market("BTC");
+        let row = state.markets.iter().find(|m| m.symbol == "BTC").unwrap();
+        // Never updated: no price available.
+        assert_eq!(row.yes_display(), None);
+        assert_eq!(row.no_display(), None);
+        assert_eq!(row.both_prices(), None);
+    }
+
+    #[test]
+    fn one_sided_update_shows_only_the_available_side() {
+        let mut state = DashboardState::new_live(String::from("GTD"), 1000.0);
+        state.update_market("BTC", Some(0.99), None, false);
+        let row = state.markets.iter().find(|m| m.symbol == "BTC").unwrap();
+        assert_eq!(row.yes_display(), Some(0.99));
+        assert_eq!(row.no_display(), None);
+        assert_eq!(row.both_prices(), None);
+        assert_eq!(state.profit_pct(row), 0.0);
+    }
+
+    #[test]
+    fn two_sided_update_enables_total_and_edge() {
+        let mut state = DashboardState::new_live(String::from("GTD"), 1000.0);
+        state.update_market("BTC", Some(0.52), Some(0.47), true);
+        let row = state.markets.iter().find(|m| m.symbol == "BTC").unwrap();
+        assert_eq!(row.yes_display(), Some(0.52));
+        assert_eq!(row.no_display(), Some(0.47));
+        assert_eq!(row.both_prices(), Some((0.52, 0.47)));
+        assert!((state.profit_pct(row) - 1.0).abs() < 1e-9);
+        assert!(row.is_arb);
+    }
+
+    #[test]
+    fn stale_market_shows_dash_after_threshold() {
+        let mut state = DashboardState::new_live(String::from("GTD"), 1000.0);
+        state.update_market("BTC", Some(0.60), Some(0.40), false);
+        let row = state.markets.iter_mut().find(|m| m.symbol == "BTC").unwrap();
+        // Simulate an old update: force last_update far in the past.
+        row.last_update = Some(Instant::now() - Duration::from_secs(MARKET_PRICE_STALE_SECS + 5));
+        assert_eq!(row.market_fresh(), false);
+        assert_eq!(row.yes_display(), None);
+        assert_eq!(row.no_display(), None);
+    }
 }

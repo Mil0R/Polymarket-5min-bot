@@ -10,13 +10,10 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 
-use crate::ui::state::{DashboardAction, DashboardState};
 use crate::ui::render;
+use crate::ui::state::{DashboardAction, DashboardState};
 
-pub fn spawn_dashboard_thread(
-    state: Arc<Mutex<DashboardState>>,
-    shutdown: Arc<AtomicBool>,
-) {
+pub fn spawn_dashboard_thread(state: Arc<Mutex<DashboardState>>, shutdown: Arc<AtomicBool>) {
     std::thread::spawn(move || {
         if let Err(e) = run_dashboard(state, shutdown) {
             let _ = std::fs::OpenOptions::new()
@@ -31,10 +28,7 @@ pub fn spawn_dashboard_thread(
     });
 }
 
-fn run_dashboard(
-    state: Arc<Mutex<DashboardState>>,
-    shutdown: Arc<AtomicBool>,
-) -> io::Result<()> {
+fn run_dashboard(state: Arc<Mutex<DashboardState>>, shutdown: Arc<AtomicBool>) -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout: Stdout = stdout();
     execute!(stdout, EnterAlternateScreen)?;

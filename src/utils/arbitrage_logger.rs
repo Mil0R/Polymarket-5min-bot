@@ -3,7 +3,6 @@ use chrono::Utc;
 use serde::Serialize;
 use std::fs::OpenOptions;
 use std::io::Write;
-use tracing::error;
 
 use crate::monitor::ArbitrageOpportunity;
 
@@ -42,29 +41,17 @@ pub fn log_arbitrage_opportunity(
         no_size: opp.no_size.to_string(),
     };
 
-    // Format record as JSON
-    let json = serde_json::to_string_pretty(&record)?;
-    
+    // Newline-delimited JSON is append-safe and easy to stream into tooling.
+    let json = serde_json::to_string(&record)?;
+
     // Append to file
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(file_path)?;
-    
-    writeln!(file, "{}", json)?;
-    writeln!(file, "---")?; // Separator
-    file.flush()?; // Flush to disk
-    
-    Ok(())
-}
 
-/// Async version of arbitrage log (avoids blocking)
-pub async fn log_arbitrage_opportunity_async(
-    opp: &ArbitrageOpportunity,
-    market_name: &str,
-    file_path: &str,
-) {
-    if let Err(e) = log_arbitrage_opportunity(opp, market_name, file_path) {
-        error!(error = %e, "Failed to write arbitrage log file");
-    }
+    writeln!(file, "{}", json)?;
+    file.flush()?; // Flush to disk
+
+    Ok(())
 }

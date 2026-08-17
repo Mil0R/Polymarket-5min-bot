@@ -1,198 +1,53 @@
 mod config;
+mod connection_supervisor;
+mod live_safety;
 mod market;
 mod monitor;
+mod network_retry;
+mod observability_server;
+mod opportunity_admission;
+#[cfg(test)]
+mod protocol_contract_tests;
 mod risk;
+mod runtime_metrics;
+mod strategy_gate;
+mod strategy_service;
 mod trading;
 mod utils;
-
-use polypulse::merge;
-use polypulse::positions::{get_positions, Position};
+mod wind_down_service;
+mod window;
+mod window_event_loop;
+mod window_session;
+mod window_session_runner;
 use polypulse::ui::{decimal_to_f64, spawn_dashboard_thread, symbol_short, DashboardHandle};
 
 use anyhow::Result;
-use dashmap::DashMap;
 use futures::StreamExt;
-use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
-use std::collections::{HashMap, HashSet};
 use std::io::{stdout, IsTerminal};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::str::FromStr as _;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
-use polymarket_client_sdk::types::{Address, B256, U256};
 
 use crate::config::Config;
-use crate::market::{MarketDiscoverer, MarketInfo, MarketScheduler};
-use crate::monitor::{ArbitrageDetector, OrderBookMonitor};
-use crate::risk::positions::PositionTracker;
+use crate::connection_supervisor::ConnectionSupervisor;
+use crate::live_safety::{CanaryPolicy, LiveSafetyGuard};
+use crate::market::{MarketDiscoverer, MarketScheduler};
+use crate::monitor::OrderBookMonitor;
+use crate::observability_server::ServiceHealth;
 use crate::risk::{HedgeMonitor, PositionBalancer, RiskManager};
+use crate::runtime_metrics::RuntimeMetrics;
+use crate::strategy_service::{StrategyService, StrategyServiceDeps};
 use crate::trading::{
-    create_authenticated_clob_client, parse_signature_type, v1_address_to_v2, TradingExecutor,
+    create_authenticated_clob_client, parse_signature_type, v1_address_to_v2, ExecutionPolicy,
+    TradingExecutor,
 };
-
-/// Filter condition_ids from positions where **both YES and NO** are held; only these markets can merge. One-sided positions are skipped.
-/// Data API may return outcome_index 0/1 (0=Yes, 1=No) or 1/2 (CTF index_set convention); both are supported.
-fn condition_ids_with_both_sides(positions: &[Position]) -> Vec<B256> {
-    let mut by_condition: HashMap<B256, HashSet<i32>> = HashMap::new();
-    for p in positions {
-        if p.size <= dec!(0) || !p.mergeable {
-            continue;
-        }
-        by_condition
-            .entry(p.condition_id)
-            .or_default()
-            .insert(p.outcome_index);
-    }
-    by_condition
-        .into_iter()
-        .filter(|(_, indices)| {
-            (indices.contains(&0) && indices.contains(&1)) || (indices.contains(&1) && indices.contains(&2))
-        })
-        .map(|(c, _)| c)
-        .collect()
-}
-
-/// Build condition_id -> (yes_token_id, no_token_id, merge_amount) from positions for exposure deduction after successful merge.
-/// Supports outcome_index 0/1 (0=Yes, 1=No) and 1/2 (CTF convention).
-fn merge_info_with_both_sides(positions: &[Position]) -> HashMap<B256, (U256, U256, Decimal)> {
-    // outcome_index -> (asset, size) grouped by condition
-    let mut by_condition: HashMap<B256, HashMap<i32, (U256, Decimal)>> = HashMap::new();
-    for p in positions {
-        if p.size <= dec!(0) || !p.mergeable {
-            continue;
-        }
-        by_condition
-            .entry(p.condition_id)
-            .or_default()
-            .insert(p.outcome_index, (p.asset, p.size));
-    }
-    by_condition
-        .into_iter()
-        .filter_map(|(c, map)| {
-            // Prefer CTF convention 1=Yes, 2=No; otherwise use 0=Yes, 1=No
-            if let (Some((yes_token, yes_size)), Some((no_token, no_size))) =
-                (map.get(&1).copied(), map.get(&2).copied())
-            {
-                return Some((c, (yes_token, no_token, yes_size.min(no_size))));
-            }
-            if let (Some((yes_token, yes_size)), Some((no_token, no_size))) =
-                (map.get(&0).copied(), map.get(&1).copied())
-            {
-                return Some((c, (yes_token, no_token, yes_size.min(no_size))));
-            }
-            None
-        })
-        .collect()
-}
-
-/// Convert on-chain share amount (6 decimals) to Decimal for position tracker updates.
-fn raw_shares_to_decimal(raw: U256) -> Decimal {
-    Decimal::from_str(&raw.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000)
-}
-
-/// Scheduled Merge task: every interval_minutes minutes fetch **positions**, run merge_max **serially** only for markets with both YES+NO positions,
-/// skip one-sided positions; delay between each merge, retry once on RPC rate limit. After merge success, deduct position_tracker holdings and exposure.
-/// Brief initial delay before first run to avoid blocking the orderbook stream by competing for runtime at startup.
-async fn run_merge_task(
-    interval_minutes: u64,
-    proxy: Address,
-    private_key: String,
-    position_tracker: Arc<PositionTracker>,
-    wind_down_in_progress: Arc<AtomicBool>,
-) {
-    let interval = Duration::from_secs(interval_minutes * 60);
-    /// Delay between each merge to reduce RPC bursts
-    const DELAY_BETWEEN_MERGES: Duration = Duration::from_secs(30);
-    /// Duration to wait before retry on rate limit (slightly longer than "retry in 10s")
-    const RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(12);
-    /// Initial delay so main loop can finish orderbook subscription and enter select! before first merge
-    const INITIAL_DELAY: Duration = Duration::from_secs(10);
-
-    // Let main loop complete get_markets, create stream and start orderbook listening before first merge
-    sleep(INITIAL_DELAY).await;
-
-    loop {
-        if wind_down_in_progress.load(Ordering::Relaxed) {
-            info!("Wind-down in progress, skipping merge for this round");
-            sleep(interval).await;
-            continue;
-        }
-        let (condition_ids, merge_info) = match get_positions().await {
-            Ok(positions) => (
-                condition_ids_with_both_sides(&positions),
-                merge_info_with_both_sides(&positions),
-            ),
-            Err(e) => {
-                warn!(error = %e, "❌ Failed to fetch positions, skipping merge for this round");
-                sleep(interval).await;
-                continue;
-            }
-        };
-
-        if condition_ids.is_empty() {
-            debug!("🔄 Merge round: no markets with both YES+NO positions");
-        } else {
-            info!(
-                count = condition_ids.len(),
-                "🔄 Merge round: {} markets have both YES+NO positions",
-                condition_ids.len()
-            );
-        }
-
-        for (i, &condition_id) in condition_ids.iter().enumerate() {
-            // For 2nd and later markets: wait 30s before merge to avoid overlap with previous on-chain tx
-            if i > 0 {
-                info!("Merge round: waiting 30s before merging next market ({}/{})", i + 1, condition_ids.len());
-                sleep(DELAY_BETWEEN_MERGES).await;
-            }
-            let asset_hint = merge_info
-                .get(&condition_id)
-                .map(|(yes_token, no_token, _)| (*yes_token, *no_token));
-            let mut result =
-                merge::merge_max(condition_id, proxy, &private_key, None, asset_hint).await;
-            if result.is_err() {
-                let msg = result.as_ref().unwrap_err().to_string();
-                if msg.contains("rate limit") || msg.contains("retry in") {
-                    warn!(condition_id = %condition_id, "⏳ RPC rate limit, waiting {}s before retry", RATE_LIMIT_BACKOFF.as_secs());
-                    sleep(RATE_LIMIT_BACKOFF).await;
-                    result = merge::merge_max(condition_id, proxy, &private_key, None, asset_hint).await;
-                }
-            }
-            match result {
-                Ok(merge_result) => {
-                    info!("✅ Merge complete | condition_id={:#x}", condition_id);
-                    info!("  📝 tx={}", merge_result.tx_hash);
-                    let chain_amt = raw_shares_to_decimal(merge_result.merged_amount);
-                    if let Some((yes_token, no_token, merge_amt)) = merge_info.get(&condition_id) {
-                        let deduct = chain_amt.min(*merge_amt);
-                        position_tracker.update_exposure_cost(*yes_token, dec!(0), -deduct);
-                        position_tracker.update_exposure_cost(*no_token, dec!(0), -deduct);
-                        position_tracker.update_position(*yes_token, -deduct);
-                        position_tracker.update_position(*no_token, -deduct);
-                        info!(
-                            "💰 Merge deducted exposure | condition_id={:#x} | amount:{} (chain:{})",
-                            condition_id, deduct, chain_amt
-                        );
-                    }
-                }
-                Err(e) => {
-                    let msg = e.to_string();
-                    if msg.contains("no mergeable shares") {
-                        debug!(condition_id = %condition_id, "⏭️ Skip merge: no mergeable shares");
-                    } else {
-                        warn!(condition_id = %condition_id, error = %e, "❌ Merge failed");
-                    }
-                }
-            }
-            tokio::task::yield_now().await;
-        }
-
-        sleep(interval).await;
-    }
-}
+use crate::wind_down_service::{ScheduledMergeService, WindDownService};
+use crate::window_event_loop::{WindowEventLoopState, WindowExitReason};
+use crate::window_session::WindowSession;
+use crate::window_session_runner::WindowSessionRunner;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -208,7 +63,9 @@ async fn main() -> Result<()> {
     let shutdown = Arc::new(AtomicBool::new(false));
 
     if use_tui {
-        tracing::info!("Polymarket 5-minute arbitrage bot starting (dashboard mode, logs → bot.log)");
+        tracing::info!(
+            "Polymarket 5-minute arbitrage bot starting (dashboard mode, logs → bot.log)"
+        );
     } else {
         tracing::info!("Polymarket 5-minute arbitrage bot starting");
     }
@@ -219,6 +76,41 @@ async fn main() -> Result<()> {
 
     let order_mode = format!("{:?}", config.arbitrage_order_type);
     let dashboard = DashboardHandle::new_live(order_mode, config.risk_max_exposure_usdc);
+    let runtime_metrics = Arc::new(RuntimeMetrics::default());
+    let live_safety = Arc::new(LiveSafetyGuard::new(CanaryPolicy {
+        enabled: config.canary_mode,
+        max_pair_notional: rust_decimal::Decimal::try_from(config.canary_max_pair_notional_usdc)?,
+        max_total_notional: rust_decimal::Decimal::try_from(config.canary_max_total_notional_usdc)?,
+        max_loss_budget: rust_decimal::Decimal::try_from(config.canary_max_loss_usdc)?,
+        max_pairs_per_window: config.canary_max_pairs_per_window,
+        max_pairs_total: config.canary_max_pairs_total,
+        max_consecutive_one_sided: config.one_sided_max_consecutive,
+    }));
+    let service_health = Arc::new(ServiceHealth::default());
+    info!(
+        enabled = live_safety.canary_enabled(),
+        snapshot = ?live_safety.snapshot(),
+        "Live safety gate initialized"
+    );
+    if let Ok(bind) = std::env::var("OBSERVABILITY_BIND") {
+        if !bind.trim().is_empty() {
+            let health_server = service_health.clone();
+            let metrics_server = runtime_metrics.clone();
+            let shutdown_server = shutdown.clone();
+            tokio::spawn(async move {
+                if let Err(error) = observability_server::serve(
+                    bind.trim(),
+                    health_server,
+                    metrics_server,
+                    shutdown_server,
+                )
+                .await
+                {
+                    error!(%error, "Observability server stopped");
+                }
+            });
+        }
+    }
     if use_tui {
         spawn_dashboard_thread(dashboard.arc(), shutdown.clone());
         dashboard.with_mut(|d| {
@@ -226,16 +118,16 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Initialize components (currently unused, main loop disabled)
-    let _discoverer = MarketDiscoverer::new(config.crypto_symbols.clone());
+    // Initialize market discovery and strategy components.
+    let _discoverer =
+        MarketDiscoverer::new(config.crypto_symbols.clone(), config.market_period_minutes);
     let _scheduler = MarketScheduler::new(_discoverer, config.market_refresh_advance_secs);
-    let _detector = ArbitrageDetector::new(config.min_profit_threshold);
-    
+
     // Validate private key format
     info!("Verifying private key format...");
     use alloy::signers::local::LocalSigner;
     use std::str::FromStr;
-    
+
     let _signer_test = LocalSigner::from_str(&config.private_key)
         .map_err(|e| anyhow::anyhow!("Invalid private key format: {}", e))?;
     info!("Private key format validated");
@@ -284,23 +176,42 @@ async fn main() -> Result<()> {
     let executor = Arc::new(TradingExecutor::from_client(
         clob_client.clone(),
         config.private_key.clone(),
-        config.max_order_size_usdc,
-        config.slippage,
-        config.gtd_expiration_secs,
-        config.arbitrage_order_type.clone(),
+        ExecutionPolicy {
+            max_order_size_usdc: config.max_order_size_usdc,
+            slippage: config.slippage,
+            min_profit_threshold: config.min_profit_threshold,
+            execution_spread: config.arbitrage_execution_spread,
+            fee_buffer: config.arbitrage_fee_buffer,
+            gtd_expiration_secs: config.gtd_expiration_secs,
+            order_type: config.arbitrage_order_type.clone(),
+            dry_run: config.dry_run,
+            paper_initial_balance_usdc: config.paper_initial_balance_usdc,
+            paper_liquidity_haircut: config.paper_liquidity_haircut,
+            paper_second_leg_delay_ms: config.paper_second_leg_delay_ms,
+        },
     ));
 
-    let _risk_manager = Arc::new(RiskManager::new(clob_client.clone(), &config));
-    
+    let _risk_manager = Arc::new(RiskManager::new(&config)?);
+
     // Create hedge monitor (pass PositionTracker Arc for exposure updates)
-    // Hedge strategy is currently disabled but hedge_monitor kept for future use
     let position_tracker = _risk_manager.position_tracker();
-    let _hedge_monitor = HedgeMonitor::new(
+    let hedge_monitor = Arc::new(HedgeMonitor::new(
         clob_client.clone(),
         config.private_key.clone(),
-        config.proxy_address.clone(),
         position_tracker,
-    );
+        _risk_manager.journal(),
+        _risk_manager.owned_orders(),
+    ));
+    let strategy_service = StrategyService::new(StrategyServiceDeps {
+        executor: executor.clone(),
+        risk_manager: _risk_manager.clone(),
+        hedge_monitor: hedge_monitor.clone(),
+        dashboard: dashboard.clone(),
+        metrics: runtime_metrics.clone(),
+        live_safety: live_safety.clone(),
+        service_health: service_health.clone(),
+        dry_run: config.dry_run,
+    });
 
     // Verify auth actually succeeded - try a simple API call
     info!("Verifying authentication (via API call test)...");
@@ -321,7 +232,44 @@ async fn main() -> Result<()> {
         }
     }
 
+    let (startup_actions, restored_recoveries) = if config.dry_run {
+        info!("DRY_RUN: startup recovery restoration disabled; no recovery writes can be armed");
+        (Vec::new(), 0)
+    } else {
+        let actions = _risk_manager
+            .reconcile_startup(&config, &clob_client)
+            .await?;
+        let restored = hedge_monitor.restore_from_journal()?;
+        for action in &actions {
+            hedge_monitor.add_position(action)?;
+        }
+        (actions, restored)
+    };
+    if restored_recoveries > 0 || !startup_actions.is_empty() {
+        warn!(
+            restored = restored_recoveries,
+            created = startup_actions.len(),
+            "Startup reconciliation restored active recovery monitors; new live entries remain paused"
+        );
+    }
+
+    let journal = _risk_manager.journal();
+    service_health.set_journal_writable(journal.probe_writable().is_ok());
+    let journal_dir = journal
+        .path()
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    const MIN_READY_DISK_BYTES: u64 = 64 * 1024 * 1024;
+    let disk_healthy = fs2::available_space(journal_dir)
+        .map(|bytes| bytes >= MIN_READY_DISK_BYTES)
+        .unwrap_or(false);
+    service_health.set_disk_healthy(disk_healthy);
+    service_health.set_no_unresolved_orders(!_risk_manager.has_unresolved_state());
+    service_health.set_safety_ok(!live_safety.is_tripped());
+
     info!("✅ All components initialized, auth verified");
+    service_health.mark_initialized();
 
     // Create position balancer
     let position_balancer = Arc::new(PositionBalancer::new(
@@ -331,7 +279,11 @@ async fn main() -> Result<()> {
     ));
 
     // Scheduled position sync: every N seconds fetch latest positions from API, overwrite local cache
-    let position_sync_interval = config.position_sync_interval_secs;
+    let position_sync_interval = if config.dry_run {
+        0
+    } else {
+        config.position_sync_interval_secs
+    };
     if position_sync_interval > 0 {
         let position_tracker_sync = _risk_manager.position_tracker();
         tokio::spawn(async move {
@@ -359,12 +311,15 @@ async fn main() -> Result<()> {
 
     // Scheduled position balance: every N seconds check positions and orders, cancel excess orders
     // Note: balance task runs in main loop as it needs market mapping
-    let balance_interval = config.position_balance_interval_secs;
+    let balance_interval = if config.dry_run {
+        0
+    } else {
+        config.position_balance_interval_secs
+    };
     if balance_interval > 0 {
         info!(
             interval_secs = balance_interval,
-            "Position balance task runs in main loop every {}s",
-            balance_interval
+            "Position balance task runs in main loop every {}s", balance_interval
         );
     } else {
         info!("Position balance not enabled (POSITION_BALANCE_INTERVAL_SECS=0)");
@@ -375,18 +330,23 @@ async fn main() -> Result<()> {
 
     // Minimum interval between two arbitrage trades
     const MIN_TRADE_INTERVAL: Duration = Duration::from_secs(3);
-    let last_trade_time: Arc<tokio::sync::Mutex<Option<Instant>>> = Arc::new(tokio::sync::Mutex::new(None));
+    let last_trade_time: Arc<tokio::sync::Mutex<Option<Instant>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
 
     // Scheduled Merge: every N minutes run merge by positions, only for markets with both YES+NO
     let merge_interval = config.merge_interval_minutes;
-    if merge_interval > 0 {
+    if merge_interval > 0 && !config.dry_run {
         if let Some(proxy) = config.proxy_address {
-            let private_key = config.private_key.clone();
-            let position_tracker = _risk_manager.position_tracker().clone();
-            let wind_down_flag = wind_down_in_progress.clone();
-            tokio::spawn(async move {
-                run_merge_task(merge_interval, proxy, private_key, position_tracker, wind_down_flag).await;
-            });
+            tokio::spawn(
+                ScheduledMergeService {
+                    interval_minutes: merge_interval,
+                    proxy,
+                    private_key: config.private_key.clone(),
+                    positions: _risk_manager.position_tracker(),
+                    wind_down_in_progress: wind_down_in_progress.clone(),
+                }
+                .run(),
+            );
             info!(
                 interval_minutes = merge_interval,
                 "Started scheduled Merge task, every {} minutes (YES+NO both positions only)",
@@ -395,11 +355,18 @@ async fn main() -> Result<()> {
         } else {
             warn!("MERGE_INTERVAL_MINUTES={} but POLYMARKET_PROXY_ADDRESS not set, scheduled Merge disabled", merge_interval);
         }
+    } else if config.dry_run && merge_interval > 0 {
+        info!("DRY_RUN: scheduled Merge disabled");
     } else {
         info!("Scheduled Merge not enabled (MERGE_INTERVAL_MINUTES=0). To enable, set MERGE_INTERVAL_MINUTES in .env (e.g. 5 or 15)");
     }
 
     // Main loop enabled, start monitoring and trading
+    let mut connection_supervisor = ConnectionSupervisor::new(
+        Duration::from_secs(1),
+        Duration::from_secs(30),
+        Duration::from_secs(30),
+    );
     #[allow(unreachable_code)]
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -422,9 +389,6 @@ async fn main() -> Result<()> {
             continue;
         }
 
-        // New round: reset risk exposure so this round accumulates from 0
-        _risk_manager.position_tracker().reset_exposure();
-
         dashboard.with_mut(|d| {
             d.window_pnl = 0.0;
             d.markets.clear();
@@ -440,6 +404,9 @@ async fn main() -> Result<()> {
                 error!(error = %e, market_id = %market.market_id, "Failed to subscribe to market");
             }
         }
+        for token_id in hedge_monitor.monitored_tokens() {
+            monitor.subscribe_recovery_token(token_id);
+        }
 
         // Create orderbook stream
         let mut stream = match monitor.create_orderbook_stream() {
@@ -452,37 +419,55 @@ async fn main() -> Result<()> {
 
         info!(market_count = markets.len(), "Monitoring orderbook");
 
-        let window_label = markets
-            .first()
-            .map(|m| format!("{}-updown-5m", symbol_short(&m.crypto_symbol).to_lowercase()))
-            .unwrap_or_else(|| "updown-5m".to_string());
+        use chrono::Utc;
+        let mut window_session = WindowSession::new(&markets, Utc::now(), config.market_period_minutes)?;
+        let window_label = window_session.label().to_string();
 
         dashboard.with_mut(|d| {
             d.set_window(&window_label, 300);
             d.set_connected(true);
-            d.push_event(format!("📡 Live — {} markets in {}", markets.len(), window_label));
+            d.push_event(format!(
+                "📡 Live — {} markets in {}",
+                markets.len(),
+                window_label
+            ));
         });
 
-        // Record current window timestamp for cycle switch and wind-down detection
-        use chrono::Utc;
-        use crate::market::discoverer::FIVE_MIN_SECS;
-        let current_window_timestamp = MarketDiscoverer::calculate_current_window_timestamp(Utc::now());
-        let window_end = chrono::DateTime::from_timestamp(current_window_timestamp + FIVE_MIN_SECS, 0)
-            .unwrap_or_else(|| Utc::now());
-        let mut wind_down_done = false;
-
-        // Create market_id -> market info mapping
-        let market_map: HashMap<B256, &MarketInfo> = markets.iter()
-            .map(|m| (m.market_id, m))
-            .collect();
-
         // Create market mapping (condition_id -> (yes_token_id, no_token_id)) for position balance
-        let market_token_map: HashMap<B256, (U256, U256)> = markets.iter()
-            .map(|m| (m.market_id, (m.yes_token_id, m.no_token_id)))
-            .collect();
+        let market_token_map = window_session.market_tokens().clone();
+        let window_scope = window_session.scope();
+
+        // Authenticated user stream closes the gap between the immediate post_order
+        // response and later maker/partial fills.
+        let user_ws_client = match polymarket_client_sdk_v2::clob::ws::Client::default()
+            .authenticate(clob_client.credentials().clone(), clob_client.address())
+        {
+            Ok(client) => client,
+            Err(e) => {
+                error!(error = %e, "Failed to authenticate user order stream");
+                sleep(connection_supervisor.connect_failed()).await;
+                continue;
+            }
+        };
+        let mut user_order_stream = match user_ws_client
+            .subscribe_orders(markets.iter().map(|market| market.market_id).collect())
+        {
+            Ok(stream) => Box::pin(stream),
+            Err(e) => {
+                error!(error = %e, "Failed to subscribe authenticated user order stream");
+                sleep(connection_supervisor.connect_failed()).await;
+                continue;
+            }
+        };
+        connection_supervisor.subscription_ready();
+        service_health.set_connected(true);
 
         // Create position balance timer
-        let balance_interval = config.position_balance_interval_secs;
+        let balance_interval = if config.dry_run {
+            0
+        } else {
+            config.position_balance_interval_secs
+        };
         let mut balance_timer = if balance_interval > 0 {
             let mut timer = tokio::time::interval(Duration::from_secs(balance_interval));
             timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -492,312 +477,176 @@ async fn main() -> Result<()> {
             None
         };
 
-        // Record last best-ask per market for direction (↑↓) calc (single HashMap read/write, no perf impact)
-        let last_prices: DashMap<B256, (Decimal, Decimal)> = DashMap::new();
-
+        let session_runner = WindowSessionRunner::new(&markets, &config, runtime_metrics.clone());
+        let mut event_loop_state = WindowEventLoopState::default();
         // Monitor orderbook updates
         loop {
             // Wind-down check: run once when <= N minutes to window end (stay in loop until natural switch by new-window detection)
             // Use second precision; num_minutes() truncation may miss in 5min windows
-            if config.wind_down_before_window_end_minutes > 0 && !wind_down_done {
-                let now = Utc::now();
-                let seconds_until_end = (window_end - now).num_seconds();
-                let threshold_seconds = config.wind_down_before_window_end_minutes as i64 * 60;
-                if seconds_until_end <= threshold_seconds {
-                    info!("🛑 Wind-down triggered | {}s until window end", seconds_until_end);
-                    wind_down_done = true;
-                    wind_down_in_progress.store(true, Ordering::Relaxed);
+            if window_session
+                .start_wind_down_if_due(Utc::now(), config.wind_down_before_window_end_minutes)
+            {
+                let seconds_until_end = window_session.remaining_seconds(Utc::now());
+                info!(
+                    "🛑 Wind-down triggered | {}s until window end",
+                    seconds_until_end
+                );
+                wind_down_in_progress.store(true, Ordering::Relaxed);
 
-                    // Wind-down runs in separate task to avoid blocking orderbook; 30s between merges per market
-                    let executor_wd = executor.clone();
-                    let config_wd = config.clone();
-                    let risk_manager_wd = _risk_manager.clone();
-                    let wind_down_flag = wind_down_in_progress.clone();
-                    tokio::spawn(async move {
-                        const MERGE_INTERVAL: Duration = Duration::from_secs(30);
-
-                        // 1. Cancel all orders
-                        if let Err(e) = executor_wd.cancel_all_orders().await {
-                            warn!(error = %e, "Wind-down: failed to cancel all orders, continuing with Merge and sell");
-                        } else {
-                            info!("✅ Wind-down: all orders cancelled");
-                        }
-
-                        // Wait 10s after cancel before Merge so recent fills can settle on-chain
-                        const DELAY_AFTER_CANCEL: Duration = Duration::from_secs(10);
-                        sleep(DELAY_AFTER_CANCEL).await;
-
-                        // 2. Merge both sides (30s between markets) and update exposure
-                        let position_tracker = risk_manager_wd.position_tracker();
-                        let mut did_any_merge = false;
-                        if let Some(proxy) = config_wd.proxy_address {
-                            match get_positions().await {
-                                Ok(positions) => {
-                                    let condition_ids = condition_ids_with_both_sides(&positions);
-                                    let merge_info = merge_info_with_both_sides(&positions);
-                                    let n = condition_ids.len();
-                                    for (i, condition_id) in condition_ids.iter().enumerate() {
-                                        let asset_hint = merge_info
-                                            .get(condition_id)
-                                            .map(|(yes_token, no_token, _)| (*yes_token, *no_token));
-                                        match merge::merge_max(
-                                            *condition_id,
-                                            proxy,
-                                            &config_wd.private_key,
-                                            None,
-                                            asset_hint,
-                                        )
-                                        .await {
-                                            Ok(merge_result) => {
-                                                did_any_merge = true;
-                                                info!(
-                                                    "✅ Wind-down: Merge done | condition_id={:#x} | tx={}",
-                                                    condition_id, merge_result.tx_hash
-                                                );
-                                                let chain_amt = raw_shares_to_decimal(merge_result.merged_amount);
-                                                if let Some((yes_token, no_token, merge_amt)) = merge_info.get(condition_id) {
-                                                    let deduct = chain_amt.min(*merge_amt);
-                                                    position_tracker.update_exposure_cost(*yes_token, dec!(0), -deduct);
-                                                    position_tracker.update_exposure_cost(*no_token, dec!(0), -deduct);
-                                                    position_tracker.update_position(*yes_token, -deduct);
-                                                    position_tracker.update_position(*no_token, -deduct);
-                                                    info!(
-                                                        "💰 Wind-down: Merge deducted exposure | condition_id={:#x} | amount:{} (chain:{})",
-                                                        condition_id, deduct, chain_amt
-                                                    );
-                                                }
-                                            }
-                                            Err(e) => {
-                                                warn!(condition_id = %condition_id, error = %e, "Wind-down: Merge failed");
-                                            }
-                                        }
-                                        // Wait 30s after each market merge before next, for on-chain settlement
-                                        if i + 1 < n {
-                                            info!("Wind-down: waiting 30s before next merge");
-                                            sleep(MERGE_INTERVAL).await;
-                                        }
-                                    }
-                                }
-                                Err(e) => { warn!(error = %e, "Wind-down: failed to get positions, skipping Merge"); }
-                            }
-                        } else {
-                            warn!("Wind-down: POLYMARKET_PROXY_ADDRESS not set, skipping Merge");
-                        }
-
-                        // If merge ran, wait 30s before selling one-sided legs for on-chain; else no wait
-                        if did_any_merge {
-                            sleep(MERGE_INTERVAL).await;
-                        }
-
-                        // 3. Market-sell remaining one-sided positions
-                        let wind_down_sell_price = Decimal::try_from(config_wd.wind_down_sell_price).unwrap_or(dec!(0.01));
-                        match get_positions().await {
-                            Ok(positions) => {
-                                for pos in positions.iter().filter(|p| p.size > dec!(0)) {
-                                    let size_floor = (pos.size * dec!(100)).floor() / dec!(100);
-                                    if size_floor < dec!(0.01) {
-                                        debug!(token_id = %pos.asset, size = %pos.size, "Wind-down: position too small, skip sell");
-                                        continue;
-                                    }
-                                    if let Err(e) = executor_wd.sell_at_price(pos.asset, wind_down_sell_price, size_floor).await {
-                                        warn!(token_id = %pos.asset, size = %pos.size, error = %e, "Wind-down: failed to sell one-sided leg");
-                                    } else {
-                                        info!("✅ Wind-down: sell order placed | token_id={:#x} | amount:{} | price:{:.4}", pos.asset, size_floor, wind_down_sell_price);
-                                    }
-                                }
-                            }
-                            Err(e) => { warn!(error = %e, "Wind-down: failed to get positions, skipping sell"); }
-                        }
-
-                        info!("🛑 Wind-down complete, continuing to monitor until window end");
-                        wind_down_flag.store(false, Ordering::Relaxed);
-                    });
-                }
+                let wind_down = WindDownService::new(
+                    config.clone(),
+                    executor.clone(),
+                    _risk_manager.clone(),
+                    wind_down_in_progress.clone(),
+                );
+                let allowed_conditions = window_scope.condition_ids();
+                let allowed_tokens = window_scope.token_ids();
+                window_session.start_wind_down(async move {
+                    wind_down.run(allowed_conditions, allowed_tokens).await;
+                });
             }
 
             tokio::select! {
+                user_event = user_order_stream.next() => {
+                    match user_event {
+                        Some(Ok(event)) => {
+                            _risk_manager.observe_order_event(&event);
+                            service_health.set_no_unresolved_orders(
+                                !_risk_manager.has_unresolved_state(),
+                            );
+                        }
+                        Some(Err(e)) => {
+                            error!(error = %e, "Authenticated user order stream failed");
+                            window_session.mark_user_stream_failed();
+                            event_loop_state.exit(WindowExitReason::UserStreamDisconnected);
+                            break;
+                        }
+                        None => {
+                            warn!("Authenticated user order stream ended; recreating window streams");
+                            window_session.mark_user_stream_failed();
+                            event_loop_state.exit(WindowExitReason::UserStreamDisconnected);
+                            break;
+                        }
+                    }
+                }
                 // Handle orderbook updates
                 book_result = stream.next() => {
                     match book_result {
                         Some(Ok(book)) => {
+                            // Recovery monitor observes the same public book stream as the strategy.
+                            if let Err(e) = hedge_monitor.check_and_execute(&book).await {
+                                warn!(error = %e, "Recovery monitor update failed");
+                            }
                             // Process orderbook update (book will be moved)
                             if let Some(pair) = monitor.handle_book_update(book) {
-                                // Note: asks last element is best ask
-                                let yes_best_ask = pair.yes_book.asks.last().map(|a| (a.price, a.size));
-                                let no_best_ask = pair.no_book.asks.last().map(|a| (a.price, a.size));
-                                let total_ask_price = yes_best_ask.and_then(|(p, _)| no_best_ask.map(|(np, _)| p + np));
-
-                                let market_id = pair.market_id;
-                                // Compare with prev tick for direction (↑ up ↓ down − flat), no arrow on first
-                                let (yes_dir, no_dir) = match (yes_best_ask, no_best_ask) {
-                                    (Some((yp, _)), Some((np, _))) => {
-                                        let prev = last_prices.get(&market_id).map(|r| (r.0, r.1));
-                                        let (y_dir, n_dir) = prev
-                                            .map(|(ly, ln)| (
-                                                if yp > ly { "↑" } else if yp < ly { "↓" } else { "−" },
-                                                if np > ln { "↑" } else if np < ln { "↓" } else { "−" },
-                                            ))
-                                            .unwrap_or(("", ""));
-                                        last_prices.insert(market_id, (yp, np));
-                                        (y_dir, n_dir)
+                                let tick = match session_runner.process_pair(
+                                    &pair,
+                                    Utc::now().timestamp_millis(),
+                                    window_scope.trading_paused() || live_safety.is_tripped(),
+                                    connection_supervisor.is_healthy(),
+                                    _risk_manager.has_unresolved_state(),
+                                ) {
+                                    Ok(tick) => tick,
+                                    Err(error) => {
+                                        debug!(%error, market_id = %pair.market_id, "Rejected unsafe orderbook pair");
+                                        continue;
                                     }
-                                    _ => ("", ""),
                                 };
-
-                                let market_info = market_map.get(&pair.market_id);
-                                let market_title = market_info.map(|m| m.title.as_str()).unwrap_or("unknown market");
-                                let market_symbol = market_info.map(|m| m.crypto_symbol.as_str()).unwrap_or("");
-                                let market_display = if !market_symbol.is_empty() {
-                                    format!("{} prediction market", market_symbol)
-                                } else {
-                                    market_title.to_string()
-                                };
+                                let yes_best_ask = tick.yes_best_ask;
+                                let no_best_ask = tick.no_best_ask;
+                                let total_ask_price = tick.total_ask_price;
+                                let yes_dir = tick.yes_direction;
+                                let no_dir = tick.no_direction;
+                                let market_display = tick.market_display;
+                                let market_symbol = tick.market_symbol;
 
                                 let (prefix, spread_info) = total_ask_price
-                                    .map(|t| {
-                                        if t < dec!(1.0) {
-                                            let profit_pct = (dec!(1.0) - t) * dec!(100.0);
-                                            ("🚨 Arbitrage", format!("total:{:.4} profit:{:.2}%", t, profit_pct))
+                                    .map(|total| {
+                                        if total < dec!(1) {
+                                            let profit_pct = (dec!(1) - total) * dec!(100);
+                                            ("🚨 Arbitrage", format!("total:{total:.4} profit:{profit_pct:.2}%"))
                                         } else {
-                                            ("📊", format!("total:{:.4} (no arb)", t))
+                                            ("📊", format!("total:{total:.4} (no arb)"))
                                         }
                                     })
                                     .unwrap_or_else(|| ("📊", "no data".to_string()));
-
-                                // Direction arrows shown only for arbitrage
                                 let is_arbitrage = prefix == "🚨 Arbitrage";
                                 let yes_info = yes_best_ask
-                                    .map(|(p, s)| {
+                                    .map(|(price, size)| {
                                         if is_arbitrage && !yes_dir.is_empty() {
-                                            format!("Yes:{:.4} size:{} {}", p, s, yes_dir)
+                                            format!("Yes:{price:.4} size:{size} {yes_dir}")
                                         } else {
-                                            format!("Yes:{:.4} size:{}", p, s)
+                                            format!("Yes:{price:.4} size:{size}")
                                         }
                                     })
                                     .unwrap_or_else(|| "Yes:none".to_string());
                                 let no_info = no_best_ask
-                                    .map(|(p, s)| {
+                                    .map(|(price, size)| {
                                         if is_arbitrage && !no_dir.is_empty() {
-                                            format!("No:{:.4} size:{} {}", p, s, no_dir)
+                                            format!("No:{price:.4} size:{size} {no_dir}")
                                         } else {
-                                            format!("No:{:.4} size:{}", p, s)
+                                            format!("No:{price:.4} size:{size}")
                                         }
                                     })
                                     .unwrap_or_else(|| "No:none".to_string());
 
                                 if use_tui {
-                                    if let (Some((yp, _)), Some((np, _))) = (yes_best_ask, no_best_ask) {
-                                        let sym = symbol_short(market_symbol);
-                                        let is_arb = total_ask_price
-                                            .map(|t| t < dec!(1.0))
-                                            .unwrap_or(false);
-                                        dashboard.with_mut(|d| {
-                                            d.update_market(
-                                                &sym,
-                                                decimal_to_f64(yp),
-                                                decimal_to_f64(np),
-                                                is_arb,
-                                            );
-                                        });
-                                    }
+                                    dashboard.with_mut(|state| {
+                                        state.update_market(
+                                            &symbol_short(&market_symbol),
+                                            yes_best_ask.map(|(price, _)| decimal_to_f64(price)),
+                                            no_best_ask.map(|(price, _)| decimal_to_f64(price)),
+                                            is_arbitrage,
+                                        );
+                                    });
                                 } else {
                                     info!(
                                         "{} {} | {} | {} | {}",
-                                        prefix,
-                                        market_display,
-                                        yes_info,
-                                        no_info,
-                                        spread_info
+                                        prefix, market_display, yes_info, no_info, spread_info
                                     );
                                 }
-
-                                // Keep structured debug log (optional)
                                 debug!(
                                     market_id = %pair.market_id,
                                     yes_token = %pair.yes_book.asset_id,
                                     no_token = %pair.no_book.asset_id,
                                     "Orderbook pair details"
                                 );
-
-                                // Detect arbitrage (monitoring: execute only when total <= 1 - execution spread)
-                                use rust_decimal::Decimal;
-                                let execution_threshold = dec!(1.0) - Decimal::try_from(config.arbitrage_execution_spread)
-                                    .unwrap_or(dec!(0.01));
-                                if let Some(total_price) = total_ask_price {
-                                    if total_price <= execution_threshold {
-                                        if let Some(opp) = _detector.check_arbitrage(
-                                            &pair.yes_book,
-                                            &pair.no_book,
-                                            &pair.market_id,
-                                        ) {
-                                            // Check YES price threshold
-                                            if config.min_yes_price_threshold > 0.0 {
-                                                use rust_decimal::Decimal;
-                                                let min_yes_price_decimal = Decimal::try_from(config.min_yes_price_threshold)
-                                                    .unwrap_or(dec!(0.0));
-                                                if opp.yes_ask_price < min_yes_price_decimal {
-                                                    debug!(
-                                                        "⏸️ YES price below threshold, skip arbitrage | market:{} | YES:{:.4} | threshold:{:.4}",
-                                                        market_display,
-                                                        opp.yes_ask_price,
-                                                        config.min_yes_price_threshold
-                                                    );
-                                                    continue; // Skip this arbitrage
-                                                }
-                                            }
-                                            
-                                            // Check NO price threshold
-                                            if config.min_no_price_threshold > 0.0 {
-                                                use rust_decimal::Decimal;
-                                                let min_no_price_decimal = Decimal::try_from(config.min_no_price_threshold)
-                                                    .unwrap_or(dec!(0.0));
-                                                if opp.no_ask_price < min_no_price_decimal {
-                                                    debug!(
-                                                        "⏸️ NO price below threshold, skip arbitrage | market:{} | NO:{:.4} | threshold:{:.4}",
-                                                        market_display,
-                                                        opp.no_ask_price,
-                                                        config.min_no_price_threshold
-                                                    );
-                                                    continue; // Skip this arbitrage
-                                                }
-                                            }
-                                            
-                                            // Check if near market end (if stop time configured)
-                                            // Second precision; num_minutes() may miss in 5min markets
-                                            if config.stop_arbitrage_before_end_minutes > 0 {
-                                                if let Some(market_info) = market_map.get(&pair.market_id) {
-                                                    use chrono::Utc;
-                                                    let now = Utc::now();
-                                                    let time_until_end = market_info.end_date.signed_duration_since(now);
-                                                    let seconds_until_end = time_until_end.num_seconds();
-                                                    let threshold_seconds = config.stop_arbitrage_before_end_minutes as i64 * 60;
-                                                    
-                                                    if seconds_until_end <= threshold_seconds {
-                                                        debug!(
-                                                            "⏰ Near market end, skip arbitrage | market:{} | seconds to end:{} | stop threshold:{}min",
-                                                            market_display,
-                                                            seconds_until_end,
-                                                            config.stop_arbitrage_before_end_minutes
-                                                        );
-                                                        continue; // Skip this arbitrage
+                                let Some(opp) = tick.opportunity else {
+                                    continue;
+                                };
+                                            if let Some(path) = config.arbitrage_log_file.clone() {
+                                                let logged_opp = opp.clone();
+                                                let logged_market = market_display.clone();
+                                                tokio::task::spawn_blocking(move || {
+                                                    if let Err(e) = utils::arbitrage_logger::log_arbitrage_opportunity(
+                                                        &logged_opp,
+                                                        &logged_market,
+                                                        &path,
+                                                    ) {
+                                                        error!(error = %e, "Failed to persist arbitrage opportunity");
                                                     }
-                                                }
+                                                });
                                             }
-                                            
-                                            // Calculate order cost (USD)
-                                            // Use actual available size from arb, but cap at max order size
-                                            use rust_decimal::Decimal;
-                                            let max_order_size = Decimal::try_from(config.max_order_size_usdc).unwrap_or(dec!(100.0));
-                                            let order_size = opp.yes_size.min(opp.no_size).min(max_order_size);
-                                            let yes_cost = opp.yes_ask_price * order_size;
-                                            let no_cost = opp.no_ask_price * order_size;
-                                            let total_cost = yes_cost + no_cost;
-                                            
+                                            // Use the exact slippage-adjusted quote for profitability,
+                                            // notional sizing and risk reservation.
+                                            let quote = match executor.execution_quote(&opp, yes_dir, no_dir).await {
+                                                Ok(quote) => quote,
+                                                Err(e) => {
+                                                    runtime_metrics.record_quote_rejection();
+                                                    debug!(error = %e, market = %market_display, "Final quote rejected");
+                                                    continue;
+                                                }
+                                            };
+                                            let order_size = quote.size;
+                                            let total_cost = quote.total_cost;
+
                                             // Check risk exposure limit
                                             let position_tracker = _risk_manager.position_tracker();
                                             let current_exposure = position_tracker.calculate_exposure();
-                                            
-                                            if position_tracker.would_exceed_limit(yes_cost, no_cost) {
+
+                                            let reservation_id = uuid::Uuid::new_v4().to_string();
+                                            let Some(reservation) = position_tracker.reserve(reservation_id, total_cost) else {
+                                                runtime_metrics.record_risk_rejection();
                                                 warn!(
                                                     "�� ️ Risk exposure limit exceeded, skip arbitrage | market:{} | exposure:{:.2} USD | order cost:{:.2} USD | limit:{:.2} USD",
                                                     market_display,
@@ -806,17 +655,18 @@ async fn main() -> Result<()> {
                                                     position_tracker.max_exposure()
                                                 );
                                                 continue; // Skip this arbitrage
-                                            }
-                                            
+                                            };
+
                                             // Check position balance (local cache, zero latency)
                                             if position_balancer.should_skip_arbitrage(opp.yes_token_id, opp.no_token_id) {
+                                                runtime_metrics.record_balance_rejection();
                                                 warn!(
                                                     "�� ️ Positions severely imbalanced, skip arbitrage | market:{}",
                                                     market_display
                                                 );
                                                 continue; // Skip this arbitrage
                                             }
-                                            
+
                                             // Check trade interval: min 3s between trades
                                             {
                                                 let mut guard = last_trade_time.lock().await;
@@ -835,17 +685,22 @@ async fn main() -> Result<()> {
                                                 *guard = Some(now);
                                             }
 
-                                            let trade_sym = symbol_short(market_symbol);
-                                            let profit_usd = decimal_to_f64(
-                                                (dec!(1.0) - opp.yes_ask_price - opp.no_ask_price)
-                                                    * order_size,
-                                            );
+                                            if let Err(reason) = live_safety.try_start_pair(
+                                                window_session.timestamp(),
+                                                &quote,
+                                            ) {
+                                                runtime_metrics.record_risk_rejection();
+                                                warn!(%reason, "Live/canary safety gate rejected order pair");
+                                                continue;
+                                            }
+
+                                            let trade_sym = symbol_short(&market_symbol);
                                             if use_tui {
                                                 dashboard.with_mut(|d| {
                                                     d.set_exposure(decimal_to_f64(current_exposure));
                                                     d.record_trade_attempt(
                                                         &trade_sym,
-                                                        decimal_to_f64(opp.profit_percentage),
+                                                        decimal_to_f64(quote.edge_per_share * dec!(100)),
                                                         decimal_to_f64(order_size),
                                                         decimal_to_f64(total_cost),
                                                     );
@@ -854,115 +709,29 @@ async fn main() -> Result<()> {
                                                 info!(
                                                     "⚡ Execute arbitrage | market:{} | profit:{:.2}% | size:{} | cost:{:.2} USD | exposure:{:.2} USD",
                                                     market_display,
-                                                    opp.profit_percentage,
+                                                    quote.edge_per_share * dec!(100),
                                                     order_size,
                                                     total_cost,
                                                     current_exposure
                                                 );
                                             }
-                                            // Simplified exposure: add on arb execution regardless of fill
-                                            let _pt = _risk_manager.position_tracker();
-                                            _pt.update_exposure_cost(opp.yes_token_id, opp.yes_ask_price, order_size);
-                                            _pt.update_exposure_cost(opp.no_token_id, opp.no_ask_price, order_size);
-                                            
-                                            // Arb execution: run whenever total <= threshold, direction only for slippage (down=second, up/flat=first)
-                                            // Clone vars for spawned task (direction used for slippage allocation)
-                                            let executor_clone = executor.clone();
-                                            let risk_manager_clone = _risk_manager.clone();
-                                            let opp_clone = opp.clone();
-                                            let yes_dir_s = yes_dir.to_string();
-                                            let no_dir_s = no_dir.to_string();
-                                            let dashboard_trade = dashboard.clone();
-                                            let trade_sym_spawn = trade_sym.clone();
-
-                                            // Spawn async to avoid blocking orderbook updates
-                                            tokio::spawn(async move {
-                                                // Execute arbitrage (slippage: down=second, up/flat=first)
-                                                match executor_clone.execute_arbitrage_pair(&opp_clone, &yes_dir_s, &no_dir_s).await {
-                                                    Ok(result) => {
-                                                        if result.success {
-                                                            dashboard_trade.with_mut(|d| {
-                                                                d.record_trade_success(
-                                                                    &trade_sym_spawn,
-                                                                    profit_usd,
-                                                                    decimal_to_f64(opp_clone.profit_percentage),
-                                                                );
-                                                            });
-                                                        } else {
-                                                            dashboard_trade.with_mut(|d| {
-                                                                d.record_trade_failure(
-                                                                    &trade_sym_spawn,
-                                                                    "orders not filled",
-                                                                );
-                                                            });
-                                                        }
-
-                                                        // Save pair_id first, result will be moved
-                                                        let pair_id = result.pair_id.clone();
-                                                        
-                                                        // Register with risk manager (with prices for exposure calc)
-                                                        risk_manager_clone.register_order_pair(
-                                                            result,
-                                                            opp_clone.market_id,
-                                                            opp_clone.yes_token_id,
-                                                            opp_clone.no_token_id,
-                                                            opp_clone.yes_ask_price,
-                                                            opp_clone.no_ask_price,
-                                                        );
-
-                                                        // Handle risk recovery
-                                                        // Hedge strategy disabled; no action on one-sided fills
-                                                        match risk_manager_clone.handle_order_pair(&pair_id).await {
-                                                            Ok(action) => {
-                                                                // Hedge strategy off; no MonitorForExit/SellExcess
-                                                                match action {
-                                                                    crate::risk::recovery::RecoveryAction::None => {
-                                                                        // Normal case, no action
-                                                                    }
-                                                                    crate::risk::recovery::RecoveryAction::MonitorForExit { .. } => {
-                                                                        info!("One-sided fill, hedge strategy disabled, no action");
-                                                                    }
-                                                                    crate::risk::recovery::RecoveryAction::SellExcess { .. } => {
-                                                                        info!("Partial fill imbalance, hedge strategy disabled, no action");
-                                                                    }
-                                                                    crate::risk::recovery::RecoveryAction::ManualIntervention { reason } => {
-                                                                        warn!("Manual intervention needed: {}", reason);
-                                                                    }
-                                                                }
-                                                            }
-                                                            Err(e) => {
-                                                                error!("Risk handling failed: {}", e);
-                                                            }
-                                                        }
-                                                    }
-                                                    Err(e) => {
-                                                        // Error details in executor; brief summary here
-                                                        let error_msg = e.to_string();
-                                                        dashboard_trade.with_mut(|d| {
-                                                            d.record_trade_failure(&trade_sym_spawn, &error_msg);
-                                                        });
-                                                        // Extract simplified error
-                                                        if error_msg.contains("Arbitrage failed") {
-                                                            // Error already formatted
-                                                            error!("{}", error_msg);
-                                                        } else {
-                                                            error!("Arbitrage execution failed: {}", error_msg);
-                                                        }
-                                                    }
-                                                }
-                                            });
-                                        }
-                                    }
-                                }
+                                            window_session.spawn_trade(strategy_service.clone().execute(
+                                                opp,
+                                                quote,
+                                                trade_sym,
+                                                reservation,
+                                            ));
                             }
                         }
                         Some(Err(e)) => {
                             error!(error = %e, "Orderbook update error");
+                            event_loop_state.exit(WindowExitReason::MarketStreamDisconnected);
                             // Stream error, recreate stream
                             break;
                         }
                         None => {
                             warn!("Orderbook stream ended, recreating");
+                            event_loop_state.exit(WindowExitReason::MarketStreamDisconnected);
                             break;
                         }
                     }
@@ -989,34 +758,68 @@ async fn main() -> Result<()> {
                     }
 
                     let now = Utc::now();
-                    let seconds_until_end =
-                        (window_end - now).num_seconds().max(0) as u32;
+                    let seconds_until_end = window_session.remaining_seconds(now);
                     let exposure = _risk_manager.position_tracker().calculate_exposure();
+                    service_health.set_journal_writable(journal.probe_writable().is_ok());
+                    let disk_healthy = fs2::available_space(journal_dir)
+                        .map(|bytes| bytes >= MIN_READY_DISK_BYTES)
+                        .unwrap_or(false);
+                    service_health.set_disk_healthy(disk_healthy);
+                    service_health.set_no_unresolved_orders(!_risk_manager.has_unresolved_state());
+                    service_health.set_safety_ok(!live_safety.is_tripped());
                     dashboard.with_mut(|d| {
                         d.set_window(&window_label, seconds_until_end);
                         d.set_exposure(decimal_to_f64(exposure));
                     });
 
-                    let new_window_timestamp = MarketDiscoverer::calculate_current_window_timestamp(now);
-
-                    // If window timestamp changed, we're in a new window
-                    if new_window_timestamp != current_window_timestamp {
+                    if window_session.has_rolled_over(now, config.market_period_minutes) {
+                        let new_window_timestamp =
+                            _scheduler.calculate_current_window_timestamp(now);
                         info!(
-                            old_window = current_window_timestamp,
+                            old_window = window_session.timestamp(),
                             new_window = new_window_timestamp,
                             "New 5min window detected, cancelling old subscriptions and switching"
                         );
                         // Drop stream to release monitor borrow, then clear old subs
                         drop(stream);
                         monitor.clear();
+                        event_loop_state.exit(WindowExitReason::Rollover);
                         break;
                     }
                 }
             }
         }
 
-        // monitor is dropped at loop end, no manual cleanup
+        // Avoid starting a new window while old tasks still change account state.
+        window_session.finish(Duration::from_secs(30)).await;
+
+        if _risk_manager.has_unresolved_state() {
+            _risk_manager.reconcile_owned_orders(&clob_client).await;
+            hedge_monitor.reconcile_owned_orders().await;
+        }
+        service_health.set_no_unresolved_orders(!_risk_manager.has_unresolved_state());
+        service_health.set_safety_ok(!live_safety.is_tripped());
+        if event_loop_state.requires_reconnect_backoff() {
+            service_health.set_connected(false);
+            runtime_metrics.record_stream_reconnect();
+            dashboard.with_mut(|d| d.set_connected(false));
+            let reconnect_delay = connection_supervisor.disconnected(window_session.elapsed());
+            warn!(
+                delay_secs = reconnect_delay.as_secs(),
+                "User stream disconnected; new entries paused during reconnect backoff"
+            );
+            sleep(reconnect_delay).await;
+        } else {
+            service_health.set_connected(false);
+            connection_supervisor.normal_session_end();
+        }
+        debug!(reason = ?event_loop_state.exit_reason(), "Window event loop exited");
+
+        match serde_json::to_string(&runtime_metrics.snapshot()) {
+            Ok(snapshot) => info!(metrics = %snapshot, "Runtime metrics snapshot"),
+            Err(error) => warn!(%error, "Failed to serialize runtime metrics"),
+        }
+
         info!("Current window monitoring ended, refreshing markets for next round");
     }
 }
-

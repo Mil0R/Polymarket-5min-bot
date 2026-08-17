@@ -23,15 +23,15 @@ sol! {
     }
 }
 
-use crate::adapter_auth::{ensure_adapter_approved, encode_set_approval_for_all, wait_relayer_tx};
+use crate::adapter_auth::{encode_set_approval_for_all, ensure_adapter_approved, wait_relayer_tx};
 use crate::deposit_wallet_relay::{
     relayer_execute_deposit_wallet_calldata, use_deposit_wallet_relayer,
 };
 use crate::proxy_relay::{
-    derive_proxy_wallet, relayer_execute_proxy_calldata, IGnosisSafe, CTF_COLLATERAL_ADAPTER,
-    CTF_POLYGON, NEG_RISK_ADAPTER, NEG_RISK_COLLATERAL_ADAPTER, PROXY_FACTORY,
-    PROXY_REDEEM_LEGACY_GAS, PROXY_REDEEM_PUSD_GAS, RELAYER_URL_DEFAULT, RPC_URL_DEFAULT,
-    USDC_POLYGON, PUSD_POLYGON,
+    derive_proxy_wallet, relayer_execute_proxy_calldata, IGnosisSafe, RelayerCredentials,
+    CTF_COLLATERAL_ADAPTER, CTF_POLYGON, NEG_RISK_ADAPTER, NEG_RISK_COLLATERAL_ADAPTER,
+    PROXY_FACTORY, PROXY_REDEEM_LEGACY_GAS, PROXY_REDEEM_PUSD_GAS, PUSD_POLYGON,
+    RELAYER_URL_DEFAULT, RPC_URL_DEFAULT, USDC_POLYGON,
 };
 
 const PARENT_COLLECTION_ID: B256 = B256::ZERO;
@@ -93,10 +93,14 @@ fn resolve_redeem_call(
 
     if neg_risk {
         let idx = outcome_index.ok_or_else(|| {
-            anyhow::anyhow!("NegRisk legacy USDC.e 赎回需要 outcome_index（或设 REDEEM_OUTPUT_TOKEN=pUSD）")
+            anyhow::anyhow!(
+                "NegRisk legacy USDC.e 赎回需要 outcome_index（或设 REDEEM_OUTPUT_TOKEN=pUSD）"
+            )
         })?;
         let size = size_raw.ok_or_else(|| {
-            anyhow::anyhow!("NegRisk legacy USDC.e 赎回需要持仓 size（或设 REDEEM_OUTPUT_TOKEN=pUSD）")
+            anyhow::anyhow!(
+                "NegRisk legacy USDC.e 赎回需要持仓 size（或设 REDEEM_OUTPUT_TOKEN=pUSD）"
+            )
         })?;
         let mut amounts = [U256::ZERO, U256::ZERO];
         if idx == 0 || idx == 1 {
@@ -116,8 +120,7 @@ fn resolve_redeem_call(
 
 async fn outcome_balance<P: Provider>(provider: &P, proxy: Address, asset: U256) -> Result<U256> {
     let ctf = IERC1155::new(CTF_POLYGON, provider);
-    ctf
-        .balanceOf(proxy, asset)
+    ctf.balanceOf(proxy, asset)
         .call()
         .await
         .map_err(|e| anyhow::anyhow!("balanceOf failed: {}", e))
@@ -168,6 +171,7 @@ fn use_relayer_by_config(code_len: usize) -> bool {
     code_len < 150
 }
 
+#[allow(clippy::too_many_arguments)] // Wallet-kind compatibility adapter.
 async fn relayer_redeem_calldata(
     redeem_data: &[u8],
     redeem_to: Address,
@@ -185,10 +189,12 @@ async fn relayer_redeem_calldata(
             redeem_to,
             wallet,
             signer,
-            builder_key,
-            builder_secret,
-            builder_passphrase,
-            relayer_url,
+            RelayerCredentials {
+                builder_key,
+                builder_secret,
+                builder_passphrase,
+                relayer_url,
+            },
             "Redeem positions",
         )
         .await
@@ -198,10 +204,12 @@ async fn relayer_redeem_calldata(
             redeem_to,
             wallet,
             signer,
-            builder_key,
-            builder_secret,
-            builder_passphrase,
-            relayer_url,
+            RelayerCredentials {
+                builder_key,
+                builder_secret,
+                builder_passphrase,
+                relayer_url,
+            },
             "Redeem positions",
             gas_limit,
         )
@@ -286,6 +294,7 @@ async fn build_redeem_calls<P: Provider>(
 
 /// Redeem winner tokens for `condition_id` on `proxy`.
 /// `verify_assets`: 赎回前后校验这些 outcome token 余额是否减少（可为空跳过）。
+#[allow(clippy::too_many_arguments)] // Public compatibility boundary; use a request type in the next API revision.
 pub async fn redeem_one(
     condition_id: B256,
     neg_risk: bool,
@@ -310,14 +319,19 @@ pub async fn redeem_one(
         condition_id, neg_risk, redeem_target, output
     );
 
-    let provider = ProviderBuilder::new().wallet(signer.clone()).connect(rpc).await?;
+    let provider = ProviderBuilder::new()
+        .wallet(signer.clone())
+        .connect(rpc)
+        .await?;
     let mut balances_before = Vec::new();
     for asset in verify_assets {
         balances_before.push(outcome_balance(&provider, proxy, *asset).await?);
     }
-    let gas_limit = Some(redeem_gas_limit());
-    info!("Relayer redeem gasLimit={}", gas_limit.unwrap_or(PROXY_REDEEM_PUSD_GAS));
-    let calls = build_redeem_calls(&provider, proxy, neg_risk, redeem_target, redeem_calldata).await?;
+    let configured_gas_limit = redeem_gas_limit();
+    let gas_limit = Some(configured_gas_limit);
+    info!("Relayer redeem gasLimit={configured_gas_limit}");
+    let calls =
+        build_redeem_calls(&provider, proxy, neg_risk, redeem_target, redeem_calldata).await?;
     let code = provider.get_code_at(proxy).await.unwrap_or_default();
     let use_relayer = use_relayer_by_config(code.len());
 
@@ -340,7 +354,8 @@ pub async fn redeem_one(
         let builder_key = env::var("POLY_BUILDER_API_KEY").ok();
         let builder_secret = env::var("POLY_BUILDER_SECRET").ok();
         let builder_passphrase = env::var("POLY_BUILDER_PASSPHRASE").ok();
-        let relayer_url = env::var("RELAYER_URL").unwrap_or_else(|_| RELAYER_URL_DEFAULT.to_string());
+        let relayer_url =
+            env::var("RELAYER_URL").unwrap_or_else(|_| RELAYER_URL_DEFAULT.to_string());
         match (builder_key.as_deref(), builder_secret.as_deref(), builder_passphrase.as_deref()) {
             (Some(k), Some(s), Some(p)) => {
                 if redeem_to_pusd() {
@@ -349,10 +364,12 @@ pub async fn redeem_one(
                         proxy,
                         pusd_adapter(neg_risk),
                         &signer,
-                        k,
-                        s,
-                        p,
-                        &relayer_url,
+                        RelayerCredentials {
+                            builder_key: k,
+                            builder_secret: s,
+                            builder_passphrase: p,
+                            relayer_url: &relayer_url,
+                        },
                     )
                     .await?;
                 }
@@ -388,7 +405,8 @@ pub async fn redeem_one(
     let safe = IGnosisSafe::new(proxy, provider.clone());
     if redeem_to_pusd() {
         let adapter = pusd_adapter(neg_risk);
-        if !crate::adapter_auth::is_adapter_approved(&provider, CTF_POLYGON, proxy, adapter).await? {
+        if !crate::adapter_auth::is_adapter_approved(&provider, CTF_POLYGON, proxy, adapter).await?
+        {
             let approve_calldata = encode_set_approval_for_all(adapter, true);
             let tx = safe_exec_call(&safe, &signer, CTF_POLYGON, approve_calldata).await?;
             info!("✅ Safe setApprovalForAll tx: {:#x}", tx);

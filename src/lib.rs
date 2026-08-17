@@ -1,8 +1,9 @@
 //! polypulse library: shared modules for the main binary and test binaries.
 
-pub mod clob_v2;
 mod adapter_auth;
+pub mod clob_v2;
 mod deposit_wallet_relay;
+mod network_retry;
 mod proxy_relay;
 mod pusd_wrap;
 mod wallet_kind;

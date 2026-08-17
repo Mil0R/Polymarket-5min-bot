@@ -8,10 +8,11 @@ use anyhow::Result;
 use tracing::info;
 
 use crate::deposit_wallet_relay::relayer_execute_deposit_wallet_calls;
-use crate::wallet_kind::WalletKind;
 use crate::proxy_relay::{
-    relayer_execute_proxy_calls, IGnosisSafe, COLLATERAL_ONRAMP, PUSD_POLYGON, USDC_POLYGON,
+    relayer_execute_proxy_calls, IGnosisSafe, RelayerCredentials, COLLATERAL_ONRAMP, PUSD_POLYGON,
+    USDC_POLYGON,
 };
+use crate::wallet_kind::WalletKind;
 
 use alloy::sol;
 sol! {
@@ -117,7 +118,7 @@ async fn safe_exec_call<P: Provider>(
             to,
             U256::ZERO,
             calldata.into(),
-             0u8,
+            0u8,
             U256::ZERO,
             U256::ZERO,
             U256::ZERO,
@@ -139,6 +140,7 @@ async fn safe_exec_call<P: Provider>(
     Ok(tx_hash_out)
 }
 
+#[allow(clippy::too_many_arguments)] // Internal wallet-kind adapter; fields map to two relayer protocols.
 async fn relayer_wrap_calls(
     wallet_kind: WalletKind,
     wallet: Address,
@@ -155,10 +157,12 @@ async fn relayer_wrap_calls(
                 &calls,
                 wallet,
                 signer,
-                builder_key,
-                builder_secret,
-                builder_passphrase,
-                relayer_url,
+                RelayerCredentials {
+                    builder_key,
+                    builder_secret,
+                    builder_passphrase,
+                    relayer_url,
+                },
                 "Wrap USDC.e to pUSD",
             )
             .await
@@ -168,10 +172,12 @@ async fn relayer_wrap_calls(
                 &calls,
                 wallet,
                 signer,
-                builder_key,
-                builder_secret,
-                builder_passphrase,
-                relayer_url,
+                RelayerCredentials {
+                    builder_key,
+                    builder_secret,
+                    builder_passphrase,
+                    relayer_url,
+                },
                 "Wrap USDC.e to pUSD",
                 None,
             )
@@ -184,6 +190,7 @@ async fn relayer_wrap_calls(
 }
 
 /// After a USDC.e-collateral merge, wrap `amount` USDC.e to pUSD in the deposit wallet.
+#[allow(clippy::too_many_arguments)] // Stable on-chain compatibility boundary retained for callers.
 pub async fn wrap_usdce_to_pusd<P: Provider>(
     provider: &P,
     prov_read: &impl Provider,
@@ -203,11 +210,7 @@ pub async fn wrap_usdce_to_pusd<P: Provider>(
 
     let usdc_before = erc20_balance(prov_read, wallet, USDC_POLYGON).await?;
     if usdc_before < amount {
-        anyhow::bail!(
-            "wrap 需要 {} USDC.e，钱包余额仅 {}",
-            amount,
-            usdc_before
-        );
+        anyhow::bail!("wrap 需要 {} USDC.e，钱包余额仅 {}", amount, usdc_before);
     }
     let pusd_before = erc20_balance(prov_read, wallet, PUSD_POLYGON).await?;
     info!(
@@ -220,7 +223,8 @@ pub async fn wrap_usdce_to_pusd<P: Provider>(
     match wallet_kind {
         WalletKind::GnosisSafe => {
             let safe = safe.ok_or_else(|| anyhow::anyhow!("Safe instance required for wrap"))?;
-            let allowance = erc20_allowance(prov_read, wallet, USDC_POLYGON, COLLATERAL_ONRAMP).await?;
+            let allowance =
+                erc20_allowance(prov_read, wallet, USDC_POLYGON, COLLATERAL_ONRAMP).await?;
             if allowance < amount {
                 let approve = encode_erc20_approve(COLLATERAL_ONRAMP, amount);
                 let tx = safe_exec_call(safe, signer, USDC_POLYGON, approve).await?;
@@ -235,7 +239,8 @@ pub async fn wrap_usdce_to_pusd<P: Provider>(
                 (Some(k), Some(s), Some(p)) => (k, s, p),
                 _ => anyhow::bail!("Wrap via relayer requires POLY_BUILDER_* credentials"),
             };
-            let allowance = erc20_allowance(prov_read, wallet, USDC_POLYGON, COLLATERAL_ONRAMP).await?;
+            let allowance =
+                erc20_allowance(prov_read, wallet, USDC_POLYGON, COLLATERAL_ONRAMP).await?;
             let mut calls: Vec<(Address, Vec<u8>)> = Vec::new();
             if allowance < amount {
                 calls.push((
@@ -244,17 +249,8 @@ pub async fn wrap_usdce_to_pusd<P: Provider>(
                 ));
             }
             calls.push((COLLATERAL_ONRAMP, encode_onramp_wrap(wallet, amount)));
-            let tx = relayer_wrap_calls(
-                wallet_kind,
-                wallet,
-                calls,
-                signer,
-                k,
-                s,
-                p,
-                relayer_url,
-            )
-            .await?;
+            let tx = relayer_wrap_calls(wallet_kind, wallet, calls, signer, k, s, p, relayer_url)
+                .await?;
             crate::adapter_auth::wait_relayer_tx(provider, &tx).await?;
             info!("✅ Relayer wrap confirmed: {}", tx);
         }
@@ -271,8 +267,7 @@ pub async fn wrap_usdce_to_pusd<P: Provider>(
     }
     info!(
         "✅ Wrapped to pUSD | +{} (wallet pUSD balance={})",
-        amount,
-        pusd_after
+        amount, pusd_after
     );
     Ok(())
 }

@@ -1,11 +1,28 @@
+use crate::network_retry::{retry_read, ReadRetryPolicy};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use polymarket_client_sdk::gamma::{Client, types::request::MarketsRequest};
+use futures::future::BoxFuture;
+use polymarket_client_sdk::gamma::{
+    types::{request::MarketsRequest, response::Market},
+    Client,
+};
 use polymarket_client_sdk::types::{B256, U256};
+use std::sync::Arc;
 use tracing::{info, warn};
 
-/// 5-minute window duration in seconds (for main etc. to compute window_end)
+/// 5-minute window duration in seconds (kept for tests that hard-code 5-minute fixtures)
+#[allow(dead_code)]
 pub const FIVE_MIN_SECS: i64 = 300;
+
+/// Window duration in seconds for a period expressed in minutes.
+pub fn window_seconds(period_minutes: u64) -> i64 {
+    (period_minutes.max(1) as i64) * 60
+}
+
+/// Period suffix used in Polymarket crypto slugs, e.g. "5m", "15m".
+pub fn period_slug_suffix(period_minutes: u64) -> String {
+    format!("{}m", period_minutes)
+}
 
 #[derive(Debug, Clone)]
 pub struct MarketInfo {
@@ -19,36 +36,77 @@ pub struct MarketInfo {
 }
 
 pub struct MarketDiscoverer {
-    gamma_client: Client,
+    gamma_transport: Arc<dyn GammaTransport>,
     crypto_symbols: Vec<String>,
+    period_minutes: u64,
+}
+
+pub trait GammaTransport: Send + Sync {
+    fn markets(&self, slugs: Vec<String>) -> BoxFuture<'_, Result<Vec<Market>>>;
+}
+
+struct SdkGammaTransport {
+    client: Client,
+}
+
+impl GammaTransport for SdkGammaTransport {
+    fn markets(&self, slugs: Vec<String>) -> BoxFuture<'_, Result<Vec<Market>>> {
+        Box::pin(async move {
+            let request = MarketsRequest::builder().slug(slugs).build();
+            Ok(self.client.markets(&request).await?)
+        })
+    }
 }
 
 impl MarketDiscoverer {
-    pub fn new(crypto_symbols: Vec<String>) -> Self {
+    pub fn new(crypto_symbols: Vec<String>, period_minutes: u64) -> Self {
         Self {
-            gamma_client: Client::default(),
+            gamma_transport: Arc::new(SdkGammaTransport {
+                client: Client::default(),
+            }),
             crypto_symbols,
+            period_minutes,
         }
     }
 
-    /// Current 5-minute window start timestamp (UTC)
-    /// Window aligned to 0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55
-    pub fn calculate_current_window_timestamp(now: DateTime<Utc>) -> i64 {
-        let ts = now.timestamp();
-        (ts / FIVE_MIN_SECS) * FIVE_MIN_SECS
+    #[allow(dead_code)] // Test/embedding injection point; main uses the SDK transport.
+    pub fn with_transport(
+        crypto_symbols: Vec<String>,
+        period_minutes: u64,
+        gamma_transport: Arc<dyn GammaTransport>,
+    ) -> Self {
+        Self {
+            gamma_transport,
+            crypto_symbols,
+            period_minutes,
+        }
     }
 
-    /// Next 5-minute window start timestamp (UTC)
-    pub fn calculate_next_window_timestamp(now: DateTime<Utc>) -> i64 {
+    #[allow(dead_code)] // convenience accessor, kept for embedding callers
+    pub fn period_minutes(&self) -> u64 {
+        self.period_minutes
+    }
+
+    /// Current window start timestamp (UTC), aligned to the configured period.
+    pub fn calculate_current_window_timestamp(&self, now: DateTime<Utc>) -> i64 {
         let ts = now.timestamp();
-        ((ts / FIVE_MIN_SECS) + 1) * FIVE_MIN_SECS
+        let secs = window_seconds(self.period_minutes);
+        (ts / secs) * secs
+    }
+
+    /// Next window start timestamp (UTC)
+    pub fn calculate_next_window_timestamp(&self, now: DateTime<Utc>) -> i64 {
+        let ts = now.timestamp();
+        let secs = window_seconds(self.period_minutes);
+        ((ts / secs) + 1) * secs
     }
 
     /// Generate market slugs, e.g. btc-updown-5m-1770972300
     pub fn generate_market_slugs(&self, timestamp: i64) -> Vec<String> {
+        let suffix = period_slug_suffix(self.period_minutes);
         self.crypto_symbols
             .iter()
-            .map(|symbol| format!("{}-updown-5m-{}", symbol, timestamp))
+            .map(|symbol| format!("{}-updown-{}-{}", symbol, suffix, timestamp))
             .collect()
     }
 
@@ -59,12 +117,11 @@ impl MarketDiscoverer {
 
         info!(timestamp, slug_count = slugs.len(), "Querying markets");
 
-        // Batch query Gamma API
-        let request = MarketsRequest::builder()
-            .slug(slugs.clone())
-            .build();
-
-        match self.gamma_client.markets(&request).await {
+        match retry_read(ReadRetryPolicy::default(), || {
+            self.gamma_transport.markets(slugs.clone())
+        })
+        .await
+        {
             Ok(markets) => {
                 // Filter and parse markets
                 let valid_markets: Vec<MarketInfo> = markets
@@ -83,20 +140,22 @@ impl MarketDiscoverer {
     }
 
     /// Parse market, extract YES and NO token_ids
-    fn parse_market(&self, market: polymarket_client_sdk::gamma::types::response::Market) -> Option<MarketInfo> {
+    fn parse_market(&self, market: Market) -> Option<MarketInfo> {
         // Check market is active, orderbook enabled and accepting orders
-        if !market.active.unwrap_or(false) 
-           || !market.enable_order_book.unwrap_or(false)
-           || !market.accepting_orders.unwrap_or(false) {
+        if !market.active.unwrap_or(false)
+            || !market.enable_order_book.unwrap_or(false)
+            || !market.accepting_orders.unwrap_or(false)
+        {
             return None;
         }
 
         // Check outcomes are ["Up", "Down"]
         let outcomes = market.outcomes.as_ref()?;
 
-        if outcomes.len() != 2 
-           || !outcomes.contains(&"Up".to_string()) 
-           || !outcomes.contains(&"Down".to_string()) {
+        if outcomes.len() != 2
+            || !outcomes.contains(&"Up".to_string())
+            || !outcomes.contains(&"Down".to_string())
+        {
             return None;
         }
 
@@ -116,11 +175,7 @@ impl MarketDiscoverer {
 
         // Extract crypto symbol from slug
         let slug = market.slug.as_ref()?;
-        let crypto_symbol = slug
-            .split('-')
-            .next()
-            .unwrap_or("")
-            .to_string();
+        let crypto_symbol = slug.split('-').next().unwrap_or("").to_string();
 
         // Get endDate
         let end_date = market.end_date?;
@@ -134,5 +189,60 @@ impl MarketDiscoverer {
             end_date,
             crypto_symbol,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    struct FakeGammaTransport {
+        requested: Mutex<Vec<Vec<String>>>,
+        response: Mutex<Option<Vec<Market>>>,
+    }
+
+    impl GammaTransport for FakeGammaTransport {
+        fn markets(&self, slugs: Vec<String>) -> BoxFuture<'_, Result<Vec<Market>>> {
+            Box::pin(async move {
+                self.requested.lock().unwrap().push(slugs);
+                Ok(self.response.lock().unwrap().take().unwrap_or_default())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn injected_transport_receives_generated_slugs_and_returns_parsed_markets() {
+        let market: Market = serde_json::from_str(
+            r#"{
+                "id":"fixture",
+                "question":"BTC Up or Down",
+                "conditionId":"0x0000000000000000000000000000000000000000000000000000000000000007",
+                "slug":"btc-updown-5m-1720000000",
+                "endDate":"2026-08-13T12:05:00Z",
+                "outcomes":"[\"Up\",\"Down\"]",
+                "active":true,
+                "enableOrderBook":true,
+                "acceptingOrders":true,
+                "clobTokenIds":"[\"42\",\"43\"]"
+            }"#,
+        )
+        .unwrap();
+        let transport = Arc::new(FakeGammaTransport {
+            requested: Mutex::new(Vec::new()),
+            response: Mutex::new(Some(vec![market])),
+        });
+        let discoverer =
+            MarketDiscoverer::with_transport(vec!["btc".to_string()], 5, transport.clone());
+        let markets = discoverer
+            .get_markets_for_timestamp(1_720_000_000)
+            .await
+            .unwrap();
+        assert_eq!(markets.len(), 1);
+        assert_eq!(markets[0].yes_token_id, U256::from(42));
+        assert_eq!(
+            transport.requested.lock().unwrap()[0],
+            vec!["btc-updown-5m-1720000000"]
+        );
     }
 }

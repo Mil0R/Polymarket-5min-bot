@@ -1,34 +1,55 @@
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use polymarket_client_sdk_v2::clob::types::OrderType;
 use std::env;
 
 use polymarket_client_sdk::types::Address;
 
+use crate::live_safety::{
+    ABSOLUTE_CANARY_LOSS_LIMIT_USDC, ABSOLUTE_CANARY_PAIR_LIMIT_USDC,
+    ABSOLUTE_CANARY_TOTAL_LIMIT_USDC,
+};
 use crate::trading::CLOB_API_URL_DEFAULT;
 
 /// Parse arbitrage order type: GTC, GTD, FOK, FAK; case-insensitive; invalid/unknown defaults to GTD.
-fn parse_arbitrage_order_type(s: &str) -> OrderType {
+fn parse_arbitrage_order_type(s: &str) -> Result<OrderType> {
     match s.trim().to_uppercase().as_str() {
-        "GTC" => OrderType::GTC,
-        "GTD" => OrderType::GTD,
-        "FOK" => OrderType::FOK,
-        "FAK" => OrderType::FAK,
-        _ => OrderType::GTD,
+        "GTC" => Ok(OrderType::GTC),
+        "GTD" => Ok(OrderType::GTD),
+        "FOK" => Ok(OrderType::FOK),
+        "FAK" => Ok(OrderType::FAK),
+        other => bail!("ARBITRAGE_ORDER_TYPE must be GTC, GTD, FOK or FAK; got {other}"),
     }
 }
 
 /// Parse slippage array: comma-separated, e.g. "-0.02,0.0".
 /// Index 0=up/flat side, 1=down-only side. Single value used for both. Default "0,0.01".
-fn parse_slippage(s: &str) -> [f64; 2] {
+fn parse_slippage(s: &str) -> Result<[f64; 2]> {
     let parts: Vec<f64> = s
         .split(',')
-        .map(|x| x.trim().parse().unwrap_or(0.0))
-        .collect();
-    match parts.len() {
-        0 => [0.0, 0.01],
-        1 => [parts[0], parts[0]],
-        _ => [parts[0], parts[1]],
-    }
+        .map(|x| {
+            x.trim()
+                .parse::<f64>()
+                .context("SLIPPAGE contains an invalid number")
+        })
+        .collect::<Result<_>>()?;
+    let parsed = match parts.as_slice() {
+        [] => bail!("SLIPPAGE cannot be empty"),
+        [one] => [*one, *one],
+        [first, second] => [*first, *second],
+        _ => bail!("SLIPPAGE accepts one or two comma-separated numbers"),
+    };
+    Ok(parsed)
+}
+
+fn env_parse<T>(name: &str, default: &str) -> Result<T>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    let raw = env::var(name).unwrap_or_else(|_| default.to_string());
+    raw.trim()
+        .parse::<T>()
+        .map_err(|e| anyhow::anyhow!("{name} has invalid value {raw:?}: {e}"))
 }
 
 #[derive(Debug, Clone)]
@@ -40,14 +61,22 @@ pub struct Config {
     /// CLOB signature type: Poly1271 | Proxy | GnosisSafe | Eoa (see SIGNATURE_TYPE)
     pub signature_type: String,
     pub min_profit_threshold: f64,
+    /// Minimum cumulative ask-side liquidity (USD) required on BOTH legs before an
+    /// opportunity is admitted. Filters out guard/phantom quotes on 5-min markets.
+    pub min_ask_depth_usdc: f64,
     pub max_order_size_usdc: f64,
     pub crypto_symbols: Vec<String>,
     pub market_refresh_advance_secs: u64,
+    /// Market window period in minutes: 5 or 15 are supported by Polymarket
+    /// crypto up/down slugs (btc-updown-5m / btc-updown-15m).
+    pub market_period_minutes: u64,
     pub risk_max_exposure_usdc: f64,
     pub risk_imbalance_threshold: f64,
     pub hedge_take_profit_pct: f64, // Hedge take-profit % (e.g. 0.05 = 5%)
     pub hedge_stop_loss_pct: f64,   // Hedge stop-loss % (e.g. 0.05 = 5%)
     pub arbitrage_execution_spread: f64, // Execute arbitrage when yes+no <= 1 - this spread
+    /// Additional conservative buffer for fees and rounding, applied to final slippage-adjusted prices.
+    pub arbitrage_fee_buffer: f64,
     /// Slippage [first, second]: down-only uses second, up/flat uses first. e.g. "-0.02,0.0"
     pub slippage: [f64; 2],
     pub gtd_expiration_secs: u64, // GTD order expiry (seconds), default 300 (5 min); only when arbitrage_order_type=GTD
@@ -72,6 +101,30 @@ pub struct Config {
     pub wind_down_before_window_end_minutes: u64,
     /// Limit price for one-sided leg sells during wind-down (aim for fast fill), default 0.01
     pub wind_down_sell_price: f64,
+    /// Optional append-only JSON opportunity log. Disabled when unset.
+    pub arbitrage_log_file: Option<String>,
+    /// Observe and simulate fills without submitting, cancelling, merging or selling.
+    pub dry_run: bool,
+    /// Explicit, fail-closed mode for the first real-money validation run.
+    pub canary_mode: bool,
+    pub canary_max_pair_notional_usdc: f64,
+    pub canary_max_total_notional_usdc: f64,
+    pub canary_max_loss_usdc: f64,
+    pub canary_max_pairs_per_window: u32,
+    pub canary_max_pairs_total: u32,
+    /// Consecutive one-sided fills that trip the safety gate (0 = disabled).
+    pub one_sided_max_consecutive: u32,
+    pub paper_initial_balance_usdc: f64,
+    pub paper_liquidity_haircut: f64,
+    pub paper_second_leg_delay_ms: u64,
+    /// Reject orderbook snapshots older than this many milliseconds.
+    pub max_book_age_ms: i64,
+    /// Reject YES/NO snapshots farther apart than this many milliseconds.
+    pub max_book_skew_ms: i64,
+    /// Suppress an identical market/price signal for this many milliseconds.
+    pub signal_cooldown_ms: u64,
+    pub state_journal_file: String,
+    pub allow_unresolved_state: bool,
 }
 
 impl Config {
@@ -79,104 +132,286 @@ impl Config {
         dotenvy::dotenv().ok();
 
         // Parse proxy_address (optional)
-        let proxy_address: Option<Address> = env::var("POLYMARKET_PROXY_ADDRESS")
-            .ok()
-            .and_then(|addr| addr.trim().parse().ok());
+        let proxy_address = match env::var("POLYMARKET_PROXY_ADDRESS") {
+            Ok(addr) if !addr.trim().is_empty() => Some(
+                addr.trim()
+                    .parse()
+                    .context("POLYMARKET_PROXY_ADDRESS has invalid format")?,
+            ),
+            _ => None,
+        };
 
-        Ok(Config {
+        let config = Config {
             private_key: env::var("POLYMARKET_PRIVATE_KEY")
-                .expect("POLYMARKET_PRIVATE_KEY must be set")
+                .context("POLYMARKET_PRIVATE_KEY must be set")?
                 .trim()
                 .to_string(),
             proxy_address,
             clob_api_url: env::var("CLOB_API_URL")
                 .unwrap_or_else(|_| CLOB_API_URL_DEFAULT.to_string()),
             signature_type: env::var("SIGNATURE_TYPE").unwrap_or_else(|_| "Poly1271".to_string()),
-            min_profit_threshold: env::var("MIN_PROFIT_THRESHOLD")
-                .unwrap_or_else(|_| "0.001".to_string())
-                .parse()
-                .unwrap_or(0.001),
-            max_order_size_usdc: env::var("MAX_ORDER_SIZE_USDC")
-                .unwrap_or_else(|_| "100.0".to_string())
-                .parse()
-                .unwrap_or(100.0),
+            min_profit_threshold: env_parse("MIN_PROFIT_THRESHOLD", "0.001")?,
+            min_ask_depth_usdc: env_parse("MIN_ASK_DEPTH_USDC", "10.0")?,
+            max_order_size_usdc: env_parse("MAX_ORDER_SIZE_USDC", "100.0")?,
             crypto_symbols: env::var("CRYPTO_SYMBOLS")
                 .unwrap_or_else(|_| "btc,eth,xrp,sol".to_string())
                 .split(',')
                 .map(|s| s.trim().to_lowercase())
                 .collect(),
-            market_refresh_advance_secs: env::var("MARKET_REFRESH_ADVANCE_SECS")
-                .unwrap_or_else(|_| "5".to_string())
-                .parse()
-                .unwrap_or(5),
-            risk_max_exposure_usdc: env::var("RISK_MAX_EXPOSURE_USDC")
-                .unwrap_or_else(|_| "1000.0".to_string())
-                .parse()
-                .unwrap_or(1000.0),
-            risk_imbalance_threshold: env::var("RISK_IMBALANCE_THRESHOLD")
-                .unwrap_or_else(|_| "0.1".to_string())
-                .parse()
-                .unwrap_or(0.1),
-            hedge_take_profit_pct: env::var("HEDGE_TAKE_PROFIT_PCT")
-                .unwrap_or_else(|_| "0.05".to_string())
-                .parse()
-                .unwrap_or(0.05), // default 5% take-profit
-            hedge_stop_loss_pct: env::var("HEDGE_STOP_LOSS_PCT")
-                .unwrap_or_else(|_| "0.05".to_string())
-                .parse()
-                .unwrap_or(0.05), // default 5% stop-loss
-            arbitrage_execution_spread: env::var("ARBITRAGE_EXECUTION_SPREAD")
-                .unwrap_or_else(|_| "0.01".to_string())
-                .parse()
-                .unwrap_or(0.01), // default 0.01
-            slippage: parse_slippage(&env::var("SLIPPAGE").unwrap_or_else(|_| "0,0.01".to_string())),
-            gtd_expiration_secs: env::var("GTD_EXPIRATION_SECS")
-                .unwrap_or_else(|_| "300".to_string())
-                .parse()
-                .unwrap_or(300), // default 300s (5 min)
+            market_refresh_advance_secs: env_parse("MARKET_REFRESH_ADVANCE_SECS", "5")?,
+            market_period_minutes: env_parse("MARKET_PERIOD_MINUTES", "5")?,
+            risk_max_exposure_usdc: env_parse("RISK_MAX_EXPOSURE_USDC", "1000.0")?,
+            risk_imbalance_threshold: env_parse("RISK_IMBALANCE_THRESHOLD", "0.1")?,
+            hedge_take_profit_pct: env_parse("HEDGE_TAKE_PROFIT_PCT", "0.05")?,
+            hedge_stop_loss_pct: env_parse("HEDGE_STOP_LOSS_PCT", "0.05")?,
+            arbitrage_execution_spread: env_parse("ARBITRAGE_EXECUTION_SPREAD", "0.01")?,
+            arbitrage_fee_buffer: env_parse("ARBITRAGE_FEE_BUFFER", "0.002")?,
+            slippage: parse_slippage(
+                &env::var("SLIPPAGE").unwrap_or_else(|_| "0,0.01".to_string()),
+            )?,
+            gtd_expiration_secs: env_parse("GTD_EXPIRATION_SECS", "300")?,
             arbitrage_order_type: parse_arbitrage_order_type(
                 &env::var("ARBITRAGE_ORDER_TYPE").unwrap_or_else(|_| "GTD".to_string()),
+            )?,
+            stop_arbitrage_before_end_minutes: env_parse("STOP_ARBITRAGE_BEFORE_END_MINUTES", "0")?,
+            merge_interval_minutes: env_parse("MERGE_INTERVAL_MINUTES", "0")?,
+            min_yes_price_threshold: env_parse("MIN_YES_PRICE_THRESHOLD", "0.0")?,
+            min_no_price_threshold: env_parse("MIN_NO_PRICE_THRESHOLD", "0.0")?,
+            position_sync_interval_secs: env_parse("POSITION_SYNC_INTERVAL_SECS", "10")?,
+            position_balance_interval_secs: env_parse("POSITION_BALANCE_INTERVAL_SECS", "60")?,
+            position_balance_threshold: env_parse("POSITION_BALANCE_THRESHOLD", "2.0")?,
+            position_balance_min_total: env_parse("POSITION_BALANCE_MIN_TOTAL", "5.0")?,
+            wind_down_before_window_end_minutes: env_parse(
+                "WIND_DOWN_BEFORE_WINDOW_END_MINUTES",
+                "0",
+            )?,
+            wind_down_sell_price: env_parse("WIND_DOWN_SELL_PRICE", "0.01")?,
+            arbitrage_log_file: env::var("ARBITRAGE_LOG_FILE")
+                .ok()
+                .filter(|value| !value.trim().is_empty()),
+            dry_run: env_bool("DRY_RUN", false)?,
+            canary_mode: env_bool("CANARY_MODE", false)?,
+            canary_max_pair_notional_usdc: env_parse("CANARY_MAX_PAIR_NOTIONAL_USDC", "3.0")?,
+            canary_max_total_notional_usdc: env_parse("CANARY_MAX_TOTAL_NOTIONAL_USDC", "3.0")?,
+            canary_max_loss_usdc: env_parse("CANARY_MAX_LOSS_USDC", "2.0")?,
+            canary_max_pairs_per_window: env_parse("CANARY_MAX_PAIRS_PER_WINDOW", "1")?,
+            canary_max_pairs_total: env_parse("CANARY_MAX_PAIRS_TOTAL", "1")?,
+            one_sided_max_consecutive: env_parse("ONE_SIDED_MAX_CONSECUTIVE", "3")?,
+            paper_initial_balance_usdc: env_parse("PAPER_INITIAL_BALANCE_USDC", "50.0")?,
+            paper_liquidity_haircut: env_parse("PAPER_LIQUIDITY_HAIRCUT", "0.75")?,
+            paper_second_leg_delay_ms: env_parse("PAPER_SECOND_LEG_DELAY_MS", "250")?,
+            max_book_age_ms: env_parse("MAX_BOOK_AGE_MS", "2000")?,
+            max_book_skew_ms: env_parse("MAX_BOOK_SKEW_MS", "1000")?,
+            signal_cooldown_ms: env_parse("SIGNAL_COOLDOWN_MS", "3000")?,
+            state_journal_file: env::var("STATE_JOURNAL_FILE")
+                .unwrap_or_else(|_| "order-state.ndjson".to_string()),
+            allow_unresolved_state: env_bool("ALLOW_UNRESOLVED_STATE", false)?,
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.private_key.is_empty() {
+            bail!("POLYMARKET_PRIVATE_KEY cannot be empty");
+        }
+        if self.crypto_symbols.is_empty() || self.crypto_symbols.iter().any(String::is_empty) {
+            bail!("CRYPTO_SYMBOLS must contain at least one non-empty symbol");
+        }
+        let signature = self.signature_type.trim().to_ascii_lowercase();
+        let valid_signature = matches!(
+            signature.as_str(),
+            "eoa"
+                | "0"
+                | "proxy"
+                | "magic"
+                | "email"
+                | "gnosissafe"
+                | "safe"
+                | "poly1271"
+                | "deposit"
+                | "deposit_wallet"
+                | "3"
+        );
+        if !valid_signature {
+            bail!(
+                "SIGNATURE_TYPE has unsupported value {:?}",
+                self.signature_type
+            );
+        }
+        for (name, value) in [
+            ("MIN_PROFIT_THRESHOLD", self.min_profit_threshold),
+            (
+                "ARBITRAGE_EXECUTION_SPREAD",
+                self.arbitrage_execution_spread,
             ),
-            stop_arbitrage_before_end_minutes: env::var("STOP_ARBITRAGE_BEFORE_END_MINUTES")
-                .unwrap_or_else(|_| "0".to_string())
-                .parse()
-                .unwrap_or(0), // default 0 (no stop)
-            merge_interval_minutes: env::var("MERGE_INTERVAL_MINUTES")
-                .unwrap_or_else(|_| "0".to_string())
-                .parse()
-                .unwrap_or(0), // 0=disabled
-            min_yes_price_threshold: env::var("MIN_YES_PRICE_THRESHOLD")
-                .unwrap_or_else(|_| "0.0".to_string())
-                .parse()
-                .unwrap_or(0.0), // default 0.0 (no limit)
-            min_no_price_threshold: env::var("MIN_NO_PRICE_THRESHOLD")
-                .unwrap_or_else(|_| "0.0".to_string())
-                .parse()
-                .unwrap_or(0.0), // default 0.0 (no limit)
-            position_sync_interval_secs: env::var("POSITION_SYNC_INTERVAL_SECS")
-                .unwrap_or_else(|_| "10".to_string())
-                .parse()
-                .unwrap_or(10), // default 10s
-            position_balance_interval_secs: env::var("POSITION_BALANCE_INTERVAL_SECS")
-                .unwrap_or_else(|_| "60".to_string())
-                .parse()
-                .unwrap_or(60), // default 60s
-            position_balance_threshold: env::var("POSITION_BALANCE_THRESHOLD")
-                .unwrap_or_else(|_| "2.0".to_string())
-                .parse()
-                .unwrap_or(2.0), // default 2.0
-            position_balance_min_total: env::var("POSITION_BALANCE_MIN_TOTAL")
-                .unwrap_or_else(|_| "5.0".to_string())
-                .parse()
-                .unwrap_or(5.0), // default 5.0
-            wind_down_before_window_end_minutes: env::var("WIND_DOWN_BEFORE_WINDOW_END_MINUTES")
-                .unwrap_or_else(|_| "0".to_string())
-                .parse()
-                .unwrap_or(0), // 0=disabled
-            wind_down_sell_price: env::var("WIND_DOWN_SELL_PRICE")
-                .unwrap_or_else(|_| "0.01".to_string())
-                .parse()
-                .unwrap_or(0.01), // default 0.01
-        })
+            ("ARBITRAGE_FEE_BUFFER", self.arbitrage_fee_buffer),
+            ("MIN_YES_PRICE_THRESHOLD", self.min_yes_price_threshold),
+            ("MIN_NO_PRICE_THRESHOLD", self.min_no_price_threshold),
+            ("HEDGE_TAKE_PROFIT_PCT", self.hedge_take_profit_pct),
+            ("HEDGE_STOP_LOSS_PCT", self.hedge_stop_loss_pct),
+        ] {
+            if !value.is_finite() || !(0.0..1.0).contains(&value) {
+                bail!("{name} must be finite and in [0, 1)");
+            }
+        }
+        for (name, value) in [
+            ("MAX_ORDER_SIZE_USDC", self.max_order_size_usdc),
+            ("MIN_ASK_DEPTH_USDC", self.min_ask_depth_usdc),
+            ("RISK_MAX_EXPOSURE_USDC", self.risk_max_exposure_usdc),
+            (
+                "POSITION_BALANCE_THRESHOLD",
+                self.position_balance_threshold,
+            ),
+            (
+                "POSITION_BALANCE_MIN_TOTAL",
+                self.position_balance_min_total,
+            ),
+            (
+                "CANARY_MAX_PAIR_NOTIONAL_USDC",
+                self.canary_max_pair_notional_usdc,
+            ),
+            (
+                "CANARY_MAX_TOTAL_NOTIONAL_USDC",
+                self.canary_max_total_notional_usdc,
+            ),
+            ("CANARY_MAX_LOSS_USDC", self.canary_max_loss_usdc),
+            (
+                "PAPER_INITIAL_BALANCE_USDC",
+                self.paper_initial_balance_usdc,
+            ),
+        ] {
+            if !value.is_finite() || value <= 0.0 {
+                bail!("{name} must be greater than 0");
+            }
+        }
+        if !self.paper_liquidity_haircut.is_finite()
+            || !(0.0..=1.0).contains(&self.paper_liquidity_haircut)
+            || self.paper_liquidity_haircut == 0.0
+        {
+            bail!("PAPER_LIQUIDITY_HAIRCUT must be in (0, 1]");
+        }
+        if self.paper_second_leg_delay_ms > 30_000 {
+            bail!("PAPER_SECOND_LEG_DELAY_MS cannot exceed 30000");
+        }
+        if self.canary_max_pair_notional_usdc > ABSOLUTE_CANARY_PAIR_LIMIT_USDC
+            || self.canary_max_total_notional_usdc > ABSOLUTE_CANARY_TOTAL_LIMIT_USDC
+            || self.canary_max_loss_usdc > ABSOLUTE_CANARY_LOSS_LIMIT_USDC
+        {
+            bail!(
+                "canary limits exceed absolute safety ceilings: pair<=10, total<=20, loss<=5 USDC"
+            );
+        }
+        if self.canary_max_pair_notional_usdc > self.canary_max_total_notional_usdc {
+            bail!("CANARY_MAX_PAIR_NOTIONAL_USDC cannot exceed CANARY_MAX_TOTAL_NOTIONAL_USDC");
+        }
+        if self.canary_max_pairs_per_window == 0
+            || self.canary_max_pairs_per_window > 1
+            || self.canary_max_pairs_total == 0
+            || self.canary_max_pairs_total > 3
+        {
+            bail!("canary pair limits require per-window=1 and total in 1..=3");
+        }
+        if self.canary_mode
+            && !self.dry_run
+            && !matches!(self.arbitrage_order_type, OrderType::FOK | OrderType::FAK)
+        {
+            bail!("live CANARY_MODE requires ARBITRAGE_ORDER_TYPE=FOK or FAK");
+        }
+        if self
+            .slippage
+            .iter()
+            .any(|v| !v.is_finite() || *v <= -1.0 || *v >= 1.0)
+        {
+            bail!("SLIPPAGE values must be finite and in (-1, 1)");
+        }
+        if !(0.0..=1.0).contains(&self.wind_down_sell_price) {
+            bail!("WIND_DOWN_SELL_PRICE must be in [0, 1]");
+        }
+        if matches!(self.arbitrage_order_type, OrderType::GTD) && self.gtd_expiration_secs == 0 {
+            bail!("GTD_EXPIRATION_SECS must be greater than 0 for GTD orders");
+        }
+        if self
+            .arbitrage_execution_spread
+            .max(self.min_profit_threshold)
+            + self.arbitrage_fee_buffer
+            >= 1.0
+        {
+            bail!("max(ARBITRAGE_EXECUTION_SPREAD, MIN_PROFIT_THRESHOLD) + ARBITRAGE_FEE_BUFFER must be below 1");
+        }
+        if self.market_refresh_advance_secs > 300 {
+            bail!("MARKET_REFRESH_ADVANCE_SECS cannot exceed the 300-second window");
+        }
+        if self.max_book_age_ms <= 0 || self.max_book_skew_ms < 0 {
+            bail!("MAX_BOOK_AGE_MS must be positive and MAX_BOOK_SKEW_MS cannot be negative");
+        }
+        if self.state_journal_file.trim().is_empty() {
+            bail!("STATE_JOURNAL_FILE cannot be empty");
+        }
+        if self.stop_arbitrage_before_end_minutes > 5
+            || self.wind_down_before_window_end_minutes > 5
+        {
+            bail!("stop-arbitrage and wind-down minutes cannot exceed the 5-minute market window");
+        }
+        if self.proxy_address.is_none()
+            && (!(signature == "eoa" || signature == "0")
+                || self.position_sync_interval_secs > 0
+                || self.merge_interval_minutes > 0
+                || self.wind_down_before_window_end_minutes > 0)
+        {
+            bail!("POLYMARKET_PROXY_ADDRESS is required for non-EOA trading and for position sync, Merge or wind-down");
+        }
+        if !self.dry_run
+            && (self.merge_interval_minutes > 0 || self.wind_down_before_window_end_minutes > 0)
+            && [
+                "POLY_BUILDER_API_KEY",
+                "POLY_BUILDER_SECRET",
+                "POLY_BUILDER_PASSPHRASE",
+            ]
+            .iter()
+            .any(|name| env::var(name).map(|v| v.trim().is_empty()).unwrap_or(true))
+        {
+            bail!("scheduled Merge or wind-down requires all POLY_BUILDER_* credentials");
+        }
+        Ok(())
+    }
+}
+
+fn env_bool(name: &str, default: bool) -> Result<bool> {
+    let raw = match env::var(name) {
+        Ok(value) => value,
+        Err(_) => return Ok(default),
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => bail!("{name} must be true/false, 1/0, yes/no or on/off"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_unknown_order_type() {
+        assert!(parse_arbitrage_order_type("IOC").is_err());
+    }
+
+    #[test]
+    fn parses_one_or_two_slippage_values() {
+        assert_eq!(parse_slippage("0.01").unwrap(), [0.01, 0.01]);
+        assert_eq!(parse_slippage("-0.01,0.02").unwrap(), [-0.01, 0.02]);
+        assert!(parse_slippage("0,1,2").is_err());
+        assert!(parse_slippage("bad").is_err());
+    }
+
+    #[test]
+    fn parses_strict_boolean_values() {
+        std::env::set_var("TEST_BOOL_CONFIG", "yes");
+        assert!(env_bool("TEST_BOOL_CONFIG", false).unwrap());
+        std::env::set_var("TEST_BOOL_CONFIG", "maybe");
+        assert!(env_bool("TEST_BOOL_CONFIG", false).is_err());
+        std::env::remove_var("TEST_BOOL_CONFIG");
     }
 }

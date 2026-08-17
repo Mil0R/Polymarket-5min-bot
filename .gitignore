@@ -1,5 +1,11 @@
 /target
 .env
 bot.log
+order-state.ndjson
+arbitrage.ndjson
 .idea
 _vendor
+.env.backup-*
+paper-order-state.ndjson
+*.png
+scripts/__pycache__/

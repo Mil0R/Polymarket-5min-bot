@@ -13,21 +13,23 @@ use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::local::LocalSigner;
 use alloy::signers::Signer as _;
 use anyhow::Result;
-use polymarket_client_sdk::ctf::types::{CollectionIdRequest, MergePositionsRequest, PositionIdRequest};
+use polymarket_client_sdk::ctf::types::{
+    CollectionIdRequest, MergePositionsRequest, PositionIdRequest,
+};
 use polymarket_client_sdk::ctf::Client;
 use polymarket_client_sdk::{contract_config, POLYGON};
 use std::str::FromStr as _;
 use tracing::{info, warn};
 
-use crate::adapter_auth::{ensure_adapter_approved, encode_set_approval_for_all, wait_relayer_tx};
+use crate::adapter_auth::{encode_set_approval_for_all, ensure_adapter_approved, wait_relayer_tx};
 use crate::deposit_wallet_relay::relayer_execute_deposit_wallet_calldata;
+use crate::proxy_relay::{
+    self, derive_proxy_wallet, relayer_execute_proxy_calldata, IGnosisSafe, RelayerCredentials,
+    CTF_COLLATERAL_ADAPTER, CTF_POLYGON, PROXY_FACTORY, PROXY_MERGE_PUSD_GAS, PUSD_POLYGON,
+    RELAYER_URL_DEFAULT, RPC_URL_DEFAULT, USDC_POLYGON,
+};
 use crate::pusd_wrap::{merge_wrap_to_pusd, wrap_usdce_to_pusd};
 use crate::wallet_kind::{classify_wallet, WalletKind};
-use crate::proxy_relay::{
-    self, derive_proxy_wallet, relayer_execute_proxy_calldata, IGnosisSafe, CTF_COLLATERAL_ADAPTER,
-    CTF_POLYGON, PROXY_FACTORY, PROXY_MERGE_PUSD_GAS, PUSD_POLYGON, RELAYER_URL_DEFAULT,
-    RPC_URL_DEFAULT, USDC_POLYGON,
-};
 
 use alloy::sol;
 sol! {
@@ -179,8 +181,12 @@ async fn resolve_merge_balances(
     }
 
     let (pref_yes, pref_no) = binary_position_ids(client, condition_id, merge_collateral()).await?;
-    let pref_by = erc1155_balance(prov_read, wallet, pref_yes).await.unwrap_or(U256::ZERO);
-    let pref_bn = erc1155_balance(prov_read, wallet, pref_no).await.unwrap_or(U256::ZERO);
+    let pref_by = erc1155_balance(prov_read, wallet, pref_yes)
+        .await
+        .unwrap_or(U256::ZERO);
+    let pref_bn = erc1155_balance(prov_read, wallet, pref_no)
+        .await
+        .unwrap_or(U256::ZERO);
     if let Some((yes_id, no_id)) = asset_hint {
         let hint_yes = erc1155_balance(prov_read, wallet, yes_id)
             .await
@@ -282,6 +288,7 @@ pub fn short_hex(s: &str) -> String {
     proxy_relay::short_hex(s)
 }
 
+#[allow(clippy::too_many_arguments)] // Wallet-kind compatibility adapter.
 async fn relayer_merge(
     wallet_kind: WalletKind,
     merge_calldata: &[u8],
@@ -301,10 +308,12 @@ async fn relayer_merge(
                 merge_to,
                 wallet,
                 signer,
-                builder_key,
-                builder_secret,
-                builder_passphrase,
-                relayer_url,
+                RelayerCredentials {
+                    builder_key,
+                    builder_secret,
+                    builder_passphrase,
+                    relayer_url,
+                },
                 "Merge positions",
             )
             .await
@@ -315,10 +324,12 @@ async fn relayer_merge(
                 merge_to,
                 wallet,
                 signer,
-                builder_key,
-                builder_secret,
-                builder_passphrase,
-                relayer_url,
+                RelayerCredentials {
+                    builder_key,
+                    builder_secret,
+                    builder_passphrase,
+                    relayer_url,
+                },
                 "Merge positions",
                 gas_limit,
             )
@@ -394,6 +405,7 @@ async fn safe_exec_call<P: Provider>(
     Ok(tx_hash_out)
 }
 
+#[allow(clippy::too_many_arguments)] // Stable on-chain compatibility boundary retained for callers.
 async fn maybe_wrap_merge_output<P: Provider>(
     provider: &P,
     prov_read: &impl Provider,
@@ -445,13 +457,18 @@ pub async fn merge_max(
 
     let output = if merge_to_pusd() { "pUSD" } else { "USDC.e" };
 
-    let provider = ProviderBuilder::new().wallet(signer.clone()).connect(rpc).await?;
+    let provider = ProviderBuilder::new()
+        .wallet(signer.clone())
+        .connect(rpc)
+        .await?;
     let client = Client::new(provider.clone(), chain)?;
-    let config = contract_config(chain, false).ok_or_else(|| anyhow::anyhow!("Unsupported chain_id: {}", chain))?;
+    let config = contract_config(chain, false)
+        .ok_or_else(|| anyhow::anyhow!("Unsupported chain_id: {}", chain))?;
     let prov_read = ProviderBuilder::new().connect(rpc).await?;
     let ctf = config.conditional_tokens;
 
-    let resolved = resolve_merge_balances(&client, &prov_read, wallet, condition_id, asset_hint).await?;
+    let resolved =
+        resolve_merge_balances(&client, &prov_read, wallet, condition_id, asset_hint).await?;
     let ResolvedMerge {
         collateral,
         yes_id: pos_yes_id,
@@ -462,7 +479,11 @@ pub async fn merge_max(
 
     let merge_amount = b_yes.min(b_no);
     if merge_amount == U256::ZERO {
-        anyhow::bail!("No mergeable shares: YES={} NO={}, at least one is 0.", b_yes, b_no);
+        anyhow::bail!(
+            "No mergeable shares: YES={} NO={}, at least one is 0.",
+            b_yes,
+            b_no
+        );
     }
     info!(
         "🔄 Merge amount: {} ({}) | wallet={:?} | collateral={:?} | target={}",
@@ -473,7 +494,8 @@ pub async fn merge_max(
         output
     );
 
-    let merge_req = MergePositionsRequest::for_binary_market(collateral, condition_id, merge_amount);
+    let merge_req =
+        MergePositionsRequest::for_binary_market(collateral, condition_id, merge_amount);
     let merge_calldata = encode_merge_calldata(&merge_req);
     let merge_to = merge_target_for_collateral(ctf, collateral);
     let gas_limit = merge_gas_for_collateral(collateral);
@@ -517,10 +539,12 @@ pub async fn merge_max(
                             wallet,
                             CTF_COLLATERAL_ADAPTER,
                             &signer,
-                            k,
-                            s,
-                            p,
-                            &relayer_url,
+                            RelayerCredentials {
+                                builder_key: k,
+                                builder_secret: s,
+                                builder_passphrase: p,
+                                relayer_url: &relayer_url,
+                            },
                         )
                         .await?;
                     }
@@ -626,7 +650,10 @@ pub async fn merge_max(
         &relayer_url,
     )
     .await?;
-    info!("✅ Merge success (Safe) tx: {:#x} | merged={}", tx_hash_out, merged_amount);
+    info!(
+        "✅ Merge success (Safe) tx: {:#x} | merged={}",
+        tx_hash_out, merged_amount
+    );
     Ok(MergeResult {
         tx_hash: format!("{:#x}", tx_hash_out),
         merged_amount,

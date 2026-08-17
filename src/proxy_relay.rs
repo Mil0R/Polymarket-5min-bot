@@ -1,10 +1,11 @@
 //! Proxy wallet + Relayer/Safe shared infrastructure for merge, redeem, withdraw.
+#![allow(clippy::too_many_arguments)] // Solidity-generated Safe ABI mirrors contract signatures.
 //!
 //! Relayer requests (/relay-payload, /submit), proxy call encoding, Gnosis Safe interface and signing.
 
 use std::env;
 
-use alloy::primitives::{keccak256, Address, B256, Bytes, U256};
+use alloy::primitives::{keccak256, Address, Bytes, B256, U256};
 use alloy::sol_types::SolCall;
 use anyhow::Result;
 use tracing::info;
@@ -68,7 +69,8 @@ pub const CTF_COLLATERAL_ADAPTER: Address = address!("0xAdA100Db00Ca000738118206
 /// V2 Collateral Onramp：USDC.e → pUSD wrap
 pub const COLLATERAL_ONRAMP: Address = address!("0x93070a847efEf7F70739046A929D47a521F5B8ee");
 /// V2 NegRisk 抵押品适配器（赎回为 pUSD）
-pub const NEG_RISK_COLLATERAL_ADAPTER: Address = address!("0xadA2005600Dec949baf300f4C6120000bDB6eAab");
+pub const NEG_RISK_COLLATERAL_ADAPTER: Address =
+    address!("0xadA2005600Dec949baf300f4C6120000bDB6eAab");
 
 const RELAYER_GET_RELAY_PAYLOAD: &str = "/relay-payload";
 const RELAYER_SUBMIT: &str = "/submit";
@@ -125,7 +127,13 @@ pub(crate) fn to_hex_0x(b: &[u8]) -> String {
     s
 }
 
-fn build_hmac_signature(secret: &[u8], timestamp: u64, method: &str, path: &str, body: &str) -> String {
+fn build_hmac_signature(
+    secret: &[u8],
+    timestamp: u64,
+    method: &str,
+    path: &str,
+    body: &str,
+) -> String {
     let msg = format!("{}{}{}{}", timestamp, method, path, body);
     let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC key");
     mac.update(msg.as_bytes());
@@ -133,11 +141,22 @@ fn build_hmac_signature(secret: &[u8], timestamp: u64, method: &str, path: &str,
     sig.replace('+', "-").replace('/', "_")
 }
 
-pub(crate) async fn get_relay_payload(client: &reqwest::Client, base: &str, eoa: Address) -> Result<(Address, String)> {
-    let url = format!("{}{}", base.trim_end_matches('/'), RELAYER_GET_RELAY_PAYLOAD);
+pub(crate) async fn get_relay_payload(
+    client: &reqwest::Client,
+    base: &str,
+    eoa: Address,
+) -> Result<(Address, String)> {
+    let url = format!(
+        "{}{}",
+        base.trim_end_matches('/'),
+        RELAYER_GET_RELAY_PAYLOAD
+    );
     let resp = client
         .get(&url)
-        .query(&[("address", format!("{:#x}", eoa)), ("type", "PROXY".to_string())])
+        .query(&[
+            ("address", format!("{:#x}", eoa)),
+            ("type", "PROXY".to_string()),
+        ])
         .send()
         .await?;
     let status = resp.status();
@@ -146,7 +165,10 @@ pub(crate) async fn get_relay_payload(client: &reqwest::Client, base: &str, eoa:
         anyhow::bail!("GET /relay-payload failed status={} body={}", status, text);
     }
     let j: serde_json::Value = serde_json::from_str(&text)?;
-    let addr = j.get("address").and_then(|v| v.as_str()).ok_or_else(|| anyhow::anyhow!("relay-payload missing address"))?;
+    let addr = j
+        .get("address")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("relay-payload missing address"))?;
     let nonce = j
         .get("nonce")
         .map(|v| {
@@ -156,12 +178,11 @@ pub(crate) async fn get_relay_payload(client: &reqwest::Client, base: &str, eoa:
                 .unwrap_or_else(|| "0".into())
         })
         .unwrap_or_else(|| "0".into());
-    let relay = addr.trim().parse::<Address>().map_err(|e| anyhow::anyhow!("Failed to parse relay address: {}", e))?;
+    let relay = addr
+        .trim()
+        .parse::<Address>()
+        .map_err(|e| anyhow::anyhow!("Failed to parse relay address: {}", e))?;
     Ok((relay, nonce.to_string()))
-}
-
-pub(crate) fn encode_proxy_call(target: Address, data: &[u8]) -> Vec<u8> {
-    encode_proxy_calls(&[(target, data)])
 }
 
 pub(crate) fn encode_proxy_calls(calls: &[(Address, &[u8])]) -> Vec<u8> {
@@ -177,6 +198,7 @@ pub(crate) fn encode_proxy_calls(calls: &[(Address, &[u8])]) -> Vec<u8> {
     proxyCall { calls: tuples }.abi_encode().to_vec()
 }
 
+#[allow(clippy::too_many_arguments)] // Mirrors the fixed EIP-191 relayer payload fields.
 pub(crate) fn create_struct_hash(
     from: Address,
     to: Address,
@@ -215,10 +237,7 @@ pub(crate) async fn relayer_execute_proxy_calldata(
     target_address: Address,
     proxy_wallet: Address,
     signer: &impl alloy::signers::Signer,
-    builder_key: &str,
-    builder_secret: &str,
-    builder_passphrase: &str,
-    relayer_url: &str,
+    credentials: RelayerCredentials<'_>,
     metadata: &str,
     gas_limit: Option<u64>,
 ) -> Result<String> {
@@ -226,10 +245,7 @@ pub(crate) async fn relayer_execute_proxy_calldata(
         &[(target_address, calldata.to_vec())],
         proxy_wallet,
         signer,
-        builder_key,
-        builder_secret,
-        builder_passphrase,
-        relayer_url,
+        credentials,
         metadata,
         gas_limit,
     )
@@ -240,10 +256,7 @@ pub(crate) async fn relayer_execute_proxy_calls(
     calls: &[(Address, Vec<u8>)],
     proxy_wallet: Address,
     signer: &impl alloy::signers::Signer,
-    builder_key: &str,
-    builder_secret: &str,
-    builder_passphrase: &str,
-    relayer_url: &str,
+    credentials: RelayerCredentials<'_>,
     metadata: &str,
     gas_limit: Option<u64>,
 ) -> Result<String> {
@@ -252,7 +265,7 @@ pub(crate) async fn relayer_execute_proxy_calls(
     }
     let client = reqwest::Client::new();
     let eoa = signer.address();
-    let base = relayer_url.trim_end_matches('/');
+    let base = credentials.relayer_url.trim_end_matches('/');
 
     let (relay, nonce) = get_relay_payload(&client, base, eoa).await?;
     let call_refs: Vec<(Address, &[u8])> = calls.iter().map(|(a, d)| (*a, d.as_slice())).collect();
@@ -265,13 +278,29 @@ pub(crate) async fn relayer_execute_proxy_calls(
     });
     let gas_limit = base_gas.saturating_mul(calls.len() as u64).max(base_gas);
 
-    if env::var("MERGE_PROXY_TO").map(|s| s.trim().eq_ignore_ascii_case("PROXY_WALLET")).unwrap_or(false) {
+    if env::var("MERGE_PROXY_TO")
+        .map(|s| s.trim().eq_ignore_ascii_case("PROXY_WALLET"))
+        .unwrap_or(false)
+    {
         info!("ℹ️ MERGE_PROXY_TO=PROXY_WALLET ignored, using to=PROXY_FACTORY");
     }
     let to = PROXY_FACTORY;
-    let struct_hash = create_struct_hash(eoa, to, &proxy_data, 0, 0, gas_limit, &nonce, RELAY_HUB, relay);
+    let struct_hash = create_struct_hash(
+        eoa,
+        to,
+        &proxy_data,
+        0,
+        0,
+        gas_limit,
+        &nonce,
+        RELAY_HUB,
+        relay,
+    );
     let to_sign = eip191_hash(struct_hash);
-    let sig = signer.sign_hash(&to_sign).await.map_err(|e| anyhow::anyhow!("EOA signing failed: {}", e))?;
+    let sig = signer
+        .sign_hash(&to_sign)
+        .await
+        .map_err(|e| anyhow::anyhow!("EOA signing failed: {}", e))?;
     let mut sig_bytes = sig.as_bytes().to_vec();
     if sig_bytes.len() == 65 && (sig_bytes[64] == 0 || sig_bytes[64] == 1) {
         sig_bytes[64] += 27;
@@ -296,37 +325,14 @@ pub(crate) async fn relayer_execute_proxy_calls(
         "type": "PROXY",
         "metadata": metadata
     });
-    let body_str = serde_json::to_string(&body)?;
-
-    let path = RELAYER_SUBMIT;
-    let method = "POST";
-    let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis() as u64;
-    let secret_b64 = builder_secret
-        .trim()
-        .replace('-', "+")
-        .replace('_', "/");
-    let secret_bytes = base64::engine::general_purpose::STANDARD
-        .decode(&secret_b64)
-        .map_err(|e| anyhow::anyhow!("POLY_BUILDER_SECRET base64 decode failed: {}", e))?;
-    let sig_hmac = build_hmac_signature(&secret_bytes, timestamp, method, path, &body_str);
-
-    let url = format!("{}{}", base, path);
-    let resp = client
-        .post(&url)
-        .header("Content-Type", "application/json")
-        .header("POLY_BUILDER_API_KEY", builder_key.trim())
-        .header("POLY_BUILDER_TIMESTAMP", timestamp.to_string())
-        .header("POLY_BUILDER_PASSPHRASE", builder_passphrase.trim())
-        .header("POLY_BUILDER_SIGNATURE", sig_hmac)
-        .body(body_str)
-        .send()
-        .await?;
-    let status = resp.status();
-    let text = resp.text().await?;
-    if !status.is_success() {
-        anyhow::bail!("Relayer request failed status={} body={}", status, text);
-    }
-    parse_relayer_tx_hash(&text)
+    relayer_submit_authed(
+        body,
+        credentials.builder_key,
+        credentials.builder_secret,
+        credentials.builder_passphrase,
+        credentials.relayer_url,
+    )
+    .await
 }
 
 pub(crate) fn parse_relayer_tx_hash(text: &str) -> Result<String> {
@@ -347,7 +353,26 @@ pub(crate) async fn relayer_submit_authed(
     builder_passphrase: &str,
     relayer_url: &str,
 ) -> Result<String> {
-    let client = reqwest::Client::new();
+    relayer_submit_authed_with_timeout(
+        body,
+        builder_key,
+        builder_secret,
+        builder_passphrase,
+        relayer_url,
+        std::time::Duration::from_secs(15),
+    )
+    .await
+}
+
+async fn relayer_submit_authed_with_timeout(
+    body: serde_json::Value,
+    builder_key: &str,
+    builder_secret: &str,
+    builder_passphrase: &str,
+    relayer_url: &str,
+    timeout: std::time::Duration,
+) -> Result<String> {
+    let client = reqwest::Client::builder().timeout(timeout).build()?;
     let base = relayer_url.trim_end_matches('/');
     let path = RELAYER_SUBMIT;
     let method = "POST";
@@ -355,10 +380,7 @@ pub(crate) async fn relayer_submit_authed(
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_millis() as u64;
-    let secret_b64 = builder_secret
-        .trim()
-        .replace('-', "+")
-        .replace('_', "/");
+    let secret_b64 = builder_secret.trim().replace('-', "+").replace('_', "/");
     let secret_bytes = base64::engine::general_purpose::STANDARD
         .decode(&secret_b64)
         .map_err(|e| anyhow::anyhow!("POLY_BUILDER_SECRET base64 decode failed: {}", e))?;
@@ -384,3 +406,155 @@ pub(crate) async fn relayer_submit_authed(
 }
 
 // IGnosisSafe from sol! above, used by merge/redeem/withdraw via crate::proxy_relay::IGnosisSafe
+#[derive(Clone, Copy)]
+pub(crate) struct RelayerCredentials<'a> {
+    pub builder_key: &'a str,
+    pub builder_secret: &'a str,
+    pub builder_passphrase: &'a str,
+    pub relayer_url: &'a str,
+}
+
+#[cfg(test)]
+mod protocol_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    async fn mock_relayer(
+        response_status: &str,
+        response_body: &str,
+    ) -> (String, tokio::task::JoinHandle<String>) {
+        mock_relayer_delayed(response_status, response_body, std::time::Duration::ZERO).await
+    }
+
+    async fn mock_relayer_delayed(
+        response_status: &str,
+        response_body: &str,
+        delay: std::time::Duration,
+    ) -> (String, tokio::task::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let status = response_status.to_string();
+        let body = response_body.to_string();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut received = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let count = stream.read(&mut buffer).await.unwrap();
+                if count == 0 {
+                    break;
+                }
+                received.extend_from_slice(&buffer[..count]);
+                let text = String::from_utf8_lossy(&received);
+                let header_end = text.find("\r\n\r\n");
+                let content_length = text.lines().find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(str::trim)
+                        .and_then(|value| value.parse::<usize>().ok())
+                });
+                if let (Some(header_end), Some(content_length)) = (header_end, content_length) {
+                    if received.len() >= header_end + 4 + content_length {
+                        break;
+                    }
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            tokio::time::sleep(delay).await;
+            stream.write_all(response.as_bytes()).await.unwrap();
+            String::from_utf8(received).unwrap()
+        });
+        (format!("http://{address}"), task)
+    }
+
+    #[tokio::test]
+    async fn relayer_protocol_sends_auth_headers_and_parses_hash() {
+        let (url, server) = mock_relayer("200 OK", r#"{"transactionHash":"0xabc123"}"#).await;
+        let hash = relayer_submit_authed(
+            serde_json::json!({"type":"WALLET","nonce":"7"}),
+            "fixture-key",
+            "c2VjcmV0",
+            "fixture-passphrase",
+            &url,
+        )
+        .await
+        .unwrap();
+        let request = server.await.unwrap();
+        let request_lower = request.to_ascii_lowercase();
+        assert_eq!(hash, "0xabc123");
+        assert!(request.starts_with("POST /submit HTTP/1.1"));
+        assert!(request_lower.contains("poly_builder_api_key: fixture-key"));
+        assert!(request_lower.contains("poly_builder_signature:"));
+        assert!(request.contains(r#""type":"WALLET""#));
+    }
+
+    #[tokio::test]
+    async fn relayer_protocol_preserves_error_status_and_body() {
+        let (url, server) =
+            mock_relayer("429 Too Many Requests", r#"{"error":"rate limit"}"#).await;
+        let error = relayer_submit_authed(
+            serde_json::json!({"type":"PROXY"}),
+            "fixture-key",
+            "c2VjcmV0",
+            "fixture-passphrase",
+            &url,
+        )
+        .await
+        .unwrap_err();
+        server.await.unwrap();
+        let message = error.to_string();
+        assert!(message.contains("429"));
+        assert!(message.contains("rate limit"));
+    }
+
+    #[tokio::test]
+    async fn relayer_protocol_preserves_server_errors() {
+        let (url, server) = mock_relayer(
+            "500 Internal Server Error",
+            r#"{"error":"upstream unavailable"}"#,
+        )
+        .await;
+        let error = relayer_submit_authed(
+            serde_json::json!({"type":"PROXY"}),
+            "fixture-key",
+            "c2VjcmV0",
+            "fixture-passphrase",
+            &url,
+        )
+        .await
+        .unwrap_err();
+        server.await.unwrap();
+        assert!(error.to_string().contains("upstream unavailable"));
+    }
+
+    #[tokio::test]
+    async fn relayer_protocol_enforces_request_timeout() {
+        let (url, server) = mock_relayer_delayed(
+            "200 OK",
+            r#"{"transactionHash":"0xlate"}"#,
+            std::time::Duration::from_millis(200),
+        )
+        .await;
+        let error = relayer_submit_authed_with_timeout(
+            serde_json::json!({"type":"PROXY"}),
+            "fixture-key",
+            "c2VjcmV0",
+            "fixture-passphrase",
+            &url,
+            std::time::Duration::from_millis(25),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<reqwest::Error>()
+                .is_some_and(reqwest::Error::is_timeout),
+            "unexpected error: {error:#}"
+        );
+        let _ = server.await;
+    }
+}

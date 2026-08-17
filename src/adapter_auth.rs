@@ -8,7 +8,7 @@ use tracing::info;
 use crate::deposit_wallet_relay::{
     relayer_execute_deposit_wallet_calldata, use_deposit_wallet_relayer,
 };
-use crate::proxy_relay::{relayer_execute_proxy_calldata, CTF_POLYGON};
+use crate::proxy_relay::{relayer_execute_proxy_calldata, RelayerCredentials, CTF_POLYGON};
 
 use alloy::sol;
 sol! {
@@ -62,10 +62,7 @@ async fn submit_adapter_approval<P: Provider>(
     wallet: Address,
     adapter: Address,
     signer: &impl alloy::signers::Signer,
-    builder_key: &str,
-    builder_secret: &str,
-    builder_passphrase: &str,
-    relayer_url: &str,
+    credentials: RelayerCredentials<'_>,
 ) -> Result<String> {
     let approve_calldata = encode_set_approval_for_all(adapter, true);
     if use_deposit_wallet_relayer() {
@@ -74,10 +71,7 @@ async fn submit_adapter_approval<P: Provider>(
             CTF_POLYGON,
             wallet,
             signer,
-            builder_key,
-            builder_secret,
-            builder_passphrase,
-            relayer_url,
+            credentials,
             "Approve CTF adapter",
         )
         .await
@@ -87,10 +81,7 @@ async fn submit_adapter_approval<P: Provider>(
             CTF_POLYGON,
             wallet,
             signer,
-            builder_key,
-            builder_secret,
-            builder_passphrase,
-            relayer_url,
+            credentials,
             "Approve CTF adapter",
             None,
         )
@@ -103,26 +94,16 @@ pub async fn ensure_adapter_approved<P: Provider>(
     wallet: Address,
     adapter: Address,
     signer: &impl alloy::signers::Signer,
-    builder_key: &str,
-    builder_secret: &str,
-    builder_passphrase: &str,
-    relayer_url: &str,
+    credentials: RelayerCredentials<'_>,
 ) -> Result<()> {
     if is_adapter_approved(provider, CTF_POLYGON, wallet, adapter).await? {
         return Ok(());
     }
-    info!("pUSD adapter {:?} 未授权，提交 setApprovalForAll …", adapter);
-    let tx = submit_adapter_approval(
-        provider,
-        wallet,
-        adapter,
-        signer,
-        builder_key,
-        builder_secret,
-        builder_passphrase,
-        relayer_url,
-    )
-    .await?;
+    info!(
+        "pUSD adapter {:?} 未授权，提交 setApprovalForAll …",
+        adapter
+    );
+    let tx = submit_adapter_approval(provider, wallet, adapter, signer, credentials).await?;
     wait_relayer_tx(provider, &tx).await?;
     if !is_adapter_approved(provider, CTF_POLYGON, wallet, adapter).await? {
         anyhow::bail!(

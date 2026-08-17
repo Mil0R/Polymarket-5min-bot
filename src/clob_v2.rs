@@ -1,8 +1,8 @@
 //! Polymarket V2 CLOB client factory (shared by main bot and test binaries).
 
-use anyhow::Result;
 use alloy::signers::local::LocalSigner;
 use alloy::signers::Signer as _;
+use anyhow::Result;
 use polymarket_client_sdk_v2::clob::types::SignatureType;
 use polymarket_client_sdk_v2::clob::{Client, Config as ClobConfig};
 use polymarket_client_sdk_v2::types::Address;
@@ -12,9 +12,7 @@ use std::str::FromStr;
 pub const CLOB_API_URL_DEFAULT: &str = "https://clob.polymarket.com";
 
 pub type AuthenticatedClobClient = Client<
-    polymarket_client_sdk_v2::auth::state::Authenticated<
-        polymarket_client_sdk_v2::auth::Normal,
-    >,
+    polymarket_client_sdk_v2::auth::state::Authenticated<polymarket_client_sdk_v2::auth::Normal>,
 >;
 
 /// Parse V2 CLOB signature type from env string.
@@ -50,13 +48,10 @@ pub async fn create_authenticated_clob_client(
         .with_chain_id(Some(POLYGON));
 
     let clob_config = ClobConfig::builder().use_server_time(true).build();
-    let mut auth_builder = Client::new(clob_api_url, clob_config)?
-        .authentication_builder(&signer);
+    let mut auth_builder = Client::new(clob_api_url, clob_config)?.authentication_builder(&signer);
 
     if let Some(funder) = funder_address {
-        auth_builder = auth_builder
-            .funder(funder)
-            .signature_type(signature_type);
+        auth_builder = auth_builder.funder(funder).signature_type(signature_type);
     }
 
     auth_builder
