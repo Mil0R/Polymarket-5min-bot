@@ -280,6 +280,20 @@ impl TradingExecutor {
         Ok(())
     }
 
+    /// Best (cheapest) ask for a token from the live REST book. The WS orderbook
+    /// stream carries the full price grid including deep 0.01 levels, which is
+    /// useless for buying a decided winner; the REST book returns real ask
+    /// levels near the top of book.
+    pub async fn winner_best_ask(&self, token_id: U256) -> Result<Option<Decimal>> {
+        let book = self.live_paper_book(token_id).await?;
+        Ok(book
+            .asks
+            .iter()
+            .filter(|level| level.size > Decimal::ZERO)
+            .min_by_key(|level| level.price)
+            .map(|level| level.price))
+    }
+
     /// Single-leg "buy the determined winner" for the window-end strategy.
     /// Dry-run mode simulates a fill against the live CLOB book; live mode posts
     /// a real buy order. Returns the filled share count (0 = not filled).

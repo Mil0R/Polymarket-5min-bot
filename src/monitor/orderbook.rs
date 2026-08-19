@@ -203,17 +203,6 @@ impl OrderBookMonitor {
         self.market_map.clear();
         self.extra_tokens.clear();
     }
-
-    /// Best ask of both legs for a market (None per side when that side has no
-    /// asks), if both books are cached. Used by the window-end winner-buy strategy.
-    pub fn market_best_asks(&self, market_id: &B256) -> Option<(Option<Decimal>, Option<Decimal>)> {
-        let (yes_token, no_token) = self.market_map.get(market_id)?;
-        let yes_book = self.books.get(yes_token)?;
-        let no_book = self.books.get(no_token)?;
-        let yes_ask = best_ask(&yes_book).map(|level| level.price);
-        let no_ask = best_ask(&no_book).map(|level| level.price);
-        Some((yes_ask, no_ask))
-    }
 }
 
 #[cfg(test)]

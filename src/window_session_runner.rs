@@ -200,6 +200,7 @@ mod tests {
             title: "BTC Up or Down".into(),
             end_date: Utc::now() + chrono::Duration::minutes(2),
             crypto_symbol: "btc".into(),
+            outcome_prices: Some((dec!(0.5), dec!(0.5))),
         };
         WindowSessionRunner {
             markets: HashMap::from([(market_id, market)]),

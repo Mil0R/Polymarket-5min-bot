@@ -19,43 +19,43 @@ pub struct WinnerSignal {
     pub price: Decimal,
 }
 
-/// Decide whether the market's direction is decided enough to buy the winner.
+/// Decide whether the winner side's ask is buyable, from live REST book asks.
 ///
-/// Rules (window-end state):
-/// - one side's best ask >= `min_price` (e.g. 0.95) AND
-/// - the other side's best ask is absent or <= `1 - min_price`
-///   (the losing side must not itself be expensive).
-/// Returns `None` when direction is not (yet) decided.
-pub fn detect_winner(
+/// At window end the decided winner's side shows only high asks (0.95-0.99 —
+/// makers selling the winner for small certainty gains) while the losing side
+/// carries a full grid down to 0.01 (dumped/panic sells). We buy the side whose
+/// best ask is high (`>= min_price`) and whose opponent is cheap (`< 0.1` or
+/// absent) — direction inferred purely from Polymarket's own book, so it is
+/// consistent with settlement.
+pub fn detect_winner_asks(
     yes_ask: Option<Decimal>,
     no_ask: Option<Decimal>,
     min_price: Decimal,
+    max_price: Decimal,
 ) -> Option<WinnerSignal> {
     let min = min_price.clamp(dec!(0.5), dec!(0.999));
-    let max_loser = dec!(1) - min;
+    let max = max_price.clamp(min, dec!(0.9999));
+    const LOSER_MAX: Decimal = dec!(0.1);
 
-    let yes_decided = matches!(yes_ask, Some(p) if p >= min);
-    let no_decided = matches!(no_ask, Some(p) if p >= min);
-    // Both sides expensive (both guard-sided, e.g. 0.84/0.84) → not decided.
-    if yes_decided && no_decided {
-        return None;
-    }
+    let high_side = |ask: Option<Decimal>| match ask {
+        Some(p) if p >= min && p <= max => Some(p),
+        _ => None,
+    };
+    let low_or_absent = |ask: Option<Decimal>| ask.map_or(true, |p| p <= LOSER_MAX);
 
-    if yes_decided {
-        let loser_ok = no_ask.map_or(true, |p| p <= max_loser);
-        if loser_ok {
+    if let Some(yes) = high_side(yes_ask) {
+        if low_or_absent(no_ask) {
             return Some(WinnerSignal {
                 buy_yes: true,
-                price: yes_ask.expect("checked above"),
+                price: yes,
             });
         }
     }
-    if no_decided {
-        let loser_ok = yes_ask.map_or(true, |p| p <= max_loser);
-        if loser_ok {
+    if let Some(no) = high_side(no_ask) {
+        if low_or_absent(yes_ask) {
             return Some(WinnerSignal {
                 buy_yes: false,
-                price: no_ask.expect("checked above"),
+                price: no,
             });
         }
     }
@@ -76,43 +76,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn buys_yes_when_yes_ask_is_decided_and_no_is_cheap() {
-        let signal = detect_winner(Some(dec!(0.98)), Some(dec!(0.02)), dec!(0.95)).unwrap();
+    fn buys_yes_when_yes_ask_high_and_no_low() {
+        let signal = detect_winner_asks(Some(dec!(0.98)), Some(dec!(0.01)), dec!(0.95), dec!(0.99)).unwrap();
         assert!(signal.buy_yes);
         assert_eq!(signal.price, dec!(0.98));
     }
 
     #[test]
-    fn buys_no_when_no_ask_is_decided_and_yes_is_cheap() {
-        let signal = detect_winner(Some(dec!(0.03)), Some(dec!(0.98)), dec!(0.95)).unwrap();
+    fn buys_no_when_no_ask_high_and_yes_low() {
+        let signal = detect_winner_asks(Some(dec!(0.03)), Some(dec!(0.985)), dec!(0.95), dec!(0.99)).unwrap();
         assert!(!signal.buy_yes);
-        assert_eq!(signal.price, dec!(0.98));
+        assert_eq!(signal.price, dec!(0.985));
     }
 
     #[test]
     fn buys_yes_when_no_side_has_no_asks() {
-        // NO side has no asks at all; YES side decided → buy YES.
-        let signal = detect_winner(Some(dec!(0.98)), None, dec!(0.95)).unwrap();
-        assert!(signal.buy_yes);
-        assert_eq!(signal.price, dec!(0.98));
+        assert!(detect_winner_asks(Some(dec!(0.98)), None, dec!(0.95), dec!(0.99)).is_some());
     }
 
     #[test]
-    fn rejects_when_both_sides_expensive() {
-        // Classic guard-order shape 0.84/0.84: direction not decided.
-        assert!(detect_winner(Some(dec!(0.84)), Some(dec!(0.84)), dec!(0.95)).is_none());
+    fn rejects_when_both_sides_high() {
+        // Direction not decided: both sides carry 0.99 guard asks.
+        assert!(detect_winner_asks(Some(dec!(0.99)), Some(dec!(0.99)), dec!(0.95), dec!(0.99)).is_none());
     }
 
     #[test]
-    fn rejects_when_loser_side_still_expensive() {
-        // YES at 0.98 but NO at 0.30 → not a clear winner (loser not cheap enough).
-        assert!(detect_winner(Some(dec!(0.98)), Some(dec!(0.30)), dec!(0.95)).is_none());
-        assert!(detect_winner(Some(dec!(0.98)), Some(dec!(0.04)), dec!(0.95)).is_some());
+    fn rejects_when_winner_side_above_max_price() {
+        assert!(detect_winner_asks(Some(dec!(0.993)), Some(dec!(0.01)), dec!(0.95), dec!(0.99)).is_none());
+        assert!(detect_winner_asks(Some(dec!(0.985)), Some(dec!(0.01)), dec!(0.95), dec!(0.99)).is_some());
     }
 
     #[test]
-    fn rejects_when_winner_side_below_min_price() {
-        assert!(detect_winner(Some(dec!(0.80)), Some(dec!(0.10)), dec!(0.95)).is_none());
+    fn rejects_when_winner_below_min_price() {
+        assert!(detect_winner_asks(Some(dec!(0.80)), Some(dec!(0.01)), dec!(0.95), dec!(0.99)).is_none());
     }
 
     #[test]

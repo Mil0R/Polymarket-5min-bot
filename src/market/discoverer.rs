@@ -6,7 +6,7 @@ use polymarket_client_sdk::gamma::{
     types::{request::MarketsRequest, response::Market},
     Client,
 };
-use polymarket_client_sdk::types::{B256, U256};
+use polymarket_client_sdk::types::{B256, Decimal, U256};
 use std::sync::Arc;
 use tracing::{info, warn};
 
@@ -33,6 +33,12 @@ pub struct MarketInfo {
     pub title: String,
     pub end_date: DateTime<Utc>,
     pub crypto_symbol: String,
+    /// Reference (last-trade) prices for (YES, NO) from gamma, captured at
+    /// subscription time. Kept for diagnostics; direction for winner-buy comes
+    /// from the live price feed instead (gamma prices stop updating on
+    /// low-volume windows).
+    #[allow(dead_code)]
+    pub outcome_prices: Option<(Decimal, Decimal)>,
 }
 
 pub struct MarketDiscoverer {
@@ -188,6 +194,10 @@ impl MarketDiscoverer {
             title: market.question.unwrap_or_default(),
             end_date,
             crypto_symbol,
+            outcome_prices: market
+                .outcome_prices
+                .filter(|prices| prices.len() == 2)
+                .map(|prices| (prices[0], prices[1])),
         })
     }
 }

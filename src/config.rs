@@ -99,6 +99,8 @@ pub struct Config {
     pub winner_buy_before_end_secs: u32,
     /// Only buy a side whose best ask is >= this price (direction considered decided).
     pub winner_buy_min_price: f64,
+    /// Do not buy above this price (edge < 1 - max_price becomes too thin).
+    pub winner_buy_max_price: f64,
     /// Max notional (USDC) per winner buy.
     pub winner_buy_max_order_usdc: f64,
     /// Max winner buys per window (0 = unlimited).
@@ -197,6 +199,7 @@ impl Config {
             winner_buy_enabled: env_bool("WINNER_BUY_ENABLED", false)?,
             winner_buy_before_end_secs: env_parse("WINNER_BUY_BEFORE_END_SECS", "30")?,
             winner_buy_min_price: env_parse("WINNER_BUY_MIN_PRICE", "0.95")?,
+            winner_buy_max_price: env_parse("WINNER_BUY_MAX_PRICE", "0.99")?,
             winner_buy_max_order_usdc: env_parse("WINNER_BUY_MAX_ORDER_USDC", "50.0")?,
             winner_buy_max_per_window: env_parse("WINNER_BUY_MAX_PER_WINDOW", "1")?,
             merge_interval_minutes: env_parse("MERGE_INTERVAL_MINUTES", "0")?,

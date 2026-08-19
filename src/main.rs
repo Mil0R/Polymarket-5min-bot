@@ -38,6 +38,7 @@ use crate::live_safety::{CanaryPolicy, LiveSafetyGuard};
 use crate::market::{MarketDiscoverer, MarketScheduler};
 use crate::monitor::OrderBookMonitor;
 use crate::observability_server::ServiceHealth;
+
 use crate::risk::{HedgeMonitor, PositionBalancer, RiskManager};
 use crate::runtime_metrics::RuntimeMetrics;
 use crate::strategy_service::{StrategyService, StrategyServiceDeps};
@@ -48,7 +49,7 @@ use crate::trading::{
 use crate::wind_down_service::{ScheduledMergeService, WindDownService};
 use crate::window_event_loop::{WindowEventLoopState, WindowExitReason};
 use crate::window_session::WindowSession;
-use crate::winner_buy::{capped_size, detect_winner};
+use crate::winner_buy::{capped_size, detect_winner_asks};
 use crate::window_session_runner::WindowSessionRunner;
 
 #[tokio::main]
@@ -427,6 +428,7 @@ async fn main() -> Result<()> {
             info!(
                 before_end_secs = config.winner_buy_before_end_secs,
                 min_price = config.winner_buy_min_price,
+                max_price = config.winner_buy_max_price,
                 max_order_usdc = config.winner_buy_max_order_usdc,
                 "Winner-buy strategy enabled"
             );
@@ -789,6 +791,15 @@ async fn main() -> Result<()> {
                     // nearly over and one side's ask is decided (>= min price)
                     // while the other has no/cheap asks, buy the winner and hold
                     // to settlement (pays 1.00). One attempt per window.
+                    if config.winner_buy_enabled && seconds_until_end <= 120 {
+                        debug!(
+                            seconds_until_end,
+                            enabled = config.winner_buy_enabled,
+                            count = winner_buy_count.load(Ordering::Relaxed),
+                            max_per_window = config.winner_buy_max_per_window,
+                            "winner-buy window check"
+                        );
+                    }
                     if config.winner_buy_enabled
                         && (config.winner_buy_max_per_window == 0
                             || winner_buy_count.load(Ordering::Relaxed)
@@ -799,29 +810,21 @@ async fn main() -> Result<()> {
                         winner_buy_count.fetch_add(1, Ordering::Relaxed);
                         let min_price = rust_decimal::Decimal::try_from(config.winner_buy_min_price)
                             .unwrap_or(dec!(0.95));
+                        let max_price = rust_decimal::Decimal::try_from(config.winner_buy_max_price)
+                            .unwrap_or(dec!(0.99));
                         let max_order = rust_decimal::Decimal::try_from(
                             config.winner_buy_max_order_usdc,
                         )
                         .unwrap_or(dec!(50));
                         for market in &markets {
-                            let Some((yes_ask, no_ask)) = monitor.market_best_asks(&market.market_id)
-                            else {
-                                continue;
-                            };
-                            let Some(signal) = detect_winner(yes_ask, no_ask, min_price) else {
-                                continue;
-                            };
-                            let size = capped_size(signal.price, max_order);
-                            if size <= dec!(0) {
-                                continue;
-                            }
-                            let token_v1 = if signal.buy_yes {
-                                market.yes_token_id
-                            } else {
-                                market.no_token_id
-                            };
-                            let token = match polymarket_client_sdk::types::U256::from_str(
-                                &token_v1.to_string(),
+                            // Direction from Polymarket's own book (consistent with
+                            // settlement): at window end the winner side shows only
+                            // high asks (0.95-0.99) while the loser carries a grid
+                            // down to 0.01. Query both sides via REST — the WS
+                            // orderbook stream carries the full grid and cannot
+                            // price the winner side.
+                            let yes_token = match polymarket_client_sdk::types::U256::from_str(
+                                &market.yes_token_id.to_string(),
                             ) {
                                 Ok(t) => t,
                                 Err(e) => {
@@ -829,6 +832,50 @@ async fn main() -> Result<()> {
                                     continue;
                                 }
                             };
+                            let no_token = match polymarket_client_sdk::types::U256::from_str(
+                                &market.no_token_id.to_string(),
+                            ) {
+                                Ok(t) => t,
+                                Err(e) => {
+                                    warn!(error = %e, "Winner-buy token parse failed");
+                                    continue;
+                                }
+                            };
+                            let (yes_ask, no_ask) = tokio::join!(
+                                executor.winner_best_ask(yes_token),
+                                executor.winner_best_ask(no_token),
+                            );
+                            let yes_ask = match yes_ask {
+                                Ok(Some(price)) => Some(price),
+                                _ => None,
+                            };
+                            let no_ask = match no_ask {
+                                Ok(Some(price)) => Some(price),
+                                _ => None,
+                            };
+                            if yes_ask.is_none() && no_ask.is_none() {
+                                debug!(
+                                    market = %market.crypto_symbol,
+                                    "Winner-buy: no REST asks, skipping"
+                                );
+                                continue;
+                            }
+                            let Some(signal) =
+                                detect_winner_asks(yes_ask, no_ask, min_price, max_price)
+                            else {
+                                debug!(
+                                    market = %market.crypto_symbol,
+                                    yes_ask = ?yes_ask,
+                                    no_ask = ?no_ask,
+                                    "Winner-buy: winner not identifiable, skipping"
+                                );
+                                continue;
+                            };
+                            let token = if signal.buy_yes { yes_token } else { no_token };
+                            let size = capped_size(signal.price, max_order);
+                            if size <= dec!(0) {
+                                continue;
+                            }
                             runtime_metrics.record_winner_buy_attempt();
                             let side = if signal.buy_yes { "YES" } else { "NO" };
                             info!(

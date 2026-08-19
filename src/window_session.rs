@@ -175,6 +175,7 @@ impl WindowTaskSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rust_decimal_macros::dec;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
@@ -187,6 +188,7 @@ mod tests {
             title: "BTC Up or Down".to_string(),
             end_date: DateTime::from_timestamp(1_720_000_300, 0).unwrap(),
             crypto_symbol: "BTC".to_string(),
+            outcome_prices: Some((dec!(0.5), dec!(0.5))),
         }
     }
 
