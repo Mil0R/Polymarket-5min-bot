@@ -153,6 +153,12 @@ pub struct DashboardState {
     pub total_trades: u32,
     pub successful_trades: u32,
     pub best_trade: f64,
+    /// Window-end winner-buy (strategy B) stats.
+    pub winner_buy_fills: u64,
+    pub winner_buy_wins: u64,
+    pub winner_buy_losses: u64,
+    pub winner_buy_est_pnl: f64,
+    pub winner_buy_realized_pnl: f64,
     pub pnl_sparkline: Vec<u64>,
     pub window_pnl_sparkline: Vec<u64>,
     pub exposure_sparkline: Vec<u64>,
@@ -205,6 +211,11 @@ impl DashboardState {
             total_trades: 0,
             successful_trades: 0,
             best_trade: 0.0,
+            winner_buy_fills: 0,
+            winner_buy_wins: 0,
+            winner_buy_losses: 0,
+            winner_buy_est_pnl: 0.0,
+            winner_buy_realized_pnl: 0.0,
             pnl_sparkline: vec![2, 3, 3, 4, 5, 6, 5, 7, 8, 9, 10, 11],
             window_pnl_sparkline: vec![1, 2, 2, 3, 4, 5, 4, 6, 7, 8],
             exposure_sparkline: vec![3, 4, 5, 4, 6, 5, 7, 6, 8, 7],
@@ -532,6 +543,25 @@ impl DashboardState {
 
     pub fn record_trade_failure(&mut self, symbol: &str, err: &str) {
         self.push_event(format!("❌ {symbol} failed: {err}"));
+    }
+
+    /// Strategy B: a winner-buy paper fill was recorded.
+    pub fn record_winner_buy_fill(&mut self, est_pnl: f64) {
+        self.winner_buy_fills = self.winner_buy_fills.saturating_add(1);
+        self.winner_buy_est_pnl += est_pnl;
+        self.push_event(format!("🎯 Winner-buy filled | est +${est_pnl:.2}"));
+    }
+
+    /// Strategy B: a paper winner-buy position settled against the real market.
+    pub fn record_winner_buy_settlement(&mut self, pnl: f64, won: bool) {
+        if won {
+            self.winner_buy_wins = self.winner_buy_wins.saturating_add(1);
+        } else {
+            self.winner_buy_losses = self.winner_buy_losses.saturating_add(1);
+        }
+        self.winner_buy_realized_pnl += pnl;
+        let icon = if won { "✅" } else { "❌" };
+        self.push_event(format!("🏁 Winner-buy settled {icon} ${pnl:.2}"));
     }
 
     pub fn on_render_tick(&mut self) {

@@ -552,6 +552,7 @@ fn draw_risk(frame: &mut Frame, area: Rect, app: &DashboardState) {
         .constraints([
             Constraint::Length(2),
             Constraint::Length(3),
+            Constraint::Length(5),
             Constraint::Min(2),
         ])
         .split(inner);
@@ -579,6 +580,42 @@ fn draw_risk(frame: &mut Frame, area: Rect, app: &DashboardState) {
         .label(format!("{pct:.0}%"));
     frame.render_widget(gauge, rows[1]);
 
+    // Window-end winner-buy (strategy B) stats.
+    let total = app.winner_buy_wins + app.winner_buy_losses;
+    let win_rate = if total > 0 {
+        (app.winner_buy_wins as f64 / total as f64) * 100.0
+    } else {
+        0.0
+    };
+    let est_color = if app.winner_buy_est_pnl >= 0.0 {
+        Color::Green
+    } else {
+        Color::Red
+    };
+    let realized_color = if app.winner_buy_realized_pnl >= 0.0 {
+        Color::Green
+    } else {
+        Color::Red
+    };
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(format!("Winner-Buy fills: {}", app.winner_buy_fills)),
+            Line::from(format!(
+                "Win rate: {}/{} ({win_rate:.0}%)",
+                app.winner_buy_wins, total
+            )),
+            Line::from(Span::styled(
+                format!("est pnl: ${:.2}", app.winner_buy_est_pnl),
+                Style::default().fg(est_color),
+            )),
+            Line::from(Span::styled(
+                format!("realized: ${:.2}", app.winner_buy_realized_pnl),
+                Style::default().fg(realized_color),
+            )),
+        ]),
+        rows[2],
+    );
+
     frame.render_widget(
         Paragraph::new(vec![
             Line::from(format!("Positions: {}", app.positions)),
@@ -587,7 +624,7 @@ fn draw_risk(frame: &mut Frame, area: Rect, app: &DashboardState) {
                 app.last_trade_secs.min(999.0)
             )),
         ]),
-        rows[2],
+        rows[3],
     );
 }
 

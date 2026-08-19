@@ -832,6 +832,12 @@ async fn main() -> Result<()> {
                                             Some(pnl) => {
                                                 runtime_metrics
                                                     .record_winner_buy_settlement(pnl);
+                                                dashboard.with_mut(|d| {
+                                                    d.record_winner_buy_settlement(
+                                                        decimal_to_f64(pnl),
+                                                        pnl > dec!(0),
+                                                    );
+                                                });
                                                 info!(
                                                     slug = %buy.slug,
                                                     %pnl,
@@ -946,6 +952,10 @@ async fn main() -> Result<()> {
                                     runtime_metrics.record_winner_buy_pnl(filled, signal.price);
                                     // Track the paper position for settlement.
                                     if filled > dec!(0) {
+                                        let est_pnl = filled * (dec!(1) - signal.price);
+                                        dashboard.with_mut(|d| {
+                                            d.record_winner_buy_fill(decimal_to_f64(est_pnl));
+                                        });
                                         pending_winners.lock().expect("pending lock").push(
                                             PendingWinnerBuy {
                                                 slug: market.slug.clone(),
