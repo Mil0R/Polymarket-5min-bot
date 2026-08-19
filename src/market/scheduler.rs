@@ -24,6 +24,14 @@ impl MarketScheduler {
         self.discoverer.calculate_current_window_timestamp(now)
     }
 
+    /// Raw markets by slug — used for settlement checks of winner-buy positions.
+    pub async fn fetch_markets_by_slug(
+        &self,
+        slugs: Vec<String>,
+    ) -> Result<Vec<polymarket_client_sdk::gamma::types::response::Market>> {
+        self.discoverer.fetch_markets_by_slug(slugs).await
+    }
+
     /// Calculate wait time until next window
     pub fn calculate_wait_time(&self, now: DateTime<Utc>) -> Duration {
         let next_window_ts = self.discoverer.calculate_next_window_timestamp(now);

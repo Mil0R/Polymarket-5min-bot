@@ -27,7 +27,7 @@ use futures::StreamExt;
 use rust_decimal_macros::dec;
 use std::io::{stdout, IsTerminal};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
@@ -49,7 +49,7 @@ use crate::trading::{
 use crate::wind_down_service::{ScheduledMergeService, WindDownService};
 use crate::window_event_loop::{WindowEventLoopState, WindowExitReason};
 use crate::window_session::WindowSession;
-use crate::winner_buy::{capped_size, detect_winner_asks};
+use crate::winner_buy::{capped_size, detect_winner_asks, settle_winner_buy, PendingWinnerBuy};
 use crate::window_session_runner::WindowSessionRunner;
 
 #[tokio::main]
@@ -424,6 +424,9 @@ async fn main() -> Result<()> {
 
         // Window-end winner-buy: attempt counter reset on each window rollover.
         let winner_buy_count = Arc::new(AtomicU32::new(0));
+        // Paper winner-buy positions awaiting Polymarket settlement (crosses windows).
+        let pending_winners: Arc<Mutex<Vec<PendingWinnerBuy>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut last_settle_check = Instant::now();
         if config.winner_buy_enabled {
             info!(
                 before_end_secs = config.winner_buy_before_end_secs,
@@ -800,6 +803,57 @@ async fn main() -> Result<()> {
                             "winner-buy window check"
                         );
                     }
+
+                    // Settle paper winner-buy positions whose markets have
+                    // resolved (~every 10s). Realized PnL reflects the ACTUAL
+                    // win rate, unlike the optimistic est_pnl.
+                    if config.winner_buy_enabled
+                        && last_settle_check.elapsed() >= Duration::from_secs(10)
+                    {
+                        last_settle_check = Instant::now();
+                        let pending = pending_winners.lock().expect("pending lock").clone();
+                        if !pending.is_empty() {
+                            let mut remaining = Vec::new();
+                            for buy in pending {
+                                match _scheduler
+                                    .fetch_markets_by_slug(vec![buy.slug.clone()])
+                                    .await
+                                {
+                                    Ok(markets) => {
+                                        let settled = markets.iter().find_map(|m| {
+                                            let prices = m.outcome_prices.as_ref()?;
+                                            if prices.len() == 2 {
+                                                Some((prices[0], prices[1]))
+                                            } else {
+                                                None
+                                            }
+                                        });
+                                        match settled.and_then(|p| settle_winner_buy(&buy, &p)) {
+                                            Some(pnl) => {
+                                                runtime_metrics
+                                                    .record_winner_buy_settlement(pnl);
+                                                info!(
+                                                    slug = %buy.slug,
+                                                    %pnl,
+                                                    "🏁 Winner-buy settled (realized)"
+                                                );
+                                            }
+                                            None => remaining.push(buy),
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            error = %e,
+                                            slug = %buy.slug,
+                                            "Winner-buy settlement query failed"
+                                        );
+                                        remaining.push(buy);
+                                    }
+                                }
+                            }
+                            *pending_winners.lock().expect("pending lock") = remaining;
+                        }
+                    }
                     if config.winner_buy_enabled
                         && (config.winner_buy_max_per_window == 0
                             || winner_buy_count.load(Ordering::Relaxed)
@@ -890,6 +944,17 @@ async fn main() -> Result<()> {
                                 Ok(filled) => {
                                     runtime_metrics.record_winner_buy_fill();
                                     runtime_metrics.record_winner_buy_pnl(filled, signal.price);
+                                    // Track the paper position for settlement.
+                                    if filled > dec!(0) {
+                                        pending_winners.lock().expect("pending lock").push(
+                                            PendingWinnerBuy {
+                                                slug: market.slug.clone(),
+                                                token_is_yes: signal.buy_yes,
+                                                filled,
+                                                price: signal.price,
+                                            },
+                                        );
+                                    }
                                     info!(
                                         market = %market.crypto_symbol,
                                         %side,

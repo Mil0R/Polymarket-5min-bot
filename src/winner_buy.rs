@@ -19,6 +19,40 @@ pub struct WinnerSignal {
     pub price: Decimal,
 }
 
+/// A paper winner-buy position awaiting Polymarket settlement.
+#[derive(Debug, Clone)]
+pub struct PendingWinnerBuy {
+    /// Market slug used to re-query gamma for the settlement result.
+    pub slug: String,
+    /// True if the bought token is the YES (Up) side.
+    pub token_is_yes: bool,
+    pub filled: Decimal,
+    pub price: Decimal,
+}
+
+/// Settle a winner-buy position against the market's outcome prices.
+/// Returns the realized PnL (positive = win, negative = loss).
+/// `outcome_prices` is the (YES, NO) settlement pair from gamma: the winner
+/// side is ~1.0 and the loser ~0.0 after the market closes.
+pub fn settle_winner_buy(
+    buy: &PendingWinnerBuy,
+    outcome_prices: &(Decimal, Decimal),
+) -> Option<Decimal> {
+    let yes_settled = outcome_prices.0 >= dec!(0.5);
+    let no_settled = outcome_prices.1 >= dec!(0.5);
+    // Not settled yet (both < 0.5 is not a valid up/down settlement; a decided
+    // market always resolves one side to ~1.0).
+    if yes_settled == no_settled {
+        return None;
+    }
+    let won = if buy.token_is_yes { yes_settled } else { no_settled };
+    Some(if won {
+        buy.filled * (dec!(1) - buy.price)
+    } else {
+        -buy.filled * buy.price
+    })
+}
+
 /// Decide whether the winner side's ask is buyable, from live REST book asks.
 ///
 /// At window end the decided winner's side shows only high asks (0.95-0.99 —
@@ -116,5 +150,27 @@ mod tests {
         assert_eq!(capped_size(dec!(0.98), dec!(50)), dec!(51.02));
         assert_eq!(capped_size(dec!(0.99), dec!(100)), dec!(101.01));
         assert_eq!(capped_size(dec!(0.98), dec!(0)), dec!(0));
+    }
+
+    #[test]
+    fn settle_credits_win_and_debits_loss() {
+        let buy = PendingWinnerBuy {
+            slug: "btc-updown-5m-1".into(),
+            token_is_yes: true,
+            filled: dec!(20),
+            price: dec!(0.97),
+        };
+        // YES won: +20 * (1 - 0.97)
+        assert_eq!(
+            settle_winner_buy(&buy, &(dec!(1.0), dec!(0.0))),
+            Some(dec!(0.6))
+        );
+        // NO won: -20 * 0.97
+        assert_eq!(
+            settle_winner_buy(&buy, &(dec!(0.0), dec!(1.0))),
+            Some(-dec!(19.4))
+        );
+        // Not settled: both sides ambiguous.
+        assert_eq!(settle_winner_buy(&buy, &(dec!(0.5), dec!(0.5))), None);
     }
 }

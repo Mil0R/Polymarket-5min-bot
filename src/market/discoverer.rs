@@ -107,6 +107,17 @@ impl MarketDiscoverer {
         ((ts / secs) + 1) * secs
     }
 
+    /// Fetch raw markets by slugs (settlement checks, diagnostics).
+    pub async fn fetch_markets_by_slug(
+        &self,
+        slugs: Vec<String>,
+    ) -> Result<Vec<Market>> {
+        retry_read(ReadRetryPolicy::default(), || {
+            self.gamma_transport.markets(slugs.clone())
+        })
+        .await
+    }
+
     /// Generate market slugs, e.g. btc-updown-5m-1770972300
     pub fn generate_market_slugs(&self, timestamp: i64) -> Vec<String> {
         let suffix = period_slug_suffix(self.period_minutes);
