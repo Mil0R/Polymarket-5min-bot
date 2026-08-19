@@ -280,6 +280,35 @@ impl TradingExecutor {
         Ok(())
     }
 
+    /// Single-leg "buy the determined winner" for the window-end strategy.
+    /// Dry-run mode simulates a fill against the live CLOB book; live mode posts
+    /// a real buy order. Returns the filled share count (0 = not filled).
+    pub async fn buy_winner(
+        &self,
+        token_id: U256,
+        limit_price: Decimal,
+        size: Decimal,
+    ) -> Result<Decimal> {
+        if self.dry_run {
+            let book = self.live_paper_book(token_id).await?;
+            let fill = self.paper.simulate_buy(
+                &book.asks,
+                limit_price,
+                size,
+                &self.arbitrage_order_type,
+            );
+            return Ok(fill.filled);
+        }
+        let expiration = Utc::now() + chrono::Duration::seconds(self.gtd_expiration_secs as i64);
+        let signed = self
+            .build_and_sign_buy(token_id, limit_price, size, expiration)
+            .await?;
+        let response = self.client.post_order(signed).await?;
+        let filled =
+            outcome_shares_filled(&Side::Buy, response.making_amount, response.taking_amount);
+        Ok(filled)
+    }
+
     /// Cancel only active orders whose token belongs to the target window.
     pub async fn cancel_orders_for_tokens(&self, tokens: &HashSet<U256>) -> Result<usize> {
         let mut cursor = None;

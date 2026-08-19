@@ -25,6 +25,9 @@ pub struct MetricsSnapshot {
     pub paper_pairs: u64,
     pub paper_one_sided: u64,
     pub paper_net_pnl_microusd: i64,
+    pub winner_buy_attempts: u64,
+    pub winner_buy_fills: u64,
+    pub winner_buy_est_pnl_microusd: i64,
 }
 
 #[derive(Default)]
@@ -50,6 +53,9 @@ pub struct RuntimeMetrics {
     paper_pairs: AtomicU64,
     paper_one_sided: AtomicU64,
     paper_net_pnl_microusd: AtomicI64,
+    winner_buy_attempts: AtomicU64,
+    winner_buy_fills: AtomicU64,
+    winner_buy_est_pnl_microusd: AtomicI64,
 }
 
 macro_rules! incrementer {
@@ -72,6 +78,18 @@ impl RuntimeMetrics {
     incrementer!(record_trade_succeeded, trades_succeeded);
     incrementer!(record_trade_failed, trades_failed);
     incrementer!(record_stream_reconnect, stream_reconnects);
+    incrementer!(record_winner_buy_attempt, winner_buy_attempts);
+    incrementer!(record_winner_buy_fill, winner_buy_fills);
+
+    /// Estimate winner-buy profit: filled shares held to settlement (pays 1.00).
+    pub fn record_winner_buy_pnl(&self, filled: rust_decimal::Decimal, price: rust_decimal::Decimal) {
+        use rust_decimal::prelude::ToPrimitive;
+        use rust_decimal_macros::dec;
+        let pnl = filled * (dec!(1) - price);
+        let microusd = (pnl * dec!(1000000)).round().to_i64().unwrap_or(0);
+        self.winner_buy_est_pnl_microusd
+            .fetch_add(microusd, Ordering::Relaxed);
+    }
 
     pub fn record_paper_result(
         &self,
@@ -134,6 +152,9 @@ impl RuntimeMetrics {
             paper_pairs: load(&self.paper_pairs),
             paper_one_sided: load(&self.paper_one_sided),
             paper_net_pnl_microusd: self.paper_net_pnl_microusd.load(Ordering::Relaxed),
+            winner_buy_attempts: load(&self.winner_buy_attempts),
+            winner_buy_fills: load(&self.winner_buy_fills),
+            winner_buy_est_pnl_microusd: self.winner_buy_est_pnl_microusd.load(Ordering::Relaxed),
         }
     }
 
@@ -184,6 +205,8 @@ impl RuntimeMetrics {
             ),
             ("paper_pairs_total", snapshot.paper_pairs),
             ("paper_one_sided_total", snapshot.paper_one_sided),
+            ("winner_buy_attempts_total", snapshot.winner_buy_attempts),
+            ("winner_buy_fills_total", snapshot.winner_buy_fills),
         ];
         let mut output = String::new();
         for (name, value) in values {
@@ -197,6 +220,9 @@ impl RuntimeMetrics {
         }
         output.push_str("# TYPE polypulse_paper_net_pnl_usd gauge\npolypulse_paper_net_pnl_usd ");
         output.push_str(&(snapshot.paper_net_pnl_microusd as f64 / 1_000_000.0).to_string());
+        output.push('\n');
+        output.push_str("# TYPE polypulse_winner_buy_est_pnl_usd gauge\npolypulse_winner_buy_est_pnl_usd ");
+        output.push_str(&(snapshot.winner_buy_est_pnl_microusd as f64 / 1_000_000.0).to_string());
         output.push('\n');
         output
     }

@@ -14,6 +14,7 @@ mod strategy_gate;
 mod strategy_service;
 mod trading;
 mod utils;
+mod winner_buy;
 mod wind_down_service;
 mod window;
 mod window_event_loop;
@@ -25,7 +26,7 @@ use anyhow::Result;
 use futures::StreamExt;
 use rust_decimal_macros::dec;
 use std::io::{stdout, IsTerminal};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
@@ -47,6 +48,7 @@ use crate::trading::{
 use crate::wind_down_service::{ScheduledMergeService, WindDownService};
 use crate::window_event_loop::{WindowEventLoopState, WindowExitReason};
 use crate::window_session::WindowSession;
+use crate::winner_buy::{capped_size, detect_winner};
 use crate::window_session_runner::WindowSessionRunner;
 
 #[tokio::main]
@@ -419,6 +421,17 @@ async fn main() -> Result<()> {
 
         info!(market_count = markets.len(), "Monitoring orderbook");
 
+        // Window-end winner-buy: attempt counter reset on each window rollover.
+        let winner_buy_count = Arc::new(AtomicU32::new(0));
+        if config.winner_buy_enabled {
+            info!(
+                before_end_secs = config.winner_buy_before_end_secs,
+                min_price = config.winner_buy_min_price,
+                max_order_usdc = config.winner_buy_max_order_usdc,
+                "Winner-buy strategy enabled"
+            );
+        }
+
         use chrono::Utc;
         let mut window_session = WindowSession::new(&markets, Utc::now(), config.market_period_minutes)?;
         let window_label = window_session.label().to_string();
@@ -771,6 +784,84 @@ async fn main() -> Result<()> {
                         d.set_window(&window_label, seconds_until_end);
                         d.set_exposure(decimal_to_f64(exposure));
                     });
+
+                    // Window-end winner-buy (strategy B): when the window is
+                    // nearly over and one side's ask is decided (>= min price)
+                    // while the other has no/cheap asks, buy the winner and hold
+                    // to settlement (pays 1.00). One attempt per window.
+                    if config.winner_buy_enabled
+                        && (config.winner_buy_max_per_window == 0
+                            || winner_buy_count.load(Ordering::Relaxed)
+                                < config.winner_buy_max_per_window)
+                        && seconds_until_end > 0
+                        && seconds_until_end <= config.winner_buy_before_end_secs
+                    {
+                        winner_buy_count.fetch_add(1, Ordering::Relaxed);
+                        let min_price = rust_decimal::Decimal::try_from(config.winner_buy_min_price)
+                            .unwrap_or(dec!(0.95));
+                        let max_order = rust_decimal::Decimal::try_from(
+                            config.winner_buy_max_order_usdc,
+                        )
+                        .unwrap_or(dec!(50));
+                        for market in &markets {
+                            let Some((yes_ask, no_ask)) = monitor.market_best_asks(&market.market_id)
+                            else {
+                                continue;
+                            };
+                            let Some(signal) = detect_winner(yes_ask, no_ask, min_price) else {
+                                continue;
+                            };
+                            let size = capped_size(signal.price, max_order);
+                            if size <= dec!(0) {
+                                continue;
+                            }
+                            let token_v1 = if signal.buy_yes {
+                                market.yes_token_id
+                            } else {
+                                market.no_token_id
+                            };
+                            let token = match polymarket_client_sdk::types::U256::from_str(
+                                &token_v1.to_string(),
+                            ) {
+                                Ok(t) => t,
+                                Err(e) => {
+                                    warn!(error = %e, "Winner-buy token parse failed");
+                                    continue;
+                                }
+                            };
+                            runtime_metrics.record_winner_buy_attempt();
+                            let side = if signal.buy_yes { "YES" } else { "NO" };
+                            info!(
+                                market = %market.crypto_symbol,
+                                %side,
+                                price = %signal.price,
+                                %size,
+                                secs_left = seconds_until_end,
+                                "🛒 Winner-buy order submitted"
+                            );
+                            match executor.buy_winner(token, signal.price, size).await {
+                                Ok(filled) => {
+                                    runtime_metrics.record_winner_buy_fill();
+                                    runtime_metrics.record_winner_buy_pnl(filled, signal.price);
+                                    info!(
+                                        market = %market.crypto_symbol,
+                                        %side,
+                                        price = %signal.price,
+                                        %filled,
+                                        "✅ Winner-buy filled; holding to settlement"
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        market = %market.crypto_symbol,
+                                        %side,
+                                        error = %e,
+                                        "Winner-buy failed"
+                                    );
+                                }
+                            }
+                        }
+                    }
 
                     if window_session.has_rolled_over(now, config.market_period_minutes) {
                         let new_window_timestamp =

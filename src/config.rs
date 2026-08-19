@@ -93,6 +93,16 @@ pub struct Config {
     /// Order type for arbitrage: GTC (good till cancel), GTD (with gtd_expiration_secs), FOK (fill or kill), FAK (fill and kill remainder)
     pub arbitrage_order_type: OrderType,
     pub stop_arbitrage_before_end_minutes: u64, // Stop arbitrage N minutes before market end, default 0 (no stop)
+    /// Window-end "buy the determined winner" strategy (single-leg directional buy).
+    pub winner_buy_enabled: bool,
+    /// Trigger when the window has this many seconds left.
+    pub winner_buy_before_end_secs: u32,
+    /// Only buy a side whose best ask is >= this price (direction considered decided).
+    pub winner_buy_min_price: f64,
+    /// Max notional (USDC) per winner buy.
+    pub winner_buy_max_order_usdc: f64,
+    /// Max winner buys per window (0 = unlimited).
+    pub winner_buy_max_per_window: u32,
     /// Scheduled Merge interval (minutes); 0 = disabled. CONDITION_ID from current window markets like orderbook.
     pub merge_interval_minutes: u64,
     /// YES price threshold: only execute arbitrage when YES >= this, default 0.0 (no limit)
@@ -184,6 +194,11 @@ impl Config {
                 &env::var("ARBITRAGE_ORDER_TYPE").unwrap_or_else(|_| "GTD".to_string()),
             )?,
             stop_arbitrage_before_end_minutes: env_parse("STOP_ARBITRAGE_BEFORE_END_MINUTES", "0")?,
+            winner_buy_enabled: env_bool("WINNER_BUY_ENABLED", false)?,
+            winner_buy_before_end_secs: env_parse("WINNER_BUY_BEFORE_END_SECS", "30")?,
+            winner_buy_min_price: env_parse("WINNER_BUY_MIN_PRICE", "0.95")?,
+            winner_buy_max_order_usdc: env_parse("WINNER_BUY_MAX_ORDER_USDC", "50.0")?,
+            winner_buy_max_per_window: env_parse("WINNER_BUY_MAX_PER_WINDOW", "1")?,
             merge_interval_minutes: env_parse("MERGE_INTERVAL_MINUTES", "0")?,
             min_yes_price_threshold: env_parse("MIN_YES_PRICE_THRESHOLD", "0.0")?,
             min_no_price_threshold: env_parse("MIN_NO_PRICE_THRESHOLD", "0.0")?,
