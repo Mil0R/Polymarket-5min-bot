@@ -948,10 +948,9 @@ async fn main() -> Result<()> {
                             );
                             match executor.buy_winner(token, signal.price, size).await {
                                 Ok(filled) => {
-                                    runtime_metrics.record_winner_buy_fill();
-                                    runtime_metrics.record_winner_buy_pnl(filled, signal.price);
-                                    // Track the paper position for settlement.
                                     if filled > dec!(0) {
+                                        runtime_metrics.record_winner_buy_fill();
+                                        runtime_metrics.record_winner_buy_pnl(filled, signal.price);
                                         let est_pnl = filled * (dec!(1) - signal.price);
                                         dashboard.with_mut(|d| {
                                             d.record_winner_buy_fill(decimal_to_f64(est_pnl));
@@ -964,14 +963,21 @@ async fn main() -> Result<()> {
                                                 price: signal.price,
                                             },
                                         );
+                                        info!(
+                                            market = %market.crypto_symbol,
+                                            %side,
+                                            price = %signal.price,
+                                            %filled,
+                                            "✅ Winner-buy filled; holding to settlement"
+                                        );
+                                    } else {
+                                        warn!(
+                                            market = %market.crypto_symbol,
+                                            %side,
+                                            price = %signal.price,
+                                            "Winner-buy order not filled (no depth at limit)"
+                                        );
                                     }
-                                    info!(
-                                        market = %market.crypto_symbol,
-                                        %side,
-                                        price = %signal.price,
-                                        %filled,
-                                        "✅ Winner-buy filled; holding to settlement"
-                                    );
                                 }
                                 Err(e) => {
                                     warn!(
