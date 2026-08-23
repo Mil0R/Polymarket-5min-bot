@@ -2,10 +2,10 @@ use anyhow::Result;
 use chrono::Utc;
 use dotenvy::dotenv;
 use polypulse::copy_trading::{
-    BookFetcher, CopyTradeExecutor, CopyTradingConfig, CopyTradingCoordinator, ExecutionOrderProposal,
-    GammaSettlementSource, LadderExitConfig, LadderExitTracker, MarketMetadata,
-    MarketMetadataFetcher, OnChainTradeFeed, OrderBookSnapshot, OrderSide, SettlementMonitor,
-    SignalAction, SignalEvent, TradeFeed, WalletHistoryFetcher,
+    BookFetcher, CopyTradeExecutor, CopyTradeJournal, CopyTradingConfig, CopyTradingCoordinator,
+    ExecutionOrderProposal, GammaSettlementSource, init_copy_trader_logging, LadderExitConfig,
+    LadderExitTracker, MarketMetadata, MarketMetadataFetcher, OnChainTradeFeed, OrderBookSnapshot,
+    OrderSide, SettlementMonitor, SignalAction, SignalEvent, TradeFeed, WalletHistoryFetcher,
 };
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -16,7 +16,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration as StdDuration, Instant};
 use tokio::time::{sleep, Duration};
 use tracing::{debug, error, info, warn};
-use tracing_subscriber::EnvFilter;
 
 /// Cache TTLs for upstream API data (avoids hammering gamma/clob on every poll).
 const MARKET_CACHE_TTL: StdDuration = StdDuration::from_secs(3600);
@@ -28,14 +27,10 @@ type BookCache = Arc<Mutex<HashMap<String, (Instant, OrderBookSnapshot)>>>;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // 1. Initialize environment & logging
+    // 1. Initialize environment & logging (stdout + rotating file, see
+    //    LOG_FILE / LOG_ROTATE_MAX_BYTES / LOG_ROTATE_FILES).
     dotenv().ok();
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info,polypulse=debug")),
-        )
-        .init();
+    init_copy_trader_logging("logs/copy-trader.log")?;
 
     // 1b. Master switch
     let enabled = env::var("COPY_TRADING_ENABLED")
@@ -95,6 +90,23 @@ async fn main() -> Result<()> {
     info!("Configuration Loaded:");
     info!(" -> Initial NAV:               ${:.2} USDC", initial_nav);
     info!(" -> Execution Mode:            {}", if dry_run { "PAPER / DRY-RUN (Safe Simulation)" } else { "LIVE (real CLOB orders)" });
+
+    // Structured results journal (NDJSON) for post-run regression analysis.
+    let mode = if dry_run { "paper" } else { "live" };
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let journal = CopyTradeJournal::new(run_id.clone());
+    let results_dir = env::var("COPY_TRADING_RESULTS_DIR")
+        .unwrap_or_else(|_| format!("results/copy-trading/{}", mode));
+    let events_file = format!("{}/events.ndjson", results_dir);
+    match journal.enable(&events_file) {
+        Ok(()) => info!(run_id = %run_id, file = %events_file, "Copy-trading results journal enabled"),
+        Err(e) => warn!(error = %e, "Results journal could not be enabled; continuing without it"),
+    }
+    journal.record_run_meta(mode, serde_json::json!({
+        "initialNav": initial_nav.to_string(),
+        "dryRun": dry_run,
+        "targetWallets": env::var("COPY_TARGET_WALLETS").unwrap_or_default(),
+    }));
 
     let now = Utc::now();
     // Whitelist persistence (Opinion 4): profiles + strike counters survive
@@ -179,6 +191,10 @@ async fn main() -> Result<()> {
                 .whitelist()
                 .get_fresh_profile(addr, refresh_days, now)
             {
+                journal.record("wallet_warmstart", serde_json::json!({
+                    "address": addr, "tier": format!("{:?}", fresh.tier),
+                    "lastEvaluated": fresh.last_evaluated_at.to_rfc3339(),
+                }));
                 info!(
                     " -> Warm-started wallet {} (Tier: {:?}, last evaluated {})",
                     addr,
@@ -194,8 +210,14 @@ async fn main() -> Result<()> {
                         let tier = res.tier;
                         let settled = res.profile.total_settled_events;
                         coordinator.whitelist().upsert_wallet(res.profile);
+                        journal.record("wallet_enrolled", serde_json::json!({
+                            "address": addr, "tier": format!("{:?}", tier), "settledEvents": settled,
+                        }));
                         info!(" -> Enrolled wallet {} (Tier: {:?}, settled: {})", addr, tier, settled);
                     } else {
+                        journal.record("wallet_rejected", serde_json::json!({
+                            "address": addr, "reasons": res.failure_reasons,
+                        }));
                         warn!(" -> Wallet {} rejected by funnel: {:?}", addr, res.failure_reasons);
                     }
                 }
@@ -218,6 +240,7 @@ async fn main() -> Result<()> {
     let bcache = book_cache.clone();
     let settle_monitor = settlement_monitor.clone();
     let ladder_for_loop = ladder_tracker.clone();
+    let journal_for_loop = journal.clone();
     let executor_for_loop = live_executor.clone();
     let onchain_for_loop = onchain_feed.clone();
     let runner_handle = tokio::spawn(async move {
@@ -271,6 +294,7 @@ async fn main() -> Result<()> {
                 dry_run,
                 live_executor: executor_for_loop.clone(),
                 ladder_tracker: ladder_for_loop.clone(),
+                journal: journal_for_loop.clone(),
             };
             for sig in signals {
                 handle_signal(&ctx, sig).await;
@@ -281,17 +305,22 @@ async fn main() -> Result<()> {
 
             // 3b. Settlement monitor: detect resolved markets, mark to final
             //     values, redeem winners on-chain (live) / realize (paper).
-            settle_monitor
+            let settled_markets = settle_monitor
                 .check_and_settle(
                     &coordinator_clone,
                     executor_for_loop.as_deref(),
                     dry_run,
                 )
                 .await;
+            for market_id in &settled_markets {
+                journal_for_loop.record("settlement", serde_json::json!({
+                    "market": market_id,
+                }));
+            }
 
             // 3c. Laddered scale-out: finish partially-filled exits at descending
             //     prices (Opinion 5) so positions do not get stuck.
-            ladder_for_loop
+            let ladder_legs = ladder_for_loop
                 .run(
                     &coordinator_clone,
                     &book_clone,
@@ -299,13 +328,20 @@ async fn main() -> Result<()> {
                     dry_run,
                 )
                 .await;
+            if ladder_legs > 0 {
+                journal_for_loop.record("ladder_exit", serde_json::json!({
+                    "legsPlaced": ladder_legs,
+                }));
+            }
 
-            // 4. Periodic status log
+            // 4. Periodic status log + NAV snapshot for equity-curve analysis
             if loop_count.is_multiple_of(12) {
                 let risk_guard = coordinator_clone.risk().read().await;
                 let nav = risk_guard.calculate_total_nav();
                 let open = risk_guard.list_exposures().len();
                 let active_whitelist = coordinator_clone.whitelist().list_active_whitelist();
+                let cash = risk_guard.cash_balance();
+                journal_for_loop.record_nav_snapshot(nav, cash, open, active_whitelist.len());
                 info!(
                     "Status Update [{}]: NAV: ${:.2} | Open positions: {} | Whitelist: {} wallets | Mode: {}",
                     current_time.format("%Y-%m-%d %H:%M:%S UTC"),
@@ -336,6 +372,7 @@ struct SignalContext {
     dry_run: bool,
     live_executor: Option<Arc<CopyTradeExecutor>>,
     ladder_tracker: LadderExitTracker,
+    journal: CopyTradeJournal,
 }
 
 /// Routes a single live signal through the full coordinator pipeline and
@@ -367,9 +404,33 @@ async fn handle_signal(ctx: &SignalContext, signal: SignalEvent) {
         }
     };
 
+    ctx.journal.record("signal", serde_json::json!({
+        "signalId": signal.signal_id,
+        "wallet": signal.source_wallet,
+        "action": format!("{:?}", signal.action),
+        "market": signal.market_id,
+        "token": signal.token_id,
+        "outcome": signal.outcome.to_string(),
+        "domain": signal.domain.to_string(),
+        "shares": signal.target_shares.to_string(),
+        "vwap": signal.target_vwap.to_string(),
+        "notional": signal.target_notional_usdc.to_string(),
+    }));
+
     let market_ref = market.as_ref();
     match ctx.coordinator.process_signal(signal.clone(), market_ref, &book, now).await {
         Ok(Some(prop)) => {
+            ctx.journal.record("proposal", serde_json::json!({
+                "proposalId": prop.proposal_id,
+                "side": format!("{:?}", prop.side),
+                "market": prop.market_id,
+                "token": prop.token_id,
+                "outcome": prop.outcome.to_string(),
+                "limitPrice": prop.limit_price.to_string(),
+                "shares": prop.shares.to_string(),
+                "notional": prop.notional_usdc.to_string(),
+                "ttlSeconds": prop.ttl_seconds,
+            }));
             let order_id = format!("order-{}", prop.proposal_id);
             if ctx.dry_run {
                 // Paper mode: register and fill at the proposal limit price.
@@ -384,6 +445,14 @@ async fn handle_signal(ctx: &SignalContext, signal: SignalEvent) {
                         now,
                     )
                     .await;
+                ctx.journal.record("order", serde_json::json!({
+                    "orderId": order_id,
+                    "side": format!("{:?}", prop.side),
+                    "mode": "paper",
+                    "filled": prop.shares.to_string(),
+                    "avgPrice": prop.limit_price.to_string(),
+                    "market": prop.market_id,
+                }));
                 info!(
                     "[PAPER] {} {} {} shares @ {} = ${:.2} | reason: {}",
                     side_label(&prop),
@@ -423,6 +492,16 @@ async fn handle_signal(ctx: &SignalContext, signal: SignalEvent) {
                                 )
                                 .await;
                         }
+                        ctx.journal.record("order", serde_json::json!({
+                            "orderId": outcome.order_id,
+                            "side": format!("{:?}", prop.side),
+                            "mode": "live",
+                            "filled": outcome.filled_shares.to_string(),
+                            "avgPrice": outcome.avg_price.to_string(),
+                            "market": prop.market_id,
+                            "status": outcome.status,
+                            "fullyFilled": outcome.fully_filled,
+                        }));
                         info!(
                             "[LIVE] {} {} filled {} shares @ ${:.4} ({} {}) | reason: {}",
                             side_label(&prop),
@@ -467,6 +546,10 @@ async fn handle_signal(ctx: &SignalContext, signal: SignalEvent) {
         }
         Ok(None) => {}
         Err(e) => {
+            ctx.journal.record("signal_rejected", serde_json::json!({
+                "signalId": signal.signal_id,
+                "reason": e,
+            }));
             debug!(signal = %signal.signal_id, error = %e, "Signal rejected by strategy pipeline");
         }
     }

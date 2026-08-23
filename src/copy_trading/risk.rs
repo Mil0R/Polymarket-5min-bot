@@ -150,9 +150,13 @@ impl RiskController {
         }
     }
 
+    /// Current cash (USDC) balance held by the risk engine.
+    pub fn cash_balance(&self) -> Decimal {
+        *self.cash_balance.read().unwrap()
+    }
+
     /// Calculates live Total NAV = Cash + Marked Position Value.
-    pub fn calculate_total_nav(&self) -> Decimal {
-        let position_value: Decimal = self
+    pub fn calculate_total_nav(&self) -> Decimal {        let position_value: Decimal = self
             .market_exposures
             .iter()
             .map(|e| e.shares * e.current_mark_price)
