@@ -3,8 +3,8 @@ use chrono::Utc;
 use dotenvy::dotenv;
 use polypulse::copy_trading::{
     BookFetcher, CopyTradeExecutor, CopyTradingConfig, CopyTradingCoordinator, ExecutionOrderProposal,
-    MarketMetadata, MarketMetadataFetcher, OrderBookSnapshot, OrderSide, SignalAction, SignalEvent,
-    TradeFeed, WalletHistoryFetcher,
+    GammaSettlementSource, MarketMetadata, MarketMetadataFetcher, OrderBookSnapshot, OrderSide,
+    SettlementMonitor, SignalAction, SignalEvent, TradeFeed, WalletHistoryFetcher,
 };
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -105,6 +105,7 @@ async fn main() -> Result<()> {
     let book_fetcher = Arc::new(BookFetcher::new()?);
     let market_cache: MarketCache = Arc::new(Mutex::new(HashMap::new()));
     let book_cache: BookCache = Arc::new(Mutex::new(HashMap::new()));
+    let settlement_monitor = SettlementMonitor::new(Arc::new(GammaSettlementSource::new()?));
 
     // 4. Seed target wallets from env, or discover from the profit leaderboard
     let target_wallets: Vec<String> = match env::var("COPY_TARGET_WALLETS") {
@@ -159,6 +160,7 @@ async fn main() -> Result<()> {
     let book_clone = book_fetcher.clone();
     let mcache = market_cache.clone();
     let bcache = book_cache.clone();
+    let settle_monitor = settlement_monitor.clone();
     let executor_for_loop = live_executor.clone();
     let runner_handle = tokio::spawn(async move {
         let mut loop_count: u64 = 0;
@@ -203,6 +205,16 @@ async fn main() -> Result<()> {
 
             // 3. Refresh mark prices for open positions from live book mid
             refresh_mark_prices(&coordinator_clone, &book_clone, &bcache).await;
+
+            // 3b. Settlement monitor: detect resolved markets, mark to final
+            //     values, redeem winners on-chain (live) / realize (paper).
+            settle_monitor
+                .check_and_settle(
+                    &coordinator_clone,
+                    executor_for_loop.as_deref(),
+                    dry_run,
+                )
+                .await;
 
             // 4. Periodic status log
             if loop_count.is_multiple_of(12) {
@@ -400,29 +412,82 @@ async fn fetch_cached_book(
     Ok(book)
 }
 
+/// Mark-price sanity limits (Opinion 3): a distorted mark (thin book, wide
+/// spread) must never feed the drawdown breaker or exposure caps. When the live
+/// book fails the filters, the PREVIOUS valid mark is retained.
+fn mark_filter_config() -> (Decimal, Decimal) {
+    let max_spread = env::var("COPY_MARK_MAX_SPREAD_PCT")
+        .ok()
+        .and_then(|v| v.parse::<Decimal>().ok())
+        .unwrap_or(dec!(0.05));
+    let min_depth = env::var("COPY_MARK_MIN_DEPTH_USDC")
+        .ok()
+        .and_then(|v| v.parse::<Decimal>().ok())
+        .unwrap_or(dec!(5.0));
+    (max_spread, min_depth)
+}
+
 /// Refreshes unrealized P&L marks from live book mid prices so the daily
-/// drawdown circuit breaker actually observes real market moves.
+/// drawdown circuit breaker actually observes real market moves. Skips updates
+/// when the book is too wide/thin to be trustworthy (retains previous mark).
 async fn refresh_mark_prices(
     coordinator: &CopyTradingCoordinator,
     book_fetcher: &BookFetcher,
     book_cache: &BookCache,
 ) {
+    let (max_spread, min_depth) = mark_filter_config();
     let exposures = coordinator.risk().read().await.list_exposures();
     for exp in exposures {
         if exp.shares <= Decimal::ZERO {
             continue;
         }
-        match fetch_cached_book(book_fetcher, book_cache, &exp.token_id, &exp.market_id).await {
-            Ok(book) => {
-                if let Some(mid) = book.mid_price() {
-                    coordinator
-                        .risk()
-                        .read()
-                        .await
-                        .update_mark_price(&exp.token_id, mid);
-                }
+        let book = match fetch_cached_book(book_fetcher, book_cache, &exp.token_id, &exp.market_id).await {
+            Ok(b) => b,
+            Err(e) => {
+                debug!(token = %exp.token_id, error = %e, "Mark price refresh failed");
+                continue;
             }
-            Err(e) => debug!(token = %exp.token_id, error = %e, "Mark price refresh failed"),
+        };
+
+        // Filter 1: relative spread sanity (e.g. bid 0.01 / ask 0.99 -> 98%).
+        if let Some(rel) = book.relative_spread() {
+            if rel > max_spread {
+                debug!(
+                    token = %exp.token_id,
+                    spread_pct = %(rel * dec!(100)),
+                    max_pct = %(max_spread * dec!(100)),
+                    "Mark refresh skipped: orderbook spread too wide"
+                );
+                continue;
+            }
+        }
+        // Filter 2: top-of-book notional depth must be meaningful.
+        let top_depth = book
+            .bids
+            .first()
+            .map(|l| l.price * l.size)
+            .unwrap_or(Decimal::ZERO)
+            + book
+                .asks
+                .first()
+                .map(|l| l.price * l.size)
+                .unwrap_or(Decimal::ZERO);
+        if top_depth < min_depth {
+            debug!(
+                token = %exp.token_id,
+                top_depth = %top_depth,
+                min_depth = %min_depth,
+                "Mark refresh skipped: orderbook too thin"
+            );
+            continue;
+        }
+
+        if let Some(mid) = book.mid_price() {
+            coordinator
+                .risk()
+                .read()
+                .await
+                .update_mark_price(&exp.token_id, mid);
         }
     }
 }

@@ -6,6 +6,7 @@ pub mod feed;
 pub mod live_executor;
 pub mod market_filter;
 pub mod risk;
+pub mod settlement;
 pub mod types;
 pub mod whitelist;
 
@@ -17,6 +18,7 @@ pub use feed::{BookFetcher, DomainClassifier, MarketMetadataFetcher, TradeFeed, 
 pub use live_executor::{CopyTradeExecutor, OrderExecutionOutcome};
 pub use market_filter::MarketFilterEngine;
 pub use risk::RiskController;
+pub use settlement::{determine_resolved_outcome, GammaSettlementSource, SettlementMonitor};
 pub use types::*;
 pub use whitelist::WhitelistManager;
 

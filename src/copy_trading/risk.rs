@@ -398,4 +398,105 @@ impl RiskController {
             }
         }
     }
+
+    /// Converts a settled WINNING position into cash (post on-chain redeem, or
+    /// simulated in paper mode). Cash is credited with `proceeds` and the token
+    /// position is removed, keeping NAV continuous (the position was already
+    /// marked at 1.0 by [`Self::settle_market_positions`]).
+    ///
+    /// Returns the credited amount, or `None` if no matching position exists.
+    pub fn realize_settled_position(&self, token_id: &str, proceeds: Decimal) -> Option<Decimal> {
+        let exists = self
+            .market_exposures
+            .get(token_id)
+            .map(|e| e.shares > Decimal::ZERO)
+            .unwrap_or(false);
+        if !exists {
+            return None;
+        }
+
+        if let Ok(mut cash) = self.cash_balance.write() {
+            *cash += proceeds;
+        }
+        if let Some(mut entry) = self.market_exposures.get_mut(token_id) {
+            entry.shares = Decimal::ZERO;
+            entry.notional_usdc = Decimal::ZERO;
+        }
+        info!(
+            token_id = %token_id,
+            proceeds = %proceeds,
+            "Realized settled position into cash"
+        );
+        Some(proceeds)
+    }
+
+    /// Removes zero-value/settled positions (shares gone OR marked to 0.0) so
+    /// they stop consuming mark-refresh and exposure accounting.
+    pub fn prune_settled_positions(&self) -> usize {
+        let mut removed = 0usize;
+        let keys: Vec<String> = self
+            .market_exposures
+            .iter()
+            .filter(|e| e.shares <= Decimal::ZERO || e.notional_usdc <= Decimal::ZERO)
+            .map(|e| e.key().clone())
+            .collect();
+        for key in keys {
+            if self.market_exposures.remove(&key).is_some() {
+                removed += 1;
+            }
+        }
+        removed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::copy_trading::types::CopyTradingConfig;
+    use rust_decimal_macros::dec;
+
+    #[test]
+    fn settlement_closed_loop_realizes_winner_and_prunes_loser() {
+        let now = Utc::now();
+        let risk = RiskController::new(CopyTradingConfig::default(), dec!(10_000.0), now);
+
+        // Hold YES (winner) and NO (loser) in the same market.
+        risk.record_position_fill("mkt-s", "tok-yes", &OutcomeSide::Yes, dec!(200.0), dec!(0.60));
+        risk.record_position_fill("mkt-s", "tok-no", &OutcomeSide::No, dec!(300.0), dec!(0.40));
+        // cash = 10000 - 120 - 120 = 9760; NAV = 9760 + 120 + 120 = 10000
+
+        // Market resolves YES: mark YES -> 1.0, NO -> 0.0.
+        risk.settle_market_positions("mkt-s", &OutcomeSide::Yes);
+        let nav_before_realize = risk.calculate_total_nav();
+        assert_eq!(nav_before_realize, dec!(9960.0)); // 9760 + 200 + 0
+
+        // Realize the winning YES position into cash (proceeds = shares x 1.0).
+        let credited = risk.realize_settled_position("tok-yes", dec!(200.0)).unwrap();
+        assert_eq!(credited, dec!(200.0));
+        // NAV must be CONTINUOUS across realize (position value -> cash 1:1).
+        assert_eq!(risk.calculate_total_nav(), nav_before_realize);
+
+        // Cash actually increased so future buys are not blocked.
+        let cash = *risk.cash_balance.read().unwrap();
+        assert_eq!(cash, dec!(9960.0));
+
+        // The loser (shares>0 but marked 0.0) and the realized winner (shares=0)
+        // are both pruned.
+        assert_eq!(risk.prune_settled_positions(), 2);
+        assert!(risk.list_exposures().is_empty());
+    }
+
+    #[test]
+    fn realize_settled_position_is_idempotent_guarded() {
+        let now = Utc::now();
+        let risk = RiskController::new(CopyTradingConfig::default(), dec!(10_000.0), now);
+        risk.record_position_fill("mkt-x", "tok-a", &OutcomeSide::Yes, dec!(50.0), dec!(0.50));
+
+        assert!(risk.realize_settled_position("tok-a", dec!(50.0)).is_some());
+        // Second call: position already zeroed -> None, cash not double-credited.
+        assert!(risk.realize_settled_position("tok-a", dec!(50.0)).is_none());
+        // cash = 10000 - (50*0.50=25) + 50 realized = 10025; NAV unchanged by realize.
+        assert_eq!(*risk.cash_balance.read().unwrap(), dec!(10025.0));
+        assert_eq!(risk.calculate_total_nav(), dec!(10025.0));
+    }
 }

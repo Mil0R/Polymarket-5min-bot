@@ -16,13 +16,13 @@
 //!   COPY_FEE_BUFFER_PCT  = 0.01 (fraction of notional reserved for fees)
 
 use crate::clob_v2::{create_authenticated_clob_client, parse_signature_type, AuthenticatedClobClient, CLOB_API_URL_DEFAULT};
-use crate::copy_trading::types::ExecutionOrderProposal;
+use crate::copy_trading::types::{ExecutionOrderProposal, OutcomeSide};
 use anyhow::{Context, Result};
 use alloy::signers::local::LocalSigner;
 use alloy::signers::Signer;
 use polymarket_client_sdk_v2::clob::types::request::BalanceAllowanceRequest;
 use polymarket_client_sdk_v2::clob::types::{AssetType, OrderType, Side, SignedOrder};
-use polymarket_client_sdk_v2::types::{Address, Decimal, U256};
+use polymarket_client_sdk_v2::types::{Address, B256, Decimal, U256};
 use polymarket_client_sdk_v2::POLYGON;
 use rust_decimal_macros::dec;
 use std::str::FromStr;
@@ -300,6 +300,60 @@ impl CopyTradeExecutor {
             fully_filled: filled >= size,
             status: format!("{:?}", response.status),
         })
+    }
+
+    /// Redeems a settled WINNING position on-chain (CTF adapter redeemPositions)
+    /// so the ERC-1155 winner tokens become spendable collateral again.
+    ///
+    /// `shares` is the decimal share count held; `outcome` selects the outcome
+    /// index (YES=0 / NO=1) used by the redeem call.
+    pub async fn redeem_settled_position(
+        &self,
+        condition_id: &str,
+        outcome: &OutcomeSide,
+        token_id: &str,
+        shares: Decimal,
+        neg_risk: bool,
+    ) -> Result<String> {
+        let cond: B256 = condition_id.parse().context("invalid condition id")?;
+        let token: U256 = token_id.parse().context("invalid token id")?;
+        let outcome_index = match outcome {
+            OutcomeSide::Yes => 0,
+            OutcomeSide::No => 1,
+            OutcomeSide::Other(_) => anyhow::bail!("cannot redeem non-binary outcome"),
+        };
+        // ERC-1155 balances are 1e6-scaled integers (matches the main bot's redeem path).
+        let raw_size_str = (shares * dec!(1_000_000)).floor().to_string();
+        let raw_size: U256 = U256::from_str(&raw_size_str).context("invalid redeem size")?;
+
+        let proxy_raw = std::env::var("POLYMARKET_PROXY_ADDRESS")
+            .context("POLYMARKET_PROXY_ADDRESS not set (required for redeem)")?;
+        let proxy: Address = proxy_raw
+            .parse()
+            .context("invalid POLYMARKET_PROXY_ADDRESS")?;
+
+        info!(
+            condition_id = %condition_id,
+            token_id = %token_id,
+            shares = %shares,
+            outcome = ?outcome,
+            neg_risk = neg_risk,
+            "Redeeming settled winner position on-chain"
+        );
+
+        let tx = crate::redeem::redeem_one(
+            cond,
+            neg_risk,
+            proxy,
+            &self.private_key,
+            None,
+            Some(outcome_index),
+            Some(raw_size),
+            &[token],
+        )
+        .await
+        .context("on-chain redeem failed")?;
+        Ok(tx)
     }
 
     /// Cancels a resting order (used for GTC/GTD TTL expiry).

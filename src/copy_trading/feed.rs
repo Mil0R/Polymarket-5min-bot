@@ -20,6 +20,7 @@ use crate::copy_trading::types::{
     BookLevel, DomainTag, MarketMetadata, OrderBookSnapshot, OutcomeSide, SignalAction, SignalEvent,
     WalletTradeRecord,
 };
+use crate::network_retry::{retry_read, ReadRetryPolicy};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Utc};
 use dashmap::DashMap;
@@ -512,11 +513,12 @@ impl WalletHistoryFetcher {
         Ok(records)
     }
 
-    /// Fetches `/closed-positions` pages with bounded parallelism (8 concurrent
-    /// requests per batch), stopping as soon as a full batch comes back empty.
+    /// Fetches `/closed-positions` pages with bounded parallelism (4 concurrent
+    /// requests per batch, 429-aware retries), stopping as soon as a full batch
+    /// comes back empty.
     async fn fetch_closed_positions_paged(&self, wallet: &str) -> Result<Vec<RawClosedPosition>> {
         const PAGE_SIZE: i32 = 50;
-        const CONCURRENCY: i32 = 8;
+        const CONCURRENCY: i32 = 4;
         const SAFETY_CAP: i32 = 5000;
 
         let mut out = Vec::new();
@@ -530,16 +532,29 @@ impl WalletHistoryFetcher {
                 );
                 let client = self.http.clone();
                 handles.push(tokio::spawn(async move {
-                    client
-                        .get(&url)
-                        .send()
-                        .await
-                        .map_err(|e| anyhow::anyhow!("request: {e}"))?
-                        .error_for_status()
-                        .map_err(|e| anyhow::anyhow!("status: {e}"))?
-                        .json::<Vec<RawClosedPosition>>()
-                        .await
-                        .map_err(|e| anyhow::anyhow!("parse: {e}"))
+                    // 429-aware retry (data-api rate limits): back off up to ~6s.
+                    let policy = ReadRetryPolicy {
+                        max_attempts: 4,
+                        initial_delay: std::time::Duration::from_secs(1),
+                        max_delay: std::time::Duration::from_secs(6),
+                    };
+                    retry_read(policy, || {
+                        let client = client.clone();
+                        let url = url.clone();
+                        async move {
+                            let resp = client
+                                .get(&url)
+                                .send()
+                                .await
+                                .map_err(anyhow::Error::from)?;
+                            resp.error_for_status()
+                                .map_err(anyhow::Error::from)?
+                                .json::<Vec<RawClosedPosition>>()
+                                .await
+                                .map_err(anyhow::Error::from)
+                        }
+                    })
+                    .await
                 }));
             }
 
@@ -553,7 +568,7 @@ impl WalletHistoryFetcher {
                             out.extend(page);
                         }
                     }
-                    Ok(Err(e)) => warn!(wallet = %wallet, offset = offset + i as i32 * PAGE_SIZE, error = %e, "closed-positions page failed"),
+                    Ok(Err(e)) => warn!(wallet = %wallet, offset = offset + i as i32 * PAGE_SIZE, error = %e, "closed-positions page failed after retries"),
                     Err(e) => warn!(wallet = %wallet, "closed-positions task panicked: {e}"),
                 }
             }
