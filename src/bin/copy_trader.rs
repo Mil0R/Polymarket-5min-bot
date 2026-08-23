@@ -2,16 +2,28 @@ use anyhow::Result;
 use chrono::Utc;
 use dotenvy::dotenv;
 use polypulse::copy_trading::{
-    CopyTradingConfig, CopyTradingCoordinator, DomainTag, OutcomeSide, WalletTradeRecord,
+    BookFetcher, CopyTradingConfig, CopyTradingCoordinator, ExecutionOrderProposal,
+    MarketMetadata, MarketMetadataFetcher, OrderBookSnapshot, SignalAction, SignalEvent,
+    TradeFeed, WalletHistoryFetcher,
 };
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
+use std::collections::HashMap;
 use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration as StdDuration, Instant};
 use tokio::time::{sleep, Duration};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
+
+/// Cache TTLs for upstream API data (avoids hammering gamma/clob on every poll).
+const MARKET_CACHE_TTL: StdDuration = StdDuration::from_secs(3600);
+const BOOK_CACHE_TTL: StdDuration = StdDuration::from_secs(15);
+const POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+type MarketCache = Arc<Mutex<HashMap<String, (Instant, Option<MarketMetadata>)>>>;
+type BookCache = Arc<Mutex<HashMap<String, (Instant, OrderBookSnapshot)>>>;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -36,6 +48,7 @@ async fn main() -> Result<()> {
     info!("=================================================================");
     info!("   Polymarket Multi-Factor Copy-Trading System (V2)             ");
     info!("   Strategy: 5-Stage Funnel + Strict Limit + Multi-Consensus    ");
+    info!("   Data: data-api / gamma / clob public endpoints (live feed)   ");
     info!("=================================================================");
 
     // 2. Load Configuration from Environment Variables / Defaults
@@ -51,100 +64,287 @@ async fn main() -> Result<()> {
 
     info!("Configuration Loaded:");
     info!(" -> Initial NAV:               ${:.2} USDC", initial_nav);
-    info!(" -> Execution Mode:            {}", if dry_run { "PAPER / DRY-RUN (Safe Simulation)" } else { "LIVE TRADING (Real Funds)" });
-    info!(" -> Whitelist Filters:         Settled >= {}, Active >= {}d, Entry in [{:.2}, {:.2}], MaxSingleProfit <= {:.1}%",
-        config.min_settled_events, config.min_active_days, config.min_avg_entry_price, config.max_avg_entry_price, config.max_single_profit_ratio * dec!(100));
-    info!(" -> Market Admission:          Spread <= {:.1}%, 24h Vol >= ${:.0}, Expiry >= {:.0}h, Binary Only: {}",
-        config.max_spread * dec!(100), config.min_24h_volume_usdc, config.min_hours_to_expiry, config.isolate_multi_outcome);
-    info!(" -> Price & Execution:         Max Slippage <= {:.1}%, Price Cap Offset <= +${:.3}, Top-5 Depth Cap <= {:.1}%, TTL: {}s",
-        config.max_slippage_pct * dec!(100), config.max_price_offset_usd, config.max_top5_depth_pct * dec!(100), config.default_ttl_seconds);
-    info!(" -> Portfolio Risk:            Single Allocation: {:.1}%, Max Market Exposure: {:.1}%, Daily Loss Breaker: {:.1}% (24h freeze)",
-        config.single_trade_allocation_pct * dec!(100), config.max_single_market_exposure_pct * dec!(100), config.daily_max_drawdown_pct * dec!(100));
-    info!(" -> Consensus & Exit:          Window: {}h, Min Wallets: {}, Exit Trigger: {:.0}% reduction",
-        config.consensus_window_hours, config.min_consensus_wallets, config.exit_trigger_reduction_pct * dec!(100));
+    info!(" -> Execution Mode:            {}", if dry_run { "PAPER / DRY-RUN (Safe Simulation)" } else { "LIVE READY (order placement requires authenticated CLOB wiring)" });
 
     let now = Utc::now();
     let coordinator = Arc::new(CopyTradingCoordinator::new(config.clone(), initial_nav, now));
 
-    // 3. Seed initial expert wallets from env or historical database
-    if let Ok(seed_wallets_raw) = env::var("COPY_TARGET_WALLETS") {
-        let addresses: Vec<&str> = seed_wallets_raw.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
-        info!("Seeding {} target wallets from COPY_TARGET_WALLETS...", addresses.len());
-        for addr in addresses {
-            // Mock or query historical records for wallet profiling
-            let mut demo_records = Vec::new();
-            for i in 0..65 {
-                let days_ago = 120 - (i as i64 * 2);
-                let won = i % 3 != 0;
-                let pnl = if won { dec!(25.0) } else { dec!(-20.0) };
-                demo_records.push(WalletTradeRecord {
-                    trade_id: format!("seed-t-{}", i),
-                    market_id: format!("mkt-seed-{}", i),
-                    domain: DomainTag::MacroInterestRate,
-                    outcome_bought: OutcomeSide::Yes,
-                    entry_price: dec!(0.50),
-                    exit_price: Some(if won { dec!(1.0) } else { dec!(0.0) }),
-                    notional_usdc: dec!(100.0),
-                    pnl_usdc: pnl,
-                    return_pct: pnl / dec!(100.0),
-                    is_maker: false,
-                    is_arbitrage_leg: false,
-                    resolved_outcome: if won { Some(OutcomeSide::Yes) } else { Some(OutcomeSide::No) },
-                    opened_at: now - chrono::Duration::days(days_ago),
-                    settled_at: Some(now - chrono::Duration::days(days_ago - 1)),
-                });
-            }
-            let eval = coordinator.whitelist().evaluate_wallet(addr, &demo_records, now);
-            if eval.is_accepted {
-                coordinator.whitelist().upsert_wallet(eval.profile);
-                info!(" -> Successfully enrolled seed wallet: {} (Tier: {:?})", addr, eval.tier);
-            } else {
-                warn!(" -> Seed wallet {} rejected by funnel: {:?}", addr, eval.failure_reasons);
+    // 3. Live data infrastructure
+    let feed = Arc::new(TradeFeed::new()?);
+    let history = Arc::new(WalletHistoryFetcher::new()?);
+    let meta_fetcher = Arc::new(MarketMetadataFetcher::new()?);
+    let book_fetcher = Arc::new(BookFetcher::new()?);
+    let market_cache: MarketCache = Arc::new(Mutex::new(HashMap::new()));
+    let book_cache: BookCache = Arc::new(Mutex::new(HashMap::new()));
+
+    // 4. Seed target wallets from env, or discover from the profit leaderboard
+    let target_wallets: Vec<String> = match env::var("COPY_TARGET_WALLETS") {
+        Ok(raw) => raw
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        Err(_) => {
+            info!("No COPY_TARGET_WALLETS specified. Discovering candidates from profit leaderboard...");
+            match history.discover_candidates(30).await {
+                Ok(cands) => cands,
+                Err(e) => {
+                    warn!("Leaderboard discovery failed: {e:#}");
+                    Vec::new()
+                }
             }
         }
+    };
+
+    if target_wallets.is_empty() {
+        warn!("No target wallets available; copy-trading will idle until COPY_TARGET_WALLETS is configured.");
     } else {
-        info!("No COPY_TARGET_WALLETS specified. Running in automatic discovery mode.");
+        info!("Profiling {} target wallets from real Polymarket history...", target_wallets.len());
+        for addr in &target_wallets {
+            match history.fetch_records(addr).await {
+                Ok(records) => {
+                    let res = coordinator.whitelist().evaluate_wallet(addr, &records, now);
+                    if res.is_accepted {
+                        let tier = res.tier;
+                        let settled = res.profile.total_settled_events;
+                        coordinator.whitelist().upsert_wallet(res.profile);
+                        info!(" -> Enrolled wallet {} (Tier: {:?}, settled: {})", addr, tier, settled);
+                    } else {
+                        warn!(" -> Wallet {} rejected by funnel: {:?}", addr, res.failure_reasons);
+                    }
+                }
+                Err(e) => warn!(" -> Failed to fetch history for {}: {e:#}", addr),
+            }
+        }
     }
 
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
     ctrlc_handler(r);
 
-    info!("Strategy coordinator initialized. Starting real-time event & heartbeat loop...");
+    info!("Strategy coordinator initialized. Polling live wallet trades every {}s...", POLL_INTERVAL.as_secs());
 
     let coordinator_clone = coordinator.clone();
+    let feed_clone = feed.clone();
+    let meta_clone = meta_fetcher.clone();
+    let book_clone = book_fetcher.clone();
+    let mcache = market_cache.clone();
+    let bcache = book_cache.clone();
     let runner_handle = tokio::spawn(async move {
         let mut loop_count: u64 = 0;
         while running.load(Ordering::Relaxed) {
             let current_time = Utc::now();
 
-            // Periodic heartbeat: check TTL cancellations, daily rollover, risk health
+            // 1. Heartbeat: TTL cancellations, daily rollover, risk health
             let cancelled = coordinator_clone.tick(current_time).await;
             if !cancelled.is_empty() {
                 info!("Heartbeat: Cancelled {} expired TTL orders", cancelled.len());
             }
 
-            if loop_count % 30 == 0 {
+            // 2. Poll each whitelisted wallet for fresh trades
+            let active = coordinator_clone.whitelist().list_active_whitelist();
+            for profile in active {
+                match feed_clone.poll_wallet(&profile.address, current_time).await {
+                    Ok(signals) => {
+                        for sig in signals {
+                            handle_signal(
+                                &coordinator_clone,
+                                sig,
+                                &meta_clone,
+                                &book_clone,
+                                &mcache,
+                                &bcache,
+                                dry_run,
+                            )
+                            .await;
+                        }
+                    }
+                    Err(e) => warn!(wallet = %profile.address, error = %e, "Trade poll failed"),
+                }
+            }
+
+            // 3. Refresh mark prices for open positions from live book mid
+            refresh_mark_prices(&coordinator_clone, &book_clone, &bcache).await;
+
+            // 4. Periodic status log
+            if loop_count.is_multiple_of(12) {
                 let risk_guard = coordinator_clone.risk().read().await;
                 let nav = risk_guard.calculate_total_nav();
+                let open = risk_guard.list_exposures().len();
                 let active_whitelist = coordinator_clone.whitelist().list_active_whitelist();
                 info!(
-                    "Status Update [{}]: Total NAV: ${:.2} USDC | Active Whitelist: {} wallets | Mode: {}",
+                    "Status Update [{}]: NAV: ${:.2} | Open positions: {} | Whitelist: {} wallets | Mode: {}",
                     current_time.format("%Y-%m-%d %H:%M:%S UTC"),
                     nav,
+                    open,
                     active_whitelist.len(),
                     if dry_run { "PAPER" } else { "LIVE" }
                 );
             }
 
             loop_count += 1;
-            sleep(Duration::from_secs(2)).await;
+            sleep(POLL_INTERVAL).await;
         }
     });
 
     runner_handle.await?;
     info!("Copy-trading system safely terminated.");
     Ok(())
+}
+
+/// Routes a single live signal through the full coordinator pipeline and
+/// (in dry-run mode) records paper fills so the simulation is end-to-end.
+async fn handle_signal(
+    coordinator: &CopyTradingCoordinator,
+    signal: SignalEvent,
+    meta_fetcher: &MarketMetadataFetcher,
+    book_fetcher: &BookFetcher,
+    market_cache: &MarketCache,
+    book_cache: &BookCache,
+    dry_run: bool,
+) {
+    let now = Utc::now();
+
+    // Market metadata is only required for buy-side signals (exit routing skips
+    // the market filter). Fetch it lazily with a per-condition cache.
+    let market: Option<MarketMetadata> = if signal.action == SignalAction::OpenBuy {
+        match fetch_cached_market(meta_fetcher, market_cache, &signal.market_id).await {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(market = %signal.market_id, error = %e, "Market metadata fetch failed; skipping signal");
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
+    // Order book is required for both sides (pricing + depth protection).
+    let book = match fetch_cached_book(book_fetcher, book_cache, &signal.token_id, &signal.market_id).await {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(token = %signal.token_id, error = %e, "Book fetch failed; skipping signal");
+            return;
+        }
+    };
+
+    let market_ref = market.as_ref();
+    match coordinator.process_signal(signal.clone(), market_ref, &book, now).await {        Ok(Some(prop)) => {
+            let order_id = format!("order-{}", prop.proposal_id);
+            coordinator.on_order_placed(order_id.clone(), prop.clone(), now);
+            if dry_run {
+                // Paper fill at the proposal limit price (fully filled).
+                coordinator
+                    .on_order_fill(
+                        &order_id,
+                        &prop.market_id,
+                        &prop.token_id,
+                        prop.shares,
+                        prop.limit_price,
+                        now,
+                    )
+                    .await;
+                info!(
+                    "[PAPER] {} {} {} shares @ {} = ${:.2} | reason: {}",
+                    side_label(&prop),
+                    prop.market_id,
+                    prop.shares,
+                    prop.limit_price,
+                    prop.notional_usdc,
+                    prop.reason
+                );
+            } else {
+                // Live order placement requires an authenticated CLOB client with
+                // signing keys (separate integration step). We log the intent.
+                info!(
+                    "[LIVE-READY] {} {} {} shares @ {} = ${:.2} | reason: {}",
+                    side_label(&prop),
+                    prop.market_id,
+                    prop.shares,
+                    prop.limit_price,
+                    prop.notional_usdc,
+                    prop.reason
+                );
+            }
+        }
+        Ok(None) => {}
+        Err(e) => {
+            debug!(signal = %signal.signal_id, error = %e, "Signal rejected by strategy pipeline");
+        }
+    }
+}
+
+fn side_label(prop: &ExecutionOrderProposal) -> &'static str {
+    match prop.side {
+        polypulse::copy_trading::OrderSide::Buy => "BUY",
+        polypulse::copy_trading::OrderSide::Sell => "SELL",
+    }
+}
+
+async fn fetch_cached_market(
+    fetcher: &MarketMetadataFetcher,
+    cache: &MarketCache,
+    condition_id: &str,
+) -> Result<Option<MarketMetadata>> {
+    {
+        let guard = cache.lock().unwrap();
+        if let Some((at, meta)) = guard.get(condition_id) {
+            if at.elapsed() < MARKET_CACHE_TTL {
+                return Ok(meta.clone());
+            }
+        }
+    }
+    let meta = fetcher.fetch_by_condition(condition_id).await?;
+    let mut guard = cache.lock().unwrap();
+    guard.insert(condition_id.to_string(), (Instant::now(), meta.clone()));
+    Ok(meta)
+}
+
+async fn fetch_cached_book(
+    fetcher: &BookFetcher,
+    cache: &BookCache,
+    token_id: &str,
+    market_id: &str,
+) -> Result<OrderBookSnapshot> {
+    {
+        let guard = cache.lock().unwrap();
+        if let Some((at, book)) = guard.get(token_id) {
+            if at.elapsed() < BOOK_CACHE_TTL {
+                return Ok(book.clone());
+            }
+        }
+    }
+    let book = fetcher.fetch(token_id, market_id).await?;
+    let mut guard = cache.lock().unwrap();
+    guard.insert(token_id.to_string(), (Instant::now(), book.clone()));
+    Ok(book)
+}
+
+/// Refreshes unrealized P&L marks from live book mid prices so the daily
+/// drawdown circuit breaker actually observes real market moves.
+async fn refresh_mark_prices(
+    coordinator: &CopyTradingCoordinator,
+    book_fetcher: &BookFetcher,
+    book_cache: &BookCache,
+) {
+    let exposures = coordinator.risk().read().await.list_exposures();
+    for exp in exposures {
+        if exp.shares <= Decimal::ZERO {
+            continue;
+        }
+        match fetch_cached_book(book_fetcher, book_cache, &exp.token_id, &exp.market_id).await {
+            Ok(book) => {
+                if let Some(mid) = book.mid_price() {
+                    coordinator
+                        .risk()
+                        .read()
+                        .await
+                        .update_mark_price(&exp.token_id, mid);
+                }
+            }
+            Err(e) => debug!(token = %exp.token_id, error = %e, "Mark price refresh failed"),
+        }
+    }
 }
 
 fn ctrlc_handler(running: Arc<AtomicBool>) {

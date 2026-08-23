@@ -79,11 +79,11 @@ impl CopyTradingCoordinator {
     pub async fn process_signal(
         &self,
         signal: SignalEvent,
-        market: &MarketMetadata,
+        market: Option<&MarketMetadata>,
         book: &OrderBookSnapshot,
         now: DateTime<Utc>,
     ) -> Result<Option<ExecutionOrderProposal>, String> {
-        // 1. Exit / Reduction action routing
+        // 1. Exit / Reduction action routing (does not need market metadata)
         if signal.action != SignalAction::OpenBuy {
             let risk_guard = self.risk.read().await;
             if let Some(exit_prop) = self.exit_engine.handle_exit_signal(&signal, book, &risk_guard, now) {
@@ -92,7 +92,8 @@ impl CopyTradingCoordinator {
             return Ok(None);
         }
 
-        // 2. Market Admission Filtering (Module 2)
+        // 2. Market Admission Filtering (Module 2) — requires metadata
+        let market = market.ok_or_else(|| "Market metadata unavailable for buy signal".to_string())?;
         self.market_filter
             .validate_market(market, book, now)
             .map_err(|e| format!("Market validation failed: {}", e))?;

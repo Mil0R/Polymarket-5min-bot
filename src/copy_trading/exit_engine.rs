@@ -50,6 +50,18 @@ impl ExitEngine {
             return None;
         }
 
+        // 1b. Dust gate: ignore exit signals below the minimum signal notional so
+        //     a 1-share sell by a target wallet cannot force us to dump a position.
+        if signal.target_notional_usdc < self.config.min_signal_notional_usdc {
+            debug!(
+                wallet = %signal.source_wallet,
+                notional = %signal.target_notional_usdc,
+                min_notional = %self.config.min_signal_notional_usdc,
+                "Exit signal ignored: below minimum signal notional"
+            );
+            return None;
+        }
+
         // 2. Signal source must be an authorized whitelisted wallet in this domain.
         let (is_auth, _) = self.whitelist.is_authorized_in_domain(&signal.source_wallet, &signal.domain);
         if !is_auth {

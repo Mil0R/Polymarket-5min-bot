@@ -370,6 +370,11 @@ impl RiskController {
             .map(|e| e.value().clone())
     }
 
+    /// Returns all open positions (for mark-price refresh loops and reporting).
+    pub fn list_exposures(&self) -> Vec<MarketExposure> {
+        self.market_exposures.iter().map(|e| e.value().clone()).collect()
+    }
+
     /// Marks all positions of a market to their settlement value (1.0 for the
     /// resolved side, 0.0 otherwise), realizing the outcome into NAV.
     pub fn settle_market_positions(&self, market_id: &str, resolved_outcome: &OutcomeSide) {

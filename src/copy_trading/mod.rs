@@ -2,6 +2,7 @@ pub mod consensus;
 pub mod coordinator;
 pub mod execution;
 pub mod exit_engine;
+pub mod feed;
 pub mod market_filter;
 pub mod risk;
 pub mod types;
@@ -11,6 +12,7 @@ pub use consensus::ConsensusEngine;
 pub use coordinator::CopyTradingCoordinator;
 pub use execution::SmartExecutionEngine;
 pub use exit_engine::ExitEngine;
+pub use feed::{BookFetcher, DomainClassifier, MarketMetadataFetcher, TradeFeed, WalletHistoryFetcher};
 pub use market_filter::MarketFilterEngine;
 pub use risk::RiskController;
 pub use types::*;
@@ -352,7 +354,7 @@ mod tests {
             target_notional_usdc: dec!(250.0),
             timestamp: now,
         };
-        let prop1 = coordinator.process_signal(sig1, &market, &book, now).await.unwrap();
+        let prop1 = coordinator.process_signal(sig1, Some(&market), &book, now).await.unwrap();
         assert!(prop1.is_none(), "Single A-tier wallet must not trigger execution alone");
 
         // 3. Second wallet 0xBeta enters within 12h: consensus ACHIEVED -> Generates proposal!
@@ -369,7 +371,7 @@ mod tests {
             target_notional_usdc: dec!(250.0),
             timestamp: now + Duration::minutes(30),
         };
-        let prop2 = coordinator.process_signal(sig2, &market, &book, now + Duration::minutes(30)).await.unwrap();
+        let prop2 = coordinator.process_signal(sig2, Some(&market), &book, now + Duration::minutes(30)).await.unwrap();
         assert!(prop2.is_some(), "Consensus achieved: proposal must be generated");
         let proposal = prop2.unwrap();
         assert_eq!(proposal.side, OrderSide::Buy);
@@ -394,7 +396,7 @@ mod tests {
             target_notional_usdc: dec!(300.0),
             timestamp: now + Duration::hours(2),
         };
-        let exit_prop = coordinator.process_signal(exit_sig, &market, &book, now + Duration::hours(2)).await.unwrap();
+        let exit_prop = coordinator.process_signal(exit_sig, Some(&market), &book, now + Duration::hours(2)).await.unwrap();
         assert!(exit_prop.is_some(), "Exit mirroring must generate Sell proposal");
         let exit_proposal = exit_prop.unwrap();
         assert_eq!(exit_proposal.side, OrderSide::Sell);
@@ -464,7 +466,7 @@ mod tests {
             target_notional_usdc: dec!(250.0),
             timestamp: now,
         };
-        let _ = coordinator.process_signal(sig1, &market, &book, now).await.unwrap();
+        let _ = coordinator.process_signal(sig1, Some(&market), &book, now).await.unwrap();
         let sig2 = SignalEvent {
             signal_id: "sig-b".to_string(),
             source_wallet: "0xBeta".to_string(),
@@ -478,7 +480,7 @@ mod tests {
             target_notional_usdc: dec!(250.0),
             timestamp: now + Duration::minutes(5),
         };
-        let prop = coordinator.process_signal(sig2, &market, &book, now + Duration::minutes(5)).await.unwrap().unwrap();
+        let prop = coordinator.process_signal(sig2, Some(&market), &book, now + Duration::minutes(5)).await.unwrap().unwrap();
         coordinator.on_order_placed("order-dir".to_string(), prop.clone(), now);
         coordinator.on_order_fill("order-dir", "mkt-dir", "tok-yes", prop.shares, prop.limit_price, now).await;
 
@@ -496,7 +498,7 @@ mod tests {
             target_notional_usdc: dec!(300.0),
             timestamp: now + Duration::hours(2),
         };
-        let no_exit_prop = coordinator.process_signal(no_exit, &market, &book, now + Duration::hours(2)).await.unwrap();
+        let no_exit_prop = coordinator.process_signal(no_exit, Some(&market), &book, now + Duration::hours(2)).await.unwrap();
         assert!(no_exit_prop.is_none(), "Exit on the opposite side must not be mirrored");
 
         // Sanity: exit on the YES side (our position) still works
@@ -513,7 +515,7 @@ mod tests {
             target_notional_usdc: dec!(300.0),
             timestamp: now + Duration::hours(3),
         };
-        let yes_exit_prop = coordinator.process_signal(yes_exit, &market, &book, now + Duration::hours(3)).await.unwrap();
+        let yes_exit_prop = coordinator.process_signal(yes_exit, Some(&market), &book, now + Duration::hours(3)).await.unwrap();
         assert!(yes_exit_prop.is_some(), "Exit matching our held direction must be mirrored");
     }
 
@@ -574,9 +576,9 @@ mod tests {
             timestamp: ts,
         };
 
-        let _ = coordinator.process_signal(mk("s1", "0xAlpha", now), &market, &book, now).await.unwrap();
+        let _ = coordinator.process_signal(mk("s1", "0xAlpha", now), Some(&market), &book, now).await.unwrap();
         let prop = coordinator
-            .process_signal(mk("s2", "0xBeta", now + Duration::minutes(5)), &market, &book, now + Duration::minutes(5))
+            .process_signal(mk("s2", "0xBeta", now + Duration::minutes(5)), Some(&market), &book, now + Duration::minutes(5))
             .await
             .unwrap()
             .unwrap();
@@ -597,7 +599,7 @@ mod tests {
             target_notional_usdc: dec!(300.0),
             timestamp: now + Duration::hours(2),
         };
-        let eve_prop = coordinator.process_signal(eve_exit, &market, &book, now + Duration::hours(2)).await.unwrap();
+        let eve_prop = coordinator.process_signal(eve_exit, Some(&market), &book, now + Duration::hours(2)).await.unwrap();
         assert!(eve_prop.is_none(), "Exit from non-whitelisted wallet must be blocked");
 
         // Authorized wallet exit generates a sell; executing its fill must reduce
@@ -615,7 +617,7 @@ mod tests {
             target_notional_usdc: dec!(300.0),
             timestamp: now + Duration::hours(3),
         };
-        let exit_prop = coordinator.process_signal(alpha_exit, &market, &book, now + Duration::hours(3)).await.unwrap().unwrap();
+        let exit_prop = coordinator.process_signal(alpha_exit, Some(&market), &book, now + Duration::hours(3)).await.unwrap().unwrap();
         coordinator.on_order_placed("order-exit".to_string(), exit_prop.clone(), now);
 
         let shares_before = coordinator.risk().read().await.get_market_exposure("mkt-auth", &OutcomeSide::Yes).unwrap().shares;
