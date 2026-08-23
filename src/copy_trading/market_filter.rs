@@ -1,7 +1,6 @@
 use crate::copy_trading::types::{CopyTradingConfig, MarketMetadata, OrderBookSnapshot};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
-use rust_decimal::prelude::ToPrimitive;
 use rust_decimal_macros::dec;
 use std::fmt;
 use tracing::{debug, warn};
@@ -13,8 +12,8 @@ pub enum MarketFilterError {
         is_neg_risk: bool,
     },
     ExpiryTooSoon {
-        hours_left_i64: i64,
-        min_hours: u32,
+        hours_left: Decimal,
+        min_hours: Decimal,
     },
     Insufficient24hVolume {
         volume_24h: Decimal,
@@ -43,12 +42,12 @@ impl fmt::Display for MarketFilterError {
                 outcome_count, is_neg_risk
             ),
             MarketFilterError::ExpiryTooSoon {
-                hours_left_i64,
+                hours_left,
                 min_hours,
             } => write!(
                 f,
                 "Time to expiry {}h is below minimum {}h threshold",
-                hours_left_i64, min_hours
+                hours_left, min_hours
             ),
             MarketFilterError::Insufficient24hVolume {
                 volume_24h,
@@ -118,22 +117,24 @@ impl MarketFilterEngine {
             });
         }
 
-        // 3. Expiry Window Limitation (>= config.min_hours_to_expiry)
+        // 3. Expiry Window Limitation (>= config.min_hours_to_expiry).
+        //    Computed in FRACTIONAL hours — integer-hour truncation would wrongly
+        //    reject markets expiring within the current hour (e.g. 71.5h -> 71).
         let duration_to_expiry = market.settlement_time - now;
-        let hours_left_i64 = duration_to_expiry.num_hours();
+        let seconds_left = duration_to_expiry.num_seconds().max(0);
+        let hours_left = Decimal::from(seconds_left) / dec!(3600.0);
         let min_hours = self.config.min_hours_to_expiry;
-        let min_hours_u32 = min_hours.round().to_u32().unwrap_or(72);
 
-        if Decimal::from(hours_left_i64) < min_hours {
+        if hours_left < min_hours {
             debug!(
                 market_id = %market.market_id,
-                hours_left = %hours_left_i64,
-                min_hours = %min_hours_u32,
+                hours_left = %hours_left,
+                min_hours = %min_hours,
                 "Market rejected: expiry window below minimum (short-term/settling market)"
             );
             return Err(MarketFilterError::ExpiryTooSoon {
-                hours_left_i64,
-                min_hours: min_hours_u32,
+                hours_left,
+                min_hours,
             });
         }
 

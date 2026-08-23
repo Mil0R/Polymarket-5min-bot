@@ -52,10 +52,16 @@ pub fn token_id_str(asset: &polymarket_client_sdk::types::U256) -> String {
 }
 
 /// Maps a Polymarket outcome label to our `OutcomeSide`.
+///
+/// Besides the literal "Yes"/"No" labels, directional binary markets use
+/// "Up"/"Down" (or similar) pairs for their two outcome tokens — these map to
+/// the YES/NO sides of a binary directional bet. Markets with more than two
+/// outcomes (categorical) fall through to `Other` and are rejected by the
+/// binary-only market filter.
 pub fn outcome_from_label(label: &str) -> OutcomeSide {
     match label.trim().to_ascii_lowercase().as_str() {
-        "yes" => OutcomeSide::Yes,
-        "no" => OutcomeSide::No,
+        "yes" | "up" => OutcomeSide::Yes,
+        "no" | "down" => OutcomeSide::No,
         other => OutcomeSide::Other(other.to_string()),
     }
 }
@@ -479,37 +485,12 @@ impl WalletHistoryFetcher {
     pub async fn fetch_records(&self, wallet: &str) -> Result<Vec<WalletTradeRecord>> {
         let user: Address = wallet.parse().context("invalid wallet address")?;
 
-        // Closed positions (paged; each page up to 50) via raw HTTP (SDK
-        // cannot parse the API's date-only `endDate` values).
+        // Closed positions via raw HTTP, fetched with bounded concurrency so large
+        // histories (thousands of positions) do not take minutes to load.
         let mut records = Vec::new();
-        let mut offset = 0i32;
-        loop {
-            let url = format!(
-                "{}/closed-positions?user={}&limit=50&offset={}",
-                DATA_API_URL, wallet, offset
-            );
-            let page: Vec<RawClosedPosition> = self
-                .http
-                .get(&url)
-                .send()
-                .await
-                .context("closed-positions request failed")?
-                .error_for_status()
-                .context("closed-positions non-2xx response")?
-                .json()
-                .await
-                .context("closed-positions parse failed")?;
-            if page.is_empty() {
-                break;
-            }
-            for cp in page {
-                records.push(self.raw_closed_position_to_record(&cp));
-            }
-            offset += 50;
-            if offset > 5000 {
-                warn!(wallet = %wallet, "Closed position fetch hit safety cap (5000)");
-                break;
-            }
+        let closed = self.fetch_closed_positions_paged(wallet).await?;
+        for cp in closed {
+            records.push(self.raw_closed_position_to_record(&cp));
         }
 
         // Open positions (current holdings; contribute entry/domain stats).
@@ -529,6 +510,59 @@ impl WalletHistoryFetcher {
             "Fetched wallet history from Data API"
         );
         Ok(records)
+    }
+
+    /// Fetches `/closed-positions` pages with bounded parallelism (8 concurrent
+    /// requests per batch), stopping as soon as a full batch comes back empty.
+    async fn fetch_closed_positions_paged(&self, wallet: &str) -> Result<Vec<RawClosedPosition>> {
+        const PAGE_SIZE: i32 = 50;
+        const CONCURRENCY: i32 = 8;
+        const SAFETY_CAP: i32 = 5000;
+
+        let mut out = Vec::new();
+        let mut offset = 0i32;
+        while offset < SAFETY_CAP {
+            let mut handles = Vec::new();
+            for page_offset in offset..(offset + CONCURRENCY * PAGE_SIZE).min(SAFETY_CAP) {
+                let url = format!(
+                    "{}/closed-positions?user={}&limit={}&offset={}",
+                    DATA_API_URL, wallet, PAGE_SIZE, page_offset
+                );
+                let client = self.http.clone();
+                handles.push(tokio::spawn(async move {
+                    client
+                        .get(&url)
+                        .send()
+                        .await
+                        .map_err(|e| anyhow::anyhow!("request: {e}"))?
+                        .error_for_status()
+                        .map_err(|e| anyhow::anyhow!("status: {e}"))?
+                        .json::<Vec<RawClosedPosition>>()
+                        .await
+                        .map_err(|e| anyhow::anyhow!("parse: {e}"))
+                }));
+            }
+
+            let results = futures::future::join_all(handles).await;
+            let mut got_any = false;
+            for (i, r) in results.into_iter().enumerate() {
+                match r {
+                    Ok(Ok(page)) => {
+                        if !page.is_empty() {
+                            got_any = true;
+                            out.extend(page);
+                        }
+                    }
+                    Ok(Err(e)) => warn!(wallet = %wallet, offset = offset + i as i32 * PAGE_SIZE, error = %e, "closed-positions page failed"),
+                    Err(e) => warn!(wallet = %wallet, "closed-positions task panicked: {e}"),
+                }
+            }
+            if !got_any {
+                break;
+            }
+            offset += CONCURRENCY * PAGE_SIZE;
+        }
+        Ok(out)
     }
 
     /// Discovers candidate wallets from the builders leaderboard (the classic
@@ -640,7 +674,11 @@ mod tests {
     fn outcome_labels_map_to_yes_no() {
         assert_eq!(outcome_from_label("Yes"), OutcomeSide::Yes);
         assert_eq!(outcome_from_label("NO"), OutcomeSide::No);
-        assert_eq!(outcome_from_label("Up"), OutcomeSide::Other("up".to_string()));
+        // Directional binary markets use Up/Down pairs.
+        assert_eq!(outcome_from_label("Up"), OutcomeSide::Yes);
+        assert_eq!(outcome_from_label("down"), OutcomeSide::No);
+        // Categorical outcomes stay Other (rejected by the binary-only filter).
+        assert_eq!(outcome_from_label("Over"), OutcomeSide::Other("over".to_string()));
     }
 
     #[test]
