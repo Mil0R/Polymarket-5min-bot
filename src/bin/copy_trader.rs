@@ -53,7 +53,7 @@ async fn main() -> Result<()> {
 
     // 2. Load Configuration from Environment Variables / Defaults
     let config = CopyTradingConfig::from_env();
-    let initial_nav = env::var("COPY_INITIAL_NAV_USDC")
+    let configured_nav = env::var("COPY_INITIAL_NAV_USDC")
         .ok()
         .and_then(|v| v.trim().parse::<Decimal>().ok())
         .unwrap_or(dec!(10_000.0));
@@ -69,11 +69,26 @@ async fn main() -> Result<()> {
         info!("Initializing live CLOB execution engine...");
         let executor = CopyTradeExecutor::new_from_env().await?;
         executor.verify_authentication().await?;
-        match executor.usdc_balance().await {
-            Ok(bal) => info!("Live CLOB execution engine authenticated. USDC balance: ${:.2}", bal),
-            Err(e) => warn!(error = %e, "Could not read USDC balance (read-only check failed)"),
-        }
         Some(Arc::new(executor))
+    };
+
+    // Initial NAV for the risk engine. In live mode prefer the REAL USDC balance
+    // so exposure caps (10%/market, 30%/portfolio) are computed against actual
+    // capital; fall back to the configured value when the balance is unreadable.
+    let initial_nav = if dry_run {
+        configured_nav
+    } else {
+        match live_executor.as_ref().unwrap().usdc_balance().await {
+            Ok(bal) if bal > Decimal::ZERO => bal,
+            Ok(_) => {
+                warn!("Live USDC balance is zero/empty; using configured initial NAV ${:.2}", configured_nav);
+                configured_nav
+            }
+            Err(e) => {
+                warn!(error = %e, "Could not read live USDC balance; using configured initial NAV ${:.2}", configured_nav);
+                configured_nav
+            }
+        }
     };
 
     info!("Configuration Loaded:");
