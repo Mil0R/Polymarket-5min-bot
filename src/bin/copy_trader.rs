@@ -3,8 +3,9 @@ use chrono::Utc;
 use dotenvy::dotenv;
 use polypulse::copy_trading::{
     BookFetcher, CopyTradeExecutor, CopyTradingConfig, CopyTradingCoordinator, ExecutionOrderProposal,
-    GammaSettlementSource, MarketMetadata, MarketMetadataFetcher, OrderBookSnapshot, OrderSide,
-    SettlementMonitor, SignalAction, SignalEvent, TradeFeed, WalletHistoryFetcher,
+    GammaSettlementSource, LadderExitConfig, LadderExitTracker, MarketMetadata,
+    MarketMetadataFetcher, OrderBookSnapshot, OrderSide, SettlementMonitor, SignalAction,
+    SignalEvent, TradeFeed, WalletHistoryFetcher,
 };
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -106,6 +107,7 @@ async fn main() -> Result<()> {
     let market_cache: MarketCache = Arc::new(Mutex::new(HashMap::new()));
     let book_cache: BookCache = Arc::new(Mutex::new(HashMap::new()));
     let settlement_monitor = SettlementMonitor::new(Arc::new(GammaSettlementSource::new()?));
+    let ladder_tracker = LadderExitTracker::new(LadderExitConfig::from_env());
 
     // 4. Seed target wallets from env, or discover from the profit leaderboard
     let target_wallets: Vec<String> = match env::var("COPY_TARGET_WALLETS") {
@@ -161,6 +163,7 @@ async fn main() -> Result<()> {
     let mcache = market_cache.clone();
     let bcache = book_cache.clone();
     let settle_monitor = settlement_monitor.clone();
+    let ladder_for_loop = ladder_tracker.clone();
     let executor_for_loop = live_executor.clone();
     let runner_handle = tokio::spawn(async move {
         let mut loop_count: u64 = 0;
@@ -194,6 +197,7 @@ async fn main() -> Result<()> {
                             book_cache: bcache.clone(),
                             dry_run,
                             live_executor: executor_for_loop.clone(),
+                            ladder_tracker: ladder_for_loop.clone(),
                         };
                         for sig in signals {
                             handle_signal(&ctx, sig).await;
@@ -211,6 +215,17 @@ async fn main() -> Result<()> {
             settle_monitor
                 .check_and_settle(
                     &coordinator_clone,
+                    executor_for_loop.as_deref(),
+                    dry_run,
+                )
+                .await;
+
+            // 3c. Laddered scale-out: finish partially-filled exits at descending
+            //     prices (Opinion 5) so positions do not get stuck.
+            ladder_for_loop
+                .run(
+                    &coordinator_clone,
+                    &book_clone,
                     executor_for_loop.as_deref(),
                     dry_run,
                 )
@@ -251,6 +266,7 @@ struct SignalContext {
     book_cache: BookCache,
     dry_run: bool,
     live_executor: Option<Arc<CopyTradeExecutor>>,
+    ladder_tracker: LadderExitTracker,
 }
 
 /// Routes a single live signal through the full coordinator pipeline and
@@ -348,6 +364,27 @@ async fn handle_signal(ctx: &SignalContext, signal: SignalEvent) {
                             if outcome.fully_filled { "full" } else { "partial" },
                             prop.reason
                         );
+                        // Partial/incomplete SELL: arm the ladder so the position
+                        // is cleared at descending prices over later cycles.
+                        if prop.side == OrderSide::Sell {
+                            let remaining = ctx
+                                .coordinator
+                                .risk()
+                                .read()
+                                .await
+                                .get_market_exposure(&prop.market_id, &prop.outcome)
+                                .map(|e| e.shares)
+                                .unwrap_or_default();
+                            if remaining > Decimal::ZERO {
+                                ctx.ladder_tracker.record_exit_intent(
+                                    &prop.market_id,
+                                    &prop.outcome,
+                                    &prop.token_id,
+                                    remaining,
+                                    outcome.avg_price,
+                                );
+                            }
+                        }
                     }
                     Err(e) => {
                         warn!(
