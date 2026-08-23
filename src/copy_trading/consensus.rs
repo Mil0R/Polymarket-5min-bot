@@ -26,11 +26,18 @@ struct SignalBucket {
 }
 
 /// Multi-source consensus engine implementing Module 5 rules.
+///
+/// Sybil defense (Opinion 7): wallets declared as correlated (same operator /
+/// funding source) count as ONE independent source. Two such wallets alone can
+/// never satisfy `min_consensus_wallets`; an additional INDEPENDENT wallet is
+/// required.
 #[derive(Debug, Clone)]
 pub struct ConsensusEngine {
     config: CopyTradingConfig,
     whitelist: WhitelistManager,
     buckets: Arc<DashMap<ConsensusKey, SignalBucket>>,
+    /// wallet address -> correlation group id (same id = same operator).
+    correlated: Arc<dashmap::DashMap<String, usize>>,
 }
 
 impl ConsensusEngine {
@@ -39,6 +46,69 @@ impl ConsensusEngine {
             config,
             whitelist,
             buckets: Arc::new(DashMap::new()),
+            correlated: Arc::new(dashmap::DashMap::new()),
+        }
+    }
+
+    /// Declares two wallets as correlated (same operator). Accepts both
+    /// lowercase and checksummed addresses (compared case-insensitively).
+    pub fn declare_correlated(&self, a: &str, b: &str) {
+        let a = a.to_ascii_lowercase();
+        let b = b.to_ascii_lowercase();
+        if a == b {
+            return;
+        }
+        // Union-find-lite: merge by taking min of existing group ids.
+        let gid_a = self.correlated.get(&a).map(|g| *g);
+        let gid_b = self.correlated.get(&b).map(|g| *g);
+        match (gid_a, gid_b) {
+            (Some(ga), Some(gb)) => {
+                let keep = ga.min(gb);
+                let drop = ga.max(gb);
+                if ga != gb {
+                    self.correlated.insert(a.clone(), keep);
+                    self.correlated.insert(b.clone(), keep);
+                    // Reassign any wallet in the dropped group to `keep`.
+                    let to_fix: Vec<(String, usize)> = self
+                        .correlated
+                        .iter()
+                        .map(|e| (e.key().clone(), *e.value()))
+                        .filter(|(_, g)| *g == drop)
+                        .collect();
+                    for (addr, _) in to_fix {
+                        self.correlated.insert(addr, keep);
+                    }
+                }
+            }
+            (Some(ga), None) => {
+                self.correlated.insert(b.clone(), ga);
+            }
+            (None, Some(gb)) => {
+                self.correlated.insert(a.clone(), gb);
+            }
+            (None, None) => {
+                let gid = self.correlated.len() + 1;
+                self.correlated.insert(a.clone(), gid);
+                self.correlated.insert(b.clone(), gid);
+            }
+        }
+    }
+
+    /// Loads correlated pairs from `COPY_CORRELATED_WALLET_PAIRS`
+    /// (comma-separated `addr1:addr2` pairs).
+    pub fn load_correlated_from_env(&self) {
+        if let Ok(raw) = std::env::var("COPY_CORRELATED_WALLET_PAIRS") {
+            for pair in raw.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                let mut parts = pair.split(':');
+                if let (Some(a), Some(b)) = (parts.next(), parts.next()) {
+                    let a = a.trim();
+                    let b = b.trim();
+                    if !a.is_empty() && !b.is_empty() && a != b {
+                        self.declare_correlated(a, b);
+                        info!(a = %a, b = %b, "Declared correlated wallet pair");
+                    }
+                }
+            }
         }
     }
 
@@ -139,27 +209,43 @@ impl ConsensusEngine {
             }
         }
 
-        // 4. Count distinct authorized wallets in the same domain
-        let mut distinct_wallets = HashSet::new();
+        // 4. Count distinct INDEPENDENT sources in the same domain. Correlated
+        //    wallets (declared same-operator) collapse into a single source so a
+        //    two-wallet sybil pair cannot manufacture consensus (Opinion 7).
+        //    `Source::Group` and `Source::Wallet` are disjoint by construction,
+        //    so there is no id-collision risk.
+        #[derive(Hash, PartialEq, Eq)]
+        enum Source {
+            Group(usize),
+            Wallet(String),
+        }
+        let mut distinct_sources: HashSet<Source> = HashSet::new();
+        let mut contributing_wallets: Vec<String> = Vec::new();
         let mut total_vwap_weight = Decimal::ZERO;
         let mut total_shares_weight = Decimal::ZERO;
 
         for s in &bucket_entry.signals {
-            if s.domain == signal.domain {
-                distinct_wallets.insert(s.source_wallet.clone());
-                total_vwap_weight += s.target_vwap * s.target_shares;
-                total_shares_weight += s.target_shares;
+            if s.domain != signal.domain {
+                continue;
             }
+            let lower = s.source_wallet.to_ascii_lowercase();
+            let source = match self.correlated.get(&lower) {
+                Some(g) => Source::Group(*g),
+                None => Source::Wallet(lower.clone()),
+            };
+            if distinct_sources.insert(source) {
+                contributing_wallets.push(s.source_wallet.clone());
+            }
+            total_vwap_weight += s.target_vwap * s.target_shares;
+            total_shares_weight += s.target_shares;
         }
 
-        if distinct_wallets.len() >= self.config.min_consensus_wallets {
+        if distinct_sources.len() >= self.config.min_consensus_wallets {
             let avg_vwap = if total_shares_weight > Decimal::ZERO {
                 total_vwap_weight / total_shares_weight
             } else {
                 signal.target_vwap
             };
-
-            let contributing_wallets: Vec<String> = distinct_wallets.into_iter().collect();
             bucket_entry.last_consensus_at = Some(now);
             // Clear the consumed signals so the SAME set of wallets cannot re-trigger
             // a duplicate entry after the 6h cooldown with stale information.
@@ -169,6 +255,7 @@ impl ConsensusEngine {
                 market_id = %signal.market_id,
                 outcome = %signal.outcome,
                 domain = %signal.domain,
+                independent_sources = distinct_sources.len(),
                 wallets_count = contributing_wallets.len(),
                 avg_vwap = %avg_vwap,
                 "Multi-source consensus achieved (>= 2 top wallets in 12h window)"
@@ -204,5 +291,105 @@ impl ConsensusEngine {
             bucket.signals.retain(|s| s.timestamp >= cutoff);
             !bucket.signals.is_empty()
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::copy_trading::types::{DomainTag, WalletTradeRecord};
+
+    fn seed_wallet(manager: &WhitelistManager, addr: &str, now: DateTime<Utc>) {
+        let records: Vec<WalletTradeRecord> = (0..60)
+            .map(|i| {
+                let days_ago = 120 - (i as i64 * 2);
+                WalletTradeRecord {
+                    trade_id: format!("{}-{}", addr, i),
+                    market_id: format!("mkt-{}", i),
+                    domain: DomainTag::MacroInterestRate,
+                    outcome_bought: OutcomeSide::Yes,
+                    entry_price: dec!(0.50),
+                    exit_price: Some(dec!(1.0)),
+                    notional_usdc: dec!(100.0),
+                    pnl_usdc: dec!(20.0),
+                    return_pct: dec!(0.2),
+                    is_maker: false,
+                    is_arbitrage_leg: false,
+                    resolved_outcome: Some(OutcomeSide::Yes),
+                    opened_at: now - Duration::days(days_ago),
+                    settled_at: Some(now - Duration::days(days_ago - 1)),
+                }
+            })
+            .collect();
+        let res = manager.evaluate_wallet(addr, &records, now);
+        assert!(res.is_accepted);
+        manager.upsert_wallet(res.profile);
+    }
+
+    fn mk(addr: &str, ts: DateTime<Utc>) -> SignalEvent {
+        SignalEvent {
+            signal_id: format!("s-{}-{}", addr, ts.timestamp()),
+            source_wallet: addr.to_string(),
+            market_id: "mkt-sybil".to_string(),
+            token_id: "tok-yes".to_string(),
+            outcome: OutcomeSide::Yes,
+            domain: DomainTag::MacroInterestRate,
+            action: SignalAction::OpenBuy,
+            target_vwap: dec!(0.50),
+            target_shares: dec!(500.0),
+            target_notional_usdc: dec!(250.0),
+            timestamp: ts,
+        }
+    }
+
+    #[test]
+    fn correlated_wallets_cannot_manufacture_consensus() {
+        let config = CopyTradingConfig::default();
+        let manager = WhitelistManager::new(config.clone());
+        let now = Utc::now();
+        for addr in ["0xAlpha", "0xBeta", "0xGamma"] {
+            seed_wallet(&manager, addr, now);
+        }
+        let engine = ConsensusEngine::new(config, manager.clone());
+        // Declare Alpha and Beta as the same operator (sybil pair).
+        engine.declare_correlated("0xAlpha", "0xBeta");
+
+        // Alpha + Beta alone: ONE independent source -> NO consensus (would have
+        // fired before the sybil fix).
+        assert!(engine.ingest_signal(mk("0xAlpha", now), now).is_none());
+        assert!(
+            engine
+                .ingest_signal(mk("0xBeta", now + Duration::minutes(5)), now + Duration::minutes(5))
+                .is_none(),
+            "correlated pair must not satisfy consensus"
+        );
+
+        // A third INDEPENDENT wallet provides the second source -> consensus.
+        let t3 = now + Duration::minutes(30);
+        let sig = engine
+            .ingest_signal(mk("0xGamma", t3), t3)
+            .expect("independent third wallet must complete consensus");
+        assert_eq!(sig.contributing_wallets.len(), 2);
+        assert!(sig.contributing_wallets.iter().any(|w| w == "0xGamma"));
+    }
+
+    #[test]
+    fn case_insensitive_correlation_merges() {
+        let config = CopyTradingConfig::default();
+        let manager = WhitelistManager::new(config.clone());
+        let now = Utc::now();
+        for addr in ["0xAlpha", "0xBeta"] {
+            seed_wallet(&manager, addr, now);
+        }
+        let engine = ConsensusEngine::new(config, manager.clone());
+        engine.declare_correlated("0xALPHA", "0xbeta");
+
+        assert!(engine.ingest_signal(mk("0xAlpha", now), now).is_none());
+        assert!(
+            engine
+                .ingest_signal(mk("0xBeta", now + Duration::minutes(5)), now + Duration::minutes(5))
+                .is_none(),
+            "case-insensitive pair must still count as one source"
+        );
     }
 }

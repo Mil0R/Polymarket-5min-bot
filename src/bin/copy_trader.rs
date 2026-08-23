@@ -4,8 +4,8 @@ use dotenvy::dotenv;
 use polypulse::copy_trading::{
     BookFetcher, CopyTradeExecutor, CopyTradingConfig, CopyTradingCoordinator, ExecutionOrderProposal,
     GammaSettlementSource, LadderExitConfig, LadderExitTracker, MarketMetadata,
-    MarketMetadataFetcher, OrderBookSnapshot, OrderSide, SettlementMonitor, SignalAction,
-    SignalEvent, TradeFeed, WalletHistoryFetcher,
+    MarketMetadataFetcher, OnChainTradeFeed, OrderBookSnapshot, OrderSide, SettlementMonitor,
+    SignalAction, SignalEvent, TradeFeed, WalletHistoryFetcher,
 };
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -118,6 +118,33 @@ async fn main() -> Result<()> {
     let settlement_monitor = SettlementMonitor::new(Arc::new(GammaSettlementSource::new()?));
     let ladder_tracker = LadderExitTracker::new(LadderExitConfig::from_env());
 
+    // Sybil defense (Opinion 7): load operator-declared correlated wallet pairs
+    // so same-source wallets cannot manufacture consensus.
+    coordinator.consensus().load_correlated_from_env();
+
+    // Optional on-chain OrderFilled feed (Opinion 1): bypasses the Data-API
+    // indexing delay for whitelisted wallet fills.
+    let onchain_feed: Option<Arc<OnChainTradeFeed>> =
+        if env::var("COPY_ONCHAIN_FEED_ENABLED")
+            .map(|v| v.trim().to_lowercase() == "true" || v.trim() == "1")
+            .unwrap_or(false)
+        {
+            let rpc = env::var("COPY_ONCHAIN_RPC_URL")
+                .unwrap_or_else(|_| "https://polygon-bor-rpc.publicnode.com".to_string());
+            match OnChainTradeFeed::new(&rpc).await {
+                Ok(feed) => {
+                    info!("On-chain OrderFilled feed enabled (RPC: {})", rpc);
+                    Some(Arc::new(feed))
+                }
+                Err(e) => {
+                    warn!(error = %e, "On-chain feed init failed; falling back to Data-API polling");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
     // 4. Seed target wallets from env, or discover from the profit leaderboard
     let target_wallets: Vec<String> = match env::var("COPY_TARGET_WALLETS") {
         Ok(raw) => raw
@@ -192,6 +219,7 @@ async fn main() -> Result<()> {
     let settle_monitor = settlement_monitor.clone();
     let ladder_for_loop = ladder_tracker.clone();
     let executor_for_loop = live_executor.clone();
+    let onchain_for_loop = onchain_feed.clone();
     let runner_handle = tokio::spawn(async move {
         let mut loop_count: u64 = 0;
         while running.load(Ordering::Relaxed) {
@@ -211,27 +239,41 @@ async fn main() -> Result<()> {
                 }
             }
 
-            // 2. Poll each whitelisted wallet for fresh trades
+            // 2. Poll each whitelisted wallet for fresh trades (Data-API backfill
+            //    + optional on-chain OrderFilled feed for lower latency).
             let active = coordinator_clone.whitelist().list_active_whitelist();
-            for profile in active {
+            let maker_addresses: Vec<_> = active
+                .iter()
+                .filter_map(|p| p.address.parse().ok())
+                .collect();
+            let mut signals = Vec::new();
+            for profile in &active {
                 match feed_clone.poll_wallet(&profile.address, current_time).await {
-                    Ok(signals) => {
-                        let ctx = SignalContext {
-                            coordinator: coordinator_clone.clone(),
-                            meta_fetcher: meta_clone.clone(),
-                            book_fetcher: book_clone.clone(),
-                            market_cache: mcache.clone(),
-                            book_cache: bcache.clone(),
-                            dry_run,
-                            live_executor: executor_for_loop.clone(),
-                            ladder_tracker: ladder_for_loop.clone(),
-                        };
-                        for sig in signals {
-                            handle_signal(&ctx, sig).await;
-                        }
-                    }
+                    Ok(s) => signals.extend(s),
                     Err(e) => warn!(wallet = %profile.address, error = %e, "Trade poll failed"),
                 }
+            }
+            if let Some(feed) = &onchain_for_loop {
+                match feed
+                    .poll_wallets(&maker_addresses, current_time)
+                    .await
+                {
+                    Ok(mut s) => signals.append(&mut s),
+                    Err(e) => warn!(error = %e, "On-chain feed poll failed"),
+                }
+            }
+            let ctx = SignalContext {
+                coordinator: coordinator_clone.clone(),
+                meta_fetcher: meta_clone.clone(),
+                book_fetcher: book_clone.clone(),
+                market_cache: mcache.clone(),
+                book_cache: bcache.clone(),
+                dry_run,
+                live_executor: executor_for_loop.clone(),
+                ladder_tracker: ladder_for_loop.clone(),
+            };
+            for sig in signals {
+                handle_signal(&ctx, sig).await;
             }
 
             // 3. Refresh mark prices for open positions from live book mid

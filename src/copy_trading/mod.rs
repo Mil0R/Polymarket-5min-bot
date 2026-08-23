@@ -6,6 +6,7 @@ pub mod feed;
 pub mod ladder_exit;
 pub mod live_executor;
 pub mod market_filter;
+pub mod onchain_feed;
 pub mod risk;
 pub mod settlement;
 pub mod types;
@@ -19,6 +20,7 @@ pub use feed::{BookFetcher, DomainClassifier, MarketMetadataFetcher, TradeFeed, 
 pub use ladder_exit::{ladder_size, ladder_target_price, LadderExitConfig, LadderExitTracker};
 pub use live_executor::{CopyTradeExecutor, OrderExecutionOutcome};
 pub use market_filter::MarketFilterEngine;
+pub use onchain_feed::OnChainTradeFeed;
 pub use risk::RiskController;
 pub use settlement::{determine_resolved_outcome, GammaSettlementSource, SettlementMonitor};
 pub use types::*;
