@@ -1,17 +1,20 @@
 use anyhow::Result;
+use chrono::Utc;
 use dashmap::DashMap;
 use futures::Stream;
 use futures::StreamExt;
 use polymarket_client_sdk::clob::ws::{
     types::response::{BookUpdate, OrderBookLevel, WsMessage},
-    Client as WsClient,
+    ChannelType, Client as WsClient,
 };
 use polymarket_client_sdk::types::{Decimal, B256, U256};
+use polymarket_client_sdk::ws::connection::ConnectionState;
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use tracing::{debug, info};
 
 use crate::market::MarketInfo;
+use crate::trading::executor::WinnerBookTop;
 
 /// Shorten B256 for logs: 0x + first 8 hex, e.g. 0xb91126b7..
 #[inline]
@@ -38,6 +41,7 @@ fn short_u256(u: &U256) -> String {
 pub struct OrderBookMonitor {
     ws_client: WsClient,
     books: DashMap<U256, BookUpdate>,
+    book_received_at_ms: DashMap<U256, i64>,
     market_map: HashMap<B256, (U256, U256)>, // market_id -> (yes_token_id, no_token_id)
     extra_tokens: HashSet<U256>,
 }
@@ -46,6 +50,14 @@ pub struct OrderBookPair {
     pub yes_book: BookUpdate,
     pub no_book: BookUpdate,
     pub market_id: B256,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarketWsConnectionState {
+    Disconnected,
+    Connecting,
+    Connected,
+    Reconnecting(u32),
 }
 
 /// Return the lowest non-empty ask without relying on wire ordering.
@@ -81,6 +93,7 @@ impl OrderBookMonitor {
             // Only user data (orders, trades) requires auth
             ws_client: WsClient::default(),
             books: DashMap::new(),
+            book_received_at_ms: DashMap::new(),
             market_map: HashMap::new(),
             extra_tokens: HashSet::new(),
         }
@@ -171,6 +184,8 @@ impl OrderBookMonitor {
         }
 
         // Update orderbook cache
+        self.book_received_at_ms
+            .insert(book.asset_id, Utc::now().timestamp_millis());
         self.books.insert(book.asset_id, book.clone());
 
         // Find which market this token belongs to; either side update returns OrderBookPair for arbitrage
@@ -197,9 +212,44 @@ impl OrderBookMonitor {
         None
     }
 
+    /// Return the latest WebSocket top-of-book without requiring both sides.
+    /// Near settlement a valid outcome book is frequently one-sided.
+    pub fn winner_book_top(&self, token_id: U256) -> Option<WinnerBookTop> {
+        let book = self.books.get(&token_id)?;
+        let bid = best_bid(&book);
+        let ask = best_ask(&book);
+        if bid.is_none() && ask.is_none() {
+            return None;
+        }
+        Some(WinnerBookTop {
+            received_at_ms: self
+                .book_received_at_ms
+                .get(&token_id)
+                .map(|value| *value)
+                .unwrap_or(book.timestamp),
+            exchange_updated_at_ms: book.timestamp,
+            bid_price: bid.map(|level| level.price),
+            ask_price: ask.map(|level| level.price),
+            ask_size: ask.map(|level| level.size),
+        })
+    }
+
+    pub fn connection_state(&self) -> MarketWsConnectionState {
+        match self.ws_client.connection_state(ChannelType::Market) {
+            ConnectionState::Disconnected => MarketWsConnectionState::Disconnected,
+            ConnectionState::Connecting => MarketWsConnectionState::Connecting,
+            ConnectionState::Connected { .. } => MarketWsConnectionState::Connected,
+            ConnectionState::Reconnecting { attempt } => {
+                MarketWsConnectionState::Reconnecting(attempt)
+            }
+            _ => MarketWsConnectionState::Disconnected,
+        }
+    }
+
     /// Clear all subscriptions
     pub fn clear(&mut self) {
         self.books.clear();
+        self.book_received_at_ms.clear();
         self.market_map.clear();
         self.extra_tokens.clear();
     }
@@ -241,6 +291,27 @@ mod tests {
             "timestamp":"1720000000123"
         }"#;
         assert!(replay_book_frame(frame).is_err());
+    }
+
+    #[test]
+    fn winner_top_preserves_valid_one_sided_book() {
+        let frame = r#"{
+            "event_type":"book",
+            "asset_id":"42",
+            "market":"0x0000000000000000000000000000000000000000000000000000000000000007",
+            "timestamp":"1720000000123",
+            "bids":[],
+            "asks":[{"price":"0.97","size":"12"}],
+            "hash":"fixture-hash"
+        }"#;
+        let monitor = OrderBookMonitor::new();
+        monitor.handle_book_update(replay_book_frame(frame).unwrap());
+        let top = monitor.winner_book_top(U256::from(42)).unwrap();
+        assert_eq!(top.bid_price, None);
+        assert_eq!(top.ask_price, Some(dec!(0.97)));
+        assert_eq!(top.ask_size, Some(dec!(12)));
+        assert_eq!(top.exchange_updated_at_ms, 1_720_000_000_123);
+        assert!(top.received_at_ms > top.exchange_updated_at_ms);
     }
 
     #[test]

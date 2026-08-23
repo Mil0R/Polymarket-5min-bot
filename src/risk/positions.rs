@@ -298,9 +298,10 @@ impl PositionTracker {
             .lock()
             .expect("position ledger lock poisoned");
 
-        // Reconcile both positions and actual exposure with the account-wide API view.
-        // Data API does not provide a reliable cost basis here, so use a conservative
-        // $1 per outstanding share. Pending order reservations remain separate.
+        // Reconcile both positions and cost exposure with the account-wide API
+        // view. Data API exposes initialValue/avgPrice; using $1 per share would
+        // double-count a normal YES+NO pair and spuriously trip the risk limit.
+        // Pending order reservations remain separate.
         self.positions.clear();
         self.exposure_costs.clear();
 
@@ -312,7 +313,8 @@ impl PositionTracker {
             if pos.size > dec!(0) {
                 // Position.asset is token_id
                 self.positions.insert(pos.asset, pos.size);
-                self.exposure_costs.insert(pos.asset, pos.size);
+                self.exposure_costs
+                    .insert(pos.asset, api_position_cost(&pos));
                 valid_positions.push(pos);
                 updated_count += 1;
             }
@@ -372,9 +374,39 @@ impl PositionTracker {
     }
 }
 
+fn api_position_cost(position: &Position) -> Decimal {
+    if position.initial_value > dec!(0) {
+        position.initial_value
+    } else if position.avg_price > dec!(0) {
+        position.avg_price * position.size
+    } else {
+        // Fail conservatively only when the API omitted both cost fields.
+        position.size
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn api_position(asset: &str, size: &str, avg_price: &str, initial_value: &str) -> Position {
+        serde_json::from_str(&format!(
+            r#"{{
+                "proxyWallet":"0x0000000000000000000000000000000000000001",
+                "asset":"{asset}",
+                "conditionId":"0x0000000000000000000000000000000000000000000000000000000000000007",
+                "size":"{size}","avgPrice":"{avg_price}","initialValue":"{initial_value}",
+                "currentValue":"0","cashPnl":"0","percentPnl":"0",
+                "totalBought":"{size}","realizedPnl":"0","percentRealizedPnl":"0",
+                "curPrice":"0","redeemable":false,"mergeable":true,
+                "title":"Fixture","slug":"fixture","icon":"","eventSlug":"fixture",
+                "eventId":"fixture","outcome":"Up","outcomeIndex":0,
+                "oppositeOutcome":"Down","oppositeAsset":"43",
+                "endDate":"2026-08-13","negativeRisk":false
+            }}"#
+        ))
+        .unwrap()
+    }
 
     #[test]
     fn reservations_are_bounded_and_releasable() {
@@ -404,6 +436,21 @@ mod tests {
         assert_eq!(tracker.calculate_exposure(), dec!(3));
         tracker.set_active_order_exposure(dec!(0));
         assert_eq!(tracker.calculate_exposure(), dec!(0));
+    }
+
+    #[test]
+    fn api_sync_cost_prefers_initial_value_instead_of_one_dollar_per_share() {
+        let yes = api_position("42", "100", "0.45", "45");
+        let no = api_position("43", "100", "0.50", "50");
+        assert_eq!(api_position_cost(&yes) + api_position_cost(&no), dec!(95));
+    }
+
+    #[test]
+    fn api_sync_cost_falls_back_to_average_price_then_conservative_notional() {
+        let average = api_position("42", "10", "0.40", "0");
+        let missing = api_position("43", "10", "0", "0");
+        assert_eq!(api_position_cost(&average), dec!(4));
+        assert_eq!(api_position_cost(&missing), dec!(10));
     }
 
     #[test]

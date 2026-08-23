@@ -1,11 +1,15 @@
 /target
 .env
 bot.log
+logs/
+results/
 order-state.ndjson
 arbitrage.ndjson
 .idea
 _vendor
 .env.backup-*
 paper-order-state.ndjson
+*.winner-buy-*.ndjson
 *.png
 scripts/__pycache__/
+data/

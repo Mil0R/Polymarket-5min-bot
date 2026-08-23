@@ -5,7 +5,7 @@ use chrono::Utc;
 use polymarket_client_sdk_v2::clob::types::request::{OrderBookSummaryRequest, OrdersRequest};
 use polymarket_client_sdk_v2::clob::types::response::PostOrderResponse;
 use polymarket_client_sdk_v2::clob::types::{OrderType, Side, SignedOrder};
-use polymarket_client_sdk_v2::types::{Decimal, U256};
+use polymarket_client_sdk_v2::types::{Decimal, B256, U256};
 use polymarket_client_sdk_v2::POLYGON;
 use rust_decimal_macros::dec;
 use std::collections::HashSet;
@@ -17,7 +17,8 @@ use uuid::Uuid;
 use dashmap::DashMap;
 
 use crate::monitor::arbitrage::ArbitrageOpportunity;
-use crate::trading::paper::{PaperFill, PaperSettings, PaperTradingEngine};
+use crate::network_retry::{retry_read, ReadRetryPolicy};
+use crate::trading::paper::{PaperFill, PaperSettings, PaperSnapshot, PaperTradingEngine};
 use crate::trading::AuthenticatedClobClient;
 
 #[derive(Debug)]
@@ -70,6 +71,44 @@ pub struct ExecutionQuote {
     pub size: Decimal,
     pub total_cost: Decimal,
     pub edge_per_share: Decimal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WinnerBuyExecution {
+    pub requested: Decimal,
+    pub filled: Decimal,
+    pub cost: Decimal,
+    pub average_price: Decimal,
+    pub estimated_fee: Decimal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WinnerBookTop {
+    /// Local wall-clock time at which this process received the snapshot.
+    pub received_at_ms: i64,
+    /// Exchange timestamp for diagnostics. An unchanged book can legitimately
+    /// have an old exchange timestamp while a freshly fetched snapshot is valid.
+    pub exchange_updated_at_ms: i64,
+    pub bid_price: Option<Decimal>,
+    pub ask_price: Option<Decimal>,
+    pub ask_size: Option<Decimal>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WinnerFeePolicy {
+    pub rate: Decimal,
+    pub exponent: u32,
+}
+
+impl WinnerFeePolicy {
+    pub fn fee_per_share(self, price: Decimal) -> Decimal {
+        if self.rate <= dec!(0) || price <= dec!(0) || price >= dec!(1) {
+            return dec!(0);
+        }
+        let base = price * (dec!(1) - price);
+        let factor = (0..self.exponent).fold(dec!(1), |value, _| value * base);
+        self.rate * factor
+    }
 }
 
 struct QuoteRequest<'a> {
@@ -155,9 +194,11 @@ pub struct TradingExecutor {
     gtd_expiration_secs: u64,
     arbitrage_order_type: OrderType,
     dry_run: bool,
+    paper_winner_buy_delay_ms: u64,
     paper: PaperTradingEngine,
     /// token_id -> minimum tick size, cached to avoid an HTTP round-trip per quote.
     tick_cache: DashMap<U256, Decimal>,
+    winner_fee_cache: DashMap<B256, WinnerFeePolicy>,
 }
 
 #[derive(Debug, Clone)]
@@ -173,6 +214,7 @@ pub struct ExecutionPolicy {
     pub paper_initial_balance_usdc: f64,
     pub paper_liquidity_haircut: f64,
     pub paper_second_leg_delay_ms: u64,
+    pub paper_winner_buy_delay_ms: u64,
 }
 
 struct SendErrorContext<'a> {
@@ -260,6 +302,7 @@ impl TradingExecutor {
             gtd_expiration_secs: policy.gtd_expiration_secs,
             arbitrage_order_type: policy.order_type,
             dry_run: policy.dry_run,
+            paper_winner_buy_delay_ms: policy.paper_winner_buy_delay_ms,
             paper: PaperTradingEngine::new(PaperSettings {
                 initial_balance: Decimal::try_from(policy.paper_initial_balance_usdc)
                     .unwrap_or(dec!(50)),
@@ -268,6 +311,7 @@ impl TradingExecutor {
                 second_leg_delay_ms: policy.paper_second_leg_delay_ms,
             }),
             tick_cache: DashMap::new(),
+            winner_fee_cache: DashMap::new(),
         }
     }
 
@@ -280,38 +324,109 @@ impl TradingExecutor {
         Ok(())
     }
 
-    /// Best (cheapest) ask for a token from the live REST book. The WS orderbook
-    /// stream carries the full price grid including deep 0.01 levels, which is
-    /// useless for buying a decided winner; the REST book returns real ask
-    /// levels near the top of book.
-    pub async fn winner_best_ask(&self, token_id: U256) -> Result<Option<Decimal>> {
+    pub async fn winner_book_top(&self, token_id: U256) -> Result<Option<WinnerBookTop>> {
         let book = self.live_paper_book(token_id).await?;
-        Ok(book
+        let bid = book
+            .bids
+            .iter()
+            .filter(|level| level.size > dec!(0))
+            .max_by_key(|level| level.price);
+        let ask = book
             .asks
             .iter()
-            .filter(|level| level.size > Decimal::ZERO)
-            .min_by_key(|level| level.price)
-            .map(|level| level.price))
+            .filter(|level| level.size > dec!(0))
+            .min_by_key(|level| level.price);
+        if bid.is_none() && ask.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(WinnerBookTop {
+            received_at_ms: Utc::now().timestamp_millis(),
+            exchange_updated_at_ms: book.timestamp.timestamp_millis(),
+            bid_price: bid.map(|level| level.price),
+            ask_price: ask.map(|level| level.price),
+            ask_size: ask.map(|level| level.size),
+        }))
     }
 
-    /// Single-leg "buy the determined winner" for the window-end strategy.
+    pub async fn winner_fee_policy(&self, condition_id: B256) -> Result<WinnerFeePolicy> {
+        if let Some(cached) = self.winner_fee_cache.get(&condition_id) {
+            return Ok(*cached);
+        }
+        let condition = condition_id.to_string();
+        let info = retry_read(ReadRetryPolicy::default(), || async {
+            self.client
+                .clob_market_info(&condition)
+                .await
+                .map_err(anyhow::Error::from)
+        })
+        .await?;
+        let details = info.fee_details.ok_or_else(|| {
+            anyhow::anyhow!("CLOB V2 fee_details missing for Winner Buy condition {condition_id}")
+        })?;
+        let policy = WinnerFeePolicy {
+            rate: details.rate,
+            exponent: details.exponent,
+        };
+        self.winner_fee_cache.insert(condition_id, policy);
+        Ok(policy)
+    }
+
+    /// Conservative cash/risk reservation for a Winner Buy. Live fills use
+    /// exchange-reported amounts; paper fills use the configured fee buffer.
+    pub fn winner_planned_cost(
+        &self,
+        limit_price: Decimal,
+        size: Decimal,
+        fee_per_share: Decimal,
+    ) -> Decimal {
+        (limit_price + fee_per_share).min(dec!(1)) * size
+    }
+
+    /// Single-leg winner-candidate buy for the window-end strategy.
     /// Dry-run mode simulates a fill against the live CLOB book; live mode posts
-    /// a real buy order. Returns the filled share count (0 = not filled).
+    /// a real buy order. Paper cash is reserved before the live-book simulation.
     pub async fn buy_winner(
         &self,
         token_id: U256,
         limit_price: Decimal,
         size: Decimal,
-    ) -> Result<Decimal> {
+        fee_per_share: Decimal,
+    ) -> Result<WinnerBuyExecution> {
         if self.dry_run {
+            let reservation =
+                self.paper
+                    .reserve(self.winner_planned_cost(limit_price, size, fee_per_share))?;
+            if self.paper_winner_buy_delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    self.paper_winner_buy_delay_ms,
+                ))
+                .await;
+            }
             let book = self.live_paper_book(token_id).await?;
-            let fill = self.paper.simulate_buy(
-                &book.asks,
-                limit_price,
-                size,
-                &self.arbitrage_order_type,
+            let mut fill =
+                self.paper
+                    .simulate_buy(&book.asks, limit_price, size, &self.arbitrage_order_type);
+            let estimated_fee = fill.filled * fee_per_share;
+            if fill.filled > dec!(0) {
+                fill.cost += estimated_fee;
+                fill.average_price = fill.cost / fill.filled;
+            }
+            let paper = reservation.commit_winner(fill);
+            info!(target: "polypulse::strategy::winner_buy",
+                filled = %fill.filled,
+                average_price = %fill.average_price,
+                cost = %fill.cost,
+                cash_remaining = %paper.cash_remaining,
+                winner_positions_open = paper.winner_positions_open,
+                "PAPER winner-buy cash committed"
             );
-            return Ok(fill.filled);
+            return Ok(WinnerBuyExecution {
+                requested: size,
+                filled: fill.filled,
+                cost: fill.cost,
+                average_price: fill.average_price,
+                estimated_fee,
+            });
         }
         let expiration = Utc::now() + chrono::Duration::seconds(self.gtd_expiration_secs as i64);
         let signed = self
@@ -320,7 +435,50 @@ impl TradingExecutor {
         let response = self.client.post_order(signed).await?;
         let filled =
             outcome_shares_filled(&Side::Buy, response.making_amount, response.taking_amount);
-        Ok(filled)
+        let cost = if filled > dec!(0) {
+            response.making_amount.max(dec!(0))
+        } else {
+            dec!(0)
+        };
+        let average_price = if filled > dec!(0) && cost > dec!(0) {
+            cost / filled
+        } else if filled > dec!(0) {
+            limit_price
+        } else {
+            dec!(0)
+        };
+        Ok(WinnerBuyExecution {
+            requested: size,
+            filled,
+            cost: if cost > dec!(0) {
+                cost
+            } else {
+                average_price * filled
+            },
+            average_price,
+            estimated_fee: dec!(0),
+        })
+    }
+
+    pub fn restore_paper_winner_history(
+        &self,
+        pending_cost: Decimal,
+        total_spent: Decimal,
+        realized_pnl: Decimal,
+        open_positions: u64,
+    ) -> Option<PaperSnapshot> {
+        self.dry_run.then(|| {
+            self.paper.restore_winner_history(
+                pending_cost,
+                total_spent,
+                realized_pnl,
+                open_positions,
+            )
+        })
+    }
+
+    pub fn settle_paper_winner(&self, cost: Decimal, payout: Decimal) -> Option<PaperSnapshot> {
+        self.dry_run.then(|| self.paper.settle_winner(cost, payout))
     }
 
     /// Cancel only active orders whose token belongs to the target window.
@@ -395,8 +553,10 @@ impl TradingExecutor {
     ) -> Result<ExecutionQuote> {
         let yes_token = U256::from_str(&opp.yes_token_id.to_string())?;
         let no_token = U256::from_str(&opp.no_token_id.to_string())?;
-        let (yes_tick, no_tick) =
-            tokio::join!(self.cached_tick_size(yes_token), self.cached_tick_size(no_token));
+        let (yes_tick, no_tick) = tokio::join!(
+            self.cached_tick_size(yes_token),
+            self.cached_tick_size(no_token)
+        );
         let yes_tick = yes_tick?;
         let no_tick = no_tick?;
         calculate_execution_quote(QuoteRequest {
@@ -502,7 +662,13 @@ impl TradingExecutor {
         let request = OrderBookSummaryRequest::builder()
             .token_id(token_id)
             .build();
-        Ok(self.client.order_book(&request).await?)
+        retry_read(ReadRetryPolicy::default(), || async {
+            self.client
+                .order_book(&request)
+                .await
+                .map_err(anyhow::Error::from)
+        })
+        .await
     }
 
     async fn execute_paper_pair(
@@ -761,9 +927,7 @@ impl TradingExecutor {
                     %second_error,
                     "Pre-flight book queries failed; aborting to avoid one-sided exposure"
                 );
-                return Err(anyhow::anyhow!(
-                    "pre-flight book queries failed; aborting"
-                ));
+                return Err(anyhow::anyhow!("pre-flight book queries failed; aborting"));
             }
             (Err(error), _) | (_, Err(error)) => {
                 warn!(
@@ -1234,6 +1398,24 @@ mod tests {
         assert_eq!(opposite_leg_size(dec!(0), dec!(10)), dec!(0));
         assert_eq!(opposite_leg_size(dec!(3.456), dec!(10)), dec!(3.45));
         assert_eq!(opposite_leg_size(dec!(12), dec!(10)), dec!(10));
+    }
+
+    #[test]
+    fn winner_fee_uses_v2_rate_and_exponent() {
+        let policy = WinnerFeePolicy {
+            rate: dec!(0.07),
+            exponent: 1,
+        };
+        assert_eq!(policy.fee_per_share(dec!(0.95)), dec!(0.003325));
+        assert_eq!(policy.fee_per_share(dec!(0.98)), dec!(0.001372));
+        assert_eq!(
+            WinnerFeePolicy {
+                rate: dec!(0),
+                exponent: 0,
+            }
+            .fee_per_share(dec!(0.95)),
+            dec!(0)
+        );
     }
 
     #[test]

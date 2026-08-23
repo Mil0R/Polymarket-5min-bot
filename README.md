@@ -105,16 +105,31 @@ Get these from Polymarket → Settings → Builder.
 | `CANARY_MAX_PAIR_NOTIONAL_USDC` / `CANARY_MAX_TOTAL_NOTIONAL_USDC` | `3.0` / `3.0` | Per-pair and process-total planned notional limits |
 | `CANARY_MAX_LOSS_USDC` | `2.0` | Conservative downside budget; permanently pauses entries for the process when reached |
 | `CANARY_MAX_PAIRS_PER_WINDOW` / `CANARY_MAX_PAIRS_TOTAL` | `1` / `1` | Hard pair-count limits per window and process |
+| `WINNER_BUY_MAX_STRATEGY_LOSS_USDC` / `WINNER_BUY_MAX_ASSET_LOSS_USDC` | `20.0` / `10.0` | Persisted Winner Buy realized-loss circuit breakers, globally and per asset |
+| `WINNER_BUY_MAX_CONSECUTIVE_LOSSES` | `3` | Persisted consecutive-loss circuit breaker; `0` disables it |
+| `WINNER_BUY_AUTO_REDEEM` | `false` | Automatically redeem confirmed winning tokens in live mode; requires proxy/builder credentials |
+| `WINNER_BUY_RTDS_URL` / `WINNER_BUY_FEED_MAX_AGE_MS` | official RTDS / `5000` | Chainlink 60-second TWAP source and fail-closed freshness limit |
+| `WINNER_BUY_CONFIRMATION_OBSERVATIONS` / `WINNER_BUY_MAX_ATTEMPTS_PER_MARKET` | `3` / `1` | Distinct Chainlink updates required and finite per-market execution retries |
+| `WINNER_BUY_MIN_MARGIN_BPS` / `WINNER_BUY_REVERSAL_SIGMA` | `3.0` / `2.0` | Directional TWAP margin and remaining-time reversal boundary |
+| `WINNER_BUY_MAX_SPREAD` / `WINNER_BUY_MIN_DEPTH_USDC` | `0.03` / `10.0` | Selected outcome book-quality filters |
+| `WINNER_BUY_MIN_NET_EV` | `0.002` | Minimum `p_model - effective_price - model_risk_buffer` |
+| `ARBITRAGE_ENABLED` / `WINNER_BUY_ENABLED` | `true` / `false` | Initial strategy states; the TUI can pause/resume entries for the current process |
 | `PAPER_INITIAL_BALANCE_USDC` | `50.0` | Independent virtual cash budget for Dry-run |
 | `PAPER_LIQUIDITY_HAIRCUT` | `0.75` | Fraction of displayed depth treated as executable in paper fills |
 | `PAPER_SECOND_LEG_DELAY_MS` | `250` | Delay before fetching a fresh live book for the opposite leg |
+| `PAPER_WINNER_BUY_DELAY_MS` | `250` | Dry-run latency before Winner Buy re-reads the live book and simulates the fill |
 | `MAX_BOOK_AGE_MS` / `MAX_BOOK_SKEW_MS` | `2000` / `1000` | Reject stale or mutually skewed leg snapshots |
 | `SIGNAL_COOLDOWN_MS` | `3000` | Cooldown for identical market/price signals |
-| `STATE_JOURNAL_FILE` | `order-state.ndjson` | Append-only order-pair and recovery state journal |
+| `ARBITRAGE_STATE_JOURNAL_FILE` | `results/spread-arbitrage/{paper|live}/orders.ndjson` | Arbitrage order-pair/recovery journal; legacy `STATE_JOURNAL_FILE` remains supported |
+| `WINNER_BUY_STATE_JOURNAL_FILE` | `results/winner-buy/{paper|live}/orders.ndjson` | Winner Buy order, fill, and settlement journal |
+| `WINNER_BUY_EVALUATION_JOURNAL_FILE` | `results/winner-buy/{paper|live}/evaluations.ndjson` | Winner Buy candidate and counterfactual evaluations |
+| `ARBITRAGE_SHADOW_LOG_FILE` | unset | Optional NDJSON research log for price-positive candidates rejected by depth; never changes admission |
+| `LOG_FILE` | `logs/system.log` in TUI mode | System log; strategy events move to their configured strategy file without duplication |
+| `ARBITRAGE_STRATEGY_LOG_FILE` / `WINNER_BUY_STRATEGY_LOG_FILE` | unset | Optional mutually exclusive per-strategy text logs |
 | `MERGE_INTERVAL_MINUTES` | `0` | Scheduled Merge interval (minutes); `0` = disabled |
 | `WIND_DOWN_BEFORE_WINDOW_END_MINUTES` | `0` | Wind-down before window end (minutes); `0` = disabled |
 | `RUST_LOG` | `info` | Log level |
-| `LOG_ROTATE_MAX_BYTES` | `10485760` | Startup rotation threshold; logs are appended between rotations |
+| `LOG_ROTATE_MAX_BYTES` | `10485760` | Runtime size-rotation threshold per log file |
 | `LOG_ROTATE_FILES` | `5` | Number of numbered log backups to retain |
 | `OBSERVABILITY_BIND` | unset | Optional `/livez`, `/readyz`, compatible `/healthz`, and Prometheus `/metrics` bind address |
 
@@ -124,7 +139,7 @@ Startup reconciles cumulative CLOB fills and Data API positions, then restores m
 
 For the first tiny live validation, use `DRY_RUN=false`, `CANARY_MODE=true`, and `ARBITRAGE_ORDER_TYPE=FAK`. `/readyz` returns 200 only when initialization, market/user-stream connectivity, journal writability, disk capacity, unresolved-order state, and the process-wide live safety gate are all healthy. Any ambiguous CLOB write pauses new entries across windows and requires a restart plus account/order reconciliation; it cannot be cleared in-process.
 
-With `DRY_RUN=true`, paper execution walks the real multi-level CLOB book for the harder leg, waits `PAPER_SECOND_LEG_DELAY_MS`, fetches a fresh live book for the opposite leg, and applies FOK/FAK/immediate-fill semantics to the confirmed virtual first-leg amount. It never restores real recovery tasks, syncs real positions, places/cancels orders, merges, or sells. Prometheus exposes `polypulse_paper_pairs_total`, `polypulse_paper_one_sided_total`, and `polypulse_paper_net_pnl_usd`.
+With `DRY_RUN=true`, paper execution walks the real multi-level CLOB book for the harder leg, waits `PAPER_SECOND_LEG_DELAY_MS`, fetches a fresh live book for the opposite leg, and applies FOK/FAK/immediate-fill semantics to the confirmed virtual first-leg amount. It never restores real recovery tasks, syncs real positions, places/cancels orders, merges, or sells. Prometheus exposes paper pair/one-sided/PnL metrics, CLOB connect-failure/reconnect/recovery counters, and the Winner Buy scan → signal → model rejection/confirmation → attempt → fill → pending → resolved → redeemed funnel. The TUI keeps estimated winner payout separate from realized settlement PnL.
 
 ## Disclaimer
 

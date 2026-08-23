@@ -188,6 +188,7 @@ mod tests {
             title: "BTC Up or Down".to_string(),
             end_date: DateTime::from_timestamp(1_720_000_300, 0).unwrap(),
             crypto_symbol: "BTC".to_string(),
+            neg_risk: false,
             outcome_prices: Some((dec!(0.5), dec!(0.5))),
         }
     }
@@ -217,8 +218,8 @@ mod tests {
         assert_eq!(session.market_tokens().len(), 1);
         assert!(!session.start_wind_down_if_due(now, 1));
 
-        let near_end = DateTime::from_timestamp(session.timestamp() + window_seconds(5) - 30, 0)
-            .unwrap();
+        let near_end =
+            DateTime::from_timestamp(session.timestamp() + window_seconds(5) - 30, 0).unwrap();
         assert!(session.start_wind_down_if_due(near_end, 1));
         assert!(session.scope().trading_paused());
         assert!(!session.start_wind_down_if_due(near_end, 1));

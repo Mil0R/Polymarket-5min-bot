@@ -110,11 +110,16 @@ cargo run              # 运行程序
 | `PAPER_SECOND_LEG_DELAY_MS` | `250` | 第一腿模拟后等待多久重新读取第二腿真实盘口 |
 | `MAX_BOOK_AGE_MS` / `MAX_BOOK_SKEW_MS` | `2000` / `1000` | 拒绝过期或两腿时间差过大的行情快照 |
 | `SIGNAL_COOLDOWN_MS` | `3000` | 相同市场和价格信号的去重冷却时间 |
-| `STATE_JOURNAL_FILE` | `order-state.ndjson` | 订单对与恢复状态的追加式持久化日志 |
+| `ARBITRAGE_STATE_JOURNAL_FILE` | `results/spread-arbitrage/{paper|live}/orders.ndjson` | 套利订单对与恢复状态；旧 `STATE_JOURNAL_FILE` 仍兼容 |
+| `WINNER_BUY_STATE_JOURNAL_FILE` | `results/winner-buy/{paper|live}/orders.ndjson` | Winner Buy 下单、成交与结算状态 |
+| `WINNER_BUY_EVALUATION_JOURNAL_FILE` | `results/winner-buy/{paper|live}/evaluations.ndjson` | Winner Buy 候选与反事实评估数据 |
+| `ARBITRAGE_SHADOW_LOG_FILE` | 未设置 | 可选的深度拒绝候选 NDJSON 研究日志，不改变准入阈值 |
+| `LOG_FILE` | TUI 下为 `logs/system.log` | 系统日志；配置分策略日志后不再重复对应策略事件 |
+| `ARBITRAGE_STRATEGY_LOG_FILE` / `WINNER_BUY_STRATEGY_LOG_FILE` | 未设置 | 可选、互斥的分策略文本日志 |
 | `MERGE_INTERVAL_MINUTES` | `0` | 定时 Merge 间隔（分钟），`0` 为关闭 |
 | `WIND_DOWN_BEFORE_WINDOW_END_MINUTES` | `0` | 窗口结束前收尾（分钟），`0` 为关闭 |
 | `RUST_LOG` | `info` | 日志级别 |
-| `LOG_ROTATE_MAX_BYTES` | `10485760` | 日志启动轮转阈值；日志采用追加写入 |
+| `LOG_ROTATE_MAX_BYTES` | `10485760` | 每个日志文件的运行期按大小轮转阈值 |
 | `LOG_ROTATE_FILES` | `5` | 保留的编号日志备份数量 |
 | `OBSERVABILITY_BIND` | 未设置 | 可选本地 `/livez`、`/readyz`、兼容 `/healthz` 与 Prometheus `/metrics` |
 

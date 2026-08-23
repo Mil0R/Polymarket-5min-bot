@@ -24,12 +24,27 @@ impl MarketScheduler {
         self.discoverer.calculate_current_window_timestamp(now)
     }
 
+    /// Next window start timestamp. Kept separate from the wake-up instant so
+    /// an early refresh never rounds back down to the expiring window.
+    pub fn calculate_next_window_timestamp(&self, now: DateTime<Utc>) -> i64 {
+        self.discoverer.calculate_next_window_timestamp(now)
+    }
+
     /// Raw markets by slug — used for settlement checks of winner-buy positions.
+    #[allow(dead_code)]
     pub async fn fetch_markets_by_slug(
         &self,
         slugs: Vec<String>,
     ) -> Result<Vec<polymarket_client_sdk::gamma::types::response::Market>> {
         self.discoverer.fetch_markets_by_slug(slugs).await
+    }
+
+    /// Closed-market lookup used exclusively for terminal outcome resolution.
+    pub async fn fetch_closed_markets_by_slug(
+        &self,
+        slugs: Vec<String>,
+    ) -> Result<Vec<polymarket_client_sdk::gamma::types::response::Market>> {
+        self.discoverer.fetch_closed_markets_by_slug(slugs).await
     }
 
     /// Calculate wait time until next window
@@ -110,23 +125,28 @@ impl MarketScheduler {
 
     /// Wait for next 5-minute window and fetch markets
     pub async fn wait_for_next_window(&self) -> Result<Vec<MarketInfo>> {
-        loop {
-            let wait_time = self.calculate_wait_time(Utc::now());
-            if wait_time > Duration::ZERO {
-                info!(
-                    wait_secs = wait_time.as_secs(),
-                    "Waiting for next window"
-                );
-                sleep(wait_time).await;
-            }
+        let started_at = Utc::now();
+        let target_timestamp = self.calculate_next_window_timestamp(started_at);
+        let wait_time = self.calculate_wait_time(started_at);
+        if wait_time > Duration::ZERO {
+            info!(
+                wait_secs = wait_time.as_secs(),
+                target_timestamp, "Waiting for next window"
+            );
+            sleep(wait_time).await;
+        }
 
-            // Query current window markets
-            let now = Utc::now();
-            let timestamp = self.discoverer.calculate_current_window_timestamp(now);
-            match self.discoverer.get_markets_for_timestamp(timestamp).await {
+        loop {
+            // Always query the captured next-window target. When refresh wakes
+            // a few seconds early, `Utc::now()` still belongs to the old window.
+            match self
+                .discoverer
+                .get_markets_for_timestamp(target_timestamp)
+                .await
+            {
                 Ok(markets) => {
                     if !markets.is_empty() {
-                        info!(count = markets.len(), "Found new markets");
+                        info!(count = markets.len(), target_timestamp, "Found new markets");
                         return Ok(markets);
                     }
                     // Markets not created yet, wait and retry
@@ -139,5 +159,27 @@ impl MarketScheduler {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    #[test]
+    fn early_refresh_keeps_the_next_window_as_query_target() {
+        let scheduler = MarketScheduler::new(MarketDiscoverer::new(vec!["btc".into()], 5), 5);
+        let now = Utc.with_ymd_and_hms(2026, 8, 20, 12, 4, 55).unwrap();
+
+        assert_eq!(
+            scheduler.calculate_current_window_timestamp(now),
+            1_787_227_200
+        );
+        assert_eq!(
+            scheduler.calculate_next_window_timestamp(now),
+            1_787_227_500
+        );
+        assert_eq!(scheduler.calculate_wait_time(now), Duration::ZERO);
     }
 }

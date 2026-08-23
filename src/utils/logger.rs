@@ -1,50 +1,181 @@
 use anyhow::Result;
 use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use std::sync::Mutex;
+use tracing::Metadata;
+use tracing_subscriber::filter::filter_fn;
+use tracing_subscriber::fmt::writer::BoxMakeWriter;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
+
+pub const ARBITRAGE_LOG_TARGET: &str = "polypulse::strategy::spread_arbitrage";
+pub const WINNER_BUY_LOG_TARGET: &str = "polypulse::strategy::winner_buy";
+type LogLayer = Box<dyn Layer<tracing_subscriber::Registry> + Send + Sync>;
 
 pub fn init_logger(quiet_stdout: bool) -> Result<()> {
+    // Logger setup happens before Config::from_env(), so load .env here as well.
+    dotenvy::dotenv().ok();
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
-    if quiet_stdout {
-        let path = std::env::var("LOG_FILE").unwrap_or_else(|_| "bot.log".to_string());
-        let file = open_log_writer(&path)?;
-        tracing_subscriber::registry()
-            .with(env_filter)
-            .with(
-                tracing_subscriber::fmt::layer()
-                    .with_writer(file)
-                    .with_ansi(false),
-            )
-            .init();
+    let system_writer = if quiet_stdout {
+        let path = std::env::var("LOG_FILE").unwrap_or_else(|_| "logs/system.log".to_string());
+        BoxMakeWriter::new(Mutex::new(open_log_writer(path)?))
     } else if let Ok(path) = std::env::var("LOG_FILE") {
-        let file = open_log_writer(&path)?;
-        tracing_subscriber::registry()
-            .with(env_filter)
-            .with(
-                tracing_subscriber::fmt::layer()
-                    .with_writer(file)
-                    .with_ansi(false),
-            )
-            .init();
+        BoxMakeWriter::new(Mutex::new(open_log_writer(path)?))
     } else {
-        tracing_subscriber::fmt().with_env_filter(env_filter).init();
+        BoxMakeWriter::new(std::io::stdout)
+    };
+
+    let split_arbitrage = log_path_configured("ARBITRAGE_STRATEGY_LOG_FILE");
+    let split_winner_buy = log_path_configured("WINNER_BUY_STRATEGY_LOG_FILE");
+    let mut log_layers: Vec<LogLayer> = vec![tracing_subscriber::fmt::layer()
+        .with_writer(system_writer)
+        .with_ansi(false)
+        .with_filter(filter_fn(move |metadata| {
+            !(split_arbitrage && is_arbitrage_metadata(metadata)
+                || split_winner_buy && is_winner_buy_metadata(metadata))
+        }))
+        .boxed()];
+    if let Some(layer) = strategy_log_layer("ARBITRAGE_STRATEGY_LOG_FILE", is_arbitrage_metadata)? {
+        log_layers.push(layer);
     }
+    if let Some(layer) = strategy_log_layer("WINNER_BUY_STRATEGY_LOG_FILE", is_winner_buy_metadata)?
+    {
+        log_layers.push(layer);
+    }
+
+    tracing_subscriber::registry()
+        .with(log_layers)
+        .with(env_filter)
+        .init();
 
     Ok(())
 }
 
-fn open_log_writer(path: impl AsRef<Path>) -> Result<File> {
-    let max_bytes = std::env::var("LOG_ROTATE_MAX_BYTES")
+fn strategy_log_layer(
+    variable: &str,
+    predicate: for<'a> fn(&Metadata<'a>) -> bool,
+) -> Result<Option<LogLayer>> {
+    let Some(path) = std::env::var(variable)
         .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(10 * 1024 * 1024);
-    let retention = std::env::var("LOG_ROTATE_FILES")
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+    let writer = Mutex::new(open_log_writer(path)?);
+    Ok(Some(
+        tracing_subscriber::fmt::layer()
+            .with_writer(writer)
+            .with_ansi(false)
+            .with_filter(filter_fn(predicate))
+            .boxed(),
+    ))
+}
+
+fn log_path_configured(variable: &str) -> bool {
+    std::env::var(variable)
         .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(5);
-    rotate_log_file(path.as_ref(), max_bytes, retention)?;
-    Ok(OpenOptions::new().create(true).append(true).open(path)?)
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn is_arbitrage_metadata(metadata: &Metadata<'_>) -> bool {
+    let target = metadata.target();
+    target == ARBITRAGE_LOG_TARGET
+        || target.ends_with("::strategy_service")
+        || target.ends_with("::monitor::arbitrage")
+        || target.ends_with("::trading::executor")
+}
+
+fn is_winner_buy_metadata(metadata: &Metadata<'_>) -> bool {
+    let target = metadata.target();
+    target == WINNER_BUY_LOG_TARGET
+        || target.ends_with("::winner_buy")
+        || target.ends_with("::winner_model")
+}
+
+struct SizeRotatingWriter {
+    path: PathBuf,
+    file: Option<File>,
+    bytes_written: u64,
+    max_bytes: u64,
+    retention: usize,
+}
+
+impl SizeRotatingWriter {
+    fn new(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent)?;
+        }
+        let max_bytes = std::env::var("LOG_ROTATE_MAX_BYTES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(10 * 1024 * 1024);
+        let retention = std::env::var("LOG_ROTATE_FILES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(5);
+        rotate_log_file(&path, max_bytes, retention)?;
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let bytes_written = file.metadata()?.len();
+        Ok(Self {
+            path,
+            file: Some(file),
+            bytes_written,
+            max_bytes: max_bytes.max(1),
+            retention,
+        })
+    }
+
+    fn rotate_before(&mut self, incoming_bytes: usize) -> io::Result<()> {
+        if self.retention == 0
+            || self.bytes_written == 0
+            || self.bytes_written.saturating_add(incoming_bytes as u64) <= self.max_bytes
+        {
+            return Ok(());
+        }
+        if let Some(mut file) = self.file.take() {
+            file.flush()?;
+            drop(file);
+        }
+        rotate_log_file(&self.path, 1, self.retention)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        self.file = Some(
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.path)?,
+        );
+        self.bytes_written = 0;
+        Ok(())
+    }
+}
+
+impl Write for SizeRotatingWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.rotate_before(buffer.len())?;
+        let written = self
+            .file
+            .as_mut()
+            .expect("rotating log writer must keep a file open")
+            .write(buffer)?;
+        self.bytes_written = self.bytes_written.saturating_add(written as u64);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file
+            .as_mut()
+            .expect("rotating log writer must keep a file open")
+            .flush()
+    }
+}
+
+fn open_log_writer(path: impl AsRef<Path>) -> Result<SizeRotatingWriter> {
+    SizeRotatingWriter::new(path)
 }
 
 fn rotated_path(path: &Path, index: usize) -> PathBuf {
@@ -110,6 +241,33 @@ mod tests {
         writer.write_all(b"new log").unwrap();
         drop(writer);
         assert_eq!(fs::read(&path).unwrap(), b"new log");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn rotates_while_process_is_running() {
+        let directory =
+            std::env::temp_dir().join(format!("polypulse-live-log-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("bot.log");
+        let mut writer = SizeRotatingWriter {
+            path: path.clone(),
+            file: Some(
+                OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                    .unwrap(),
+            ),
+            bytes_written: 0,
+            max_bytes: 8,
+            retention: 2,
+        };
+        writer.write_all(b"12345678").unwrap();
+        writer.write_all(b"next").unwrap();
+        writer.flush().unwrap();
+        assert_eq!(fs::read(rotated_path(&path, 1)).unwrap(), b"12345678");
+        assert_eq!(fs::read(&path).unwrap(), b"next");
         fs::remove_dir_all(directory).unwrap();
     }
 }

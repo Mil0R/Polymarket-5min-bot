@@ -33,6 +33,35 @@ pub struct HedgePosition {
     pub order_id: Option<String>,     // GTC order ID if placed
     pub pending_sell_amount: Decimal, // Pending sell amount
     pub accounted_sell_fill: Decimal, // Cumulative fill already applied locally
+    close_state: HedgeCloseState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HedgeCloseState {
+    Open,
+    Closing,
+    Resting,
+    Failed,
+}
+
+impl HedgeCloseState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Closing => "closing",
+            Self::Resting => "resting",
+            Self::Failed => "failed",
+        }
+    }
+
+    fn restore(value: &str, order_id: Option<&str>) -> Self {
+        match value {
+            "closing" | "failed" => Self::Failed,
+            "resting" => Self::Resting,
+            _ if order_id.is_some() => Self::Resting,
+            _ => Self::Open,
+        }
+    }
 }
 
 pub struct HedgeMonitor {
@@ -96,6 +125,7 @@ impl HedgeMonitor {
                 order_id: None,
                 pending_sell_amount: dec!(0),
                 accounted_sell_fill: dec!(0),
+                close_state: HedgeCloseState::Open,
             };
 
             self.positions.insert(pair_id.clone(), position.clone());
@@ -117,6 +147,8 @@ impl HedgeMonitor {
             let Some(snapshot) = event.recovery else {
                 continue;
             };
+            let close_state =
+                HedgeCloseState::restore(&snapshot.close_state, snapshot.order_id.as_deref());
             let position = HedgePosition {
                 token_id: U256::from_str(&snapshot.token_id)?,
                 opposite_token_id: U256::from_str(&snapshot.opposite_token_id)?,
@@ -129,6 +161,7 @@ impl HedgeMonitor {
                 order_id: snapshot.order_id,
                 pending_sell_amount: Decimal::from_str(&snapshot.pending_sell_amount)?,
                 accounted_sell_fill: Decimal::from_str(&snapshot.accounted_sell_fill)?,
+                close_state,
             };
             if let Some(order_id) = position.order_id.clone() {
                 self.owned_orders.register(OwnedOrder {
@@ -189,6 +222,9 @@ impl HedgeMonitor {
                         stored.accounted_sell_fill = order.size_matched;
                         if matches!(order.status, OrderStatusType::Canceled) {
                             stored.order_id = None;
+                            stored.close_state = HedgeCloseState::Open;
+                        } else {
+                            stored.close_state = HedgeCloseState::Resting;
                         }
                         append_recovery_event(
                             &self.journal,
@@ -216,6 +252,14 @@ impl HedgeMonitor {
             .collect();
 
         for (pair_id, position) in positions_to_check {
+            // Closing is acquired atomically below. A failed/ambiguous write is
+            // deliberately fail-closed until restart/manual reconciliation.
+            if matches!(
+                position.close_state,
+                HedgeCloseState::Closing | HedgeCloseState::Failed
+            ) {
+                continue;
+            }
             // A late fill on the missing buy leg can remove the imbalance while
             // recovery monitoring is active. Stop before considering another sell.
             let current_position = self.position_tracker.get_position(position.token_id);
@@ -223,7 +267,7 @@ impl HedgeMonitor {
                 .position_tracker
                 .get_position(position.opposite_token_id);
             let difference = current_position - opposite_position;
-            if difference <= dec!(0) {
+            if difference <= dec!(0) && position.order_id.is_none() {
                 info!(
                     "⏸️ No sell needed | market:{} | pos:{} | opposite:{} | diff:{} | opposite covers",
                     position.market_display, current_position, opposite_position, difference
@@ -236,9 +280,6 @@ impl HedgeMonitor {
             // Reconcile a previously posted recovery order before deciding whether
             // to submit anything else. The CLOB endpoint reports cumulative fills.
             if let Some(ref order_id) = position.order_id {
-                if order_id == "processing" {
-                    continue;
-                }
                 match self.client.order(order_id).await {
                     Ok(order) => {
                         let delta = match self
@@ -281,6 +322,7 @@ impl HedgeMonitor {
                         } else if matches!(order.status, OrderStatusType::Canceled) {
                             if let Some(mut stored) = self.positions.get_mut(&pair_id) {
                                 stored.order_id = None;
+                                stored.close_state = HedgeCloseState::Open;
                                 stored.pending_sell_amount = remaining;
                                 stored.accounted_sell_fill = order.size_matched;
                                 append_recovery_event(
@@ -292,6 +334,7 @@ impl HedgeMonitor {
                             }
                             info!(order_id, remaining = %remaining, "Recovery sell was canceled; retry is enabled");
                         } else if let Some(mut stored) = self.positions.get_mut(&pair_id) {
+                            stored.close_state = HedgeCloseState::Resting;
                             stored.pending_sell_amount = remaining;
                             stored.accounted_sell_fill = order.size_matched;
                             append_recovery_event(
@@ -362,7 +405,12 @@ impl HedgeMonitor {
 
                 // Sell via GTC order
                 // Spawn async to avoid blocking main loop
-                let position_clone = position.clone();
+                // Compare-and-transition while holding the DashMap entry guard.
+                // Concurrent book callbacks can observe the same earlier snapshot,
+                // but exactly one is allowed to move Open -> Closing.
+                let Some(position_clone) = begin_close(&self.positions, &pair_id) else {
+                    continue;
+                };
                 let pair_id_clone = pair_id.clone();
                 let position_tracker = self.position_tracker.clone();
                 let positions = self.positions.clone();
@@ -370,12 +418,6 @@ impl HedgeMonitor {
                 let private_key = self.private_key.clone();
                 let journal = self.journal.clone();
                 let owned_orders = self.owned_orders.clone();
-
-                // Mark processing to avoid duplicate orders
-                if let Some((_, mut pos)) = self.positions.remove(&pair_id) {
-                    pos.order_id = Some("processing".to_string());
-                    self.positions.insert(pair_id.clone(), pos);
-                }
 
                 tokio::spawn(async move {
                     // Recreate signer (cannot use self in spawn)
@@ -386,6 +428,15 @@ impl HedgeMonitor {
                                 "❌ Create signer failed | market:{} | err:{}",
                                 position_clone.market_display, e
                             );
+                            if let Some(mut pos) = positions.get_mut(&pair_id_clone) {
+                                pos.close_state = HedgeCloseState::Open;
+                                append_recovery_event(
+                                    &journal,
+                                    &pos,
+                                    JournalState::Recovering,
+                                    "recovery signer creation failed before submission; retry enabled",
+                                );
+                            }
                             return;
                         }
                     };
@@ -416,6 +467,7 @@ impl HedgeMonitor {
                                 if remaining > dec!(0) {
                                     // Partial fill; save order_id
                                     pos.order_id = Some(order_id);
+                                    pos.close_state = HedgeCloseState::Resting;
                                     pos.pending_sell_amount = remaining;
                                     pos.accounted_sell_fill = filled;
                                     append_recovery_event(
@@ -480,9 +532,17 @@ impl HedgeMonitor {
                                 "❌ Sell order failed | market:{} | price:{:.4} | err:{}",
                                 position_clone.market_display, best_bid_price, e
                             );
-                            // On failure, clear processing
+                            // A transport error after submission can be ambiguous:
+                            // retrying could duplicate the sell. Persist Failed and
+                            // require reconciliation/restart before another attempt.
                             if let Some(mut pos) = positions.get_mut(&pair_id_clone) {
-                                pos.order_id = None;
+                                pos.close_state = HedgeCloseState::Failed;
+                                append_recovery_event(
+                                    &journal,
+                                    &pos,
+                                    JournalState::ManualReview,
+                                    "recovery sell submission failed or is ambiguous; automatic retry blocked",
+                                );
                             }
                         }
                     }
@@ -567,6 +627,15 @@ impl HedgeMonitor {
     }
 }
 
+fn begin_close(positions: &DashMap<String, HedgePosition>, pair_id: &str) -> Option<HedgePosition> {
+    let mut position = positions.get_mut(pair_id)?;
+    if position.close_state != HedgeCloseState::Open || position.order_id.is_some() {
+        return None;
+    }
+    position.close_state = HedgeCloseState::Closing;
+    Some(position.clone())
+}
+
 fn append_recovery_event(
     journal: &StateJournal,
     position: &HedgePosition,
@@ -601,9 +670,61 @@ fn append_recovery_event(
             order_id: position.order_id.clone(),
             pending_sell_amount: position.pending_sell_amount.to_string(),
             accounted_sell_fill: position.accounted_sell_fill.to_string(),
+            close_state: position.close_state.as_str().to_string(),
         }),
     };
     if let Err(e) = journal.append(&event) {
         error!(error = %e, pair_id = %position.pair_id, "Failed to persist recovery state");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn open_position() -> HedgePosition {
+        HedgePosition {
+            token_id: U256::from(1),
+            opposite_token_id: U256::from(2),
+            target_amount: dec!(2),
+            entry_price: dec!(0.5),
+            take_profit_price: dec!(0.55),
+            stop_loss_price: dec!(0.45),
+            market_display: "test".into(),
+            pair_id: "pair".into(),
+            order_id: None,
+            pending_sell_amount: dec!(0),
+            accounted_sell_fill: dec!(0),
+            close_state: HedgeCloseState::Open,
+        }
+    }
+
+    #[test]
+    fn close_transition_can_only_be_acquired_once() {
+        let positions = DashMap::new();
+        positions.insert("pair".into(), open_position());
+
+        assert!(begin_close(&positions, "pair").is_some());
+        assert!(begin_close(&positions, "pair").is_none());
+        assert_eq!(
+            positions.get("pair").unwrap().close_state,
+            HedgeCloseState::Closing
+        );
+    }
+
+    #[test]
+    fn ambiguous_close_is_restored_fail_closed() {
+        assert_eq!(
+            HedgeCloseState::restore("closing", None),
+            HedgeCloseState::Failed
+        );
+        assert_eq!(
+            HedgeCloseState::restore("failed", None),
+            HedgeCloseState::Failed
+        );
+        assert_eq!(
+            HedgeCloseState::restore("", Some("order")),
+            HedgeCloseState::Resting
+        );
     }
 }

@@ -8,6 +8,7 @@ pub struct ConnectionSupervisor {
     minimum_delay: Duration,
     maximum_delay: Duration,
     stable_after: Duration,
+    awaiting_recovery: bool,
 }
 
 impl ConnectionSupervisor {
@@ -18,11 +19,14 @@ impl ConnectionSupervisor {
             minimum_delay,
             maximum_delay,
             stable_after,
+            awaiting_recovery: false,
         }
     }
 
-    pub fn subscription_ready(&mut self) {
+    /// Returns true when this ready state recovered a prior connection failure.
+    pub fn subscription_ready(&mut self) -> bool {
         self.healthy = true;
+        std::mem::take(&mut self.awaiting_recovery)
     }
 
     pub fn is_healthy(&self) -> bool {
@@ -31,11 +35,13 @@ impl ConnectionSupervisor {
 
     pub fn connect_failed(&mut self) -> Duration {
         self.healthy = false;
+        self.awaiting_recovery = true;
         self.take_delay()
     }
 
     pub fn disconnected(&mut self, connected_for: Duration) -> Duration {
         self.healthy = false;
+        self.awaiting_recovery = true;
         if connected_for >= self.stable_after {
             self.current_delay = self.minimum_delay;
         }
@@ -65,7 +71,7 @@ mod tests {
             Duration::from_secs(4),
             Duration::from_secs(30),
         );
-        supervisor.subscription_ready();
+        assert!(!supervisor.subscription_ready());
         assert!(supervisor.is_healthy());
         assert_eq!(
             supervisor.disconnected(Duration::from_secs(2)),
@@ -79,5 +85,7 @@ mod tests {
             supervisor.disconnected(Duration::from_secs(30)),
             Duration::from_secs(1)
         );
+        assert!(supervisor.subscription_ready());
+        assert!(!supervisor.subscription_ready());
     }
 }

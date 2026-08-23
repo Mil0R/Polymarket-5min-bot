@@ -3,8 +3,14 @@ use rand::Rng;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use super::control::StrategyDisplayState;
+
 const SPARKLINE_LEN: usize = 36;
 const EVENT_COUNT: usize = 30;
+
+fn timestamp_event(message: impl Into<String>) -> String {
+    format!("[{}] {}", Utc::now().format("%H:%M:%S"), message.into())
+}
 
 fn push_sparkline(buf: &mut Vec<u64>, val: u64) {
     if buf.len() >= SPARKLINE_LEN {
@@ -70,7 +76,7 @@ impl MarketRow {
     /// Whether the last orderbook update for this market is still fresh.
     pub fn market_fresh(&self) -> bool {
         self.last_update
-            .map_or(false, |t| t.elapsed().as_secs() < MARKET_PRICE_STALE_SECS)
+            .is_some_and(|t| t.elapsed().as_secs() < MARKET_PRICE_STALE_SECS)
     }
 
     /// Best ask to display for the YES side, if it exists and is fresh.
@@ -155,6 +161,14 @@ pub struct DashboardState {
     pub best_trade: f64,
     /// Window-end winner-buy (strategy B) stats.
     pub winner_buy_fills: u64,
+    pub winner_buy_scans: u64,
+    pub winner_buy_signals: u64,
+    pub winner_buy_attempts: u64,
+    pub winner_buy_model_rejections: u64,
+    pub winner_buy_awaiting_confirmation: u64,
+    pub winner_buy_pending: u64,
+    pub winner_buy_resolved: u64,
+    pub winner_buy_redeemed: u64,
     pub winner_buy_wins: u64,
     pub winner_buy_losses: u64,
     pub winner_buy_est_pnl: f64,
@@ -168,6 +182,26 @@ pub struct DashboardState {
     pub profit_pulse: u32,
     pub last_trade_symbol: String,
     pub connected: bool,
+    pub execution_mode: String,
+    pub selected_strategy: usize,
+    pub arbitrage_state: StrategyDisplayState,
+    pub winner_buy_state: StrategyDisplayState,
+    pub strategy_message: String,
+    pub opportunities_admitted: u64,
+    pub opportunities_rejected: u64,
+    pub depth_rejections: u64,
+    pub risk_rejections: u64,
+    pub quote_rejections: u64,
+    pub trades_started: u64,
+    pub trades_succeeded: u64,
+    pub trades_failed: u64,
+    pub paper_one_sided: u64,
+    pub paper_pnl: f64,
+    pub winner_data_rejections: u64,
+    pub winner_market_rejections: u64,
+    pub winner_boundary_rejections: u64,
+    pub winner_ev_rejections: u64,
+    pub winner_shadow_ev_failures: u64,
 }
 
 impl DashboardState {
@@ -190,16 +224,26 @@ impl DashboardState {
             window_secs_left: 300,
             window_label: "updown-5m".to_string(),
             order_mode: order_mode.into(),
-            events: vec!["🚀 Bot started — scanning for arbitrage…".to_string()],
+            events: vec![timestamp_event("🚀 Bot started — scanning for arbitrage…")],
             services: vec![
                 ServiceHealth {
-                    name: "CLOB WS",
-                    status: HealthStatus::Ok,
+                    name: "MARKET WS",
+                    status: HealthStatus::Warn,
                     latency_ms: 0,
                 },
                 ServiceHealth {
-                    name: "CLOB API",
-                    status: HealthStatus::Ok,
+                    name: "USER WS",
+                    status: HealthStatus::Warn,
+                    latency_ms: 0,
+                },
+                ServiceHealth {
+                    name: "RTDS",
+                    status: HealthStatus::Warn,
+                    latency_ms: 0,
+                },
+                ServiceHealth {
+                    name: "SAFETY",
+                    status: HealthStatus::Warn,
                     latency_ms: 0,
                 },
             ],
@@ -212,6 +256,14 @@ impl DashboardState {
             successful_trades: 0,
             best_trade: 0.0,
             winner_buy_fills: 0,
+            winner_buy_scans: 0,
+            winner_buy_signals: 0,
+            winner_buy_attempts: 0,
+            winner_buy_model_rejections: 0,
+            winner_buy_awaiting_confirmation: 0,
+            winner_buy_pending: 0,
+            winner_buy_resolved: 0,
+            winner_buy_redeemed: 0,
             winner_buy_wins: 0,
             winner_buy_losses: 0,
             winner_buy_est_pnl: 0.0,
@@ -224,6 +276,26 @@ impl DashboardState {
             profit_pulse: 0,
             last_trade_symbol: String::new(),
             connected: false,
+            execution_mode: "LIVE".into(),
+            selected_strategy: 0,
+            arbitrage_state: StrategyDisplayState::Blocked,
+            winner_buy_state: StrategyDisplayState::Unavailable,
+            strategy_message: "initializing".into(),
+            opportunities_admitted: 0,
+            opportunities_rejected: 0,
+            depth_rejections: 0,
+            risk_rejections: 0,
+            quote_rejections: 0,
+            trades_started: 0,
+            trades_succeeded: 0,
+            trades_failed: 0,
+            paper_one_sided: 0,
+            paper_pnl: 0.0,
+            winner_data_rejections: 0,
+            winner_market_rejections: 0,
+            winner_boundary_rejections: 0,
+            winner_ev_rejections: 0,
+            winner_shadow_ev_failures: 0,
         }
     }
 
@@ -329,7 +401,10 @@ impl DashboardState {
             last_sym,
             last_trade_pnl,
             successful_trades,
-        );
+        )
+        .into_iter()
+        .map(timestamp_event)
+        .collect();
 
         // Fast-forward 60–180 ticks so curves & prices look mid-session, not freshly booted.
         let warmup_ticks = rng.gen_range(60..180);
@@ -433,7 +508,7 @@ impl DashboardState {
     }
 
     pub fn push_event(&mut self, msg: impl Into<String>) {
-        let msg = msg.into();
+        let msg = timestamp_event(msg);
         if self.events.len() >= EVENT_COUNT {
             self.events.remove(0);
         }
@@ -475,13 +550,7 @@ impl DashboardState {
 
     /// Update one or both sides of a market's displayed best-ask price.
     /// `None` means that side has no best ask (no liquidity) and the TUI shows "—".
-    pub fn update_market(
-        &mut self,
-        symbol: &str,
-        yes: Option<f64>,
-        no: Option<f64>,
-        is_arb: bool,
-    ) {
+    pub fn update_market(&mut self, symbol: &str, yes: Option<f64>, no: Option<f64>, is_arb: bool) {
         self.ensure_market(symbol);
         if let Some(row) = self.markets.iter_mut().find(|m| m.symbol == symbol) {
             if let Some(yes) = yes {
@@ -564,6 +633,100 @@ impl DashboardState {
         self.push_event(format!("🏁 Winner-buy settled {icon} ${pnl:.2}"));
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_winner_buy_funnel(
+        &mut self,
+        scans: u64,
+        signals: u64,
+        attempts: u64,
+        model_rejections: u64,
+        awaiting_confirmation: u64,
+        pending: u64,
+        resolved: u64,
+        redeemed: u64,
+    ) {
+        self.winner_buy_scans = scans;
+        self.winner_buy_signals = signals;
+        self.winner_buy_attempts = attempts;
+        self.winner_buy_model_rejections = model_rejections;
+        self.winner_buy_awaiting_confirmation = awaiting_confirmation;
+        self.winner_buy_pending = pending;
+        self.winner_buy_resolved = resolved;
+        self.winner_buy_redeemed = redeemed;
+    }
+
+    pub fn set_execution_mode(&mut self, mode: impl Into<String>) {
+        self.execution_mode = mode.into();
+    }
+
+    pub fn set_strategy_states(
+        &mut self,
+        arbitrage: StrategyDisplayState,
+        winner_buy: StrategyDisplayState,
+        message: impl Into<String>,
+    ) {
+        self.arbitrage_state = arbitrage;
+        self.winner_buy_state = winner_buy;
+        self.strategy_message = message.into();
+    }
+
+    pub fn set_runtime_health(&mut self, market_ws: bool, user_ws: bool, rtds: bool, safety: bool) {
+        for (name, healthy) in [
+            ("MARKET WS", market_ws),
+            ("USER WS", user_ws),
+            ("RTDS", rtds),
+            ("SAFETY", safety),
+        ] {
+            if let Some(service) = self
+                .services
+                .iter_mut()
+                .find(|service| service.name == name)
+            {
+                service.status = if healthy {
+                    HealthStatus::Ok
+                } else {
+                    HealthStatus::Err
+                };
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_strategy_metrics(
+        &mut self,
+        opportunities_admitted: u64,
+        opportunities_rejected: u64,
+        depth_rejections: u64,
+        risk_rejections: u64,
+        quote_rejections: u64,
+        trades_started: u64,
+        trades_succeeded: u64,
+        trades_failed: u64,
+        paper_one_sided: u64,
+        paper_pnl: f64,
+        winner_data_rejections: u64,
+        winner_market_rejections: u64,
+        winner_boundary_rejections: u64,
+        winner_ev_rejections: u64,
+        winner_shadow_ev_failures: u64,
+    ) {
+        self.opportunities_admitted = opportunities_admitted;
+        self.opportunities_rejected = opportunities_rejected;
+        self.depth_rejections = depth_rejections;
+        self.risk_rejections = risk_rejections;
+        self.quote_rejections = quote_rejections;
+        self.trades_started = trades_started;
+        self.trades_succeeded = trades_succeeded;
+        self.trades_failed = trades_failed;
+        self.paper_one_sided = paper_one_sided;
+        self.paper_pnl = paper_pnl;
+        self.winner_data_rejections = winner_data_rejections;
+        self.winner_market_rejections = winner_market_rejections;
+        self.winner_boundary_rejections = winner_boundary_rejections;
+        self.winner_ev_rejections = winner_ev_rejections;
+        self.winner_shadow_ev_failures = winner_shadow_ev_failures;
+    }
+
     pub fn on_render_tick(&mut self) {
         self.frame = self.frame.wrapping_add(1);
 
@@ -638,17 +801,34 @@ impl DashboardState {
             crossterm::event::KeyCode::Char('q') | crossterm::event::KeyCode::Esc => {
                 DashboardAction::Quit
             }
-            crossterm::event::KeyCode::Up | crossterm::event::KeyCode::Char('k') => {
-                if self.selected_market > 0 {
-                    self.selected_market -= 1;
-                }
+            crossterm::event::KeyCode::Up
+            | crossterm::event::KeyCode::Left
+            | crossterm::event::KeyCode::Char('k') => {
+                self.selected_strategy = self.selected_strategy.saturating_sub(1);
                 DashboardAction::None
             }
-            crossterm::event::KeyCode::Down | crossterm::event::KeyCode::Char('j') => {
-                if self.selected_market + 1 < self.markets.len() {
-                    self.selected_market += 1;
-                }
+            crossterm::event::KeyCode::Down
+            | crossterm::event::KeyCode::Right
+            | crossterm::event::KeyCode::Char('j') => {
+                self.selected_strategy = (self.selected_strategy + 1).min(1);
                 DashboardAction::None
+            }
+            crossterm::event::KeyCode::Char('1') => {
+                self.selected_strategy = 0;
+                DashboardAction::None
+            }
+            crossterm::event::KeyCode::Char('2') => {
+                self.selected_strategy = 1;
+                DashboardAction::None
+            }
+            crossterm::event::KeyCode::Char(' ') => {
+                DashboardAction::ToggleStrategy(self.selected_strategy)
+            }
+            crossterm::event::KeyCode::Char('p') | crossterm::event::KeyCode::Char('P') => {
+                DashboardAction::PauseAll
+            }
+            crossterm::event::KeyCode::Char('y') | crossterm::event::KeyCode::Char('Y') => {
+                DashboardAction::ConfirmEnable
             }
             _ => DashboardAction::None,
         }
@@ -658,6 +838,9 @@ impl DashboardState {
 pub enum DashboardAction {
     None,
     Quit,
+    ToggleStrategy(usize),
+    PauseAll,
+    ConfirmEnable,
 }
 
 #[derive(Clone)]
@@ -744,14 +927,53 @@ mod tests {
     }
 
     #[test]
+    fn event_history_prefixes_each_entry_with_utc_time() {
+        let mut state = DashboardState::new_live(String::from("GTD"), 1000.0);
+        state.push_event("test event");
+        let latest = state.recent_events(1).pop().unwrap();
+        assert!(latest.starts_with('['));
+        assert_eq!(latest.as_bytes().get(3), Some(&b':'));
+        assert_eq!(latest.as_bytes().get(6), Some(&b':'));
+        assert!(latest.contains("] test event"));
+    }
+
+    #[test]
     fn stale_market_shows_dash_after_threshold() {
         let mut state = DashboardState::new_live(String::from("GTD"), 1000.0);
         state.update_market("BTC", Some(0.60), Some(0.40), false);
-        let row = state.markets.iter_mut().find(|m| m.symbol == "BTC").unwrap();
+        let row = state
+            .markets
+            .iter_mut()
+            .find(|m| m.symbol == "BTC")
+            .unwrap();
         // Simulate an old update: force last_update far in the past.
         row.last_update = Some(Instant::now() - Duration::from_secs(MARKET_PRICE_STALE_SECS + 5));
-        assert_eq!(row.market_fresh(), false);
+        assert!(!row.market_fresh());
         assert_eq!(row.yes_display(), None);
         assert_eq!(row.no_display(), None);
+    }
+
+    #[test]
+    fn strategy_keyboard_navigation_emits_control_actions() {
+        let mut state = DashboardState::new_live("FAK", 1000.0);
+        assert_eq!(state.selected_strategy, 0);
+        assert!(matches!(
+            state.on_key(crossterm::event::KeyCode::Char(' ')),
+            DashboardAction::ToggleStrategy(0)
+        ));
+        state.on_key(crossterm::event::KeyCode::Down);
+        assert_eq!(state.selected_strategy, 1);
+        state.on_key(crossterm::event::KeyCode::Left);
+        assert_eq!(state.selected_strategy, 0);
+        state.on_key(crossterm::event::KeyCode::Right);
+        assert_eq!(state.selected_strategy, 1);
+        assert!(matches!(
+            state.on_key(crossterm::event::KeyCode::Char(' ')),
+            DashboardAction::ToggleStrategy(1)
+        ));
+        assert!(matches!(
+            state.on_key(crossterm::event::KeyCode::Char('p')),
+            DashboardAction::PauseAll
+        ));
     }
 }

@@ -10,12 +10,17 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 
+use crate::ui::control::{ControlResult, StrategyControls, StrategyKind};
 use crate::ui::render;
 use crate::ui::state::{DashboardAction, DashboardState};
 
-pub fn spawn_dashboard_thread(state: Arc<Mutex<DashboardState>>, shutdown: Arc<AtomicBool>) {
+pub fn spawn_dashboard_thread(
+    state: Arc<Mutex<DashboardState>>,
+    shutdown: Arc<AtomicBool>,
+    controls: Arc<StrategyControls>,
+) {
     std::thread::spawn(move || {
-        if let Err(e) = run_dashboard(state, shutdown) {
+        if let Err(e) = run_dashboard(state, shutdown, controls) {
             let _ = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -28,7 +33,11 @@ pub fn spawn_dashboard_thread(state: Arc<Mutex<DashboardState>>, shutdown: Arc<A
     });
 }
 
-fn run_dashboard(state: Arc<Mutex<DashboardState>>, shutdown: Arc<AtomicBool>) -> io::Result<()> {
+fn run_dashboard(
+    state: Arc<Mutex<DashboardState>>,
+    shutdown: Arc<AtomicBool>,
+    controls: Arc<StrategyControls>,
+) -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout: Stdout = stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -60,6 +69,55 @@ fn run_dashboard(state: Arc<Mutex<DashboardState>>, shutdown: Arc<AtomicBool>) -
                         shutdown.store(true, Ordering::Relaxed);
                         break;
                     }
+                    let result = match action {
+                        DashboardAction::ToggleStrategy(0) => {
+                            Some(controls.toggle(StrategyKind::Arbitrage))
+                        }
+                        DashboardAction::ToggleStrategy(1) => {
+                            Some(controls.toggle(StrategyKind::WinnerBuy))
+                        }
+                        DashboardAction::PauseAll => {
+                            controls.pause_all();
+                            let mut app = state.lock().expect("dashboard lock");
+                            app.push_event("All strategy entries manually paused");
+                            None
+                        }
+                        DashboardAction::ConfirmEnable => Some(controls.confirm()),
+                        _ => None,
+                    };
+                    if let Some(result) = result {
+                        let mut app = state.lock().expect("dashboard lock");
+                        match result {
+                            ControlResult::Changed { strategy, enabled } => {
+                                tracing::info!(
+                                    ?strategy,
+                                    enabled,
+                                    "Strategy runtime state changed from TUI"
+                                );
+                                app.push_event(format!(
+                                    "{} {}",
+                                    strategy_name(strategy),
+                                    if enabled { "started" } else { "paused" }
+                                ))
+                            }
+                            ControlResult::ConfirmationRequired { strategy } => {
+                                app.push_event(format!(
+                                    "Enable LIVE {}? Press Y within 5 seconds",
+                                    strategy_name(strategy)
+                                ))
+                            }
+                            ControlResult::Rejected(reason) => {
+                                tracing::warn!(%reason, "Strategy control rejected");
+                                app.push_event(format!("Strategy control rejected: {reason}"));
+                            }
+                        }
+                    }
+                    let mut app = state.lock().expect("dashboard lock");
+                    app.set_strategy_states(
+                        controls.state(StrategyKind::Arbitrage),
+                        controls.state(StrategyKind::WinnerBuy),
+                        controls.blocked_reason(),
+                    );
                 }
             }
         }
@@ -77,4 +135,11 @@ fn run_dashboard(state: Arc<Mutex<DashboardState>>, shutdown: Arc<AtomicBool>) -
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     Ok(())
+}
+
+fn strategy_name(strategy: StrategyKind) -> &'static str {
+    match strategy {
+        StrategyKind::Arbitrage => "Spread Arbitrage",
+        StrategyKind::WinnerBuy => "Winner Buy",
+    }
 }

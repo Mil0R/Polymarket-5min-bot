@@ -1,6 +1,8 @@
 use crate::config::Config;
 use crate::market::MarketInfo;
-use crate::monitor::arbitrage::{ArbitrageDetector, ArbitrageOpportunity, ArbitrageScan};
+use crate::monitor::arbitrage::{
+    ArbitrageDetector, ArbitrageOpportunity, ArbitrageScan, ArbitrageShadowCandidate,
+};
 use crate::monitor::orderbook::{best_ask, OrderBookPair};
 use crate::opportunity_admission::{AdmissionContext, OpportunityAdmissionService};
 use crate::runtime_metrics::RuntimeMetrics;
@@ -20,11 +22,13 @@ pub struct MarketTick {
     pub market_display: String,
     pub market_symbol: String,
     pub opportunity: Option<ArbitrageOpportunity>,
+    pub shadow_candidate: Option<ArbitrageShadowCandidate>,
 }
 
 pub struct WindowSessionRunner {
     markets: HashMap<B256, MarketInfo>,
     last_prices: DashMap<B256, (Decimal, Decimal)>,
+    shadow_observations: DashMap<B256, (Decimal, Decimal, i64, i64)>,
     detector: ArbitrageDetector,
     admission: OpportunityAdmissionService,
     deduplicator: SignalDeduplicator,
@@ -42,6 +46,7 @@ impl WindowSessionRunner {
                 .map(|market| (market.market_id, market))
                 .collect(),
             last_prices: DashMap::new(),
+            shadow_observations: DashMap::new(),
             detector: ArbitrageDetector::with_min_depth(
                 config.min_profit_threshold,
                 config.min_ask_depth_usdc,
@@ -86,21 +91,52 @@ impl WindowSessionRunner {
         } else {
             format!("{market_symbol} prediction market")
         };
+        let mut shadow_candidate = None;
         let opportunity = (|| {
             let total_price = total_ask_price?;
-            let scan = self
-                .detector
-                .check_arbitrage_reasoned(&pair.yes_book, &pair.no_book, &pair.market_id);
+            let scan = self.detector.check_arbitrage_reasoned(
+                &pair.yes_book,
+                &pair.no_book,
+                &pair.market_id,
+            );
             let opportunity = match scan {
-                ArbitrageScan::Opportunity(opportunity) => opportunity,
-                ArbitrageScan::DepthRejected => {
+                ArbitrageScan::Opportunity(opportunity) => {
+                    self.shadow_observations.remove(&pair.market_id);
+                    opportunity
+                }
+                ArbitrageScan::DepthRejected(mut candidate) => {
                     self.metrics.record_depth_rejection();
+                    let first_seen_at_ms = self
+                        .shadow_observations
+                        .get(&pair.market_id)
+                        .filter(|previous| {
+                            previous.0 == candidate.yes_ask_price
+                                && previous.1 == candidate.no_ask_price
+                                && now_ms.saturating_sub(previous.3) <= self.max_book_age_ms
+                        })
+                        .map(|previous| previous.2)
+                        .unwrap_or(now_ms);
+                    candidate.first_seen_at_ms = first_seen_at_ms;
+                    candidate.observed_duration_ms = now_ms.saturating_sub(first_seen_at_ms);
+                    self.shadow_observations.insert(
+                        pair.market_id,
+                        (
+                            candidate.yes_ask_price,
+                            candidate.no_ask_price,
+                            first_seen_at_ms,
+                            now_ms,
+                        ),
+                    );
+                    shadow_candidate = Some(candidate);
                     return None;
                 }
-                ArbitrageScan::NoEdge => return None,
+                ArbitrageScan::NoEdge => {
+                    self.shadow_observations.remove(&pair.market_id);
+                    return None;
+                }
             };
-            let now = chrono::DateTime::from_timestamp_millis(now_ms)
-                .unwrap_or_else(chrono::Utc::now);
+            let now =
+                chrono::DateTime::from_timestamp_millis(now_ms).unwrap_or_else(chrono::Utc::now);
             let result = self.admission.evaluate(
                 &opportunity,
                 AdmissionContext {
@@ -137,6 +173,7 @@ impl WindowSessionRunner {
             market_display,
             market_symbol,
             opportunity,
+            shadow_candidate,
         })
     }
 
@@ -200,11 +237,13 @@ mod tests {
             title: "BTC Up or Down".into(),
             end_date: Utc::now() + chrono::Duration::minutes(2),
             crypto_symbol: "btc".into(),
+            neg_risk: false,
             outcome_prices: Some((dec!(0.5), dec!(0.5))),
         };
         WindowSessionRunner {
             markets: HashMap::from([(market_id, market)]),
             last_prices: DashMap::new(),
+            shadow_observations: DashMap::new(),
             detector: ArbitrageDetector::new(0.001),
             admission: OpportunityAdmissionService::new(dec!(0.99), dec!(0), dec!(0), 0, false),
             deduplicator: SignalDeduplicator::new(Duration::from_secs(3)),

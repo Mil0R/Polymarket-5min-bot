@@ -11,7 +11,7 @@ use rust_decimal_macros::dec;
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr as _;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
@@ -176,14 +176,30 @@ impl WindDownService {
         }
     }
 
-    pub async fn run(self, allowed_conditions: HashSet<B256>, allowed_tokens: HashSet<U256>) {
+    pub async fn run(
+        self,
+        allowed_conditions: HashSet<B256>,
+        allowed_tokens: HashSet<U256>,
+        protected_tokens: Arc<RwLock<HashSet<U256>>>,
+    ) {
         const BETWEEN_MERGES: Duration = Duration::from_secs(30);
         if self.config.dry_run {
             info!("DRY_RUN: simulated wind-down; no writes submitted");
             self.in_progress.store(false, Ordering::Relaxed);
             return;
         }
-        match self.executor.cancel_window_orders(&allowed_tokens).await {
+        let protected_count = protected_tokens
+            .read()
+            .expect("winner token lock poisoned")
+            .len();
+        if protected_count > 0 {
+            info!(
+                protected = protected_count,
+                "Winner-buy hold-to-settlement tokens excluded from wind-down"
+            );
+        }
+        let wind_down_tokens = unprotected_tokens(&allowed_tokens, &protected_tokens);
+        match self.executor.cancel_window_orders(&wind_down_tokens).await {
             Ok(count) => info!(count, "Wind-down orders cancelled"),
             Err(error) => warn!(%error, "Wind-down cancellation failed; continuing"),
         }
@@ -195,9 +211,20 @@ impl WindDownService {
             match get_positions().await {
                 Ok(fetched) => {
                     let details = merge_info(&fetched);
+                    let protected_snapshot = protected_tokens
+                        .read()
+                        .expect("winner token lock poisoned")
+                        .clone();
                     let ids: Vec<_> = mergeable_conditions(&fetched)
                         .into_iter()
-                        .filter(|id| allowed_conditions.contains(id))
+                        .filter(|id| {
+                            allowed_conditions.contains(id)
+                                && !condition_contains_protected_token(
+                                    *id,
+                                    &details,
+                                    &protected_snapshot,
+                                )
+                        })
                         .collect();
                     let count = ids.len();
                     for (index, condition_id) in ids.into_iter().enumerate() {
@@ -231,10 +258,11 @@ impl WindDownService {
         }
 
         let price = Decimal::try_from(self.config.wind_down_sell_price).unwrap_or(dec!(0.01));
+        let wind_down_tokens = unprotected_tokens(&allowed_tokens, &protected_tokens);
         match get_positions().await {
             Ok(fetched) => {
                 for position in fetched.iter().filter(|position| {
-                    position.size > dec!(0) && allowed_tokens.contains(&position.asset)
+                    position.size > dec!(0) && wind_down_tokens.contains(&position.asset)
                 }) {
                     let size = (position.size * dec!(100)).floor() / dec!(100);
                     if size < dec!(0.01) {
@@ -258,6 +286,24 @@ impl WindDownService {
     }
 }
 
+fn unprotected_tokens(
+    allowed_tokens: &HashSet<U256>,
+    protected_tokens: &RwLock<HashSet<U256>>,
+) -> HashSet<U256> {
+    let protected = protected_tokens.read().expect("winner token lock poisoned");
+    allowed_tokens.difference(&protected).copied().collect()
+}
+
+fn condition_contains_protected_token(
+    condition_id: B256,
+    details: &MergeInfo,
+    protected_tokens: &HashSet<U256>,
+) -> bool {
+    details
+        .get(&condition_id)
+        .is_some_and(|(yes, no, _)| protected_tokens.contains(yes) || protected_tokens.contains(no))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,5 +311,39 @@ mod tests {
     #[test]
     fn converts_raw_shares_using_six_decimals() {
         assert_eq!(raw_shares_to_decimal(U256::from(1_250_000_u64)), dec!(1.25));
+    }
+
+    #[test]
+    fn protected_winner_token_excludes_its_condition_from_merge() {
+        let condition = B256::repeat_byte(7);
+        let yes = U256::from(10);
+        let no = U256::from(11);
+        let details = HashMap::from([(condition, (yes, no, dec!(5)))]);
+
+        assert!(condition_contains_protected_token(
+            condition,
+            &details,
+            &HashSet::from([yes])
+        ));
+        assert!(!condition_contains_protected_token(
+            condition,
+            &details,
+            &HashSet::new()
+        ));
+    }
+
+    #[test]
+    fn wind_down_reads_winner_protection_dynamically() {
+        let yes = U256::from(10);
+        let no = U256::from(11);
+        let allowed = HashSet::from([yes, no]);
+        let protected = RwLock::new(HashSet::new());
+        assert_eq!(unprotected_tokens(&allowed, &protected), allowed);
+
+        protected.write().unwrap().insert(yes);
+        assert_eq!(
+            unprotected_tokens(&allowed, &protected),
+            HashSet::from([no])
+        );
     }
 }

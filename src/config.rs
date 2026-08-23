@@ -93,6 +93,8 @@ pub struct Config {
     /// Order type for arbitrage: GTC (good till cancel), GTD (with gtd_expiration_secs), FOK (fill or kill), FAK (fill and kill remainder)
     pub arbitrage_order_type: OrderType,
     pub stop_arbitrage_before_end_minutes: u64, // Stop arbitrage N minutes before market end, default 0 (no stop)
+    /// Initial runtime state for the YES+NO spread arbitrage strategy.
+    pub arbitrage_enabled: bool,
     /// Window-end "buy the determined winner" strategy (single-leg directional buy).
     pub winner_buy_enabled: bool,
     /// Trigger when the window has this many seconds left.
@@ -105,6 +107,33 @@ pub struct Config {
     pub winner_buy_max_order_usdc: f64,
     /// Max winner buys per window (0 = unlimited).
     pub winner_buy_max_per_window: u32,
+    /// Stop Winner Buy after cumulative realized losses reach this amount.
+    pub winner_buy_max_strategy_loss_usdc: f64,
+    /// Stop Winner Buy for one asset after its realized losses reach this amount.
+    pub winner_buy_max_asset_loss_usdc: f64,
+    /// Stop Winner Buy after this many consecutive losing settlements (0 = disabled).
+    pub winner_buy_max_consecutive_losses: u32,
+    /// Automatically redeem confirmed winning tokens in live mode.
+    pub winner_buy_auto_redeem: bool,
+    /// Polymarket RTDS endpoint for the official Chainlink 60-second TWAP.
+    pub winner_buy_rtds_url: String,
+    pub winner_buy_feed_max_age_ms: i64,
+    pub winner_buy_opening_max_skew_ms: i64,
+    pub winner_buy_volatility_lookback_secs: u64,
+    pub winner_buy_min_observations: usize,
+    pub winner_buy_confirmation_observations: u32,
+    pub winner_buy_max_attempts_per_market: u32,
+    pub winner_buy_min_margin_bps: f64,
+    pub winner_buy_reversal_sigma: f64,
+    pub winner_buy_max_spread: f64,
+    pub winner_buy_min_depth_usdc: f64,
+    pub winner_buy_min_net_ev: f64,
+    pub winner_buy_btc_min_volatility_bps: f64,
+    pub winner_buy_eth_min_volatility_bps: f64,
+    pub winner_buy_other_min_volatility_bps: f64,
+    pub winner_buy_btc_model_risk_buffer: f64,
+    pub winner_buy_eth_model_risk_buffer: f64,
+    pub winner_buy_other_model_risk_buffer: f64,
     /// Scheduled Merge interval (minutes); 0 = disabled. CONDITION_ID from current window markets like orderbook.
     pub merge_interval_minutes: u64,
     /// YES price threshold: only execute arbitrage when YES >= this, default 0.0 (no limit)
@@ -125,6 +154,13 @@ pub struct Config {
     pub wind_down_sell_price: f64,
     /// Optional append-only JSON opportunity log. Disabled when unset.
     pub arbitrage_log_file: Option<String>,
+    /// Optional append-only shadow log for price-positive candidates rejected
+    /// by the production depth floor. It never changes execution admission.
+    pub arbitrage_shadow_log_file: Option<String>,
+    /// Winner Buy order/fill/settlement lifecycle journal.
+    pub winner_buy_state_journal_file: String,
+    /// Winner Buy candidate and counterfactual evaluation journal.
+    pub winner_buy_evaluation_journal_file: String,
     /// Observe and simulate fills without submitting, cancelling, merging or selling.
     pub dry_run: bool,
     /// Explicit, fail-closed mode for the first real-money validation run.
@@ -139,6 +175,8 @@ pub struct Config {
     pub paper_initial_balance_usdc: f64,
     pub paper_liquidity_haircut: f64,
     pub paper_second_leg_delay_ms: u64,
+    /// Dry-run latency before re-reading the live book for Winner Buy fills.
+    pub paper_winner_buy_delay_ms: u64,
     /// Reject orderbook snapshots older than this many milliseconds.
     pub max_book_age_ms: i64,
     /// Reject YES/NO snapshots farther apart than this many milliseconds.
@@ -162,6 +200,16 @@ impl Config {
             ),
             _ => None,
         };
+
+        let dry_run = env_bool("DRY_RUN", false)?;
+        let mode = if dry_run { "paper" } else { "live" };
+        let state_journal_file = env::var("ARBITRAGE_STATE_JOURNAL_FILE")
+            .or_else(|_| env::var("STATE_JOURNAL_FILE"))
+            .unwrap_or_else(|_| format!("results/spread-arbitrage/{mode}/orders.ndjson"));
+        let winner_buy_state_journal_file = env::var("WINNER_BUY_STATE_JOURNAL_FILE")
+            .unwrap_or_else(|_| format!("results/winner-buy/{mode}/orders.ndjson"));
+        let winner_buy_evaluation_journal_file = env::var("WINNER_BUY_EVALUATION_JOURNAL_FILE")
+            .unwrap_or_else(|_| format!("results/winner-buy/{mode}/evaluations.ndjson"));
 
         let config = Config {
             private_key: normalize_private_key(
@@ -196,12 +244,66 @@ impl Config {
                 &env::var("ARBITRAGE_ORDER_TYPE").unwrap_or_else(|_| "GTD".to_string()),
             )?,
             stop_arbitrage_before_end_minutes: env_parse("STOP_ARBITRAGE_BEFORE_END_MINUTES", "0")?,
+            arbitrage_enabled: env_bool("ARBITRAGE_ENABLED", true)?,
             winner_buy_enabled: env_bool("WINNER_BUY_ENABLED", false)?,
             winner_buy_before_end_secs: env_parse("WINNER_BUY_BEFORE_END_SECS", "30")?,
             winner_buy_min_price: env_parse("WINNER_BUY_MIN_PRICE", "0.95")?,
             winner_buy_max_price: env_parse("WINNER_BUY_MAX_PRICE", "0.99")?,
             winner_buy_max_order_usdc: env_parse("WINNER_BUY_MAX_ORDER_USDC", "50.0")?,
             winner_buy_max_per_window: env_parse("WINNER_BUY_MAX_PER_WINDOW", "1")?,
+            winner_buy_max_strategy_loss_usdc: env_parse(
+                "WINNER_BUY_MAX_STRATEGY_LOSS_USDC",
+                "20.0",
+            )?,
+            winner_buy_max_asset_loss_usdc: env_parse("WINNER_BUY_MAX_ASSET_LOSS_USDC", "10.0")?,
+            winner_buy_max_consecutive_losses: env_parse("WINNER_BUY_MAX_CONSECUTIVE_LOSSES", "3")?,
+            winner_buy_auto_redeem: env_bool("WINNER_BUY_AUTO_REDEEM", false)?,
+            winner_buy_rtds_url: env::var("WINNER_BUY_RTDS_URL")
+                .unwrap_or_else(|_| "wss://ws-live-data.polymarket.com".to_string()),
+            winner_buy_feed_max_age_ms: env_parse("WINNER_BUY_FEED_MAX_AGE_MS", "5000")?,
+            winner_buy_opening_max_skew_ms: env_parse("WINNER_BUY_OPENING_MAX_SKEW_MS", "5000")?,
+            winner_buy_volatility_lookback_secs: env_parse(
+                "WINNER_BUY_VOLATILITY_LOOKBACK_SECS",
+                "120",
+            )?,
+            winner_buy_min_observations: env_parse("WINNER_BUY_MIN_OBSERVATIONS", "10")?,
+            winner_buy_confirmation_observations: env_parse(
+                "WINNER_BUY_CONFIRMATION_OBSERVATIONS",
+                "3",
+            )?,
+            winner_buy_max_attempts_per_market: env_parse(
+                "WINNER_BUY_MAX_ATTEMPTS_PER_MARKET",
+                "1",
+            )?,
+            winner_buy_min_margin_bps: env_parse("WINNER_BUY_MIN_MARGIN_BPS", "3.0")?,
+            winner_buy_reversal_sigma: env_parse("WINNER_BUY_REVERSAL_SIGMA", "2.0")?,
+            winner_buy_max_spread: env_parse("WINNER_BUY_MAX_SPREAD", "0.03")?,
+            winner_buy_min_depth_usdc: env_parse("WINNER_BUY_MIN_DEPTH_USDC", "10.0")?,
+            winner_buy_min_net_ev: env_parse("WINNER_BUY_MIN_NET_EV", "0.002")?,
+            winner_buy_btc_min_volatility_bps: env_parse(
+                "WINNER_BUY_BTC_MIN_VOLATILITY_BPS",
+                "0.8",
+            )?,
+            winner_buy_eth_min_volatility_bps: env_parse(
+                "WINNER_BUY_ETH_MIN_VOLATILITY_BPS",
+                "1.2",
+            )?,
+            winner_buy_other_min_volatility_bps: env_parse(
+                "WINNER_BUY_OTHER_MIN_VOLATILITY_BPS",
+                "1.5",
+            )?,
+            winner_buy_btc_model_risk_buffer: env_parse(
+                "WINNER_BUY_BTC_MODEL_RISK_BUFFER",
+                "0.01",
+            )?,
+            winner_buy_eth_model_risk_buffer: env_parse(
+                "WINNER_BUY_ETH_MODEL_RISK_BUFFER",
+                "0.015",
+            )?,
+            winner_buy_other_model_risk_buffer: env_parse(
+                "WINNER_BUY_OTHER_MODEL_RISK_BUFFER",
+                "0.02",
+            )?,
             merge_interval_minutes: env_parse("MERGE_INTERVAL_MINUTES", "0")?,
             min_yes_price_threshold: env_parse("MIN_YES_PRICE_THRESHOLD", "0.0")?,
             min_no_price_threshold: env_parse("MIN_NO_PRICE_THRESHOLD", "0.0")?,
@@ -217,7 +319,12 @@ impl Config {
             arbitrage_log_file: env::var("ARBITRAGE_LOG_FILE")
                 .ok()
                 .filter(|value| !value.trim().is_empty()),
-            dry_run: env_bool("DRY_RUN", false)?,
+            arbitrage_shadow_log_file: env::var("ARBITRAGE_SHADOW_LOG_FILE")
+                .ok()
+                .filter(|value| !value.trim().is_empty()),
+            winner_buy_state_journal_file,
+            winner_buy_evaluation_journal_file,
+            dry_run,
             canary_mode: env_bool("CANARY_MODE", false)?,
             canary_max_pair_notional_usdc: env_parse("CANARY_MAX_PAIR_NOTIONAL_USDC", "3.0")?,
             canary_max_total_notional_usdc: env_parse("CANARY_MAX_TOTAL_NOTIONAL_USDC", "3.0")?,
@@ -228,11 +335,11 @@ impl Config {
             paper_initial_balance_usdc: env_parse("PAPER_INITIAL_BALANCE_USDC", "50.0")?,
             paper_liquidity_haircut: env_parse("PAPER_LIQUIDITY_HAIRCUT", "0.75")?,
             paper_second_leg_delay_ms: env_parse("PAPER_SECOND_LEG_DELAY_MS", "250")?,
+            paper_winner_buy_delay_ms: env_parse("PAPER_WINNER_BUY_DELAY_MS", "250")?,
             max_book_age_ms: env_parse("MAX_BOOK_AGE_MS", "2000")?,
             max_book_skew_ms: env_parse("MAX_BOOK_SKEW_MS", "1000")?,
             signal_cooldown_ms: env_parse("SIGNAL_COOLDOWN_MS", "3000")?,
-            state_journal_file: env::var("STATE_JOURNAL_FILE")
-                .unwrap_or_else(|_| "order-state.ndjson".to_string()),
+            state_journal_file,
             allow_unresolved_state: env_bool("ALLOW_UNRESOLVED_STATE", false)?,
         };
         config.validate()?;
@@ -243,8 +350,8 @@ impl Config {
         if self.private_key.is_empty() {
             bail!("POLYMARKET_PRIVATE_KEY cannot be empty");
         }
-        let is_hex64 = self.private_key.len() == 64
-            && self.private_key.chars().all(|c| c.is_ascii_hexdigit());
+        let is_hex64 =
+            self.private_key.len() == 64 && self.private_key.chars().all(|c| c.is_ascii_hexdigit());
         if !is_hex64 {
             bail!(
                 "POLYMARKET_PRIVATE_KEY must be a 64-character hex string without 0x prefix (got {} chars)",
@@ -316,6 +423,14 @@ impl Config {
                 "PAPER_INITIAL_BALANCE_USDC",
                 self.paper_initial_balance_usdc,
             ),
+            (
+                "WINNER_BUY_MAX_STRATEGY_LOSS_USDC",
+                self.winner_buy_max_strategy_loss_usdc,
+            ),
+            (
+                "WINNER_BUY_MAX_ASSET_LOSS_USDC",
+                self.winner_buy_max_asset_loss_usdc,
+            ),
         ] {
             if !value.is_finite() || value <= 0.0 {
                 bail!("{name} must be greater than 0");
@@ -327,8 +442,8 @@ impl Config {
         {
             bail!("PAPER_LIQUIDITY_HAIRCUT must be in (0, 1]");
         }
-        if self.paper_second_leg_delay_ms > 30_000 {
-            bail!("PAPER_SECOND_LEG_DELAY_MS cannot exceed 30000");
+        if self.paper_second_leg_delay_ms > 30_000 || self.paper_winner_buy_delay_ms > 30_000 {
+            bail!("paper execution delays cannot exceed 30000ms");
         }
         if self.canary_max_pair_notional_usdc > ABSOLUTE_CANARY_PAIR_LIMIT_USDC
             || self.canary_max_total_notional_usdc > ABSOLUTE_CANARY_TOTAL_LIMIT_USDC
@@ -340,6 +455,9 @@ impl Config {
         }
         if self.canary_max_pair_notional_usdc > self.canary_max_total_notional_usdc {
             bail!("CANARY_MAX_PAIR_NOTIONAL_USDC cannot exceed CANARY_MAX_TOTAL_NOTIONAL_USDC");
+        }
+        if self.winner_buy_max_asset_loss_usdc > self.winner_buy_max_strategy_loss_usdc {
+            bail!("WINNER_BUY_MAX_ASSET_LOSS_USDC cannot exceed WINNER_BUY_MAX_STRATEGY_LOSS_USDC");
         }
         if self.canary_max_pairs_per_window == 0
             || self.canary_max_pairs_per_window > 1
@@ -382,13 +500,77 @@ impl Config {
             bail!("MAX_BOOK_AGE_MS must be positive and MAX_BOOK_SKEW_MS cannot be negative");
         }
         if self.state_journal_file.trim().is_empty() {
-            bail!("STATE_JOURNAL_FILE cannot be empty");
+            bail!("ARBITRAGE_STATE_JOURNAL_FILE cannot be empty");
+        }
+        if self.winner_buy_state_journal_file.trim().is_empty() {
+            bail!("WINNER_BUY_STATE_JOURNAL_FILE cannot be empty");
+        }
+        if self.winner_buy_evaluation_journal_file.trim().is_empty() {
+            bail!("WINNER_BUY_EVALUATION_JOURNAL_FILE cannot be empty");
+        }
+        if !self.winner_buy_rtds_url.starts_with("wss://") {
+            bail!("WINNER_BUY_RTDS_URL must use wss://");
+        }
+        if self.winner_buy_feed_max_age_ms <= 0
+            || self.winner_buy_opening_max_skew_ms < 0
+            || self.winner_buy_volatility_lookback_secs == 0
+            || self.winner_buy_min_observations < 2
+            || self.winner_buy_confirmation_observations == 0
+            || self.winner_buy_max_attempts_per_market == 0
+        {
+            bail!("Winner Buy model timing, observation and attempt limits must be positive");
+        }
+        for (name, value) in [
+            ("WINNER_BUY_MIN_MARGIN_BPS", self.winner_buy_min_margin_bps),
+            ("WINNER_BUY_REVERSAL_SIGMA", self.winner_buy_reversal_sigma),
+            (
+                "WINNER_BUY_BTC_MIN_VOLATILITY_BPS",
+                self.winner_buy_btc_min_volatility_bps,
+            ),
+            (
+                "WINNER_BUY_ETH_MIN_VOLATILITY_BPS",
+                self.winner_buy_eth_min_volatility_bps,
+            ),
+            (
+                "WINNER_BUY_OTHER_MIN_VOLATILITY_BPS",
+                self.winner_buy_other_min_volatility_bps,
+            ),
+            ("WINNER_BUY_MIN_DEPTH_USDC", self.winner_buy_min_depth_usdc),
+        ] {
+            if !value.is_finite() || value <= 0.0 {
+                bail!("{name} must be finite and greater than 0");
+            }
+        }
+        for (name, value) in [
+            ("WINNER_BUY_MAX_SPREAD", self.winner_buy_max_spread),
+            ("WINNER_BUY_MIN_NET_EV", self.winner_buy_min_net_ev),
+            (
+                "WINNER_BUY_BTC_MODEL_RISK_BUFFER",
+                self.winner_buy_btc_model_risk_buffer,
+            ),
+            (
+                "WINNER_BUY_ETH_MODEL_RISK_BUFFER",
+                self.winner_buy_eth_model_risk_buffer,
+            ),
+            (
+                "WINNER_BUY_OTHER_MODEL_RISK_BUFFER",
+                self.winner_buy_other_model_risk_buffer,
+            ),
+        ] {
+            if !value.is_finite() || !(0.0..1.0).contains(&value) {
+                bail!("{name} must be finite and in [0, 1)");
+            }
         }
         if self.stop_arbitrage_before_end_minutes > 5
             || self.wind_down_before_window_end_minutes > 5
         {
             bail!("stop-arbitrage and wind-down minutes cannot exceed the 5-minute market window");
         }
+        validate_strategy_compatibility(
+            self.dry_run,
+            self.winner_buy_enabled,
+            self.wind_down_before_window_end_minutes,
+        )?;
         if self.proxy_address.is_none()
             && (!(signature == "eoa" || signature == "0")
                 || self.position_sync_interval_secs > 0
@@ -409,8 +591,34 @@ impl Config {
         {
             bail!("scheduled Merge or wind-down requires all POLY_BUILDER_* credentials");
         }
+        if !self.dry_run && self.winner_buy_enabled && self.winner_buy_auto_redeem {
+            if self.proxy_address.is_none() {
+                bail!("live WINNER_BUY_AUTO_REDEEM requires POLYMARKET_PROXY_ADDRESS");
+            }
+            if [
+                "POLY_BUILDER_API_KEY",
+                "POLY_BUILDER_SECRET",
+                "POLY_BUILDER_PASSPHRASE",
+            ]
+            .iter()
+            .any(|name| env::var(name).map(|v| v.trim().is_empty()).unwrap_or(true))
+            {
+                bail!("live WINNER_BUY_AUTO_REDEEM requires all POLY_BUILDER_* credentials");
+            }
+        }
         Ok(())
     }
+}
+
+fn validate_strategy_compatibility(
+    dry_run: bool,
+    winner_buy_enabled: bool,
+    wind_down_before_window_end_minutes: u64,
+) -> Result<()> {
+    if !dry_run && winner_buy_enabled && wind_down_before_window_end_minutes > 0 {
+        bail!("live WINNER_BUY_ENABLED and WIND_DOWN_BEFORE_WINDOW_END_MINUTES cannot be enabled together");
+    }
+    Ok(())
 }
 
 fn env_bool(name: &str, default: bool) -> Result<bool> {
@@ -465,5 +673,13 @@ mod tests {
         );
         assert_eq!(normalize_private_key("  abc123  "), "abc123");
         assert_eq!(normalize_private_key("abc123"), "abc123");
+    }
+
+    #[test]
+    fn live_winner_buy_and_wind_down_are_mutually_exclusive() {
+        assert!(validate_strategy_compatibility(false, true, 1).is_err());
+        assert!(validate_strategy_compatibility(true, true, 1).is_ok());
+        assert!(validate_strategy_compatibility(false, true, 0).is_ok());
+        assert!(validate_strategy_compatibility(false, false, 1).is_ok());
     }
 }

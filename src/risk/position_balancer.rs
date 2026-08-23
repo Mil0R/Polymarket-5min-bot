@@ -183,21 +183,21 @@ impl PositionBalancer {
         // Case 1: actual positions imbalanced (without pending)
         if position_diff >= self.threshold {
             if data.yes_position > data.no_position {
-                // YES excess: cancel all YES orders, cancel matching NO orders
-                let cancel_yes_order_ids: Vec<String> =
-                    data.yes_orders.iter().map(|o| o.order_id.clone()).collect();
+                // YES excess: stop adding YES. Keep NO orders because they
+                // reduce the actual imbalance when filled.
+                let (cancel_yes_order_ids, cancel_no_order_ids) =
+                    actual_imbalance_cancel_plan(data, self.threshold)
+                        .expect("actual imbalance was checked");
+                debug_assert!(cancel_no_order_ids.is_empty());
                 let cancel_yes_count = cancel_yes_order_ids.len();
 
-                // Cancel NO size: min(no_pending, yes_pending)
-                let cancel_no_size = yes_pending.min(no_pending);
-
-                if cancel_yes_count > 0 || cancel_no_size > dec!(0) {
+                if cancel_yes_count > 0 {
                     info!(
-                        "⚠️ YES excess detected | YES:{} NO:{} | cancel {} YES orders and ~{} NO pending",
+                        "⚠️ YES excess detected | YES:{} NO:{} | cancel {} YES orders; preserve {} NO pending",
                         data.yes_position,
                         data.no_position,
                         cancel_yes_count,
-                        cancel_no_size
+                        no_pending
                     );
 
                     // Cancel YES orders
@@ -210,62 +210,23 @@ impl PositionBalancer {
                             info!("✅ Cancelled {} YES orders", cancel_yes_count);
                         }
                     }
-
-                    // Cancel NO orders (by price, lowest first, until cancel_no_size)
-                    if cancel_no_size > dec!(0) {
-                        let mut no_orders_sorted = data.no_orders.clone();
-                        no_orders_sorted.sort_by(|a, b| {
-                            a.price
-                                .partial_cmp(&b.price)
-                                .unwrap_or(std::cmp::Ordering::Equal)
-                        });
-
-                        let mut cancel_no_order_ids = Vec::new();
-                        let mut accumulated_size = dec!(0);
-
-                        for order in no_orders_sorted {
-                            if accumulated_size >= cancel_no_size {
-                                break;
-                            }
-                            cancel_no_order_ids.push(order.order_id.clone());
-                            accumulated_size += order.pending_size;
-                        }
-
-                        if !cancel_no_order_ids.is_empty() {
-                            let cancel_no_order_ids_ref: Vec<&str> =
-                                cancel_no_order_ids.iter().map(|s| s.as_str()).collect();
-                            if let Err(e) = self
-                                .clob_client
-                                .cancel_orders(&cancel_no_order_ids_ref)
-                                .await
-                            {
-                                error!(error = %e, "Cancel NO orders failed");
-                            } else {
-                                info!(
-                                    "Cancelled {} NO orders (acc {} shares)",
-                                    cancel_no_order_ids.len(),
-                                    accumulated_size
-                                );
-                            }
-                        }
-                    }
                 }
             } else {
-                // NO excess: cancel all NO orders, cancel matching YES orders
-                let cancel_no_order_ids: Vec<String> =
-                    data.no_orders.iter().map(|o| o.order_id.clone()).collect();
+                // NO excess: stop adding NO. Keep YES orders because they
+                // reduce the actual imbalance when filled.
+                let (cancel_yes_order_ids, cancel_no_order_ids) =
+                    actual_imbalance_cancel_plan(data, self.threshold)
+                        .expect("actual imbalance was checked");
+                debug_assert!(cancel_yes_order_ids.is_empty());
                 let cancel_no_count = cancel_no_order_ids.len();
 
-                // Cancel YES size: min(yes_pending, no_pending)
-                let cancel_yes_size = no_pending.min(yes_pending);
-
-                if cancel_no_count > 0 || cancel_yes_size > dec!(0) {
+                if cancel_no_count > 0 {
                     info!(
-                        "⚠️ NO excess detected | YES:{} NO:{} | cancel {} NO orders and ~{} YES pending",
+                        "⚠️ NO excess detected | YES:{} NO:{} | cancel {} NO orders; preserve {} YES pending",
                         data.yes_position,
                         data.no_position,
                         cancel_no_count,
-                        cancel_yes_size
+                        yes_pending
                     );
 
                     // Cancel NO orders
@@ -276,45 +237,6 @@ impl PositionBalancer {
                             error!(error = %e, "Cancel NO orders failed");
                         } else {
                             info!("Cancelled {} NO orders", cancel_no_count);
-                        }
-                    }
-
-                    // Cancel YES orders (by price, lowest first)
-                    if cancel_yes_size > dec!(0) {
-                        let mut yes_orders_sorted = data.yes_orders.clone();
-                        yes_orders_sorted.sort_by(|a, b| {
-                            a.price
-                                .partial_cmp(&b.price)
-                                .unwrap_or(std::cmp::Ordering::Equal)
-                        });
-
-                        let mut cancel_yes_order_ids = Vec::new();
-                        let mut accumulated_size = dec!(0);
-
-                        for order in yes_orders_sorted {
-                            if accumulated_size >= cancel_yes_size {
-                                break;
-                            }
-                            cancel_yes_order_ids.push(order.order_id.clone());
-                            accumulated_size += order.pending_size;
-                        }
-
-                        if !cancel_yes_order_ids.is_empty() {
-                            let cancel_yes_order_ids_ref: Vec<&str> =
-                                cancel_yes_order_ids.iter().map(|s| s.as_str()).collect();
-                            if let Err(e) = self
-                                .clob_client
-                                .cancel_orders(&cancel_yes_order_ids_ref)
-                                .await
-                            {
-                                error!(error = %e, "❌ Cancel YES orders failed");
-                            } else {
-                                info!(
-                                    "✅ Cancelled {} YES orders (total {} shares)",
-                                    cancel_yes_order_ids.len(),
-                                    accumulated_size
-                                );
-                            }
                         }
                     }
                 }
@@ -441,4 +363,69 @@ struct OrderInfo {
     order_id: String,
     price: Decimal,
     pending_size: Decimal,
+}
+
+fn actual_imbalance_cancel_plan(
+    data: &MarketBalanceData,
+    threshold: Decimal,
+) -> Option<(Vec<String>, Vec<String>)> {
+    let diff = data.yes_position - data.no_position;
+    if diff.abs() < threshold {
+        return None;
+    }
+    if diff > dec!(0) {
+        Some((
+            data.yes_orders
+                .iter()
+                .map(|order| order.order_id.clone())
+                .collect(),
+            Vec::new(),
+        ))
+    } else {
+        Some((
+            Vec::new(),
+            data.no_orders
+                .iter()
+                .map(|order| order.order_id.clone())
+                .collect(),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn order(id: &str) -> OrderInfo {
+        OrderInfo {
+            order_id: id.into(),
+            price: dec!(0.5),
+            pending_size: dec!(2),
+        }
+    }
+
+    fn data(yes_position: Decimal, no_position: Decimal) -> MarketBalanceData {
+        MarketBalanceData {
+            yes_token_id: U256::from(1),
+            no_token_id: U256::from(2),
+            yes_position,
+            no_position,
+            yes_orders: vec![order("yes")],
+            no_orders: vec![order("no")],
+        }
+    }
+
+    #[test]
+    fn actual_yes_excess_preserves_no_hedge_orders() {
+        let (yes, no) = actual_imbalance_cancel_plan(&data(dec!(10), dec!(5)), dec!(2)).unwrap();
+        assert_eq!(yes, vec!["yes"]);
+        assert!(no.is_empty());
+    }
+
+    #[test]
+    fn actual_no_excess_preserves_yes_hedge_orders() {
+        let (yes, no) = actual_imbalance_cancel_plan(&data(dec!(5), dec!(10)), dec!(2)).unwrap();
+        assert!(yes.is_empty());
+        assert_eq!(no, vec!["no"]);
+    }
 }

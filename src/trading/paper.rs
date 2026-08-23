@@ -31,6 +31,8 @@ pub struct PaperSnapshot {
     pub paired_shares: Decimal,
     pub unmatched_cost: Decimal,
     pub theoretical_pnl: Decimal,
+    pub winner_realized_pnl: Decimal,
+    pub winner_positions_open: u64,
     pub pairs_attempted: u64,
 }
 
@@ -41,6 +43,8 @@ struct PaperLedger {
     paired_shares: Decimal,
     unmatched_cost: Decimal,
     theoretical_pnl: Decimal,
+    winner_realized_pnl: Decimal,
+    winner_positions_open: u64,
     pairs_attempted: u64,
 }
 
@@ -59,6 +63,8 @@ impl PaperTradingEngine {
                 paired_shares: dec!(0),
                 unmatched_cost: dec!(0),
                 theoretical_pnl: dec!(0),
+                winner_realized_pnl: dec!(0),
+                winner_positions_open: 0,
                 pairs_attempted: 0,
             }),
             settings,
@@ -103,6 +109,35 @@ impl PaperTradingEngine {
         )
     }
 
+    /// Apply persisted Winner Buy history before new paper orders are admitted.
+    pub fn restore_winner_history(
+        &self,
+        pending_cost: Decimal,
+        total_spent: Decimal,
+        realized_pnl: Decimal,
+        open_positions: u64,
+    ) -> PaperSnapshot {
+        let mut ledger = self.ledger.lock().expect("paper ledger lock poisoned");
+        ledger.cash_remaining = (ledger.cash_remaining + realized_pnl - pending_cost).max(dec!(0));
+        ledger.total_spent += total_spent.max(dec!(0));
+        ledger.unmatched_cost += pending_cost.max(dec!(0));
+        ledger.winner_realized_pnl += realized_pnl;
+        ledger.winner_positions_open += open_positions;
+        snapshot(&self.settings, &ledger)
+    }
+
+    /// Resolve one open Winner Buy position and release its locked paper cash.
+    pub fn settle_winner(&self, cost: Decimal, payout: Decimal) -> PaperSnapshot {
+        let mut ledger = self.ledger.lock().expect("paper ledger lock poisoned");
+        let cost = cost.max(dec!(0));
+        let payout = payout.max(dec!(0));
+        ledger.cash_remaining += payout;
+        ledger.unmatched_cost = (ledger.unmatched_cost - cost).max(dec!(0));
+        ledger.winner_realized_pnl += payout - cost;
+        ledger.winner_positions_open = ledger.winner_positions_open.saturating_sub(1);
+        snapshot(&self.settings, &ledger)
+    }
+
     #[cfg(test)]
     pub fn record_pair(&self, yes: PaperFill, no: PaperFill) -> PaperSnapshot {
         let mut ledger = self.ledger.lock().expect("paper ledger lock poisoned");
@@ -126,6 +161,23 @@ impl PaperReservation<'_> {
             .expect("paper ledger lock poisoned");
         ledger.cash_reserved = (ledger.cash_reserved - self.planned_cost).max(dec!(0));
         record_fills(&mut ledger, yes, no);
+        self.active = false;
+        snapshot(&self.engine.settings, &ledger)
+    }
+
+    pub fn commit_winner(mut self, fill: PaperFill) -> PaperSnapshot {
+        let mut ledger = self
+            .engine
+            .ledger
+            .lock()
+            .expect("paper ledger lock poisoned");
+        ledger.cash_reserved = (ledger.cash_reserved - self.planned_cost).max(dec!(0));
+        if fill.filled > dec!(0) {
+            ledger.cash_remaining = (ledger.cash_remaining - fill.cost).max(dec!(0));
+            ledger.total_spent += fill.cost;
+            ledger.unmatched_cost += fill.cost;
+            ledger.winner_positions_open += 1;
+        }
         self.active = false;
         snapshot(&self.engine.settings, &ledger)
     }
@@ -169,6 +221,8 @@ fn snapshot(settings: &PaperSettings, ledger: &PaperLedger) -> PaperSnapshot {
         paired_shares: ledger.paired_shares,
         unmatched_cost: ledger.unmatched_cost,
         theoretical_pnl: ledger.theoretical_pnl,
+        winner_realized_pnl: ledger.winner_realized_pnl,
+        winner_positions_open: ledger.winner_positions_open,
         pairs_attempted: ledger.pairs_attempted,
     }
 }
@@ -320,5 +374,46 @@ mod tests {
         assert!(engine.reserve(dec!(2)).is_err());
         drop(reservation);
         assert!(engine.reserve(dec!(5)).is_ok());
+    }
+
+    #[test]
+    fn winner_fill_locks_cash_until_resolution() {
+        let engine = PaperTradingEngine::new(PaperSettings {
+            initial_balance: dec!(20),
+            liquidity_haircut: dec!(1),
+            second_leg_delay_ms: 0,
+        });
+        let reservation = engine.reserve(dec!(10)).unwrap();
+        let filled = PaperFill {
+            requested: dec!(10),
+            filled: dec!(10),
+            cost: dec!(9.6),
+            average_price: dec!(0.96),
+        };
+        let open = reservation.commit_winner(filled);
+        assert_eq!(open.cash_remaining, dec!(10.4));
+        assert_eq!(open.unmatched_cost, dec!(9.6));
+        assert_eq!(open.winner_positions_open, 1);
+
+        let settled = engine.settle_winner(dec!(9.6), dec!(10));
+        assert_eq!(settled.cash_remaining, dec!(20.4));
+        assert_eq!(settled.unmatched_cost, dec!(0));
+        assert_eq!(settled.winner_realized_pnl, dec!(0.4));
+        assert_eq!(settled.winner_positions_open, 0);
+    }
+
+    #[test]
+    fn restored_winner_history_rebuilds_available_cash() {
+        let engine = PaperTradingEngine::new(PaperSettings {
+            initial_balance: dec!(100),
+            liquidity_haircut: dec!(1),
+            second_leg_delay_ms: 0,
+        });
+        let restored = engine.restore_winner_history(dec!(20), dec!(60), dec!(-5), 1);
+        assert_eq!(restored.cash_remaining, dec!(75));
+        assert_eq!(restored.total_spent, dec!(60));
+        assert_eq!(restored.unmatched_cost, dec!(20));
+        assert_eq!(restored.winner_realized_pnl, dec!(-5));
+        assert_eq!(restored.winner_positions_open, 1);
     }
 }

@@ -1,14 +1,76 @@
-//! Window-end "buy the determined winner" strategy.
+//! Window-end winner-candidate buy strategy.
 //!
-//! At the very end of an up/down window the direction is effectively decided:
-//! the winning side's best ask sits at 0.95-0.99 (guard orders provide deep
-//! liquidity there) while the losing side has no asks or sits near zero. Buying
-//! the winner and holding to settlement (pays 1.00) earns the 1-5% edge with a
-//! very high win rate. This is a single-leg directional buy — distinct from the
-//! YES+NO arbitrage strategy.
+//! Near the end of an up/down window, a high ask on one side and a cheap or
+//! absent opposite ask can identify a directional candidate. This is a
+//! single-leg trade with loss risk, not a YES+NO arbitrage; a fill remains
+//! pending until the market is verifiably closed and resolved.
 
+use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use std::fs::{File, OpenOptions};
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+use crate::winner_model::ModelEvaluation;
+
+/// Check freshness against the time of the check, not against a timestamp
+/// captured before an asynchronous REST request began.
+pub fn received_at_is_fresh(received_at_ms: i64, checked_at_ms: i64, max_age_ms: i64) -> bool {
+    checked_at_ms
+        .checked_sub(received_at_ms)
+        .is_some_and(|age| age >= 0 && age <= max_age_ms)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SettlementRetry {
+    attempts: u32,
+    next_query_at_ms: i64,
+}
+
+/// Per-market exponential retry schedule for Gamma settlement visibility.
+/// The state is deliberately in-memory: journal replay still remains the
+/// source of truth after a process restart.
+#[derive(Debug, Default)]
+pub struct SettlementBackoff {
+    retries: HashMap<String, SettlementRetry>,
+}
+
+impl SettlementBackoff {
+    pub fn should_query(&self, slug: &str, now_ms: i64) -> bool {
+        self.retries
+            .get(slug)
+            .is_none_or(|retry| now_ms >= retry.next_query_at_ms)
+    }
+
+    pub fn record_retry(&mut self, slug: &str, now_ms: i64) -> u64 {
+        let attempts = self
+            .retries
+            .get(slug)
+            .map(|retry| retry.attempts.saturating_add(1))
+            .unwrap_or(1);
+        let delay_secs = 10_u64
+            .saturating_mul(1_u64 << attempts.saturating_sub(1).min(3))
+            .min(60);
+        self.retries.insert(
+            slug.to_string(),
+            SettlementRetry {
+                attempts,
+                next_query_at_ms: now_ms
+                    .saturating_add(i64::try_from(delay_secs * 1_000).unwrap_or(60_000)),
+            },
+        );
+        delay_secs
+    }
+
+    pub fn clear(&mut self, slug: &str) {
+        self.retries.remove(slug);
+    }
+}
 
 /// Result of a winner-direction scan for one market.
 #[derive(Debug, Clone, PartialEq)]
@@ -19,15 +81,372 @@ pub struct WinnerSignal {
     pub price: Decimal,
 }
 
-/// A paper winner-buy position awaiting Polymarket settlement.
-#[derive(Debug, Clone)]
+/// A paper or live winner-buy position awaiting Polymarket settlement.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PendingWinnerBuy {
+    /// Stable idempotency key for persistence and settlement.
+    pub position_id: String,
+    /// Links the actual order lifecycle to its counterfactual model evaluation.
+    #[serde(default)]
+    pub evaluation_id: String,
+    /// Asset bucket used by the independent per-asset loss circuit breaker.
+    #[serde(default)]
+    pub asset: String,
     /// Market slug used to re-query gamma for the settlement result.
     pub slug: String,
+    /// CTF condition required for an eventual on-chain redemption.
+    #[serde(default)]
+    pub condition_id: String,
+    /// Whether this market uses the NegRisk redemption path.
+    #[serde(default)]
+    pub neg_risk: bool,
+    /// Bought token, retained so wind-down can protect this hold-to-settlement position.
+    pub token_id: String,
     /// True if the bought token is the YES (Up) side.
     pub token_is_yes: bool,
+    /// Requested shares and pre-trade limit retained for order-attempt audit.
+    #[serde(default)]
+    pub requested: Decimal,
+    #[serde(default)]
+    pub limit_price: Decimal,
+    #[serde(default)]
+    pub planned_cost: Decimal,
+    /// Independent Chainlink model inputs/outputs captured at order admission.
+    #[serde(default)]
+    pub opening_twap: Decimal,
+    #[serde(default)]
+    pub current_twap: Decimal,
+    #[serde(default)]
+    pub model_observed_at_ms: i64,
+    #[serde(default)]
+    pub model_probability: Decimal,
+    #[serde(default)]
+    pub model_net_ev: Decimal,
+    #[serde(default)]
+    pub directional_margin_bps: Decimal,
+    #[serde(default)]
+    pub reversal_boundary_bps: Decimal,
+    #[serde(default)]
+    pub book_spread: Decimal,
+    #[serde(default)]
+    pub book_depth_usdc: Decimal,
     pub filled: Decimal,
     pub price: Decimal,
+    /// Fee included in the effective entry price when known/estimated.
+    #[serde(default)]
+    pub fee: Decimal,
+    /// Scheduled market end. A live market must never be treated as resolved.
+    pub end_date: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WinnerEvaluation {
+    pub evaluation_id: String,
+    pub asset: String,
+    pub slug: String,
+    pub end_date: DateTime<Utc>,
+    pub evaluated_at: DateTime<Utc>,
+    pub window_start_ms: i64,
+    pub seconds_remaining: i64,
+    pub buy_yes: bool,
+    pub bid_price: Decimal,
+    pub ask_price: Decimal,
+    pub ask_size: Decimal,
+    pub fee_per_share: Decimal,
+    pub rejection: Option<String>,
+    #[serde(default)]
+    pub failed_checks: Vec<String>,
+    pub opening_twap: Option<Decimal>,
+    pub current_twap: Option<Decimal>,
+    pub model_observed_at_ms: Option<i64>,
+    pub model_probability: Decimal,
+    pub model_net_ev: Decimal,
+    pub directional_margin_bps: f64,
+    pub reversal_boundary_bps: f64,
+    pub volatility_bps_per_sqrt_second: f64,
+    pub spread: Decimal,
+    pub depth_usdc: Decimal,
+}
+
+impl WinnerEvaluation {
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_model(
+        evaluation_id: String,
+        asset: String,
+        slug: String,
+        end_date: DateTime<Utc>,
+        evaluated_at: DateTime<Utc>,
+        window_start_ms: i64,
+        seconds_remaining: i64,
+        buy_yes: bool,
+        bid_price: Decimal,
+        ask_price: Decimal,
+        ask_size: Decimal,
+        fee_per_share: Decimal,
+        model: &ModelEvaluation,
+    ) -> Self {
+        Self {
+            evaluation_id,
+            asset,
+            slug,
+            end_date,
+            evaluated_at,
+            window_start_ms,
+            seconds_remaining,
+            buy_yes,
+            bid_price,
+            ask_price,
+            ask_size,
+            fee_per_share,
+            rejection: model.rejection.map(|reason| format!("{reason:?}")),
+            failed_checks: model
+                .failed_checks
+                .iter()
+                .map(|reason| format!("{reason:?}"))
+                .collect(),
+            opening_twap: model.opening_twap,
+            current_twap: model.current_twap,
+            model_observed_at_ms: model.observed_at_ms,
+            model_probability: model.probability,
+            model_net_ev: model.net_ev,
+            directional_margin_bps: model.directional_margin_bps,
+            reversal_boundary_bps: model.reversal_boundary_bps,
+            volatility_bps_per_sqrt_second: model.volatility_bps_per_sqrt_second,
+            spread: model.spread,
+            depth_usdc: model.depth_notional,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+enum WinnerEvaluationEvent {
+    Evaluated {
+        version: u8,
+        evaluation: Box<WinnerEvaluation>,
+    },
+    Resolved {
+        version: u8,
+        evaluation_id: String,
+        slug: String,
+        won: bool,
+        counterfactual_pnl_per_share: Decimal,
+        resolved_at: DateTime<Utc>,
+    },
+    /// One record per slug, so profitability reports do not accidentally
+    /// overweight markets that were evaluated more than once.
+    MarketResolved {
+        version: u8,
+        slug: String,
+        evaluation_count: usize,
+        selected_evaluation_id: String,
+        buy_yes: bool,
+        won: bool,
+        counterfactual_pnl_per_share: Decimal,
+        resolved_at: DateTime<Utc>,
+    },
+}
+
+/// Append-only counterfactual dataset. Unlike the position journal, it keeps
+/// rejected/no-fill candidates so thresholds can later be calibrated without
+/// survivorship bias.
+pub struct WinnerEvaluationJournal {
+    path: PathBuf,
+    writer: Mutex<File>,
+    unresolved: Mutex<HashMap<String, WinnerEvaluation>>,
+}
+
+impl WinnerEvaluationJournal {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut unresolved = HashMap::new();
+        if path.exists() {
+            let lines = BufReader::new(File::open(&path)?)
+                .lines()
+                .collect::<std::io::Result<Vec<_>>>()?;
+            let last_record = lines.iter().rposition(|line| !line.trim().is_empty());
+            for (index, line) in lines.iter().enumerate() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let event: WinnerEvaluationEvent = match serde_json::from_str(line) {
+                    Ok(event) => event,
+                    Err(error) if Some(index) == last_record => {
+                        quarantine_incomplete_tail(&path, &lines, index)?;
+                        tracing::warn!(path = %path.display(), line = index + 1, %error, "Quarantined incomplete Winner Buy evaluation journal tail");
+                        break;
+                    }
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!(
+                                "invalid Winner Buy evaluation record at {}:{}",
+                                path.display(),
+                                index + 1
+                            )
+                        });
+                    }
+                };
+                match event {
+                    WinnerEvaluationEvent::Evaluated {
+                        version: 1,
+                        evaluation,
+                    } => {
+                        unresolved.insert(evaluation.evaluation_id.clone(), *evaluation);
+                    }
+                    WinnerEvaluationEvent::Resolved {
+                        version: 1,
+                        evaluation_id,
+                        ..
+                    } => {
+                        unresolved.remove(&evaluation_id);
+                    }
+                    WinnerEvaluationEvent::MarketResolved { version: 1, .. } => {}
+                    _ => anyhow::bail!("unsupported Winner Buy evaluation journal version"),
+                }
+            }
+        }
+        let writer = OpenOptions::new().create(true).append(true).open(&path)?;
+        Ok(Self {
+            path,
+            writer: Mutex::new(writer),
+            unresolved: Mutex::new(unresolved),
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn record(&self, evaluation: WinnerEvaluation) -> Result<()> {
+        self.append(&WinnerEvaluationEvent::Evaluated {
+            version: 1,
+            evaluation: Box::new(evaluation.clone()),
+        })?;
+        self.unresolved
+            .lock()
+            .expect("Winner Buy evaluation lock poisoned")
+            .insert(evaluation.evaluation_id.clone(), evaluation);
+        Ok(())
+    }
+
+    pub fn due_slugs(&self, now: DateTime<Utc>) -> Vec<String> {
+        let mut slugs: Vec<_> = self
+            .unresolved
+            .lock()
+            .expect("Winner Buy evaluation lock poisoned")
+            .values()
+            .filter(|evaluation| now >= evaluation.end_date)
+            .map(|evaluation| evaluation.slug.clone())
+            .collect();
+        slugs.sort();
+        slugs.dedup();
+        slugs
+    }
+
+    pub fn record_resolution(
+        &self,
+        slug: &str,
+        now: DateTime<Utc>,
+        market_closed: bool,
+        outcome_prices: &(Decimal, Decimal),
+    ) -> Result<usize> {
+        const TERMINAL_HIGH: Decimal = dec!(0.999);
+        const TERMINAL_LOW: Decimal = dec!(0.001);
+        if !market_closed {
+            return Ok(0);
+        }
+        let yes_won = outcome_prices.0 >= TERMINAL_HIGH && outcome_prices.1 <= TERMINAL_LOW;
+        let no_won = outcome_prices.1 >= TERMINAL_HIGH && outcome_prices.0 <= TERMINAL_LOW;
+        if yes_won == no_won {
+            return Ok(0);
+        }
+        let matches: Vec<_> = self
+            .unresolved
+            .lock()
+            .expect("Winner Buy evaluation lock poisoned")
+            .values()
+            .filter(|evaluation| evaluation.slug == slug && now >= evaluation.end_date)
+            .cloned()
+            .collect();
+        for evaluation in &matches {
+            let won = if evaluation.buy_yes { yes_won } else { no_won };
+            let effective_price = evaluation.ask_price + evaluation.fee_per_share;
+            let pnl = if won {
+                dec!(1) - effective_price
+            } else {
+                -effective_price
+            };
+            self.append(&WinnerEvaluationEvent::Resolved {
+                version: 1,
+                evaluation_id: evaluation.evaluation_id.clone(),
+                slug: slug.to_string(),
+                won,
+                counterfactual_pnl_per_share: pnl,
+                resolved_at: now,
+            })?;
+        }
+        if let Some(selected) = matches
+            .iter()
+            .max_by_key(|evaluation| evaluation.evaluated_at)
+        {
+            let won = if selected.buy_yes { yes_won } else { no_won };
+            let effective_price = selected.ask_price + selected.fee_per_share;
+            let pnl = if won {
+                dec!(1) - effective_price
+            } else {
+                -effective_price
+            };
+            self.append(&WinnerEvaluationEvent::MarketResolved {
+                version: 1,
+                slug: slug.to_string(),
+                evaluation_count: matches.len(),
+                selected_evaluation_id: selected.evaluation_id.clone(),
+                buy_yes: selected.buy_yes,
+                won,
+                counterfactual_pnl_per_share: pnl,
+                resolved_at: now,
+            })?;
+        }
+        let mut unresolved = self
+            .unresolved
+            .lock()
+            .expect("Winner Buy evaluation lock poisoned");
+        for evaluation in &matches {
+            unresolved.remove(&evaluation.evaluation_id);
+        }
+        Ok(matches.len())
+    }
+
+    fn append(&self, event: &WinnerEvaluationEvent) -> Result<()> {
+        let encoded = serde_json::to_string(event)?;
+        let mut writer = self
+            .writer
+            .lock()
+            .expect("Winner Buy evaluation journal lock poisoned");
+        writeln!(writer, "{encoded}")?;
+        writer.flush()?;
+        writer.sync_data()?;
+        Ok(())
+    }
+}
+
+impl PendingWinnerBuy {
+    pub fn asset_key(&self) -> String {
+        if !self.asset.trim().is_empty() {
+            return self.asset.trim().to_ascii_lowercase();
+        }
+        self.slug
+            .split('-')
+            .next()
+            .unwrap_or("unknown")
+            .to_ascii_lowercase()
+    }
 }
 
 /// Settle a winner-buy position against the market's outcome prices.
@@ -36,21 +455,592 @@ pub struct PendingWinnerBuy {
 /// side is ~1.0 and the loser ~0.0 after the market closes.
 pub fn settle_winner_buy(
     buy: &PendingWinnerBuy,
+    now: DateTime<Utc>,
+    market_closed: bool,
     outcome_prices: &(Decimal, Decimal),
 ) -> Option<Decimal> {
-    let yes_settled = outcome_prices.0 >= dec!(0.5);
-    let no_settled = outcome_prices.1 >= dec!(0.5);
-    // Not settled yet (both < 0.5 is not a valid up/down settlement; a decided
-    // market always resolves one side to ~1.0).
-    if yes_settled == no_settled {
+    const TERMINAL_HIGH: Decimal = dec!(0.999);
+    const TERMINAL_LOW: Decimal = dec!(0.001);
+
+    if now < buy.end_date || !market_closed {
         return None;
     }
-    let won = if buy.token_is_yes { yes_settled } else { no_settled };
+
+    let yes_won = outcome_prices.0 >= TERMINAL_HIGH && outcome_prices.1 <= TERMINAL_LOW;
+    let no_won = outcome_prices.1 >= TERMINAL_HIGH && outcome_prices.0 <= TERMINAL_LOW;
+    if yes_won == no_won {
+        return None;
+    }
+
+    let won = if buy.token_is_yes { yes_won } else { no_won };
     Some(if won {
         buy.filled * (dec!(1) - buy.price)
     } else {
         -buy.filled * buy.price
     })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WinnerJournalAction {
+    Attempted,
+    NoFill,
+    Failed,
+    Pending,
+    Settled,
+    RedeemSubmitted,
+    Redeemed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WinnerJournalEvent {
+    version: u8,
+    action: WinnerJournalAction,
+    position: PendingWinnerBuy,
+    #[serde(default)]
+    realized_pnl: Option<Decimal>,
+    #[serde(default)]
+    reference: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WinnerLifecycleState {
+    Attempted,
+    NoFill,
+    Failed,
+    Pending,
+    Settled,
+    RedeemSubmitted,
+    Redeemed,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct WinnerBuyRiskPolicy {
+    pub max_strategy_loss: Decimal,
+    pub max_asset_loss: Decimal,
+    pub max_consecutive_losses: u32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct WinnerBuyRiskSnapshot {
+    pub strategy_loss: Decimal,
+    pub asset_loss: HashMap<String, Decimal>,
+    pub consecutive_losses: u32,
+}
+
+#[derive(Default)]
+struct WinnerBuyRiskState {
+    strategy_loss: Decimal,
+    asset_loss: HashMap<String, Decimal>,
+    consecutive_losses: u32,
+}
+
+/// Append-only state for hold-to-settlement positions. The in-memory pending
+/// map is rebuilt by replaying the journal on startup.
+pub struct WinnerBuyJournal {
+    path: PathBuf,
+    writer: Mutex<File>,
+    pending: Mutex<HashMap<String, PendingWinnerBuy>>,
+    awaiting_redeem: Mutex<HashMap<String, PendingWinnerBuy>>,
+    states: Mutex<HashMap<String, WinnerLifecycleState>>,
+    total_spent: Mutex<Decimal>,
+    realized_pnl: Mutex<Decimal>,
+    risk: Mutex<WinnerBuyRiskState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WinnerBuyPaperSummary {
+    pub pending_cost: Decimal,
+    pub total_spent: Decimal,
+    pub realized_pnl: Decimal,
+    pub open_positions: u64,
+}
+
+struct WinnerJournalReplay {
+    pending: HashMap<String, PendingWinnerBuy>,
+    awaiting_redeem: HashMap<String, PendingWinnerBuy>,
+    states: HashMap<String, WinnerLifecycleState>,
+    total_spent: Decimal,
+    realized_pnl: Decimal,
+    risk: WinnerBuyRiskState,
+}
+
+impl WinnerBuyJournal {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "failed to create winner-buy journal directory {}",
+                    parent.display()
+                )
+            })?;
+        }
+        let replay = replay_journal(&path)?;
+        let writer = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("failed to open winner-buy journal {}", path.display()))?;
+        Ok(Self {
+            path,
+            writer: Mutex::new(writer),
+            pending: Mutex::new(replay.pending),
+            awaiting_redeem: Mutex::new(replay.awaiting_redeem),
+            states: Mutex::new(replay.states),
+            total_spent: Mutex::new(replay.total_spent),
+            realized_pnl: Mutex::new(replay.realized_pnl),
+            risk: Mutex::new(replay.risk),
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn pending(&self) -> Vec<PendingWinnerBuy> {
+        self.pending
+            .lock()
+            .expect("winner-buy pending lock poisoned")
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    pub fn awaiting_redeem(&self) -> Vec<PendingWinnerBuy> {
+        self.awaiting_redeem
+            .lock()
+            .expect("winner-buy redeem lock poisoned")
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    pub fn uncertain_redeem_count(&self) -> usize {
+        self.states
+            .lock()
+            .expect("winner-buy state lock poisoned")
+            .values()
+            .filter(|state| **state == WinnerLifecycleState::RedeemSubmitted)
+            .count()
+    }
+
+    pub fn risk_snapshot(&self) -> WinnerBuyRiskSnapshot {
+        let risk = self.risk.lock().expect("winner-buy risk lock poisoned");
+        WinnerBuyRiskSnapshot {
+            strategy_loss: risk.strategy_loss,
+            asset_loss: risk.asset_loss.clone(),
+            consecutive_losses: risk.consecutive_losses,
+        }
+    }
+
+    pub fn check_risk(
+        &self,
+        asset: &str,
+        policy: WinnerBuyRiskPolicy,
+    ) -> std::result::Result<(), String> {
+        let asset = asset.trim().to_ascii_lowercase();
+        let risk = self.risk.lock().expect("winner-buy risk lock poisoned");
+        if risk.strategy_loss >= policy.max_strategy_loss {
+            return Err(format!(
+                "winner-buy strategy loss {} reached {}",
+                risk.strategy_loss, policy.max_strategy_loss
+            ));
+        }
+        let asset_loss = risk.asset_loss.get(&asset).copied().unwrap_or(dec!(0));
+        if asset_loss >= policy.max_asset_loss {
+            return Err(format!(
+                "winner-buy {asset} loss {asset_loss} reached {}",
+                policy.max_asset_loss
+            ));
+        }
+        if policy.max_consecutive_losses > 0
+            && risk.consecutive_losses >= policy.max_consecutive_losses
+        {
+            return Err(format!(
+                "winner-buy consecutive losses {} reached {}",
+                risk.consecutive_losses, policy.max_consecutive_losses
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn paper_summary(&self) -> WinnerBuyPaperSummary {
+        let pending = self
+            .pending
+            .lock()
+            .expect("winner-buy pending lock poisoned");
+        WinnerBuyPaperSummary {
+            pending_cost: pending.values().map(|buy| buy.filled * buy.price).sum(),
+            total_spent: *self
+                .total_spent
+                .lock()
+                .expect("winner-buy spent lock poisoned"),
+            realized_pnl: *self
+                .realized_pnl
+                .lock()
+                .expect("winner-buy pnl lock poisoned"),
+            open_positions: pending.len() as u64,
+        }
+    }
+
+    pub fn record_pending(&self, position: PendingWinnerBuy) -> Result<bool> {
+        if matches!(
+            self.states
+                .lock()
+                .expect("winner-buy state lock poisoned")
+                .get(&position.position_id),
+            Some(
+                WinnerLifecycleState::NoFill
+                    | WinnerLifecycleState::Failed
+                    | WinnerLifecycleState::Settled
+                    | WinnerLifecycleState::RedeemSubmitted
+                    | WinnerLifecycleState::Redeemed
+            )
+        ) {
+            return Ok(false);
+        }
+        if self
+            .pending
+            .lock()
+            .expect("winner-buy pending lock poisoned")
+            .contains_key(&position.position_id)
+        {
+            return Ok(false);
+        }
+        self.append(&WinnerJournalEvent {
+            version: 1,
+            action: WinnerJournalAction::Pending,
+            position: position.clone(),
+            realized_pnl: None,
+            reference: None,
+        })?;
+        let position_id = position.position_id.clone();
+        let cost = position.filled * position.price;
+        self.pending
+            .lock()
+            .expect("winner-buy pending lock poisoned")
+            .insert(position_id.clone(), position);
+        *self
+            .total_spent
+            .lock()
+            .expect("winner-buy spent lock poisoned") += cost;
+        self.states
+            .lock()
+            .expect("winner-buy state lock poisoned")
+            .insert(position_id, WinnerLifecycleState::Pending);
+        Ok(true)
+    }
+
+    pub fn record_attempt(&self, position: PendingWinnerBuy) -> Result<bool> {
+        let mut states = self.states.lock().expect("winner-buy state lock poisoned");
+        if states.contains_key(&position.position_id) {
+            return Ok(false);
+        }
+        self.append(&WinnerJournalEvent {
+            version: 1,
+            action: WinnerJournalAction::Attempted,
+            position: position.clone(),
+            realized_pnl: None,
+            reference: None,
+        })?;
+        states.insert(
+            position.position_id.clone(),
+            WinnerLifecycleState::Attempted,
+        );
+        Ok(true)
+    }
+
+    pub fn record_no_fill(&self, position: &PendingWinnerBuy) -> Result<bool> {
+        self.record_terminal_attempt(
+            position,
+            WinnerJournalAction::NoFill,
+            WinnerLifecycleState::NoFill,
+            None,
+        )
+    }
+
+    pub fn record_failed(&self, position: &PendingWinnerBuy, error: &str) -> Result<bool> {
+        self.record_terminal_attempt(
+            position,
+            WinnerJournalAction::Failed,
+            WinnerLifecycleState::Failed,
+            Some(error.to_string()),
+        )
+    }
+
+    fn record_terminal_attempt(
+        &self,
+        position: &PendingWinnerBuy,
+        action: WinnerJournalAction,
+        target: WinnerLifecycleState,
+        reference: Option<String>,
+    ) -> Result<bool> {
+        let mut states = self.states.lock().expect("winner-buy state lock poisoned");
+        if states.get(&position.position_id) != Some(&WinnerLifecycleState::Attempted) {
+            return Ok(false);
+        }
+        self.append(&WinnerJournalEvent {
+            version: 1,
+            action,
+            position: position.clone(),
+            realized_pnl: None,
+            reference,
+        })?;
+        states.insert(position.position_id.clone(), target);
+        Ok(true)
+    }
+
+    /// Persist the terminal event before removing the pending position. A
+    /// repeated settlement response therefore cannot be counted twice.
+    pub fn record_settled(&self, position: &PendingWinnerBuy, pnl: Decimal) -> Result<bool> {
+        if !self
+            .pending
+            .lock()
+            .expect("winner-buy pending lock poisoned")
+            .contains_key(&position.position_id)
+        {
+            return Ok(false);
+        }
+        self.append(&WinnerJournalEvent {
+            version: 1,
+            action: WinnerJournalAction::Settled,
+            position: position.clone(),
+            realized_pnl: Some(pnl),
+            reference: None,
+        })?;
+        self.pending
+            .lock()
+            .expect("winner-buy pending lock poisoned")
+            .remove(&position.position_id);
+        *self
+            .realized_pnl
+            .lock()
+            .expect("winner-buy pnl lock poisoned") += pnl;
+        if pnl > dec!(0) {
+            self.awaiting_redeem
+                .lock()
+                .expect("winner-buy redeem lock poisoned")
+                .insert(position.position_id.clone(), position.clone());
+        }
+        self.states
+            .lock()
+            .expect("winner-buy state lock poisoned")
+            .insert(position.position_id.clone(), WinnerLifecycleState::Settled);
+        record_risk_result(
+            &mut self.risk.lock().expect("winner-buy risk lock poisoned"),
+            position,
+            pnl,
+        );
+        Ok(true)
+    }
+
+    pub fn record_redeem_submitted(&self, position: &PendingWinnerBuy) -> Result<bool> {
+        let mut states = self.states.lock().expect("winner-buy state lock poisoned");
+        if states.get(&position.position_id) != Some(&WinnerLifecycleState::Settled) {
+            return Ok(false);
+        }
+        self.append(&WinnerJournalEvent {
+            version: 1,
+            action: WinnerJournalAction::RedeemSubmitted,
+            position: position.clone(),
+            realized_pnl: None,
+            reference: None,
+        })?;
+        states.insert(
+            position.position_id.clone(),
+            WinnerLifecycleState::RedeemSubmitted,
+        );
+        Ok(true)
+    }
+
+    pub fn record_redeemed(&self, position: &PendingWinnerBuy, reference: String) -> Result<bool> {
+        let mut states = self.states.lock().expect("winner-buy state lock poisoned");
+        if !matches!(
+            states.get(&position.position_id),
+            Some(WinnerLifecycleState::Settled | WinnerLifecycleState::RedeemSubmitted)
+        ) {
+            return Ok(false);
+        }
+        self.append(&WinnerJournalEvent {
+            version: 1,
+            action: WinnerJournalAction::Redeemed,
+            position: position.clone(),
+            realized_pnl: None,
+            reference: Some(reference),
+        })?;
+        self.awaiting_redeem
+            .lock()
+            .expect("winner-buy redeem lock poisoned")
+            .remove(&position.position_id);
+        states.insert(position.position_id.clone(), WinnerLifecycleState::Redeemed);
+        Ok(true)
+    }
+
+    fn append(&self, event: &WinnerJournalEvent) -> Result<()> {
+        let encoded = serde_json::to_string(event)?;
+        let mut writer = self
+            .writer
+            .lock()
+            .expect("winner-buy journal lock poisoned");
+        writeln!(writer, "{encoded}")?;
+        writer.flush()?;
+        writer.sync_data()?;
+        Ok(())
+    }
+}
+
+fn replay_journal(path: &Path) -> Result<WinnerJournalReplay> {
+    if !path.exists() {
+        return Ok(WinnerJournalReplay {
+            pending: HashMap::new(),
+            awaiting_redeem: HashMap::new(),
+            states: HashMap::new(),
+            total_spent: dec!(0),
+            realized_pnl: dec!(0),
+            risk: WinnerBuyRiskState::default(),
+        });
+    }
+    let lines = BufReader::new(File::open(path)?)
+        .lines()
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let last_record = lines.iter().rposition(|line| !line.trim().is_empty());
+    let mut pending = HashMap::new();
+    let mut awaiting_redeem = HashMap::new();
+    let mut states = HashMap::new();
+    let mut seen_positions = HashSet::new();
+    let mut settled_positions = HashSet::new();
+    let mut total_spent = dec!(0);
+    let mut realized_pnl = dec!(0);
+    let mut risk = WinnerBuyRiskState::default();
+    for (index, line) in lines.iter().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let event: WinnerJournalEvent = match serde_json::from_str(line) {
+            Ok(event) => event,
+            Err(error) if Some(index) == last_record => {
+                quarantine_incomplete_tail(path, &lines, index)?;
+                tracing::warn!(
+                    path = %path.display(),
+                    line = index + 1,
+                    %error,
+                    "Quarantined incomplete winner-buy journal tail"
+                );
+                break;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "invalid winner-buy journal record at {}:{}",
+                        path.display(),
+                        index + 1
+                    )
+                });
+            }
+        };
+        if event.version != 1 {
+            anyhow::bail!("unsupported winner-buy journal version {}", event.version);
+        }
+        match event.action {
+            WinnerJournalAction::Attempted => {
+                states.insert(
+                    event.position.position_id.clone(),
+                    WinnerLifecycleState::Attempted,
+                );
+            }
+            WinnerJournalAction::NoFill => {
+                states.insert(
+                    event.position.position_id.clone(),
+                    WinnerLifecycleState::NoFill,
+                );
+            }
+            WinnerJournalAction::Failed => {
+                states.insert(
+                    event.position.position_id.clone(),
+                    WinnerLifecycleState::Failed,
+                );
+            }
+            WinnerJournalAction::Pending => {
+                if seen_positions.insert(event.position.position_id.clone()) {
+                    total_spent += event.position.filled * event.position.price;
+                }
+                states.insert(
+                    event.position.position_id.clone(),
+                    WinnerLifecycleState::Pending,
+                );
+                pending.insert(event.position.position_id.clone(), event.position);
+            }
+            WinnerJournalAction::Settled => {
+                pending.remove(&event.position.position_id);
+                if settled_positions.insert(event.position.position_id.clone()) {
+                    let pnl = event.realized_pnl.unwrap_or(dec!(0));
+                    realized_pnl += pnl;
+                    record_risk_result(&mut risk, &event.position, pnl);
+                    if pnl > dec!(0) {
+                        awaiting_redeem
+                            .insert(event.position.position_id.clone(), event.position.clone());
+                    }
+                }
+                states.insert(
+                    event.position.position_id.clone(),
+                    WinnerLifecycleState::Settled,
+                );
+            }
+            WinnerJournalAction::RedeemSubmitted => {
+                states.insert(
+                    event.position.position_id.clone(),
+                    WinnerLifecycleState::RedeemSubmitted,
+                );
+            }
+            WinnerJournalAction::Redeemed => {
+                awaiting_redeem.remove(&event.position.position_id);
+                states.insert(
+                    event.position.position_id.clone(),
+                    WinnerLifecycleState::Redeemed,
+                );
+            }
+        }
+    }
+    Ok(WinnerJournalReplay {
+        pending,
+        awaiting_redeem,
+        states,
+        total_spent,
+        realized_pnl,
+        risk,
+    })
+}
+
+fn record_risk_result(risk: &mut WinnerBuyRiskState, position: &PendingWinnerBuy, pnl: Decimal) {
+    if pnl < dec!(0) {
+        let loss = -pnl;
+        risk.strategy_loss += loss;
+        *risk.asset_loss.entry(position.asset_key()).or_default() += loss;
+        risk.consecutive_losses = risk.consecutive_losses.saturating_add(1);
+    } else {
+        risk.consecutive_losses = 0;
+    }
+}
+
+fn quarantine_incomplete_tail(path: &Path, lines: &[String], index: usize) -> Result<()> {
+    let quarantine = PathBuf::from(format!(
+        "{}.corrupt-{}",
+        path.display(),
+        Utc::now().timestamp_millis()
+    ));
+    std::fs::write(&quarantine, lines[index..].join("\n"))?;
+    let mut valid = lines[..index].join("\n");
+    if !valid.is_empty() {
+        valid.push('\n');
+    }
+    let mut repaired = OpenOptions::new().write(true).truncate(true).open(path)?;
+    repaired.write_all(valid.as_bytes())?;
+    repaired.sync_all()?;
+    Ok(())
 }
 
 /// Decide whether the winner side's ask is buyable, from live REST book asks.
@@ -75,7 +1065,7 @@ pub fn detect_winner_asks(
         Some(p) if p >= min && p <= max => Some(p),
         _ => None,
     };
-    let low_or_absent = |ask: Option<Decimal>| ask.map_or(true, |p| p <= LOSER_MAX);
+    let low_or_absent = |ask: Option<Decimal>| ask.is_none_or(|p| p <= LOSER_MAX);
 
     if let Some(yes) = high_side(yes_ask) {
         if low_or_absent(no_ask) {
@@ -105,20 +1095,86 @@ pub fn capped_size(price: Decimal, max_order_usdc: Decimal) -> Decimal {
     (raw.floor() / dec!(100)).max(dec!(0))
 }
 
+/// Cash-capped share size including the estimated per-share fee.
+pub fn fee_inclusive_capped_size(
+    price: Decimal,
+    fee_per_share: Decimal,
+    max_order_usdc: Decimal,
+) -> Decimal {
+    capped_size((price + fee_per_share).min(dec!(1)), max_order_usdc)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeDelta;
+
+    #[test]
+    fn freshness_uses_post_request_check_time() {
+        assert!(received_at_is_fresh(1_100, 1_100, 2_000));
+        assert!(received_at_is_fresh(1_100, 1_500, 2_000));
+        assert!(!received_at_is_fresh(1_100, 3_101, 2_000));
+        assert!(!received_at_is_fresh(1_101, 1_100, 2_000));
+    }
+
+    #[test]
+    fn settlement_backoff_grows_and_clears() {
+        let mut backoff = SettlementBackoff::default();
+        assert!(backoff.should_query("market", 1_000));
+        assert_eq!(backoff.record_retry("market", 1_000), 10);
+        assert!(!backoff.should_query("market", 10_999));
+        assert!(backoff.should_query("market", 11_000));
+        assert_eq!(backoff.record_retry("market", 11_000), 20);
+        assert_eq!(backoff.record_retry("market", 31_000), 40);
+        assert_eq!(backoff.record_retry("market", 71_000), 60);
+        assert_eq!(backoff.record_retry("market", 131_000), 60);
+        backoff.clear("market");
+        assert!(backoff.should_query("market", 1_001));
+    }
+
+    fn pending_buy() -> PendingWinnerBuy {
+        PendingWinnerBuy {
+            position_id: "winner-1".into(),
+            evaluation_id: "evaluation-1".into(),
+            asset: "btc".into(),
+            slug: "btc-updown-5m-1".into(),
+            condition_id: "0x0000000000000000000000000000000000000000000000000000000000000001"
+                .into(),
+            neg_risk: false,
+            token_id: "42".into(),
+            token_is_yes: true,
+            requested: dec!(20),
+            limit_price: dec!(0.97),
+            planned_cost: dec!(19.4),
+            opening_twap: dec!(100),
+            current_twap: dec!(101),
+            model_observed_at_ms: 1,
+            model_probability: dec!(0.99),
+            model_net_ev: dec!(0.01),
+            directional_margin_bps: dec!(100),
+            reversal_boundary_bps: dec!(10),
+            book_spread: dec!(0.01),
+            book_depth_usdc: dec!(20),
+            filled: dec!(20),
+            price: dec!(0.97),
+            fee: dec!(0),
+            end_date: Utc::now() - TimeDelta::seconds(1),
+        }
+    }
 
     #[test]
     fn buys_yes_when_yes_ask_high_and_no_low() {
-        let signal = detect_winner_asks(Some(dec!(0.98)), Some(dec!(0.01)), dec!(0.95), dec!(0.99)).unwrap();
+        let signal =
+            detect_winner_asks(Some(dec!(0.98)), Some(dec!(0.01)), dec!(0.95), dec!(0.99)).unwrap();
         assert!(signal.buy_yes);
         assert_eq!(signal.price, dec!(0.98));
     }
 
     #[test]
     fn buys_no_when_no_ask_high_and_yes_low() {
-        let signal = detect_winner_asks(Some(dec!(0.03)), Some(dec!(0.985)), dec!(0.95), dec!(0.99)).unwrap();
+        let signal =
+            detect_winner_asks(Some(dec!(0.03)), Some(dec!(0.985)), dec!(0.95), dec!(0.99))
+                .unwrap();
         assert!(!signal.buy_yes);
         assert_eq!(signal.price, dec!(0.985));
     }
@@ -131,18 +1187,30 @@ mod tests {
     #[test]
     fn rejects_when_both_sides_high() {
         // Direction not decided: both sides carry 0.99 guard asks.
-        assert!(detect_winner_asks(Some(dec!(0.99)), Some(dec!(0.99)), dec!(0.95), dec!(0.99)).is_none());
+        assert!(
+            detect_winner_asks(Some(dec!(0.99)), Some(dec!(0.99)), dec!(0.95), dec!(0.99))
+                .is_none()
+        );
     }
 
     #[test]
     fn rejects_when_winner_side_above_max_price() {
-        assert!(detect_winner_asks(Some(dec!(0.993)), Some(dec!(0.01)), dec!(0.95), dec!(0.99)).is_none());
-        assert!(detect_winner_asks(Some(dec!(0.985)), Some(dec!(0.01)), dec!(0.95), dec!(0.99)).is_some());
+        assert!(
+            detect_winner_asks(Some(dec!(0.993)), Some(dec!(0.01)), dec!(0.95), dec!(0.99))
+                .is_none()
+        );
+        assert!(
+            detect_winner_asks(Some(dec!(0.985)), Some(dec!(0.01)), dec!(0.95), dec!(0.99))
+                .is_some()
+        );
     }
 
     #[test]
     fn rejects_when_winner_below_min_price() {
-        assert!(detect_winner_asks(Some(dec!(0.80)), Some(dec!(0.01)), dec!(0.95), dec!(0.99)).is_none());
+        assert!(
+            detect_winner_asks(Some(dec!(0.80)), Some(dec!(0.01)), dec!(0.95), dec!(0.99))
+                .is_none()
+        );
     }
 
     #[test]
@@ -153,24 +1221,269 @@ mod tests {
     }
 
     #[test]
+    fn fee_inclusive_cap_never_exceeds_cash_limit() {
+        let price = dec!(0.98);
+        let fee = dec!(0.001372);
+        let max = dec!(20);
+        let size = fee_inclusive_capped_size(price, fee, max);
+        assert!((price + fee) * size <= max);
+        assert_eq!(size, dec!(20.37));
+    }
+
+    #[test]
     fn settle_credits_win_and_debits_loss() {
-        let buy = PendingWinnerBuy {
-            slug: "btc-updown-5m-1".into(),
-            token_is_yes: true,
-            filled: dec!(20),
-            price: dec!(0.97),
-        };
+        let buy = pending_buy();
+        let now = Utc::now();
         // YES won: +20 * (1 - 0.97)
         assert_eq!(
-            settle_winner_buy(&buy, &(dec!(1.0), dec!(0.0))),
+            settle_winner_buy(&buy, now, true, &(dec!(1.0), dec!(0.0))),
             Some(dec!(0.6))
         );
         // NO won: -20 * 0.97
         assert_eq!(
-            settle_winner_buy(&buy, &(dec!(0.0), dec!(1.0))),
+            settle_winner_buy(&buy, now, true, &(dec!(0.0), dec!(1.0))),
             Some(-dec!(19.4))
         );
-        // Not settled: both sides ambiguous.
-        assert_eq!(settle_winner_buy(&buy, &(dec!(0.5), dec!(0.5))), None);
+        assert_eq!(
+            settle_winner_buy(&buy, now, false, &(dec!(1), dec!(0))),
+            None
+        );
+        assert_eq!(
+            settle_winner_buy(&buy, now, true, &(dec!(0.98), dec!(0.02))),
+            None
+        );
+        assert_eq!(
+            settle_winner_buy(&buy, now, true, &(dec!(0.5), dec!(0.5))),
+            None
+        );
+
+        let future_buy = PendingWinnerBuy {
+            end_date: now + TimeDelta::seconds(1),
+            ..buy
+        };
+        assert_eq!(
+            settle_winner_buy(&future_buy, now, true, &(dec!(1), dec!(0))),
+            None
+        );
+    }
+
+    #[test]
+    fn journal_restores_pending_and_settlement_is_idempotent() {
+        let path = std::env::temp_dir().join(format!(
+            "polypulse-winner-buy-{}.ndjson",
+            uuid::Uuid::new_v4()
+        ));
+        let buy = pending_buy();
+        {
+            let journal = WinnerBuyJournal::open(&path).unwrap();
+            assert!(journal.record_pending(buy.clone()).unwrap());
+            assert!(!journal.record_pending(buy.clone()).unwrap());
+            assert_eq!(journal.pending(), vec![buy.clone()]);
+        }
+        {
+            let journal = WinnerBuyJournal::open(&path).unwrap();
+            assert_eq!(journal.pending(), vec![buy.clone()]);
+            assert_eq!(
+                journal.paper_summary(),
+                WinnerBuyPaperSummary {
+                    pending_cost: dec!(19.4),
+                    total_spent: dec!(19.4),
+                    realized_pnl: dec!(0),
+                    open_positions: 1,
+                }
+            );
+            assert!(journal.record_settled(&buy, dec!(0.6)).unwrap());
+            assert!(!journal.record_settled(&buy, dec!(0.6)).unwrap());
+            assert_eq!(journal.awaiting_redeem(), vec![buy.clone()]);
+            assert!(journal.record_redeem_submitted(&buy).unwrap());
+            assert!(journal.record_redeemed(&buy, "paper:test".into()).unwrap());
+        }
+        let reloaded = WinnerBuyJournal::open(&path).unwrap();
+        assert!(reloaded.pending().is_empty());
+        assert!(reloaded.awaiting_redeem().is_empty());
+        assert_eq!(reloaded.paper_summary().realized_pnl, dec!(0.6));
+        assert_eq!(reloaded.paper_summary().total_spent, dec!(19.4));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn evaluation_journal_resolves_rejected_candidates_without_survivorship_bias() {
+        let path = std::env::temp_dir().join(format!(
+            "polypulse-winner-evaluations-{}.ndjson",
+            uuid::Uuid::new_v4()
+        ));
+        let now = Utc::now();
+        let evaluation = WinnerEvaluation {
+            evaluation_id: "eval-1".into(),
+            asset: "btc".into(),
+            slug: "btc-updown-5m-1".into(),
+            end_date: now - TimeDelta::seconds(1),
+            evaluated_at: now - TimeDelta::seconds(2),
+            window_start_ms: 1,
+            seconds_remaining: 1,
+            buy_yes: true,
+            bid_price: dec!(0.94),
+            ask_price: dec!(0.95),
+            ask_size: dec!(10),
+            fee_per_share: dec!(0.003325),
+            rejection: Some("NetEvTooLow".into()),
+            failed_checks: vec!["NetEvTooLow".into()],
+            opening_twap: Some(dec!(100)),
+            current_twap: Some(dec!(101)),
+            model_observed_at_ms: Some(2),
+            model_probability: dec!(0.94),
+            model_net_ev: dec!(-0.01),
+            directional_margin_bps: 100.0,
+            reversal_boundary_bps: 10.0,
+            volatility_bps_per_sqrt_second: 1.0,
+            spread: dec!(0.01),
+            depth_usdc: dec!(9.5),
+        };
+        {
+            let journal = WinnerEvaluationJournal::open(&path).unwrap();
+            journal.record(evaluation).unwrap();
+            assert_eq!(journal.due_slugs(now), vec!["btc-updown-5m-1"]);
+        }
+        let journal = WinnerEvaluationJournal::open(&path).unwrap();
+        assert_eq!(
+            journal
+                .record_resolution("btc-updown-5m-1", now, true, &(dec!(1), dec!(0)),)
+                .unwrap(),
+            1
+        );
+        assert!(journal.due_slugs(now).is_empty());
+        drop(journal);
+        assert!(WinnerEvaluationJournal::open(&path)
+            .unwrap()
+            .due_slugs(now)
+            .is_empty());
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("\"action\":\"market_resolved\""));
+        assert!(contents.contains("\"evaluation_count\":1"));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn journal_audits_no_fill_and_failed_attempts() {
+        let path = std::env::temp_dir().join(format!(
+            "polypulse-winner-attempt-{}.ndjson",
+            uuid::Uuid::new_v4()
+        ));
+        let first = pending_buy();
+        let mut second = pending_buy();
+        second.position_id = "winner-2".into();
+        {
+            let journal = WinnerBuyJournal::open(&path).unwrap();
+            assert!(journal.record_attempt(first.clone()).unwrap());
+            assert!(journal.record_no_fill(&first).unwrap());
+            assert!(journal.record_attempt(second.clone()).unwrap());
+            assert!(journal.record_failed(&second, "transport").unwrap());
+        }
+        let replayed = WinnerBuyJournal::open(&path).unwrap();
+        assert!(replayed.pending().is_empty());
+        assert!(!replayed.record_no_fill(&first).unwrap());
+        assert!(!replayed.record_failed(&second, "again").unwrap());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn persisted_strategy_asset_and_consecutive_loss_breakers_reject_entries() {
+        let path = std::env::temp_dir().join(format!(
+            "polypulse-winner-risk-{}.ndjson",
+            uuid::Uuid::new_v4()
+        ));
+        let btc = pending_buy();
+        let mut eth = pending_buy();
+        eth.position_id = "winner-eth".into();
+        eth.asset = "eth".into();
+        eth.slug = "eth-updown-5m-1".into();
+        {
+            let journal = WinnerBuyJournal::open(&path).unwrap();
+            journal.record_pending(btc.clone()).unwrap();
+            journal.record_settled(&btc, dec!(-6)).unwrap();
+            journal.record_pending(eth.clone()).unwrap();
+            journal.record_settled(&eth, dec!(-5)).unwrap();
+        }
+        let journal = WinnerBuyJournal::open(&path).unwrap();
+        let snapshot = journal.risk_snapshot();
+        assert_eq!(snapshot.strategy_loss, dec!(11));
+        assert_eq!(snapshot.asset_loss["btc"], dec!(6));
+        assert_eq!(snapshot.asset_loss["eth"], dec!(5));
+        assert_eq!(snapshot.consecutive_losses, 2);
+        assert!(journal
+            .check_risk(
+                "btc",
+                WinnerBuyRiskPolicy {
+                    max_strategy_loss: dec!(20),
+                    max_asset_loss: dec!(6),
+                    max_consecutive_losses: 3,
+                },
+            )
+            .is_err());
+        assert!(journal
+            .check_risk(
+                "sol",
+                WinnerBuyRiskPolicy {
+                    max_strategy_loss: dec!(11),
+                    max_asset_loss: dec!(10),
+                    max_consecutive_losses: 3,
+                },
+            )
+            .is_err());
+        assert!(journal
+            .check_risk(
+                "sol",
+                WinnerBuyRiskPolicy {
+                    max_strategy_loss: dec!(20),
+                    max_asset_loss: dec!(10),
+                    max_consecutive_losses: 2,
+                },
+            )
+            .is_err());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn submitted_but_unconfirmed_redeem_is_restored_as_uncertain() {
+        let path = std::env::temp_dir().join(format!(
+            "polypulse-winner-redeem-{}.ndjson",
+            uuid::Uuid::new_v4()
+        ));
+        let buy = pending_buy();
+        {
+            let journal = WinnerBuyJournal::open(&path).unwrap();
+            journal.record_pending(buy.clone()).unwrap();
+            journal.record_settled(&buy, dec!(0.6)).unwrap();
+            assert!(journal.record_redeem_submitted(&buy).unwrap());
+        }
+        let journal = WinnerBuyJournal::open(&path).unwrap();
+        assert_eq!(journal.uncertain_redeem_count(), 1);
+        assert_eq!(journal.awaiting_redeem(), vec![buy]);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn journal_quarantines_an_incomplete_tail_before_future_appends() {
+        let path = std::env::temp_dir().join(format!(
+            "polypulse-winner-buy-tail-{}.ndjson",
+            uuid::Uuid::new_v4()
+        ));
+        let buy = pending_buy();
+        WinnerBuyJournal::open(&path)
+            .unwrap()
+            .record_pending(buy.clone())
+            .unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{incomplete")
+            .unwrap();
+
+        let journal = WinnerBuyJournal::open(&path).unwrap();
+        assert_eq!(journal.pending(), vec![buy.clone()]);
+        journal.record_settled(&buy, dec!(0.6)).unwrap();
+        assert!(WinnerBuyJournal::open(&path).unwrap().pending().is_empty());
+        std::fs::remove_file(path).unwrap();
     }
 }

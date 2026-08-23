@@ -6,7 +6,7 @@ use polymarket_client_sdk::gamma::{
     types::{request::MarketsRequest, response::Market},
     Client,
 };
-use polymarket_client_sdk::types::{B256, Decimal, U256};
+use polymarket_client_sdk::types::{Decimal, B256, U256};
 use std::sync::Arc;
 use tracing::{info, warn};
 
@@ -33,6 +33,7 @@ pub struct MarketInfo {
     pub title: String,
     pub end_date: DateTime<Utc>,
     pub crypto_symbol: String,
+    pub neg_risk: bool,
     /// Reference (last-trade) prices for (YES, NO) from gamma, captured at
     /// subscription time. Kept for diagnostics; direction for winner-buy comes
     /// from the live price feed instead (gamma prices stop updating on
@@ -48,7 +49,11 @@ pub struct MarketDiscoverer {
 }
 
 pub trait GammaTransport: Send + Sync {
-    fn markets(&self, slugs: Vec<String>) -> BoxFuture<'_, Result<Vec<Market>>>;
+    fn markets(
+        &self,
+        slugs: Vec<String>,
+        closed: Option<bool>,
+    ) -> BoxFuture<'_, Result<Vec<Market>>>;
 }
 
 struct SdkGammaTransport {
@@ -56,9 +61,16 @@ struct SdkGammaTransport {
 }
 
 impl GammaTransport for SdkGammaTransport {
-    fn markets(&self, slugs: Vec<String>) -> BoxFuture<'_, Result<Vec<Market>>> {
+    fn markets(
+        &self,
+        slugs: Vec<String>,
+        closed: Option<bool>,
+    ) -> BoxFuture<'_, Result<Vec<Market>>> {
         Box::pin(async move {
-            let request = MarketsRequest::builder().slug(slugs).build();
+            let request = match closed {
+                Some(closed) => MarketsRequest::builder().slug(slugs).closed(closed).build(),
+                None => MarketsRequest::builder().slug(slugs).build(),
+            };
             Ok(self.client.markets(&request).await?)
         })
     }
@@ -108,12 +120,21 @@ impl MarketDiscoverer {
     }
 
     /// Fetch raw markets by slugs (settlement checks, diagnostics).
-    pub async fn fetch_markets_by_slug(
-        &self,
-        slugs: Vec<String>,
-    ) -> Result<Vec<Market>> {
+    #[allow(dead_code)]
+    pub async fn fetch_markets_by_slug(&self, slugs: Vec<String>) -> Result<Vec<Market>> {
         retry_read(ReadRetryPolicy::default(), || {
-            self.gamma_transport.markets(slugs.clone())
+            self.gamma_transport.markets(slugs.clone(), None)
+        })
+        .await
+    }
+
+    /// Fetch closed markets by slug for terminal settlement checks.
+    /// Gamma excludes closed markets from the unfiltered slug query, which can
+    /// otherwise turn a successful empty response into a permanently unresolved
+    /// Winner Buy position/evaluation.
+    pub async fn fetch_closed_markets_by_slug(&self, slugs: Vec<String>) -> Result<Vec<Market>> {
+        retry_read(ReadRetryPolicy::default(), || {
+            self.gamma_transport.markets(slugs.clone(), Some(true))
         })
         .await
     }
@@ -135,7 +156,7 @@ impl MarketDiscoverer {
         info!(timestamp, slug_count = slugs.len(), "Querying markets");
 
         match retry_read(ReadRetryPolicy::default(), || {
-            self.gamma_transport.markets(slugs.clone())
+            self.gamma_transport.markets(slugs.clone(), None)
         })
         .await
         {
@@ -205,6 +226,7 @@ impl MarketDiscoverer {
             title: market.question.unwrap_or_default(),
             end_date,
             crypto_symbol,
+            neg_risk: market.neg_risk.unwrap_or(false),
             outcome_prices: market
                 .outcome_prices
                 .filter(|prices| prices.len() == 2)
@@ -219,14 +241,18 @@ mod tests {
     use std::sync::Mutex;
 
     struct FakeGammaTransport {
-        requested: Mutex<Vec<Vec<String>>>,
+        requested: Mutex<Vec<(Vec<String>, Option<bool>)>>,
         response: Mutex<Option<Vec<Market>>>,
     }
 
     impl GammaTransport for FakeGammaTransport {
-        fn markets(&self, slugs: Vec<String>) -> BoxFuture<'_, Result<Vec<Market>>> {
+        fn markets(
+            &self,
+            slugs: Vec<String>,
+            closed: Option<bool>,
+        ) -> BoxFuture<'_, Result<Vec<Market>>> {
             Box::pin(async move {
-                self.requested.lock().unwrap().push(slugs);
+                self.requested.lock().unwrap().push((slugs, closed));
                 Ok(self.response.lock().unwrap().take().unwrap_or_default())
             })
         }
@@ -263,7 +289,27 @@ mod tests {
         assert_eq!(markets[0].yes_token_id, U256::from(42));
         assert_eq!(
             transport.requested.lock().unwrap()[0],
-            vec!["btc-updown-5m-1720000000"]
+            (vec!["btc-updown-5m-1720000000".to_string()], None)
+        );
+    }
+
+    #[tokio::test]
+    async fn settlement_lookup_explicitly_requests_closed_markets() {
+        let transport = Arc::new(FakeGammaTransport {
+            requested: Mutex::new(Vec::new()),
+            response: Mutex::new(Some(Vec::new())),
+        });
+        let discoverer =
+            MarketDiscoverer::with_transport(vec!["eth".to_string()], 5, transport.clone());
+
+        discoverer
+            .fetch_closed_markets_by_slug(vec!["eth-updown-5m-1720000000".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            transport.requested.lock().unwrap()[0],
+            (vec!["eth-updown-5m-1720000000".to_string()], Some(true))
         );
     }
 }

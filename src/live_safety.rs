@@ -62,6 +62,21 @@ impl LiveSafetyGuard {
     /// Conservatively consumes a canary attempt before any account write.
     /// Counters are intentionally not rolled back after failures.
     pub fn try_start_pair(&self, window: i64, quote: &ExecutionQuote) -> Result<(), String> {
+        self.try_start_notional(window, quote.total_cost, "pair")
+    }
+
+    /// Apply the same canary notional and frequency limits to a single-leg
+    /// Winner Buy before it can write to the account.
+    pub fn try_start_winner(&self, window: i64, planned_cost: Decimal) -> Result<(), String> {
+        self.try_start_notional(window, planned_cost, "winner-buy")
+    }
+
+    fn try_start_notional(
+        &self,
+        window: i64,
+        planned_cost: Decimal,
+        strategy: &str,
+    ) -> Result<(), String> {
         let mut state = self.state.lock().expect("live safety lock poisoned");
         if state.tripped {
             return Err(state
@@ -76,13 +91,13 @@ impl LiveSafetyGuard {
             state.current_window = Some(window);
             state.pairs_in_window = 0;
         }
-        if quote.total_cost > self.policy.max_pair_notional {
+        if planned_cost > self.policy.max_pair_notional {
             return Err(format!(
-                "canary pair notional {} exceeds {}",
-                quote.total_cost, self.policy.max_pair_notional
+                "canary {strategy} notional {} exceeds {}",
+                planned_cost, self.policy.max_pair_notional
             ));
         }
-        if state.planned_notional + quote.total_cost > self.policy.max_total_notional {
+        if state.planned_notional + planned_cost > self.policy.max_total_notional {
             return Err(format!(
                 "canary total notional would exceed {}",
                 self.policy.max_total_notional
@@ -96,7 +111,7 @@ impl LiveSafetyGuard {
         }
         state.pairs_in_window += 1;
         state.pairs_started += 1;
-        state.planned_notional += quote.total_cost;
+        state.planned_notional += planned_cost;
         Ok(())
     }
 
@@ -115,7 +130,8 @@ impl LiveSafetyGuard {
         };
         if result.write_uncertain {
             trip_locked(&mut state, "CLOB write outcome is uncertain");
-        } else if one_sided && self.policy.max_consecutive_one_sided > 0
+        } else if one_sided
+            && self.policy.max_consecutive_one_sided > 0
             && state.consecutive_one_sided >= self.policy.max_consecutive_one_sided
         {
             let reason = format!(
@@ -126,6 +142,21 @@ impl LiveSafetyGuard {
         } else if self.policy.enabled && state.loss_budget_used >= self.policy.max_loss_budget {
             let reason = format!(
                 "canary loss budget {} reached limit {}",
+                state.loss_budget_used, self.policy.max_loss_budget
+            );
+            trip_locked(&mut state, &reason);
+        }
+    }
+
+    pub fn record_winner_settlement(&self, cost: Decimal, won: bool) {
+        if won {
+            return;
+        }
+        let mut state = self.state.lock().expect("live safety lock poisoned");
+        state.loss_budget_used += cost.max(dec!(0));
+        if self.policy.enabled && state.loss_budget_used >= self.policy.max_loss_budget {
+            let reason = format!(
+                "canary loss budget {} reached limit {} after winner-buy settlement",
                 state.loss_budget_used, self.policy.max_loss_budget
             );
             trip_locked(&mut state, &reason);
@@ -269,5 +300,15 @@ mod tests {
         // One-sided again: counter restarted from 0, so only 1 so far.
         guard.record_result(&result(dec!(0), dec!(1), false));
         assert!(!guard.is_tripped());
+    }
+
+    #[test]
+    fn winner_buy_uses_canary_notional_and_loss_budget() {
+        let guard = LiveSafetyGuard::new(policy());
+        assert!(guard.try_start_winner(1, dec!(2)).is_ok());
+        assert!(guard.try_start_winner(1, dec!(1)).is_err());
+        guard.record_winner_settlement(dec!(2), false);
+        assert!(guard.is_tripped());
+        assert_eq!(guard.snapshot().loss_budget_used, dec!(2));
     }
 }

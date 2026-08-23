@@ -47,6 +47,10 @@ pub struct JournalRecoverySnapshot {
     pub order_id: Option<String>,
     pub pending_sell_amount: String,
     pub accounted_sell_fill: String,
+    /// Explicit HedgeMonitor lifecycle state. Empty on journals written by
+    /// older versions and interpreted as `open` during recovery.
+    #[serde(default)]
+    pub close_state: String,
 }
 
 impl JournalState {
@@ -334,6 +338,7 @@ mod tests {
                     order_id: Some("sell-order".into()),
                     pending_sell_amount: "2".into(),
                     accounted_sell_fill: "1".into(),
+                    close_state: "resting".into(),
                 }),
             })
             .unwrap();

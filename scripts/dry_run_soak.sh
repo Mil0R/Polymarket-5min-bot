@@ -16,7 +16,10 @@ timeout --signal=INT --kill-after=10s "${duration_seconds}s" \
   env \
     DRY_RUN=true \
     CANARY_MODE=false \
-    STATE_JOURNAL_FILE=paper-order-state.ndjson \
+    ARBITRAGE_STATE_JOURNAL_FILE=results/spread-arbitrage/paper/orders.ndjson \
+    WINNER_BUY_STATE_JOURNAL_FILE=results/winner-buy/paper/orders.ndjson \
+    WINNER_BUY_EVALUATION_JOURNAL_FILE=results/winner-buy/paper/evaluations.ndjson \
+    ARBITRAGE_LOG_FILE=results/spread-arbitrage/paper/opportunities.ndjson \
     POSITION_SYNC_INTERVAL_SECS=0 \
     POSITION_BALANCE_INTERVAL_SECS=0 \
     MERGE_INTERVAL_MINUTES=0 \
