@@ -46,6 +46,32 @@ impl CopyTradingCoordinator {
         }
     }
 
+    /// Variant with whitelist persistence (Opinion 4): wallet profiles and
+    /// 3-strike counters survive restarts via a JSON state file.
+    pub fn new_with_whitelist_state(
+        config: CopyTradingConfig,
+        initial_nav: Decimal,
+        now: DateTime<Utc>,
+        state_path: impl Into<std::path::PathBuf>,
+    ) -> Self {
+        let whitelist = WhitelistManager::new_with_state(config.clone(), state_path);
+        let market_filter = MarketFilterEngine::new(config.clone());
+        let execution = SmartExecutionEngine::new(config.clone());
+        let risk = Arc::new(RwLock::new(RiskController::new(config.clone(), initial_nav, now)));
+        let consensus = ConsensusEngine::new(config.clone(), whitelist.clone());
+        let exit_engine = ExitEngine::new(config.clone(), whitelist.clone());
+
+        Self {
+            config,
+            whitelist,
+            market_filter,
+            execution,
+            risk,
+            consensus,
+            exit_engine,
+        }
+    }
+
     pub fn config(&self) -> &CopyTradingConfig {
         &self.config
     }

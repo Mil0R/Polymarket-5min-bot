@@ -97,7 +97,16 @@ async fn main() -> Result<()> {
     info!(" -> Execution Mode:            {}", if dry_run { "PAPER / DRY-RUN (Safe Simulation)" } else { "LIVE (real CLOB orders)" });
 
     let now = Utc::now();
-    let coordinator = Arc::new(CopyTradingCoordinator::new(config.clone(), initial_nav, now));
+    // Whitelist persistence (Opinion 4): profiles + strike counters survive
+    // restarts, enabling warm-start without re-fetching all Data-API history.
+    let whitelist_state_file = env::var("COPY_WHITELIST_STATE_FILE")
+        .unwrap_or_else(|_| "data/copy-whitelist.json".to_string());
+    let coordinator = Arc::new(CopyTradingCoordinator::new_with_whitelist_state(
+        config.clone(),
+        initial_nav,
+        now,
+        whitelist_state_file,
+    ));
 
     // 3. Live data infrastructure
     let feed = Arc::new(TradeFeed::new()?);
@@ -132,7 +141,25 @@ async fn main() -> Result<()> {
         warn!("No target wallets available; copy-trading will idle until COPY_TARGET_WALLETS is configured.");
     } else {
         info!("Profiling {} target wallets from real Polymarket history...", target_wallets.len());
+        let refresh_days = env::var("COPY_WHITELIST_REFRESH_DAYS")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(7);
         for addr in &target_wallets {
+            // Warm-start: reuse a fresh persisted profile instead of re-fetching
+            // history (avoids Data-API rate limits on restart).
+            if let Some(fresh) = coordinator
+                .whitelist()
+                .get_fresh_profile(addr, refresh_days, now)
+            {
+                info!(
+                    " -> Warm-started wallet {} (Tier: {:?}, last evaluated {})",
+                    addr,
+                    fresh.tier,
+                    fresh.last_evaluated_at
+                );
+                continue;
+            }
             match history.fetch_records(addr).await {
                 Ok(records) => {
                     let res = coordinator.whitelist().evaluate_wallet(addr, &records, now);

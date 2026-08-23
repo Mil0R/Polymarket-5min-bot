@@ -6,6 +6,7 @@ use dashmap::DashMap;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{info, warn};
 
@@ -19,10 +20,15 @@ pub struct WalletEvaluationResult {
 }
 
 /// Dynamic whitelist and signal source profiling manager.
+///
+/// Optionally persists wallet profiles (including 3-strike counters) to a JSON
+/// state file so a restart does not require re-fetching all history from the
+/// Data API (Opinion 4: persistence & warm-up). Writes are atomic (tmp + rename).
 #[derive(Debug, Clone)]
 pub struct WhitelistManager {
     config: CopyTradingConfig,
     wallets: Arc<DashMap<String, WalletProfile>>,
+    state_path: Option<PathBuf>,
 }
 
 impl WhitelistManager {
@@ -30,7 +36,95 @@ impl WhitelistManager {
         Self {
             config,
             wallets: Arc::new(DashMap::new()),
+            state_path: None,
         }
+    }
+
+    /// Creates a manager with persistence enabled; loads existing state if present.
+    pub fn new_with_state(config: CopyTradingConfig, state_path: impl Into<PathBuf>) -> Self {
+        let manager = Self {
+            config,
+            wallets: Arc::new(DashMap::new()),
+            state_path: Some(state_path.into()),
+        };
+        manager.load_state();
+        manager
+    }
+
+    fn load_state(&self) {
+        let path = match &self.state_path {
+            Some(p) => p,
+            None => return,
+        };
+        if !path.exists() {
+            return;
+        }
+        let raw = match std::fs::read_to_string(path) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(path = %path.display(), error = %e, "Whitelist state read failed; starting fresh");
+                return;
+            }
+        };
+        match serde_json::from_str::<HashMap<String, WalletProfile>>(&raw) {
+            Ok(profiles) => {
+                for (addr, profile) in profiles {
+                    self.wallets.insert(addr.clone(), profile);
+                }
+                info!(
+                    path = %path.display(),
+                    loaded = self.wallets.len(),
+                    "Loaded persisted whitelist state"
+                );
+            }
+            Err(e) => {
+                warn!(path = %path.display(), error = %e, "Whitelist state corrupt; starting fresh");
+            }
+        }
+    }
+
+    /// Persists the current wallet map atomically (tmp file + rename).
+    fn save_state(&self) {
+        let path = match &self.state_path {
+            Some(p) => p,
+            None => return,
+        };
+        let snapshot: HashMap<String, WalletProfile> = self
+            .wallets
+            .iter()
+            .map(|e| (e.key().clone(), e.value().clone()))
+            .collect();
+        let raw = match serde_json::to_vec_pretty(&snapshot) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(error = %e, "Whitelist state serialization failed");
+                return;
+            }
+        };
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+        }
+        let tmp = path.with_extension("json.tmp");
+        if let Err(e) = std::fs::write(&tmp, &raw) {
+            warn!(path = %tmp.display(), error = %e, "Whitelist state write failed");
+            return;
+        }
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            warn!(path = %path.display(), error = %e, "Whitelist state rename failed");
+        }
+    }
+
+    /// Returns the persisted profile if the loaded state is fresh enough.
+    pub fn get_fresh_profile(&self, address: &str, max_age_days: i64, now: DateTime<Utc>) -> Option<WalletProfile> {
+        let profile = self.get_wallet(address)?;
+        let age = now.signed_duration_since(profile.last_evaluated_at).num_days();
+        (age <= max_age_days).then_some(profile)
+    }
+
+    pub fn state_path(&self) -> Option<&Path> {
+        self.state_path.as_deref()
     }
 
     /// Evaluates a wallet based on its historical trade records according to Module 1 rules.
@@ -289,6 +383,7 @@ impl WhitelistManager {
         let addr = profile.address.clone();
         let tier = profile.tier;
         self.wallets.insert(addr.clone(), profile);
+        self.save_state();
         info!(address = %addr, tier = ?tier, "Upserted wallet profile in whitelist store");
     }
 
@@ -327,6 +422,7 @@ impl WhitelistManager {
     /// Records a major direction failure (e.g. bought > 0.70 but resolved to 0).
     /// Enforces the 3-strike rule.
     pub fn record_direction_result(&self, address: &str, is_major_error: bool) {
+        let mut changed = false;
         if let Some(mut entry) = self.wallets.get_mut(address) {
             if is_major_error {
                 entry.consecutive_major_direction_errors += 1;
@@ -347,10 +443,17 @@ impl WhitelistManager {
                         "Wallet disqualified and blacklisted under 3-strike rule"
                     );
                 }
+                changed = true;
             } else {
                 // Reset consecutive error counter on valid prediction
                 entry.consecutive_major_direction_errors = 0;
+                changed = true;
             }
+        }
+        // Persist AFTER releasing the entry guard (save_state iterates the map;
+        // holding a shard guard while iterating would deadlock).
+        if changed {
+            self.save_state();
         }
     }
 
@@ -361,5 +464,78 @@ impl WhitelistManager {
             .filter(|entry| entry.tier == WalletTier::TierS || entry.tier == WalletTier::TierA)
             .map(|entry| entry.value().clone())
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::copy_trading::types::OutcomeSide;
+
+    fn qualified_records() -> Vec<WalletTradeRecord> {
+        (0..60)
+            .map(|i| {
+                let days_ago = 120 - (i as i64 * 2);
+                let won = i % 3 != 0;
+                WalletTradeRecord {
+                    trade_id: format!("t-{}", i),
+                    market_id: format!("mkt-{}", i),
+                    domain: DomainTag::MacroInterestRate,
+                    outcome_bought: OutcomeSide::Yes,
+                    entry_price: dec!(0.50),
+                    exit_price: Some(if won { dec!(1.0) } else { dec!(0.0) }),
+                    notional_usdc: dec!(100.0),
+                    pnl_usdc: if won { dec!(20.0) } else { dec!(-20.0) },
+                    return_pct: dec!(0.2),
+                    is_maker: false,
+                    is_arbitrage_leg: false,
+                    resolved_outcome: Some(if won { OutcomeSide::Yes } else { OutcomeSide::No }),
+                    opened_at: Utc::now() - chrono::Duration::days(days_ago),
+                    settled_at: Some(Utc::now() - chrono::Duration::days(days_ago - 1)),
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn persistence_round_trip_preserves_profile_and_strikes() {
+        let dir = std::env::temp_dir().join(format!("copy-wl-test-{}", std::process::id()));
+        let path = dir.join("whitelist.json");
+        let _ = std::fs::remove_file(&path);
+        let now = Utc::now();
+
+        // Writer: persist a wallet + 2 strikes.
+        let manager = WhitelistManager::new_with_state(CopyTradingConfig::default(), path.clone());
+        let res = manager.evaluate_wallet("0xExpert", &qualified_records(), now);
+        assert!(res.is_accepted);
+        manager.upsert_wallet(res.profile);
+        manager.record_direction_result("0xExpert", true);
+        manager.record_direction_result("0xExpert", true);
+        assert!(path.exists(), "state file must be written");
+
+        // Reader: fresh manager loads profile + strike history.
+        let reader = WhitelistManager::new_with_state(CopyTradingConfig::default(), path.clone());
+        let profile = reader.get_wallet("0xExpert").expect("profile persisted");
+        assert_eq!(profile.tier, WalletTier::TierA);
+        assert_eq!(profile.consecutive_major_direction_errors, 2, "strikes must survive restart");
+
+        // Warm-start helper: fresh profile is reusable, old one is not.
+        assert!(reader.get_fresh_profile("0xExpert", 7, now).is_some());
+        let stale = reader.get_fresh_profile("0xExpert", 7, now + chrono::Duration::days(10));
+        assert!(stale.is_none(), "stale profile must not warm-start");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_state_file_starts_fresh() {
+        let dir = std::env::temp_dir().join(format!("copy-wl-bad-{}", std::process::id()));
+        let path = dir.join("whitelist.json");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, "{{{not json").unwrap();
+        let manager = WhitelistManager::new_with_state(CopyTradingConfig::default(), path.clone());
+        assert!(manager.list_active_whitelist().is_empty(), "corrupt state must not panic");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
