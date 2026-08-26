@@ -125,7 +125,8 @@ DRY_RUN=true
 3. `winner_buy_settlement_empty_results` 不持续增长。
 4. `winner_buy_stale_rest_books` 应显著下降，正常情况下接近 0。
 5. 分资产指标能解释 BTC/ETH 在 scan、no-book、no-signal 和 evaluation 阶段的差异。
-6. 新 evaluation 同时包含 `rejection` 和 `failed_checks`。
+6. 新 evaluation 同时包含 `rejection`、`failed_checks`、`effective_entry_price`、`required_probability`、`reversal_margin_ratio`、价格/剩余时间分组及行情来源。
+7. 使用 `cargo run --release --bin winner_buy_report -- <evaluations.ndjson>` 按独立市场检查胜率下界、手续费后反事实 PnL 和 Shadow 执行 PnL。
 
 建议先运行 72 小时验证数据闭环，再累计 7–14 天及至少 100 个独立 `market_resolved` 样本。参数调整必须以市场级、含手续费并考虑模拟延迟后的结果为依据。
 

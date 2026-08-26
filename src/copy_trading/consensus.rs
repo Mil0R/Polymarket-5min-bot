@@ -114,7 +114,24 @@ impl ConsensusEngine {
 
     /// Ingests a new signal event from a target wallet.
     /// If consensus is reached according to rules, returns `Some(ConsensusSignal)`.
-    pub fn ingest_signal(&self, signal: SignalEvent, now: DateTime<Utc>) -> Option<ConsensusSignal> {
+    pub fn ingest_signal(
+        &self,
+        signal: SignalEvent,
+        now: DateTime<Utc>,
+    ) -> Option<ConsensusSignal> {
+        // Reject startup replays, delayed indexer events and implausible future
+        // timestamps before they can enter a bucket (Tier-S included).
+        let age = now.signed_duration_since(signal.timestamp).num_seconds();
+        if age > self.config.max_signal_age_seconds || age < -30 {
+            debug!(
+                signal = %signal.signal_id,
+                age_seconds = age,
+                max_age_seconds = self.config.max_signal_age_seconds,
+                "Ignored stale or future-dated signal"
+            );
+            return None;
+        }
+
         // 1. Only process OpenBuy signals for consensus opening
         if signal.action != SignalAction::OpenBuy {
             return None;
@@ -135,7 +152,9 @@ impl ConsensusEngine {
         // 1c. Sanity bounds on the observed fill VWAP. A whitelisted wallet whose
         //     observed trade price is outside [0.05, 0.95] is either data noise or
         //     a spoofed/manipulated signal; do not let it drive the price cap.
-        if signal.target_vwap < self.config.min_signal_vwap || signal.target_vwap > self.config.max_signal_vwap {
+        if signal.target_vwap < self.config.min_signal_vwap
+            || signal.target_vwap > self.config.max_signal_vwap
+        {
             debug!(
                 wallet = %signal.source_wallet,
                 vwap = %signal.target_vwap,
@@ -147,7 +166,9 @@ impl ConsensusEngine {
         }
 
         // 2. Validate wallet authorization in the specified domain
-        let (is_auth, tier_opt) = self.whitelist.is_authorized_in_domain(&signal.source_wallet, &signal.domain);
+        let (is_auth, tier_opt) = self
+            .whitelist
+            .is_authorized_in_domain(&signal.source_wallet, &signal.domain);
         if !is_auth {
             debug!(
                 wallet = %signal.source_wallet,
@@ -189,16 +210,23 @@ impl ConsensusEngine {
         let window_duration = Duration::hours(self.config.consensus_window_hours);
         let cutoff_time = now - window_duration;
 
-        let mut bucket_entry = self.buckets.entry(key.clone()).or_insert_with(|| SignalBucket {
-            signals: Vec::new(),
-            last_consensus_at: None,
-        });
+        let mut bucket_entry = self
+            .buckets
+            .entry(key.clone())
+            .or_insert_with(|| SignalBucket {
+                signals: Vec::new(),
+                last_consensus_at: None,
+            });
 
         // Prune expired signals outside 12h window
         bucket_entry.signals.retain(|s| s.timestamp >= cutoff_time);
 
         // Avoid duplicate signals from the same wallet in the same window
-        if !bucket_entry.signals.iter().any(|s| s.source_wallet == signal.source_wallet) {
+        if !bucket_entry
+            .signals
+            .iter()
+            .any(|s| s.source_wallet == signal.source_wallet)
+        {
             bucket_entry.signals.push(signal.clone());
         }
 
@@ -233,11 +261,14 @@ impl ConsensusEngine {
                 Some(g) => Source::Group(*g),
                 None => Source::Wallet(lower.clone()),
             };
+            // One independent actor gets one vote and one VWAP contribution.
+            // Otherwise ten correlated wallets could still dominate the price
+            // cap despite correctly counting as a single consensus source.
             if distinct_sources.insert(source) {
                 contributing_wallets.push(s.source_wallet.clone());
+                total_vwap_weight += s.target_vwap * s.target_shares;
+                total_shares_weight += s.target_shares;
             }
-            total_vwap_weight += s.target_vwap * s.target_shares;
-            total_shares_weight += s.target_shares;
         }
 
         if distinct_sources.len() >= self.config.min_consensus_wallets {
@@ -246,11 +277,6 @@ impl ConsensusEngine {
             } else {
                 signal.target_vwap
             };
-            bucket_entry.last_consensus_at = Some(now);
-            // Clear the consumed signals so the SAME set of wallets cannot re-trigger
-            // a duplicate entry after the 6h cooldown with stale information.
-            bucket_entry.signals.clear();
-
             info!(
                 market_id = %signal.market_id,
                 outcome = %signal.outcome,
@@ -281,6 +307,20 @@ impl ConsensusEngine {
                 "Signal recorded in consensus accumulator; waiting for partner signal"
             );
             None
+        }
+    }
+
+    /// Commits a consensus only after downstream risk reservation and proposal
+    /// construction succeed. Rejected execution attempts leave observations
+    /// available for a later fresh-book retry.
+    pub fn commit_consensus(&self, consensus: &ConsensusSignal, now: DateTime<Utc>) {
+        let key = ConsensusKey {
+            market_id: consensus.market_id.clone(),
+            outcome: consensus.outcome.clone(),
+        };
+        if let Some(mut bucket) = self.buckets.get_mut(&key) {
+            bucket.last_consensus_at = Some(now);
+            bucket.signals.clear();
         }
     }
 
@@ -315,6 +355,7 @@ mod tests {
                     return_pct: dec!(0.2),
                     is_maker: false,
                     is_arbitrage_leg: false,
+                    behavior_data_known: true,
                     resolved_outcome: Some(OutcomeSide::Yes),
                     opened_at: now - Duration::days(days_ago),
                     settled_at: Some(now - Duration::days(days_ago - 1)),
@@ -338,6 +379,7 @@ mod tests {
             target_vwap: dec!(0.50),
             target_shares: dec!(500.0),
             target_notional_usdc: dec!(250.0),
+            target_reduction_pct: None,
             timestamp: ts,
         }
     }
@@ -359,7 +401,10 @@ mod tests {
         assert!(engine.ingest_signal(mk("0xAlpha", now), now).is_none());
         assert!(
             engine
-                .ingest_signal(mk("0xBeta", now + Duration::minutes(5)), now + Duration::minutes(5))
+                .ingest_signal(
+                    mk("0xBeta", now + Duration::minutes(5)),
+                    now + Duration::minutes(5)
+                )
                 .is_none(),
             "correlated pair must not satisfy consensus"
         );
@@ -387,7 +432,10 @@ mod tests {
         assert!(engine.ingest_signal(mk("0xAlpha", now), now).is_none());
         assert!(
             engine
-                .ingest_signal(mk("0xBeta", now + Duration::minutes(5)), now + Duration::minutes(5))
+                .ingest_signal(
+                    mk("0xBeta", now + Duration::minutes(5)),
+                    now + Duration::minutes(5)
+                )
                 .is_none(),
             "case-insensitive pair must still count as one source"
         );

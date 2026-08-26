@@ -127,6 +127,8 @@ mod tests {
             profit_percentage: dec!(5),
             yes_size: dec!(10),
             no_size: dec!(10),
+            yes_book_timestamp_ms: 0,
+            no_book_timestamp_ms: 0,
         }
     }
 
@@ -136,7 +138,13 @@ mod tests {
             no_price: dec!(0.50),
             size: dec!(10),
             total_cost: dec!(9.5),
+            gross_edge_per_share: dec!(0.05),
+            yes_fee_per_share: dec!(0),
+            no_fee_per_share: dec!(0),
             edge_per_share: dec!(0.05),
+            fee_rate: dec!(0),
+            fee_exponent: 1,
+            minimum_order_size: dec!(1),
         }
     }
 

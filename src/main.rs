@@ -1,5 +1,7 @@
 mod config;
 mod connection_supervisor;
+#[path = "bin/copy_trader.rs"]
+mod copy_trader_embedded;
 mod live_safety;
 mod market;
 mod monitor;
@@ -21,11 +23,12 @@ mod window_session;
 mod window_session_runner;
 mod winner_buy;
 mod winner_model;
+use polypulse::copy_trading::CopyTradingRuntime;
 use polypulse::ui::control::{StrategyControls, StrategyKind};
 use polypulse::ui::{decimal_to_f64, spawn_dashboard_thread, symbol_short, DashboardHandle};
 
 use anyhow::Result;
-use futures::StreamExt;
+use futures::{future::join_all, StreamExt};
 use rust_decimal_macros::dec;
 use std::collections::HashMap;
 use std::io::{stdout, IsTerminal};
@@ -42,6 +45,7 @@ use crate::market::{MarketDiscoverer, MarketScheduler};
 use crate::monitor::{MarketWsConnectionState, OrderBookMonitor};
 use crate::observability_server::ServiceHealth;
 
+use crate::risk::positions::PositionTracker;
 use crate::risk::{HedgeMonitor, PositionBalancer, RiskManager};
 use crate::runtime_metrics::RuntimeMetrics;
 use crate::strategy_service::{StrategyService, StrategyServiceDeps};
@@ -54,9 +58,10 @@ use crate::window_event_loop::{WindowEventLoopState, WindowExitReason};
 use crate::window_session::WindowSession;
 use crate::window_session_runner::WindowSessionRunner;
 use crate::winner_buy::{
-    detect_winner_asks, fee_inclusive_capped_size, received_at_is_fresh, settle_winner_buy,
-    PendingWinnerBuy, SettlementBackoff, WinnerBuyJournal, WinnerBuyRiskPolicy, WinnerEvaluation,
-    WinnerEvaluationJournal,
+    detect_winner_asks, fee_inclusive_depth_capped_size, received_at_is_fresh, settle_winner_buy,
+    winner_books_need_rest, PendingWinnerBuy, SettlementBackoff, WinnerBuyJournal,
+    WinnerBuyRiskPolicy, WinnerConfirmationObservation, WinnerEvaluation, WinnerEvaluationJournal,
+    WinnerShadowExecution,
 };
 use crate::winner_model::{
     attempt_allowed, run_chainlink_twap_feed, ChainlinkTwapStore, WinnerConfirmationTracker,
@@ -89,10 +94,16 @@ async fn main() -> Result<()> {
     // dependencies. Live mode requires explicit startup configuration so all
     // credential and compatibility validation remains fail-closed.
     let winner_buy_available = config.winner_buy_enabled || (use_tui && config.dry_run);
+    // Copy Trading is embedded PAPER-first. Live coexistence remains fail-closed
+    // until all strategies share an account-wide reservation/ownership ledger.
+    let copy_trading_available = config.dry_run && (config.copy_trading_enabled || use_tui);
+    let copy_runtime = CopyTradingRuntime::new(shutdown.clone(), config.copy_trading_enabled);
     let strategy_controls = Arc::new(StrategyControls::new(
         config.arbitrage_enabled,
         config.winner_buy_enabled,
         winner_buy_available,
+        copy_trading_available,
+        copy_trading_available.then_some(copy_runtime.clone()),
         !config.dry_run,
     ));
     let run_id = uuid::Uuid::new_v4();
@@ -105,12 +116,23 @@ async fn main() -> Result<()> {
     };
     info!(%run_id, mode = execution_mode, "Run started");
     info!(
+        arbitrage_budget_usdc = config.arbitrage_budget_usdc,
+        winner_buy_budget_usdc = config.winner_buy_budget_usdc,
+        copy_trading_budget_usdc = config.copy_trading_budget_usdc,
+        "Per-strategy capital budgets loaded"
+    );
+    info!(
         target: "polypulse::strategy::spread_arbitrage",
         %run_id,
         mode = execution_mode,
         state_file = %config.state_journal_file,
         opportunity_file = ?config.arbitrage_log_file,
         shadow_file = ?config.arbitrage_shadow_log_file,
+        max_book_age_ms = config.max_book_age_ms,
+        max_book_skew_ms = config.max_book_skew_ms,
+        signal_confirmation_ms = config.arbitrage_signal_confirmation_ms,
+        rest_shadow_delays_ms = ?config.arbitrage_rest_shadow_delays_ms,
+        rest_shadow_notionals_usdc = ?config.arbitrage_rest_shadow_notionals_usdc,
         enabled = config.arbitrage_enabled,
         "Spread Arbitrage run started"
     );
@@ -125,6 +147,19 @@ async fn main() -> Result<()> {
             "Winner Buy run started"
         );
     }
+    let _copy_task = if copy_trading_available {
+        let runtime = copy_runtime.clone();
+        let budget = rust_decimal::Decimal::try_from(config.copy_trading_budget_usdc)?;
+        Some(tokio::spawn(async move {
+            if let Err(error) = copy_trader_embedded::run_embedded(runtime.clone(), budget).await {
+                runtime.set_healthy(false);
+                error!(target: "polypulse::strategy::copy_trading", %error, "Embedded Copy Trading stopped");
+            }
+        }))
+    } else {
+        warn!(target: "polypulse::strategy::copy_trading", "Copy Trading TUI integration is unavailable in LIVE mode; run PAPER validation first");
+        None
+    };
 
     let runtime_metrics = Arc::new(RuntimeMetrics::default());
     let winner_twap_store = Arc::new(ChainlinkTwapStore::default());
@@ -138,7 +173,7 @@ async fn main() -> Result<()> {
     }
 
     let order_mode = format!("{:?}", config.arbitrage_order_type);
-    let dashboard = DashboardHandle::new_live(order_mode, config.risk_max_exposure_usdc);
+    let dashboard = DashboardHandle::new_live(order_mode, config.arbitrage_budget_usdc);
     dashboard.with_mut(|dashboard| {
         dashboard.set_execution_mode(if config.dry_run {
             "DRY RUN"
@@ -150,7 +185,13 @@ async fn main() -> Result<()> {
         dashboard.set_strategy_states(
             strategy_controls.state(StrategyKind::Arbitrage),
             strategy_controls.state(StrategyKind::WinnerBuy),
+            strategy_controls.state(StrategyKind::CopyTrading),
             strategy_controls.blocked_reason(),
+        );
+        dashboard.set_strategy_budgets(
+            config.arbitrage_budget_usdc,
+            config.winner_buy_budget_usdc,
+            config.copy_trading_budget_usdc,
         );
     });
     let live_safety = Arc::new(LiveSafetyGuard::new(CanaryPolicy {
@@ -261,14 +302,19 @@ async fn main() -> Result<()> {
             gtd_expiration_secs: config.gtd_expiration_secs,
             order_type: config.arbitrage_order_type.clone(),
             dry_run: config.dry_run,
-            paper_initial_balance_usdc: config.paper_initial_balance_usdc,
+            arbitrage_budget_usdc: config.arbitrage_budget_usdc,
+            winner_buy_budget_usdc: config.winner_buy_budget_usdc,
             paper_liquidity_haircut: config.paper_liquidity_haircut,
+            arbitrage_paper_liquidity_haircut: config.arbitrage_paper_liquidity_haircut,
             paper_second_leg_delay_ms: config.paper_second_leg_delay_ms,
             paper_winner_buy_delay_ms: config.paper_winner_buy_delay_ms,
         },
     ));
 
     let _risk_manager = Arc::new(RiskManager::new(&config)?);
+    let winner_position_tracker = Arc::new(PositionTracker::new(rust_decimal::Decimal::try_from(
+        config.winner_buy_budget_usdc,
+    )?));
 
     // Create hedge monitor (pass PositionTracker Arc for exposure updates)
     let position_tracker = _risk_manager.position_tracker();
@@ -388,7 +434,7 @@ async fn main() -> Result<()> {
                 "Restored Winner Buy paper cash lifecycle"
             );
         }
-        let position_tracker = _risk_manager.position_tracker();
+        let position_tracker = winner_position_tracker.clone();
         for pending in journal
             .pending()
             .into_iter()
@@ -646,6 +692,12 @@ async fn main() -> Result<()> {
                 min_price = config.winner_buy_min_price,
                 max_price = config.winner_buy_max_price,
                 max_order_usdc = config.winner_buy_max_order_usdc,
+                max_book_age_ms = config.winner_buy_max_book_age_ms,
+                confirmation_observations = config.winner_buy_confirmation_observations,
+                min_depth_usdc = config.winner_buy_min_depth_usdc,
+                min_net_ev = config.winner_buy_min_net_ev,
+                reversal_sigma = config.winner_buy_reversal_sigma,
+                depth_adaptive_sizing = true,
                 "Winner-buy strategy enabled"
             );
         }
@@ -807,6 +859,7 @@ async fn main() -> Result<()> {
                                 let market_display = tick.market_display;
                                 let market_symbol = tick.market_symbol;
                                 let shadow_candidate = tick.shadow_candidate;
+                                let rest_shadow_candidate = tick.rest_shadow_candidate;
 
                                 let (prefix, spread_info) = total_ask_price
                                     .map(|total| {
@@ -878,6 +931,138 @@ async fn main() -> Result<()> {
                                         }
                                     });
                                 }
+                                if config.dry_run {
+                                    if let (Some(candidate), Some(path)) = (
+                                        rest_shadow_candidate,
+                                        config.arbitrage_shadow_log_file.clone(),
+                                    ) {
+                                        let shadow_executor = executor.clone();
+                                        let shadow_market = market_display.clone();
+                                        let shadow_yes_dir = yes_dir.to_string();
+                                        let shadow_no_dir = no_dir.to_string();
+                                        let shadow_delays =
+                                            config.arbitrage_rest_shadow_delays_ms.clone();
+                                        let shadow_notionals = config
+                                            .arbitrage_rest_shadow_notionals_usdc
+                                            .iter()
+                                            .filter_map(|value| rust_decimal::Decimal::try_from(*value).ok())
+                                            .collect::<Vec<_>>();
+                                        let shadow_metrics = runtime_metrics.clone();
+                                        window_session.spawn_trade(async move {
+                                            let max_shadow_notional = shadow_notionals
+                                                .iter()
+                                                .copied()
+                                                .max()
+                                                .unwrap_or(dec!(1));
+                                            let quote = match shadow_executor
+                                                .shadow_execution_quote(
+                                                    &candidate.opportunity,
+                                                    &shadow_yes_dir,
+                                                    &shadow_no_dir,
+                                                    max_shadow_notional,
+                                                )
+                                                .await
+                                            {
+                                                Ok(quote) => quote,
+                                                Err(error) => {
+                                                    debug!(target: "polypulse::strategy::spread_arbitrage",
+                                                        %error,
+                                                        source = candidate.source,
+                                                        market = %shadow_market,
+                                                        "REST shadow candidate rejected by executable quote"
+                                                    );
+                                                    return;
+                                                }
+                                            };
+                                            let samples = shadow_delays.into_iter().map(|delay_ms| {
+                                                let sample_executor = shadow_executor.clone();
+                                                let sample_candidate = candidate.clone();
+                                                let sample_quote = quote.clone();
+                                                let sample_market = shadow_market.clone();
+                                                let sample_path = path.clone();
+                                                let sample_metrics = shadow_metrics.clone();
+                                                let sample_notionals = shadow_notionals.clone();
+                                                async move {
+                                                    let target_at = sample_candidate
+                                                        .observed_at_ms
+                                                        .saturating_add(
+                                                            i64::try_from(delay_ms)
+                                                                .unwrap_or(i64::MAX),
+                                                        );
+                                                    let remaining_ms = target_at.saturating_sub(
+                                                        Utc::now().timestamp_millis(),
+                                                    );
+                                                    if remaining_ms > 0 {
+                                                        sleep(Duration::from_millis(
+                                                            u64::try_from(remaining_ms)
+                                                                .unwrap_or(u64::MAX),
+                                                        ))
+                                                        .await;
+                                                    }
+                                                    let tiers = match sample_executor
+                                                        .shadow_arbitrage_ladder(
+                                                            &sample_candidate.opportunity,
+                                                            &sample_quote,
+                                                            &sample_notionals,
+                                                        )
+                                                        .await
+                                                    {
+                                                        Ok(tiers) => tiers,
+                                                        Err(error) => {
+                                                            warn!(target: "polypulse::strategy::spread_arbitrage",
+                                                                %error,
+                                                                source = sample_candidate.source,
+                                                                market = %sample_market,
+                                                                %delay_ms,
+                                                                "REST shadow snapshot failed"
+                                                            );
+                                                            return;
+                                                        }
+                                                    };
+                                                    for tier in tiers {
+                                                        sample_metrics.record_arbitrage_rest_shadow(
+                                                            tier.snapshot.yes_fill.filled,
+                                                            tier.snapshot.no_fill.filled,
+                                                            tier.snapshot.error.is_some(),
+                                                        );
+                                                        let logged_candidate = sample_candidate.clone();
+                                                        let logged_quote = sample_quote.clone();
+                                                        let logged_market = sample_market.clone();
+                                                        let logged_path = sample_path.clone();
+                                                        if let Err(error) = tokio::task::spawn_blocking(move || {
+                                                            utils::arbitrage_logger::log_arbitrage_rest_shadow(
+                                                                logged_candidate.source,
+                                                                &logged_candidate.opportunity,
+                                                                &logged_quote,
+                                                                &logged_market,
+                                                                logged_candidate.observed_at_ms,
+                                                                delay_ms,
+                                                                tier.max_leg_notional_usdc,
+                                                                &tier.snapshot,
+                                                                &logged_path,
+                                                            )
+                                                        })
+                                                        .await
+                                                        .unwrap_or_else(|error| {
+                                                            Err(anyhow::anyhow!(
+                                                                "REST shadow logger task failed: {error}"
+                                                            ))
+                                                        }) {
+                                                            warn!(target: "polypulse::strategy::spread_arbitrage",
+                                                                %error,
+                                                                source = sample_candidate.source,
+                                                                market = %sample_market,
+                                                                %delay_ms,
+                                                                "Failed to persist REST shadow snapshot"
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                            });
+                                            join_all(samples).await;
+                                        });
+                                    }
+                                }
                                 let Some(opp) = tick.opportunity else {
                                     continue;
                                 };
@@ -885,19 +1070,6 @@ async fn main() -> Result<()> {
                                     debug!(target: "polypulse::strategy::spread_arbitrage", market = %market_display, "Spread arbitrage entry paused by operator");
                                     continue;
                                 }
-                                            if let Some(path) = config.arbitrage_log_file.clone() {
-                                                let logged_opp = opp.clone();
-                                                let logged_market = market_display.clone();
-                                                tokio::task::spawn_blocking(move || {
-                                                    if let Err(e) = utils::arbitrage_logger::log_arbitrage_opportunity(
-                                                        &logged_opp,
-                                                        &logged_market,
-                                                        &path,
-                                                    ) {
-                                                        error!(target: "polypulse::strategy::spread_arbitrage", error = %e, "Failed to persist arbitrage opportunity");
-                                                    }
-                                                });
-                                            }
                                             // Use the exact slippage-adjusted quote for profitability,
                                             // notional sizing and risk reservation.
                                             let quote = match executor.execution_quote(&opp, yes_dir, no_dir).await {
@@ -908,6 +1080,23 @@ async fn main() -> Result<()> {
                                                     continue;
                                                 }
                                             };
+                                            if let Some(path) = config.arbitrage_log_file.clone() {
+                                                let logged_opp = opp.clone();
+                                                let logged_quote = quote.clone();
+                                                let logged_market = market_display.clone();
+                                                let observed_at_ms = Utc::now().timestamp_millis();
+                                                tokio::task::spawn_blocking(move || {
+                                                    if let Err(e) = utils::arbitrage_logger::log_arbitrage_opportunity(
+                                                        &logged_opp,
+                                                        &logged_quote,
+                                                        &logged_market,
+                                                        observed_at_ms,
+                                                        &path,
+                                                    ) {
+                                                        error!(target: "polypulse::strategy::spread_arbitrage", error = %e, "Failed to persist executable arbitrage opportunity");
+                                                    }
+                                                });
+                                            }
                                             let order_size = quote.size;
                                             let total_cost = quote.total_cost;
 
@@ -1043,6 +1232,8 @@ async fn main() -> Result<()> {
                         MarketWsConnectionState::Reconnecting(attempt) => {
                             if market_ws_seen_connected && !market_ws_reconnecting {
                                 runtime_metrics.record_sdk_market_ws_reconnect();
+                                monitor.invalidate_books();
+                                session_runner.invalidate_transient_state();
                                 warn!(attempt, "SDK market WebSocket reconnecting internally");
                             }
                             market_ws_reconnecting = market_ws_seen_connected;
@@ -1051,6 +1242,9 @@ async fn main() -> Result<()> {
                         | MarketWsConnectionState::Connecting => {
                             if market_ws_seen_connected && !market_ws_reconnecting {
                                 runtime_metrics.record_sdk_market_ws_reconnect();
+                                monitor.invalidate_books();
+                                session_runner.invalidate_transient_state();
+                                warn!("SDK market WebSocket disconnected; cached books and arbitrage candidates invalidated");
                             }
                             market_ws_reconnecting = market_ws_seen_connected;
                         }
@@ -1075,6 +1269,7 @@ async fn main() -> Result<()> {
                     }
                     let seconds_until_end = window_session.remaining_seconds(now);
                     let exposure = _risk_manager.position_tracker().calculate_exposure();
+                    let winner_exposure = winner_position_tracker.calculate_exposure();
                     let journal_writable = journal.probe_writable().is_ok();
                     service_health.set_journal_writable(journal_writable);
                     let disk_healthy = fs2::available_space(journal_dir)
@@ -1108,9 +1303,11 @@ async fn main() -> Result<()> {
                         "ready"
                     };
                     strategy_controls.set_resume_allowed(entries_ready, blocked_reason);
+                    let copy_snapshot = copy_runtime.snapshot();
                     dashboard.with_mut(|d| {
                         d.set_window(&window_label, seconds_until_end);
                         d.set_exposure(decimal_to_f64(exposure));
+                        d.set_winner_buy_exposure(decimal_to_f64(winner_exposure));
                         let metrics = runtime_metrics.snapshot();
                         d.set_winner_buy_funnel(
                             metrics.winner_buy_scans,
@@ -1145,7 +1342,20 @@ async fn main() -> Result<()> {
                         d.set_strategy_states(
                             strategy_controls.state(StrategyKind::Arbitrage),
                             strategy_controls.state(StrategyKind::WinnerBuy),
+                            strategy_controls.state(StrategyKind::CopyTrading),
                             strategy_controls.blocked_reason(),
+                        );
+                        d.set_copy_trading_metrics(
+                            copy_snapshot.whitelist_wallets,
+                            copy_snapshot.signals_seen,
+                            copy_snapshot.signals_rejected,
+                            copy_snapshot.proposals,
+                            copy_snapshot.fills,
+                            copy_snapshot.open_positions,
+                            copy_snapshot.nav_microusd as f64 / 1_000_000.0,
+                            copy_snapshot.cash_microusd as f64 / 1_000_000.0,
+                            copy_snapshot.last_poll_at_ms,
+                            copy_snapshot.last_signal_at_ms,
                         );
                         let rtds_healthy = !winner_buy_available
                             || now.timestamp_millis().saturating_sub(
@@ -1288,8 +1498,7 @@ async fn main() -> Result<()> {
                                                                 .write()
                                                                 .expect("winner token lock poisoned")
                                                                 .remove(&token);
-                                                            _risk_manager
-                                                                .position_tracker()
+                                                            winner_position_tracker
                                                                 .record_sell_fill(token, buy.filled);
                                                         }
                                                     }
@@ -1516,8 +1725,7 @@ async fn main() -> Result<()> {
                                             .write()
                                             .expect("winner token lock poisoned")
                                             .remove(&token);
-                                        _risk_manager
-                                            .position_tracker()
+                                        winner_position_tracker
                                             .record_sell_fill(token, buy.filled);
                                         runtime_metrics.record_winner_buy_redeemed();
                                         info!(target: "polypulse::strategy::winner_buy",
@@ -1608,36 +1816,64 @@ async fn main() -> Result<()> {
                             let mut no_top = monitor.winner_book_top(no_token);
                             let mut yes_from_rest = false;
                             let mut no_from_rest = false;
-                            let max_book_age_ms = config.max_book_age_ms;
+                            let max_book_age_ms = config.winner_buy_max_book_age_ms;
+                            let yes_present = yes_top.is_some();
+                            let no_present = no_top.is_some();
+                            let preliminary_signal = detect_winner_asks(
+                                yes_top.as_ref().and_then(|top| top.ask_price),
+                                no_top.as_ref().and_then(|top| top.ask_price),
+                                min_price,
+                                max_price,
+                            );
                             if yes_top.is_none() {
                                 runtime_metrics.record_winner_buy_ws_missing_book();
                             }
                             if no_top.is_none() {
                                 runtime_metrics.record_winner_buy_ws_missing_book();
                             }
-                            if yes_top.as_ref().is_some_and(|top| {
-                                !received_at_is_fresh(
+                            let yes_fresh = yes_top.as_ref().is_some_and(|top| {
+                                received_at_is_fresh(
                                     top.received_at_ms,
                                     now.timestamp_millis(),
                                     max_book_age_ms,
                                 )
-                            }) {
+                            });
+                            let no_fresh = no_top.as_ref().is_some_and(|top| {
+                                received_at_is_fresh(
+                                    top.received_at_ms,
+                                    now.timestamp_millis(),
+                                    max_book_age_ms,
+                                )
+                            });
+                            if yes_present && !yes_fresh {
                                 runtime_metrics.record_winner_buy_stale_book();
                                 runtime_metrics.record_winner_buy_stale_ws_book();
                                 yes_top = None;
                             }
-                            if no_top.as_ref().is_some_and(|top| {
-                                !received_at_is_fresh(
-                                    top.received_at_ms,
-                                    now.timestamp_millis(),
-                                    max_book_age_ms,
-                                )
-                            }) {
+                            if no_present && !no_fresh {
                                 runtime_metrics.record_winner_buy_stale_book();
                                 runtime_metrics.record_winner_buy_stale_ws_book();
                                 no_top = None;
                             }
                             if yes_top.is_none() || no_top.is_none() {
+                                if !winner_books_need_rest(
+                                    matches!(
+                                        monitor.connection_state(),
+                                        MarketWsConnectionState::Connected
+                                    ),
+                                    yes_present,
+                                    no_present,
+                                    yes_fresh,
+                                    no_fresh,
+                                    preliminary_signal.is_some(),
+                                ) {
+                                    winner_confirmations.reject(&market.slug);
+                                    runtime_metrics.record_winner_buy_no_signal();
+                                    runtime_metrics.record_winner_buy_asset_no_signal(
+                                        &market.crypto_symbol,
+                                    );
+                                    continue;
+                                }
                                 let yes_requested = yes_top.is_none();
                                 let no_requested = no_top.is_none();
                                 if yes_top.is_none() {
@@ -1736,6 +1972,7 @@ async fn main() -> Result<()> {
                             let yes_ask = yes_top.and_then(|top| top.ask_price);
                             let no_ask = no_top.and_then(|top| top.ask_price);
                             if yes_ask.is_none() && no_ask.is_none() {
+                                winner_confirmations.reject(&market.slug);
                                 runtime_metrics.record_winner_buy_no_book();
                                 runtime_metrics
                                     .record_winner_buy_asset_no_book(&market.crypto_symbol);
@@ -1748,6 +1985,7 @@ async fn main() -> Result<()> {
                             let Some(signal) =
                                 detect_winner_asks(yes_ask, no_ask, min_price, max_price)
                             else {
+                                winner_confirmations.reject(&market.slug);
                                 runtime_metrics.record_winner_buy_no_signal();
                                 runtime_metrics
                                     .record_winner_buy_asset_no_signal(&market.crypto_symbol);
@@ -1764,14 +2002,25 @@ async fn main() -> Result<()> {
                             runtime_metrics
                                 .record_winner_buy_asset_signal(&market.crypto_symbol);
                             let selected_top = if signal.buy_yes { yes_top } else { no_top };
+                            let selected_from_rest = if signal.buy_yes {
+                                yes_from_rest
+                            } else {
+                                no_from_rest
+                            };
                             let Some(selected_top) = selected_top else {
+                                winner_confirmations.reject(&market.slug);
                                 continue;
                             };
+                            let book_source = if selected_from_rest { "rest" } else { "ws" };
+                            let book_age_ms = rest_checked_at_ms
+                                .saturating_sub(selected_top.received_at_ms)
+                                .max(0);
                             let (Some(bid_price), Some(ask_price), Some(ask_size)) = (
                                 selected_top.bid_price,
                                 selected_top.ask_price,
                                 selected_top.ask_size,
                             ) else {
+                                winner_confirmations.reject(&market.slug);
                                 runtime_metrics.record_winner_buy_incomplete_book();
                                 debug!(
                                     market = %market.crypto_symbol,
@@ -1818,6 +2067,8 @@ async fn main() -> Result<()> {
                                 ask_price,
                                 ask_size,
                                 fee_per_share,
+                                book_source.to_string(),
+                                book_age_ms,
                                 &model,
                             );
                             if let Err(error) = winner_evaluation_journal
@@ -1854,11 +2105,7 @@ async fn main() -> Result<()> {
                                 runtime_metrics.record_winner_model_rejection(
                                     model.rejection.expect("rejected model has reason"),
                                 );
-                                if model.failed_checks.contains(
-                                    &crate::winner_model::ModelRejection::ReversalBoundary,
-                                ) {
-                                    winner_confirmations.reject(&market.slug);
-                                }
+                                winner_confirmations.reject(&market.slug);
                                 debug!(target: "polypulse::strategy::winner_buy",
                                     market = %market.crypto_symbol,
                                     rejection = ?model.rejection,
@@ -1873,31 +2120,192 @@ async fn main() -> Result<()> {
                                     depth_usdc = %model.depth_notional,
                                     "Winner-buy rejected by independent Chainlink model"
                                 );
+                                if config.dry_run {
+                                    let shadow_size = fee_inclusive_depth_capped_size(
+                                        signal.price,
+                                        fee_per_share,
+                                        max_order,
+                                        ask_size,
+                                    );
+                                    let shadow_executor = executor.clone();
+                                    let shadow_journal = winner_evaluation_journal
+                                        .as_ref()
+                                        .expect("Winner Buy evaluation journal initialized")
+                                        .clone();
+                                    let shadow_evaluation_id = evaluation_id.clone();
+                                    let shadow_slug = market.slug.clone();
+                                    let shadow_asset = market.crypto_symbol.clone();
+                                    let shadow_delay_ms = config.paper_winner_buy_delay_ms;
+                                    let shadow_limit = signal.price;
+                                    let shadow_metrics = runtime_metrics.clone();
+                                    runtime_metrics.record_winner_buy_shadow_execution_attempt();
+                                    window_session.spawn_trade(async move {
+                                        let result = shadow_executor
+                                            .shadow_buy_winner(
+                                                token,
+                                                shadow_limit,
+                                                shadow_size,
+                                                fee_per_share,
+                                            )
+                                            .await;
+                                        let (outcome, filled, cost, average_price, estimated_fee, error) =
+                                            match result {
+                                                Ok(execution) if execution.filled > dec!(0) => {
+                                                    shadow_metrics
+                                                        .record_winner_buy_shadow_execution_fill();
+                                                    (
+                                                        "filled",
+                                                        execution.filled,
+                                                        execution.cost,
+                                                        execution.average_price,
+                                                        execution.estimated_fee,
+                                                        None,
+                                                    )
+                                                }
+                                                Ok(_) => {
+                                                    shadow_metrics
+                                                        .record_winner_buy_shadow_execution_no_fill();
+                                                    (
+                                                        "no_fill",
+                                                        dec!(0),
+                                                        dec!(0),
+                                                        dec!(0),
+                                                        dec!(0),
+                                                        None,
+                                                    )
+                                                }
+                                                Err(error) => {
+                                                    shadow_metrics
+                                                        .record_winner_buy_shadow_execution_failure();
+                                                    (
+                                                        "error",
+                                                        dec!(0),
+                                                        dec!(0),
+                                                        dec!(0),
+                                                        dec!(0),
+                                                        Some(error.to_string()),
+                                                    )
+                                                }
+                                            };
+                                        let execution = WinnerShadowExecution {
+                                            evaluation_id: shadow_evaluation_id.clone(),
+                                            slug: shadow_slug.clone(),
+                                            simulated_at: Utc::now(),
+                                            delay_ms: shadow_delay_ms,
+                                            candidate_stage: "rejected".to_string(),
+                                            outcome: outcome.to_string(),
+                                            limit_price: shadow_limit,
+                                            requested: shadow_size,
+                                            filled,
+                                            cost,
+                                            average_price,
+                                            estimated_fee,
+                                            error,
+                                        };
+                                        if let Err(error) =
+                                            shadow_journal.record_shadow_execution(execution)
+                                        {
+                                            warn!(target: "polypulse::strategy::winner_buy",
+                                                %error,
+                                                evaluation_id = %shadow_evaluation_id,
+                                                market = %shadow_asset,
+                                                "Winner Buy shadow execution persistence failed"
+                                            );
+                                            return;
+                                        }
+                                        debug!(target: "polypulse::strategy::winner_buy",
+                                            evaluation_id = %shadow_evaluation_id,
+                                            market = %shadow_asset,
+                                            %outcome,
+                                            %shadow_limit,
+                                            requested = %shadow_size,
+                                            %filled,
+                                            %average_price,
+                                            %cost,
+                                            "Winner Buy rejected-candidate shadow execution recorded"
+                                        );
+                                    });
+                                }
                                 continue;
                             }
                             let observed_at_ms = model
                                 .observed_at_ms
                                 .expect("admitted model has observation timestamp");
-                            if !winner_confirmations.confirm(
+                            let confirmation = winner_confirmations.observe(
                                 &market.slug,
                                 signal.buy_yes,
                                 observed_at_ms,
                                 config.winner_buy_confirmation_observations,
                                 config.winner_buy_feed_max_age_ms.saturating_mul(3),
-                            ) {
+                            );
+                            let confirmation_observation = WinnerConfirmationObservation {
+                                evaluation_id: evaluation_id.clone(),
+                                slug: market.slug.clone(),
+                                recorded_at: Utc::now(),
+                                model_observed_at_ms: observed_at_ms,
+                                confirmations: confirmation.confirmations,
+                                required: confirmation.required,
+                                confirmed: confirmation.confirmed,
+                            };
+                            if let Err(error) = winner_evaluation_journal
+                                .as_ref()
+                                .expect("Winner Buy evaluation journal initialized")
+                                .record_confirmation_observation(confirmation_observation)
+                            {
+                                error!(target: "polypulse::strategy::winner_buy",
+                                    %error,
+                                    %evaluation_id,
+                                    market = %market.crypto_symbol,
+                                    "Winner Buy confirmation progress persistence failed"
+                                );
+                                continue;
+                            }
+                            if !confirmation.confirmed {
                                 runtime_metrics.record_winner_buy_awaiting_confirmation();
                                 debug!(target: "polypulse::strategy::winner_buy",
                                     market = %market.crypto_symbol,
                                     p_model = %model.probability,
                                     net_ev = %model.net_ev,
+                                    confirmations = confirmation.confirmations,
+                                    required = confirmation.required,
                                     "Winner-buy awaiting consecutive Chainlink confirmations"
                                 );
+                                if config.dry_run {
+                                    let shadow_size = fee_inclusive_depth_capped_size(
+                                        signal.price,
+                                        fee_per_share,
+                                        max_order,
+                                        ask_size,
+                                    );
+                                    runtime_metrics
+                                        .record_winner_buy_shadow_execution_attempt();
+                                    window_session.spawn_trade(record_pending_winner_shadow(
+                                        executor.clone(),
+                                        winner_evaluation_journal
+                                            .as_ref()
+                                            .expect("Winner Buy evaluation journal initialized")
+                                            .clone(),
+                                        runtime_metrics.clone(),
+                                        token,
+                                        signal.price,
+                                        shadow_size,
+                                        fee_per_share,
+                                        config.paper_winner_buy_delay_ms,
+                                        evaluation_id.clone(),
+                                        market.slug.clone(),
+                                        market.crypto_symbol.clone(),
+                                    ));
+                                }
                                 continue;
                             }
                             // The configured maximum is a cash limit, so fees
                             // must be included when converting it to shares.
-                            let size =
-                                fee_inclusive_capped_size(signal.price, fee_per_share, max_order);
+                            let size = fee_inclusive_depth_capped_size(
+                                signal.price,
+                                fee_per_share,
+                                max_order,
+                                ask_size,
+                            );
                             if size <= dec!(0) {
                                 continue;
                             }
@@ -1923,7 +2331,7 @@ async fn main() -> Result<()> {
                                 );
                                 continue;
                             }
-                            let position_tracker = _risk_manager.position_tracker();
+                            let position_tracker = winner_position_tracker.clone();
                             let Some(risk_reservation) = position_tracker.reserve(
                                 format!("winner:{position_id}"),
                                 planned_cost,
@@ -2188,6 +2596,88 @@ async fn main() -> Result<()> {
 
         info!("Current window monitoring ended, refreshing markets for next round");
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn record_pending_winner_shadow(
+    executor: Arc<TradingExecutor>,
+    journal: Arc<WinnerEvaluationJournal>,
+    metrics: Arc<RuntimeMetrics>,
+    token: polymarket_client_sdk::types::U256,
+    limit_price: rust_decimal::Decimal,
+    size: rust_decimal::Decimal,
+    fee_per_share: rust_decimal::Decimal,
+    delay_ms: u64,
+    evaluation_id: String,
+    slug: String,
+    asset: String,
+) {
+    let result = executor
+        .shadow_buy_winner(token, limit_price, size, fee_per_share)
+        .await;
+    let (outcome, filled, cost, average_price, estimated_fee, error) = match result {
+        Ok(execution) if execution.filled > dec!(0) => {
+            metrics.record_winner_buy_shadow_execution_fill();
+            (
+                "filled",
+                execution.filled,
+                execution.cost,
+                execution.average_price,
+                execution.estimated_fee,
+                None,
+            )
+        }
+        Ok(_) => {
+            metrics.record_winner_buy_shadow_execution_no_fill();
+            ("no_fill", dec!(0), dec!(0), dec!(0), dec!(0), None)
+        }
+        Err(error) => {
+            metrics.record_winner_buy_shadow_execution_failure();
+            (
+                "error",
+                dec!(0),
+                dec!(0),
+                dec!(0),
+                dec!(0),
+                Some(error.to_string()),
+            )
+        }
+    };
+    let execution = WinnerShadowExecution {
+        evaluation_id: evaluation_id.clone(),
+        slug,
+        simulated_at: chrono::Utc::now(),
+        delay_ms,
+        candidate_stage: "awaiting_confirmation".to_string(),
+        outcome: outcome.to_string(),
+        limit_price,
+        requested: size,
+        filled,
+        cost,
+        average_price,
+        estimated_fee,
+        error,
+    };
+    if let Err(error) = journal.record_shadow_execution(execution) {
+        warn!(target: "polypulse::strategy::winner_buy",
+            %error,
+            %evaluation_id,
+            market = %asset,
+            "Winner Buy awaiting-confirmation shadow persistence failed"
+        );
+        return;
+    }
+    debug!(target: "polypulse::strategy::winner_buy",
+        %evaluation_id,
+        market = %asset,
+        %outcome,
+        %limit_price,
+        requested = %size,
+        %filled,
+        %average_price,
+        %cost,
+        "Winner Buy awaiting-confirmation shadow execution recorded"
+    );
 }
 
 fn winner_model_policy(

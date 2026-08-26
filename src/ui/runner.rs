@@ -76,6 +76,9 @@ fn run_dashboard(
                         DashboardAction::ToggleStrategy(1) => {
                             Some(controls.toggle(StrategyKind::WinnerBuy))
                         }
+                        DashboardAction::ToggleStrategy(2) => {
+                            Some(controls.toggle(StrategyKind::CopyTrading))
+                        }
                         DashboardAction::PauseAll => {
                             controls.pause_all();
                             let mut app = state.lock().expect("dashboard lock");
@@ -116,6 +119,7 @@ fn run_dashboard(
                     app.set_strategy_states(
                         controls.state(StrategyKind::Arbitrage),
                         controls.state(StrategyKind::WinnerBuy),
+                        controls.state(StrategyKind::CopyTrading),
                         controls.blocked_reason(),
                     );
                 }
@@ -141,5 +145,6 @@ fn strategy_name(strategy: StrategyKind) -> &'static str {
     match strategy {
         StrategyKind::Arbitrage => "Spread Arbitrage",
         StrategyKind::WinnerBuy => "Winner Buy",
+        StrategyKind::CopyTrading => "Copy Trading",
     }
 }

@@ -52,6 +52,10 @@ impl SignalDeduplicator {
         self.last.insert(market, (yes, no, now));
         true
     }
+
+    pub fn clear(&self) {
+        self.last.clear();
+    }
 }
 
 #[cfg(test)]

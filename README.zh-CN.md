@@ -99,13 +99,14 @@ cargo run              # 运行程序
 | `ARBITRAGE_EXECUTION_SPREAD` | `0.01` | 执行阈值：`yes + no <= 1 - spread` 时下单 |
 | `MAX_ORDER_SIZE_USDC` | `100.0` | 单腿最大名义金额；按最终限价换算 share 数量 |
 | `RISK_MAX_EXPOSURE_USDC` | `1000.0` | 全账户持仓成本与待提交订单的最大风险敞口 |
-| `ARBITRAGE_FEE_BUFFER` | `0.002` | 应用滑点后仍必须保留的手续费/舍入缓冲 |
+| `ARBITRAGE_FEE_BUFFER` | `0.002` | 按市场参数计算动态手续费后，仍必须保留的模型/舍入安全边际 |
 | `DRY_RUN` | `false` | 演练模式：使用真实只读数据并模拟成交，不执行账户写操作 |
 | `CANARY_MODE` | `false` | 极小额实盘硬闸门；实盘启用时必须使用 FOK/FAK |
 | `CANARY_MAX_PAIR_NOTIONAL_USDC` / `CANARY_MAX_TOTAL_NOTIONAL_USDC` | `3.0` / `3.0` | 单订单对及单进程累计名义金额上限 |
 | `CANARY_MAX_LOSS_USDC` | `2.0` | 单腿残余成本等保守损失预算，触发后永久暂停本进程开仓 |
 | `CANARY_MAX_PAIRS_PER_WINDOW` / `CANARY_MAX_PAIRS_TOTAL` | `1` / `1` | 每窗口及单进程订单对硬上限 |
-| `PAPER_INITIAL_BALANCE_USDC` | `50.0` | Dry-run 独立虚拟现金额度 |
+| `ARBITRAGE_BUDGET_USDC` / `WINNER_BUY_BUDGET_USDC` / `COPY_TRADING_BUDGET_USDC` | `1000` / `50` / `10000` | 三策略独立可用额度；TUI 分别显示并在下单前硬限制 |
+| `PAPER_INITIAL_BALANCE_USDC` | `50.0` | 旧版 PAPER 默认额度；未配置 Winner Buy 独立额度时作为兼容回退 |
 | `PAPER_LIQUIDITY_HAIRCUT` | `0.75` | 模拟时只认为盘口显示深度的该比例可以成交 |
 | `PAPER_SECOND_LEG_DELAY_MS` | `250` | 第一腿模拟后等待多久重新读取第二腿真实盘口 |
 | `MAX_BOOK_AGE_MS` / `MAX_BOOK_SKEW_MS` | `2000` / `1000` | 拒绝过期或两腿时间差过大的行情快照 |
@@ -113,6 +114,7 @@ cargo run              # 运行程序
 | `ARBITRAGE_STATE_JOURNAL_FILE` | `results/spread-arbitrage/{paper|live}/orders.ndjson` | 套利订单对与恢复状态；旧 `STATE_JOURNAL_FILE` 仍兼容 |
 | `WINNER_BUY_STATE_JOURNAL_FILE` | `results/winner-buy/{paper|live}/orders.ndjson` | Winner Buy 下单、成交与结算状态 |
 | `WINNER_BUY_EVALUATION_JOURNAL_FILE` | `results/winner-buy/{paper|live}/evaluations.ndjson` | Winner Buy 候选与反事实评估数据 |
+| `WINNER_BUY_MAX_BOOK_AGE_MS` | `1000` | Winner Buy 独立 WS 行情年龄；疑似候选或缺书时才进行严格 REST 确认 |
 | `ARBITRAGE_SHADOW_LOG_FILE` | 未设置 | 可选的深度拒绝候选 NDJSON 研究日志，不改变准入阈值 |
 | `LOG_FILE` | TUI 下为 `logs/system.log` | 系统日志；配置分策略日志后不再重复对应策略事件 |
 | `ARBITRAGE_STRATEGY_LOG_FILE` / `WINNER_BUY_STRATEGY_LOG_FILE` | 未设置 | 可选、互斥的分策略文本日志 |
@@ -125,11 +127,24 @@ cargo run              # 运行程序
 
 其余参数（CLOB 地址、签名类型、滑点、订单类型、持仓同步等）均有合理默认值，一般无需修改。完整列表与注释见 `.env.example`。
 
+Winner Buy 应按 `market_resolved` 独立市场统计，避免重复评估放大样本。可直接生成手续费后、Shadow 成交后以及 Wilson 95% 胜率下界报告：
+
+```bash
+cargo run --release --bin winner_buy_report -- \
+  results/winner-buy/server-paper-run-001/evaluations.ndjson
+```
+
+不传文件名时，命令优先读取 `WINNER_BUY_EVALUATION_JOURNAL_FILE`。
+
 启动时会用 CLOB 累计成交和 Data API 持仓自动对账，并重建可管理的恢复任务。状态日志新记录带版本号和 SHA-256 校验和；若崩溃只损坏最后一行，启动时会将其隔离为 `.corrupt-*` 文件并保留此前有效记录。中间记录损坏仍会阻止启动。缺少上下文的旧日志默认阻止实盘启动；`ALLOW_UNRESOLVED_STATE=true` 只允许进程进入核对/恢复流程，未解决状态仍禁止新实盘开仓。
 
 首次极小额验证建议使用 `DRY_RUN=false`、`CANARY_MODE=true`、`ARBITRAGE_ORDER_TYPE=FAK`。`/readyz` 只有在初始化、行情/用户流连接、journal 可写、磁盘空间充足、无未解决订单且实盘安全闸门未熔断时才返回 200。任何无法确认结果的 CLOB 写请求都会跨窗口暂停新开仓，必须重启并完成账户/订单核对，不能在进程内手工解除。
 
 `DRY_RUN=true` 使用真实 CLOB 多档盘口进行纸面撮合：困难腿先读取实时订单簿并按限价逐档成交，等待 `PAPER_SECOND_LEG_DELAY_MS` 后重新读取另一腿，再按第一腿虚拟成交量模拟 FOK/FAK/即时可成交部分。它不会恢复真实 recovery、同步真实持仓、下单、撤单、Merge 或卖出。Prometheus 提供 `polypulse_paper_pairs_total`、`polypulse_paper_one_sided_total` 和 `polypulse_paper_net_pnl_usd`。
+
+## 跟单候选钱包发现
+
+独立的只读 `copy_wallet_scout` 可按市场一级/二级分类、近期活跃度、已结算样本、收益质量、风险和当前盘口适配度筛选跟单候选地址。它不读取密钥、不下单，也不直接修改 `.env`。编译、参数和输出说明见 [跟单候选钱包发现器](docs/COPY_WALLET_SCOUT.zh-CN.md)。
 
 ## 免责声明
 

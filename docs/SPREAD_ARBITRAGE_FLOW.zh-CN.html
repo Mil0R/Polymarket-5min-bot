@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Spread Arbitrage 策略逻辑流程</title>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&amp;family=Geist:wght@400;500;600&amp;family=Geist+Mono:wght@400;500;600&amp;display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --paper: #f5f5f5;
+      --ink: #2d3142;
+      --muted: #4f5d75;
+      --soft: #7a8399;
+      --accent: #eb6c36;
+      --link: #2e5aa8;
+      --font-sans: 'Geist', system-ui, sans-serif;
+      --font-serif: 'Instrument Serif', 'Noto Serif SC', serif;
+      --font-mono: 'Geist Mono', ui-monospace, monospace;
+    }
+
+    body {
+      min-height: 100vh;
+      padding: 48px 32px;
+      background: var(--paper);
+      color: var(--ink);
+      font-family: var(--font-sans);
+    }
+
+    .frame { width: 100%; max-width: 1280px; margin: 0 auto; }
+    .eyebrow {
+      margin-bottom: 8px;
+      color: var(--muted);
+      font: 500 8px/1.4 var(--font-mono);
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+    }
+    h1 {
+      margin-bottom: 8px;
+      font: 400 32px/1.15 var(--font-serif);
+      letter-spacing: -0.02em;
+    }
+    .subtitle {
+      margin-bottom: 24px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.6;
+    }
+    svg { display: block; width: 100%; min-width: 960px; }
+    .node-name { fill: var(--ink); font: 600 12px var(--font-sans); text-anchor: middle; }
+    .node-sub { fill: var(--muted); font: 400 8px var(--font-mono); text-anchor: middle; }
+    .tag { fill: var(--soft); font: 500 8px var(--font-mono); letter-spacing: 0.12em; }
+    .arrow-label { fill: var(--muted); font: 500 8px var(--font-mono); text-anchor: middle; letter-spacing: 0.04em; }
+    .rail-title { fill: var(--ink); font: 600 12px var(--font-sans); }
+    .rail-copy { fill: var(--muted); font: 400 8px var(--font-mono); }
+  </style>
+</head>
+<body>
+  <main class="frame">
+    <p class="eyebrow">FLOWCHART · SPREAD ARBITRAGE · CODE-ALIGNED</p>
+    <h1>Spread Arbitrage 策略逻辑流程</h1>
+    <p class="subtitle">从 YES / NO 实时盘口到双腿成交；所有失败分支均 fail closed，不允许在未确认第一腿成交时盲目提交第二腿。</p>
+
+    <svg viewBox="0 0 1200 1160" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="spread-arbitrage-flow-title spread-arbitrage-flow-desc">
+      <title id="spread-arbitrage-flow-title">Spread Arbitrage 策略逻辑流程</title>
+      <desc id="spread-arbitrage-flow-desc">流程图展示策略如何验证 YES 与 NO 盘口、识别价差和深度、执行准入与风险检查、重新验证实时盘口，并按薄腿优先原则顺序成交两腿。</desc>
+      <defs>
+        <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+          <polygon points="0 0, 8 3, 0 6" fill="#4f5d75"/>
+        </marker>
+        <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+          <polygon points="0 0, 8 3, 0 6" fill="#eb6c36"/>
+        </marker>
+        <marker id="arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+          <polygon points="0 0, 8 3, 0 6" fill="#2e5aa8"/>
+        </marker>
+      </defs>
+
+      <rect width="1200" height="1160" fill="#f5f5f5"/>
+
+      <!-- Connectors are painted before nodes. -->
+      <line x1="520" y1="164" x2="520" y2="204" stroke="#2e5aa8" stroke-width="1.2" marker-end="url(#arrow-link)"/>
+      <line x1="520" y1="316" x2="520" y2="356" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="520" y1="468" x2="520" y2="508" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="520" y1="620" x2="520" y2="660" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="520" y1="772" x2="520" y2="812" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="520" y1="924" x2="520" y2="972" stroke="#eb6c36" stroke-width="1.2" marker-end="url(#arrow-accent)"/>
+
+      <path d="M680 108 H812 Q820 108 820 116 V164 Q820 172 828 172 H840" fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <path d="M680 260 H812 Q820 260 820 268 V272 Q820 280 828 280 H840" fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <path d="M680 412 H812 Q820 412 820 404 V396 Q820 388 828 388 H840" fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <path d="M680 564 H812 Q820 564 820 556 V504 Q820 496 828 496 H840" fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <path d="M680 716 H812 Q820 716 820 708 V612 Q820 604 828 604 H840" fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <path d="M680 868 H812 Q820 868 820 860 V720 Q820 712 828 712 H840" fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+      <!-- Downward branch labels: masks sit to the side of each vertical connector. -->
+      <rect x="532" y="176" width="40" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="552" y="184" class="arrow-label">通过</text>
+      <rect x="532" y="328" width="40" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="552" y="336" class="arrow-label">通过</text>
+      <rect x="532" y="480" width="40" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="552" y="488" class="arrow-label">通过</text>
+      <rect x="532" y="632" width="40" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="552" y="640" class="arrow-label">通过</text>
+      <rect x="532" y="784" width="40" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="552" y="792" class="arrow-label">通过</text>
+      <rect x="532" y="940" width="40" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="552" y="948" class="arrow-label" style="fill:#eb6c36">通过</text>
+
+      <!-- Rejection labels: 12px visual gap above their horizontal segments. -->
+      <rect x="692" y="84" width="88" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="736" y="92" class="arrow-label">失效 / 偏斜</text>
+      <rect x="692" y="236" width="112" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="748" y="244" class="arrow-label">无边际 / 浅深度</text>
+      <rect x="692" y="388" width="80" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="732" y="396" class="arrow-label">准入拒绝</text>
+      <rect x="692" y="540" width="96" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="740" y="548" class="arrow-label">净边际不足</text>
+      <rect x="692" y="692" width="80" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="732" y="700" class="arrow-label">风控拒绝</text>
+      <rect x="692" y="844" width="96" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="740" y="852" class="arrow-label">流动性消失</text>
+
+      <!-- 1. Synchronized order-book gate -->
+      <polygon points="520,52 680,108 520,164 360,108" fill="rgba(46,90,168,0.04)" stroke="#2e5aa8" stroke-width="1"/>
+      <text x="520" y="96" class="node-name">YES / NO 盘口可用且同步？</text>
+      <text x="520" y="116" class="node-sub">WS pair · max_book_age · max_book_skew</text>
+      <text x="520" y="132" class="node-sub">缺边、过期、未来时间戳一律拒绝</text>
+
+      <!-- 2. Detector -->
+      <polygon points="520,204 680,260 520,316 360,260" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <text x="520" y="240" class="node-name">存在生产级价差机会？</text>
+      <text x="520" y="260" class="node-sub">1 − (YES ask + NO ask) ≥ min_profit</text>
+      <text x="520" y="276" class="node-sub">两腿 &gt; $1 · 双侧累计深度 ≥ min_ask_depth</text>
+
+      <!-- 3. Admission -->
+      <polygon points="520,356 680,412 520,468 360,412" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <text x="520" y="392" class="node-name">策略准入与去重通过？</text>
+      <text x="520" y="412" class="node-sub">execution spread · 暂停 · 连接 · 未决状态</text>
+      <text x="520" y="428" class="node-sub">腿价格下限 · 临近收盘 · signal cooldown</text>
+
+      <!-- 4. Executable quote -->
+      <polygon points="520,508 680,564 520,620 360,564" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <text x="520" y="544" class="node-name">最终可执行报价仍有利润？</text>
+      <text x="520" y="564" class="node-sub">方向滑点 + BUY tick 向上取整 + fee buffer</text>
+      <text x="520" y="580" class="node-sub">按双腿深度与单腿 notional 上限计算 size</text>
+
+      <!-- 5. Risk gate -->
+      <polygon points="520,660 680,716 520,772 360,716" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <text x="520" y="696" class="node-name">风险、仓位与节流通过？</text>
+      <text x="520" y="716" class="node-sub">资金预留 · exposure · position imbalance</text>
+      <text x="520" y="732" class="node-sub">operator gate · 3s interval · live/canary safety</text>
+
+      <!-- 6. Last live-book preflight -->
+      <polygon points="520,812 680,868 520,924 360,868" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <text x="520" y="848" class="node-name">REST 预检确认两腿可成交？</text>
+      <text x="520" y="868" class="node-sub">并行刷新 live books · limit 内必须均有深度</text>
+      <text x="520" y="884" class="node-sub">PAPER 与 LIVE 都在首腿之前 fail closed</text>
+
+      <!-- 7. Focal execution and outcome -->
+      <rect x="336" y="972" width="368" height="88" rx="8" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1.2"/>
+      <rect x="348" y="984" width="72" height="16" rx="2" fill="transparent" stroke="rgba(235,108,54,0.50)" stroke-width="0.8"/>
+      <text x="384" y="996" class="tag" style="fill:#eb6c36;text-anchor:middle">EXECUTE</text>
+      <text x="520" y="1012" class="node-name">薄腿先下 → 冻结并确认 → 按实成交量对冲</text>
+      <text x="520" y="1032" class="node-sub">双腿成交：记入 pair · 单腿：交给 recovery · 均未成交：失败关闭</text>
+      <text x="520" y="1048" class="node-sub">PAPER 使用延迟后的实时盘口模拟；LIVE 顺序写单并核对累计成交</text>
+
+      <!-- Rejection / observation rail -->
+      <rect x="840" y="120" width="280" height="680" rx="8" fill="rgba(45,49,66,0.03)" stroke="rgba(45,49,66,0.30)" stroke-width="1"/>
+      <rect x="856" y="140" width="56" height="16" rx="2" fill="transparent" stroke="rgba(79,93,117,0.40)" stroke-width="0.8"/>
+      <text x="884" y="152" class="tag" style="text-anchor:middle">SKIP</text>
+      <text x="856" y="184" class="rail-title">不下单，等待下一组盘口</text>
+      <line x1="856" y1="204" x2="1104" y2="204" stroke="rgba(45,49,66,0.12)" stroke-width="0.8"/>
+
+      <text x="856" y="240" class="tag">DATA QUALITY</text>
+      <text x="856" y="260" class="rail-copy">时间戳失败 → unsafe pair rejection</text>
+
+      <text x="856" y="332" class="tag">DETECTOR</text>
+      <text x="856" y="352" class="rail-copy">无边际 → 等待；不产生机会</text>
+      <text x="856" y="368" class="rail-copy">深度不足 → PAPER shadow NDJSON</text>
+
+      <text x="856" y="432" class="tag">ADMISSION</text>
+      <text x="856" y="452" class="rail-copy">按具体原因累加拒绝指标</text>
+      <text x="856" y="468" class="rail-copy">重复信号在 cooldown 内抑制</text>
+
+      <text x="856" y="532" class="tag">FINAL QUOTE</text>
+      <text x="856" y="552" class="rail-copy">滑点 / tick / fee 吃掉边际则关闭</text>
+
+      <text x="856" y="632" class="tag">RISK</text>
+      <text x="856" y="652" class="rail-copy">释放预留 guard；不扩大敞口</text>
+
+      <text x="856" y="732" class="tag">PRE-FLIGHT</text>
+      <text x="856" y="752" class="rail-copy">任一 REST book 查询或深度失败</text>
+      <text x="856" y="768" class="rail-copy">均禁止提交第一腿</text>
+
+      <!-- Bottom legend, outside diagram area. -->
+      <line x1="40" y1="1100" x2="1160" y2="1100" stroke="rgba(45,49,66,0.12)" stroke-width="0.8"/>
+      <text x="40" y="1120" class="tag">LEGEND · SHAPE CARRIES TYPE</text>
+
+      <polygon points="268,1128 280,1136 268,1144 256,1136" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <text x="292" y="1140" class="rail-copy">决策门</text>
+
+      <rect x="376" y="1128" width="24" height="16" rx="4" fill="rgba(45,49,66,0.03)" stroke="rgba(45,49,66,0.30)" stroke-width="1"/>
+      <text x="412" y="1140" class="rail-copy">拒绝 / 观测出口</text>
+
+      <line x1="560" y1="1136" x2="592" y2="1136" stroke="#2e5aa8" stroke-width="1.2" marker-end="url(#arrow-link)"/>
+      <text x="604" y="1140" class="rail-copy">外部实时行情</text>
+
+      <line x1="728" y1="1136" x2="760" y2="1136" stroke="#eb6c36" stroke-width="1.2" marker-end="url(#arrow-accent)"/>
+      <text x="772" y="1140" class="rail-copy">进入顺序成交</text>
+    </svg>
+  </main>
+</body>
+</html>

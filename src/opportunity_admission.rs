@@ -109,6 +109,8 @@ mod tests {
             profit_percentage: dec!(5),
             yes_size: dec!(10),
             no_size: dec!(10),
+            yes_book_timestamp_ms: 0,
+            no_book_timestamp_ms: 0,
         }
     }
 

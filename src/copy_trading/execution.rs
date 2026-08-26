@@ -1,6 +1,6 @@
 use crate::copy_trading::types::{
     ConsensusSignal, CopyTradingConfig, ExecutionOrderProposal, ExecutionOrderState,
-    OrderLifecycleStatus, OrderSide, OrderBookSnapshot,
+    OrderBookSnapshot, OrderLifecycleStatus, OrderSide,
 };
 use chrono::{DateTime, Duration, Utc};
 use dashmap::DashMap;
@@ -55,7 +55,10 @@ impl fmt::Display for ExecutionError {
                 "Best ask ${:.4} exceeds price offset cap ${:.4}",
                 best_ask, max_allowed_price
             ),
-            ExecutionError::OrderSizeBelowMinimum { size_usdc, min_size } => write!(
+            ExecutionError::OrderSizeBelowMinimum {
+                size_usdc,
+                min_size,
+            } => write!(
                 f,
                 "Calculated order size ${:.2} is below minimum allowed ${:.2}",
                 size_usdc, min_size
@@ -106,7 +109,9 @@ impl SmartExecutionEngine {
     ) -> Result<ExecutionOrderProposal, ExecutionError> {
         // 0. Sanity bounds on consensus VWAP. Even a whitelisted consensus must not
         //    be allowed to drive the price cap toward 1.0 on manipulated/far-book data.
-        if consensus.target_vwap < self.config.min_signal_vwap || consensus.target_vwap > self.config.max_signal_vwap {
+        if consensus.target_vwap < self.config.min_signal_vwap
+            || consensus.target_vwap > self.config.max_signal_vwap
+        {
             return Err(ExecutionError::TargetVwapOutOfBounds {
                 vwap: consensus.target_vwap,
                 min_vwap: self.config.min_signal_vwap,
@@ -120,7 +125,8 @@ impl SmartExecutionEngine {
         // Cap A: Target VWAP + max price offset ($0.01 ~ $0.02)
         let price_cap_offset = consensus.target_vwap + self.config.max_price_offset_usd;
         // Cap B: Target VWAP * (1 + max_slippage_pct)
-        let price_cap_slippage = consensus.target_vwap * (Decimal::ONE + self.config.max_slippage_pct);
+        let price_cap_slippage =
+            consensus.target_vwap * (Decimal::ONE + self.config.max_slippage_pct);
 
         let max_allowed_price = price_cap_offset.min(price_cap_slippage);
 
@@ -140,10 +146,25 @@ impl SmartExecutionEngine {
             }
         }
 
-        let limit_price = best_ask.min(max_allowed_price);
+        // Cross only the first five levels that remain inside the strategy cap.
+        // The old implementation sized from five levels but placed at best ask,
+        // so paper mode assumed liquidity that a live order could not reach.
+        let eligible_asks: Vec<_> = book
+            .asks
+            .iter()
+            .take(5)
+            .filter(|level| level.price <= max_allowed_price)
+            .collect();
+        let limit_price = eligible_asks
+            .last()
+            .map(|level| level.price)
+            .ok_or(ExecutionError::NoAskLiquidity)?;
 
-        // 2. Anti-dump circuit breaker: Top-5 Depth liquidity <= 10%
-        let top5_ask_notional = book.top_n_ask_depth_notional(5);
+        // 2. Anti-dump circuit breaker: eligible Top-5 depth liquidity <= 10%
+        let top5_ask_notional: Decimal = eligible_asks
+            .iter()
+            .map(|level| level.price * level.size)
+            .sum();
         if top5_ask_notional <= Decimal::ZERO {
             return Err(ExecutionError::InsufficientOrderBookLiquidity {
                 top5_depth_usdc: Decimal::ZERO,
@@ -200,7 +221,12 @@ impl SmartExecutionEngine {
     }
 
     /// Registers placed order into active lifecycle tracker.
-    pub fn register_placed_order(&self, order_id: String, proposal: ExecutionOrderProposal, placed_at: DateTime<Utc>) {
+    pub fn register_placed_order(
+        &self,
+        order_id: String,
+        proposal: ExecutionOrderProposal,
+        placed_at: DateTime<Utc>,
+    ) {
         let ttl_duration = Duration::seconds(proposal.ttl_seconds as i64);
         let expires_at = placed_at + ttl_duration;
 
@@ -253,15 +279,31 @@ impl SmartExecutionEngine {
     /// a cumulative total. The engine accumulates it into the order state and keeps
     /// a weighted average fill price. Duplicate delivery of the same fill event
     /// must be de-duplicated by the upstream feed.
-    pub fn record_fill(&self, order_id: &str, filled_shares: Decimal, avg_price: Decimal, now: DateTime<Utc>) {
+    pub fn record_fill(
+        &self,
+        order_id: &str,
+        filled_shares: Decimal,
+        avg_price: Decimal,
+        now: DateTime<Utc>,
+    ) -> Decimal {
         if let Some(mut entry) = self.active_orders.get_mut(order_id) {
+            if filled_shares <= Decimal::ZERO || avg_price <= Decimal::ZERO {
+                return Decimal::ZERO;
+            }
             let prev_filled = entry.filled_shares;
-            let new_filled = prev_filled + filled_shares;
-            if prev_filled > Decimal::ZERO && filled_shares > Decimal::ZERO {
+            let remaining = (entry.proposal.shares - prev_filled).max(Decimal::ZERO);
+            let accepted_fill = filled_shares.min(remaining);
+            if accepted_fill <= Decimal::ZERO {
+                warn!(order_id = %order_id, "Duplicate/excess fill ignored");
+                return Decimal::ZERO;
+            }
+            let new_filled = prev_filled + accepted_fill;
+            if prev_filled > Decimal::ZERO {
                 // Weighted average of old + new fill prices
-                let total_cost = (prev_filled * entry.filled_avg_price) + (filled_shares * avg_price);
+                let total_cost =
+                    (prev_filled * entry.filled_avg_price) + (accepted_fill * avg_price);
                 entry.filled_avg_price = total_cost / new_filled;
-            } else if filled_shares > Decimal::ZERO {
+            } else {
                 entry.filled_avg_price = avg_price;
             }
             entry.filled_shares = new_filled;
@@ -272,6 +314,22 @@ impl SmartExecutionEngine {
                 entry.status = OrderLifecycleStatus::PartiallyFilled;
             }
             debug!(order_id = %order_id, filled = %new_filled, status = ?entry.status, "Updated order fill state");
+            accepted_fill
+        } else {
+            Decimal::ZERO
         }
+    }
+
+    pub fn finalize_order(&self, order_id: &str, now: DateTime<Utc>) -> Option<String> {
+        let mut entry = self.active_orders.get_mut(order_id)?;
+        if entry.filled_shares >= entry.proposal.shares {
+            entry.status = OrderLifecycleStatus::Filled;
+        } else if entry.filled_shares > Decimal::ZERO {
+            entry.status = OrderLifecycleStatus::PartiallyFilled;
+        } else {
+            entry.status = OrderLifecycleStatus::CancelledByTTL;
+        }
+        entry.last_updated_at = now;
+        Some(entry.proposal.proposal_id.clone())
     }
 }

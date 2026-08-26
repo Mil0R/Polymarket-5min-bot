@@ -70,6 +70,7 @@ pub struct OnChainTradeFeed {
     seen: Arc<DashMap<String, HashSet<String>>>,
     market_cache: Arc<DashMap<String, TokenMarketInfo>>,
     http: reqwest::Client,
+    allowed_operators: HashSet<Address>,
 }
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -77,14 +78,21 @@ use std::sync::atomic::{AtomicU64, Ordering};
 impl OnChainTradeFeed {
     pub async fn new(rpc_url: &str) -> Result<Self> {
         let provider: Arc<dyn Provider> = Arc::new(
-            ProviderBuilder::new()
-                .connect_http(rpc_url.parse().context("invalid RPC URL")?),
+            ProviderBuilder::new().connect_http(rpc_url.parse().context("invalid RPC URL")?),
         );
         let _block = provider
             .get_block_number()
             .await
             .context("RPC unreachable")?;
         info!(rpc = %rpc_url, "On-chain CTF transfer feed initialized");
+        let allowed_operators: HashSet<Address> = std::env::var("COPY_ONCHAIN_ALLOWED_OPERATORS")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect();
+        if allowed_operators.is_empty() {
+            tracing::warn!("On-chain feed has no allowed exchange operators; transfer-derived signals will be suppressed");
+        }
         Ok(Self {
             provider,
             last_block: AtomicU64::new(0),
@@ -94,6 +102,7 @@ impl OnChainTradeFeed {
                 .user_agent("polypulse-copy-trader")
                 .build()
                 .context("failed to build http client")?,
+            allowed_operators,
         })
     }
 
@@ -195,20 +204,25 @@ impl OnChainTradeFeed {
 
             for log in &logs {
                 let tx_hash = log.transaction_hash.unwrap_or_default();
-                let log_idx = log
-                    .log_index
-                    .map(|i| i.to_string())
-                    .unwrap_or_default();
+                let log_idx = log.log_index.map(|i| i.to_string()).unwrap_or_default();
                 let inner = log.clone().into_inner();
 
                 #[cfg(debug_assertions)]
-                eprintln!("[feed] raw log t0={}", inner.topics().first().map(|t| t.to_string()).unwrap_or_default());
+                eprintln!(
+                    "[feed] raw log t0={}",
+                    inner
+                        .topics()
+                        .first()
+                        .map(|t| t.to_string())
+                        .unwrap_or_default()
+                );
 
                 if let Ok(ev) = TransferSingle::decode_log(&inner) {
                     #[cfg(debug_assertions)]
                     eprintln!("[feed] TS from={:?} to={:?} id={}", ev.from, ev.to, ev.id);
                     if let Some(sig) = self
                         .transfer_to_signal(
+                            &ev.operator,
                             &ev.from,
                             &ev.to,
                             &[ev.id],
@@ -225,6 +239,7 @@ impl OnChainTradeFeed {
                 } else if let Ok(ev) = TransferBatch::decode_log(&inner) {
                     if let Some(sig) = self
                         .transfer_to_signal(
+                            &ev.operator,
                             &ev.from,
                             &ev.to,
                             &ev.ids,
@@ -258,6 +273,7 @@ impl OnChainTradeFeed {
     #[allow(clippy::too_many_arguments)]
     async fn transfer_to_signal(
         &self,
+        operator: &Address,
         from: &Address,
         to: &Address,
         ids: &[U256],
@@ -267,11 +283,21 @@ impl OnChainTradeFeed {
         wallet_set: &HashSet<Address>,
         now: chrono::DateTime<Utc>,
     ) -> Option<SignalEvent> {
+        // ERC-1155 transfers also represent splits, merges, redemptions and plain
+        // wallet transfers. Only explicitly configured exchange operators may
+        // produce trading signals.
+        if !self.allowed_operators.contains(operator) {
+            return None;
+        }
         let action = match direction_from_path(from, to, wallet_set) {
             Some(a) => a,
             None => return None, // wallet-to-wallet transfer or neither side is a target
         };
-        let wallet = if action == SignalAction::OpenBuy { *to } else { *from };
+        let wallet = if action == SignalAction::OpenBuy {
+            *to
+        } else {
+            *from
+        };
 
         // Aggregate all ids/values in this event for the target wallet.
         for (id, value) in ids.iter().zip(values.iter()) {
@@ -300,6 +326,7 @@ impl OnChainTradeFeed {
                 target_vwap: Decimal::ZERO,
                 target_shares: shares,
                 target_notional_usdc: Decimal::ZERO,
+                target_reduction_pct: None,
                 timestamp: now,
             };
             let key = sig.signal_id.clone();

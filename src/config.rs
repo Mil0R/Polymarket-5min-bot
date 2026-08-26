@@ -41,6 +41,48 @@ fn parse_slippage(s: &str) -> Result<[f64; 2]> {
     Ok(parsed)
 }
 
+fn parse_millisecond_list(name: &str, raw: &str) -> Result<Vec<u64>> {
+    let mut values = raw
+        .split(',')
+        .map(|value| {
+            value
+                .trim()
+                .parse::<u64>()
+                .with_context(|| format!("{name} contains an invalid millisecond value"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if values.is_empty() {
+        bail!("{name} cannot be empty");
+    }
+    values.sort_unstable();
+    values.dedup();
+    Ok(values)
+}
+
+fn parse_positive_decimal_list(name: &str, raw: &str) -> Result<Vec<f64>> {
+    let mut values = raw
+        .split(',')
+        .map(|value| {
+            value
+                .trim()
+                .parse::<f64>()
+                .with_context(|| format!("{name} contains an invalid decimal value"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if values.is_empty() {
+        bail!("{name} cannot be empty");
+    }
+    if values
+        .iter()
+        .any(|value| !value.is_finite() || *value <= 0.0)
+    {
+        bail!("{name} values must be finite and greater than zero");
+    }
+    values.sort_by(f64::total_cmp);
+    values.dedup_by(|left, right| left.total_cmp(right).is_eq());
+    Ok(values)
+}
+
 fn env_parse<T>(name: &str, default: &str) -> Result<T>
 where
     T: std::str::FromStr,
@@ -81,11 +123,13 @@ pub struct Config {
     /// crypto up/down slugs (btc-updown-5m / btc-updown-15m).
     pub market_period_minutes: u64,
     pub risk_max_exposure_usdc: f64,
+    /// Maximum capital/exposure assigned to Spread Arbitrage.
+    pub arbitrage_budget_usdc: f64,
     pub risk_imbalance_threshold: f64,
     pub hedge_take_profit_pct: f64, // Hedge take-profit % (e.g. 0.05 = 5%)
     pub hedge_stop_loss_pct: f64,   // Hedge stop-loss % (e.g. 0.05 = 5%)
     pub arbitrage_execution_spread: f64, // Execute arbitrage when yes+no <= 1 - this spread
-    /// Additional conservative buffer for fees and rounding, applied to final slippage-adjusted prices.
+    /// Additional net-edge safety/model/rounding buffer applied after exact dynamic fees.
     pub arbitrage_fee_buffer: f64,
     /// Slippage [first, second]: down-only uses second, up/flat uses first. e.g. "-0.02,0.0"
     pub slippage: [f64; 2],
@@ -97,6 +141,11 @@ pub struct Config {
     pub arbitrage_enabled: bool,
     /// Window-end "buy the determined winner" strategy (single-leg directional buy).
     pub winner_buy_enabled: bool,
+    pub copy_trading_enabled: bool,
+    /// Maximum simultaneous capital assigned to Winner Buy.
+    pub winner_buy_budget_usdc: f64,
+    /// PAPER NAV assigned to Copy Trading when embedded in polypulse.
+    pub copy_trading_budget_usdc: f64,
     /// Trigger when the window has this many seconds left.
     pub winner_buy_before_end_secs: u32,
     /// Only buy a side whose best ask is >= this price (direction considered decided).
@@ -117,6 +166,9 @@ pub struct Config {
     pub winner_buy_auto_redeem: bool,
     /// Polymarket RTDS endpoint for the official Chainlink 60-second TWAP.
     pub winner_buy_rtds_url: String,
+    /// Winner Buy WS snapshot age limit. Kept separate from the much stricter
+    /// two-leg arbitrage synchronization threshold.
+    pub winner_buy_max_book_age_ms: i64,
     pub winner_buy_feed_max_age_ms: i64,
     pub winner_buy_opening_max_skew_ms: i64,
     pub winner_buy_volatility_lookback_secs: u64,
@@ -174,6 +226,7 @@ pub struct Config {
     pub one_sided_max_consecutive: u32,
     pub paper_initial_balance_usdc: f64,
     pub paper_liquidity_haircut: f64,
+    pub arbitrage_paper_liquidity_haircut: f64,
     pub paper_second_leg_delay_ms: u64,
     /// Dry-run latency before re-reading the live book for Winner Buy fills.
     pub paper_winner_buy_delay_ms: u64,
@@ -183,6 +236,13 @@ pub struct Config {
     pub max_book_skew_ms: i64,
     /// Suppress an identical market/price signal for this many milliseconds.
     pub signal_cooldown_ms: u64,
+    /// Require an admissible full-depth edge across at least two independent
+    /// book updates spanning this interval before execution.
+    pub arbitrage_signal_confirmation_ms: u64,
+    /// Read-only REST sampling offsets for price-positive PAPER candidates.
+    pub arbitrage_rest_shadow_delays_ms: Vec<u64>,
+    /// Per-leg USDC notionals evaluated from each concurrently fetched REST book pair.
+    pub arbitrage_rest_shadow_notionals_usdc: Vec<f64>,
     pub state_journal_file: String,
     pub allow_unresolved_state: bool,
 }
@@ -210,6 +270,26 @@ impl Config {
             .unwrap_or_else(|_| format!("results/winner-buy/{mode}/orders.ndjson"));
         let winner_buy_evaluation_journal_file = env::var("WINNER_BUY_EVALUATION_JOURNAL_FILE")
             .unwrap_or_else(|_| format!("results/winner-buy/{mode}/evaluations.ndjson"));
+        let risk_max_exposure_usdc = env_parse("RISK_MAX_EXPOSURE_USDC", "1000.0")?;
+        let paper_initial_balance_usdc = env_parse("PAPER_INITIAL_BALANCE_USDC", "50.0")?;
+        let arbitrage_budget_usdc = env::var("ARBITRAGE_BUDGET_USDC")
+            .ok()
+            .map(|value| value.trim().parse::<f64>())
+            .transpose()
+            .context("ARBITRAGE_BUDGET_USDC has an invalid value")?
+            .unwrap_or(risk_max_exposure_usdc);
+        let winner_buy_budget_usdc = env::var("WINNER_BUY_BUDGET_USDC")
+            .ok()
+            .map(|value| value.trim().parse::<f64>())
+            .transpose()
+            .context("WINNER_BUY_BUDGET_USDC has an invalid value")?
+            .unwrap_or(paper_initial_balance_usdc);
+        let copy_trading_budget_usdc = env::var("COPY_TRADING_BUDGET_USDC")
+            .or_else(|_| env::var("COPY_INITIAL_NAV_USDC"))
+            .unwrap_or_else(|_| "10000.0".into())
+            .trim()
+            .parse::<f64>()
+            .context("COPY_TRADING_BUDGET_USDC has an invalid value")?;
 
         let config = Config {
             private_key: normalize_private_key(
@@ -230,7 +310,8 @@ impl Config {
                 .collect(),
             market_refresh_advance_secs: env_parse("MARKET_REFRESH_ADVANCE_SECS", "5")?,
             market_period_minutes: env_parse("MARKET_PERIOD_MINUTES", "5")?,
-            risk_max_exposure_usdc: env_parse("RISK_MAX_EXPOSURE_USDC", "1000.0")?,
+            risk_max_exposure_usdc,
+            arbitrage_budget_usdc,
             risk_imbalance_threshold: env_parse("RISK_IMBALANCE_THRESHOLD", "0.1")?,
             hedge_take_profit_pct: env_parse("HEDGE_TAKE_PROFIT_PCT", "0.05")?,
             hedge_stop_loss_pct: env_parse("HEDGE_STOP_LOSS_PCT", "0.05")?,
@@ -246,6 +327,9 @@ impl Config {
             stop_arbitrage_before_end_minutes: env_parse("STOP_ARBITRAGE_BEFORE_END_MINUTES", "0")?,
             arbitrage_enabled: env_bool("ARBITRAGE_ENABLED", true)?,
             winner_buy_enabled: env_bool("WINNER_BUY_ENABLED", false)?,
+            copy_trading_enabled: env_bool("COPY_TRADING_ENABLED", false)?,
+            winner_buy_budget_usdc,
+            copy_trading_budget_usdc,
             winner_buy_before_end_secs: env_parse("WINNER_BUY_BEFORE_END_SECS", "30")?,
             winner_buy_min_price: env_parse("WINNER_BUY_MIN_PRICE", "0.95")?,
             winner_buy_max_price: env_parse("WINNER_BUY_MAX_PRICE", "0.99")?,
@@ -260,6 +344,7 @@ impl Config {
             winner_buy_auto_redeem: env_bool("WINNER_BUY_AUTO_REDEEM", false)?,
             winner_buy_rtds_url: env::var("WINNER_BUY_RTDS_URL")
                 .unwrap_or_else(|_| "wss://ws-live-data.polymarket.com".to_string()),
+            winner_buy_max_book_age_ms: env_parse("WINNER_BUY_MAX_BOOK_AGE_MS", "1000")?,
             winner_buy_feed_max_age_ms: env_parse("WINNER_BUY_FEED_MAX_AGE_MS", "5000")?,
             winner_buy_opening_max_skew_ms: env_parse("WINNER_BUY_OPENING_MAX_SKEW_MS", "5000")?,
             winner_buy_volatility_lookback_secs: env_parse(
@@ -332,13 +417,28 @@ impl Config {
             canary_max_pairs_per_window: env_parse("CANARY_MAX_PAIRS_PER_WINDOW", "1")?,
             canary_max_pairs_total: env_parse("CANARY_MAX_PAIRS_TOTAL", "1")?,
             one_sided_max_consecutive: env_parse("ONE_SIDED_MAX_CONSECUTIVE", "3")?,
-            paper_initial_balance_usdc: env_parse("PAPER_INITIAL_BALANCE_USDC", "50.0")?,
+            paper_initial_balance_usdc,
             paper_liquidity_haircut: env_parse("PAPER_LIQUIDITY_HAIRCUT", "0.75")?,
+            arbitrage_paper_liquidity_haircut: env_parse(
+                "ARBITRAGE_PAPER_LIQUIDITY_HAIRCUT",
+                "0.75",
+            )?,
             paper_second_leg_delay_ms: env_parse("PAPER_SECOND_LEG_DELAY_MS", "250")?,
             paper_winner_buy_delay_ms: env_parse("PAPER_WINNER_BUY_DELAY_MS", "250")?,
             max_book_age_ms: env_parse("MAX_BOOK_AGE_MS", "2000")?,
             max_book_skew_ms: env_parse("MAX_BOOK_SKEW_MS", "1000")?,
             signal_cooldown_ms: env_parse("SIGNAL_COOLDOWN_MS", "3000")?,
+            arbitrage_signal_confirmation_ms: env_parse("ARBITRAGE_SIGNAL_CONFIRMATION_MS", "100")?,
+            arbitrage_rest_shadow_delays_ms: parse_millisecond_list(
+                "ARBITRAGE_REST_SHADOW_DELAYS_MS",
+                &env::var("ARBITRAGE_REST_SHADOW_DELAYS_MS")
+                    .unwrap_or_else(|_| "0,50,100,250".to_string()),
+            )?,
+            arbitrage_rest_shadow_notionals_usdc: parse_positive_decimal_list(
+                "ARBITRAGE_REST_SHADOW_NOTIONALS_USDC",
+                &env::var("ARBITRAGE_REST_SHADOW_NOTIONALS_USDC")
+                    .unwrap_or_else(|_| "1,2,3,5".to_string()),
+            )?,
             state_journal_file,
             allow_unresolved_state: env_bool("ALLOW_UNRESOLVED_STATE", false)?,
         };
@@ -402,6 +502,9 @@ impl Config {
             ("MAX_ORDER_SIZE_USDC", self.max_order_size_usdc),
             ("MIN_ASK_DEPTH_USDC", self.min_ask_depth_usdc),
             ("RISK_MAX_EXPOSURE_USDC", self.risk_max_exposure_usdc),
+            ("ARBITRAGE_BUDGET_USDC", self.arbitrage_budget_usdc),
+            ("WINNER_BUY_BUDGET_USDC", self.winner_buy_budget_usdc),
+            ("COPY_TRADING_BUDGET_USDC", self.copy_trading_budget_usdc),
             (
                 "POSITION_BALANCE_THRESHOLD",
                 self.position_balance_threshold,
@@ -442,6 +545,12 @@ impl Config {
         {
             bail!("PAPER_LIQUIDITY_HAIRCUT must be in (0, 1]");
         }
+        if !self.arbitrage_paper_liquidity_haircut.is_finite()
+            || !(0.0..=1.0).contains(&self.arbitrage_paper_liquidity_haircut)
+            || self.arbitrage_paper_liquidity_haircut == 0.0
+        {
+            bail!("ARBITRAGE_PAPER_LIQUIDITY_HAIRCUT must be in (0, 1]");
+        }
         if self.paper_second_leg_delay_ms > 30_000 || self.paper_winner_buy_delay_ms > 30_000 {
             bail!("paper execution delays cannot exceed 30000ms");
         }
@@ -458,6 +567,12 @@ impl Config {
         }
         if self.winner_buy_max_asset_loss_usdc > self.winner_buy_max_strategy_loss_usdc {
             bail!("WINNER_BUY_MAX_ASSET_LOSS_USDC cannot exceed WINNER_BUY_MAX_STRATEGY_LOSS_USDC");
+        }
+        if self.max_order_size_usdc > self.arbitrage_budget_usdc {
+            bail!("MAX_ORDER_SIZE_USDC cannot exceed ARBITRAGE_BUDGET_USDC");
+        }
+        if self.winner_buy_max_order_usdc > self.winner_buy_budget_usdc {
+            bail!("WINNER_BUY_MAX_ORDER_USDC cannot exceed WINNER_BUY_BUDGET_USDC");
         }
         if self.canary_max_pairs_per_window == 0
             || self.canary_max_pairs_per_window > 1
@@ -499,6 +614,20 @@ impl Config {
         if self.max_book_age_ms <= 0 || self.max_book_skew_ms < 0 {
             bail!("MAX_BOOK_AGE_MS must be positive and MAX_BOOK_SKEW_MS cannot be negative");
         }
+        if self
+            .arbitrage_rest_shadow_delays_ms
+            .last()
+            .is_some_and(|delay| *delay > 10_000)
+        {
+            bail!("ARBITRAGE_REST_SHADOW_DELAYS_MS values cannot exceed 10000ms");
+        }
+        if self
+            .arbitrage_rest_shadow_notionals_usdc
+            .last()
+            .is_some_and(|notional| *notional > self.arbitrage_budget_usdc)
+        {
+            bail!("ARBITRAGE_REST_SHADOW_NOTIONALS_USDC cannot exceed ARBITRAGE_BUDGET_USDC");
+        }
         if self.state_journal_file.trim().is_empty() {
             bail!("ARBITRAGE_STATE_JOURNAL_FILE cannot be empty");
         }
@@ -511,14 +640,16 @@ impl Config {
         if !self.winner_buy_rtds_url.starts_with("wss://") {
             bail!("WINNER_BUY_RTDS_URL must use wss://");
         }
-        if self.winner_buy_feed_max_age_ms <= 0
+        if self.winner_buy_max_book_age_ms <= 0
+            || self.winner_buy_max_book_age_ms > 30_000
+            || self.winner_buy_feed_max_age_ms <= 0
             || self.winner_buy_opening_max_skew_ms < 0
             || self.winner_buy_volatility_lookback_secs == 0
             || self.winner_buy_min_observations < 2
             || self.winner_buy_confirmation_observations == 0
             || self.winner_buy_max_attempts_per_market == 0
         {
-            bail!("Winner Buy model timing, observation and attempt limits must be positive");
+            bail!("Winner Buy book/model timing, observation and attempt limits are invalid");
         }
         for (name, value) in [
             ("WINNER_BUY_MIN_MARGIN_BPS", self.winner_buy_min_margin_bps),
@@ -648,6 +779,25 @@ mod tests {
         assert_eq!(parse_slippage("-0.01,0.02").unwrap(), [-0.01, 0.02]);
         assert!(parse_slippage("0,1,2").is_err());
         assert!(parse_slippage("bad").is_err());
+    }
+
+    #[test]
+    fn parses_sorted_unique_shadow_delays() {
+        assert_eq!(
+            parse_millisecond_list("TEST_DELAYS", "250, 0,50,50,100").unwrap(),
+            vec![0, 50, 100, 250]
+        );
+        assert!(parse_millisecond_list("TEST_DELAYS", "0,bad").is_err());
+    }
+
+    #[test]
+    fn parses_sorted_unique_shadow_notionals() {
+        assert_eq!(
+            parse_positive_decimal_list("TEST_NOTIONALS", "5, 1,2,2,3").unwrap(),
+            vec![1.0, 2.0, 3.0, 5.0]
+        );
+        assert!(parse_positive_decimal_list("TEST_NOTIONALS", "1,0").is_err());
+        assert!(parse_positive_decimal_list("TEST_NOTIONALS", "1,bad").is_err());
     }
 
     #[test]

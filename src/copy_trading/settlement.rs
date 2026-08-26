@@ -30,11 +30,14 @@ const GAMMA_API_URL: &str = "https://gamma-api.polymarket.com";
 /// Minimal gamma settlement info. `outcome_prices` may arrive as a JSON-encoded
 /// string (e.g. `"[\"0\",\"1\"]"`) or as a native array.
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SettlementInfo {
     #[serde(default)]
     pub closed: Option<bool>,
     #[serde(default)]
     pub outcome_prices: Option<serde_json::Value>,
+    #[serde(default)]
+    pub neg_risk: Option<bool>,
 }
 
 /// Testable boundary for fetching settlement status.
@@ -215,7 +218,7 @@ impl SettlementMonitor {
                             &w.outcome,
                             &w.token_id,
                             w.shares,
-                            false,
+                            info.neg_risk.unwrap_or(false),
                         )
                         .await
                     {
@@ -302,6 +305,7 @@ mod tests {
                 return_pct: dec!(0.2),
                 is_maker: false,
                 is_arbitrage_leg: false,
+                behavior_data_known: true,
                 resolved_outcome: Some(OutcomeSide::Yes),
                 opened_at: now - Duration::days(days_ago),
                 settled_at: Some(now - Duration::days(days_ago - 1)),
@@ -335,8 +339,14 @@ mod tests {
         let book = OrderBookSnapshot {
             market_id: "mkt-settle".to_string(),
             token_id: "tok-yes".to_string(),
-            bids: vec![BookLevel { price: dec!(0.595), size: dec!(1000.0) }],
-            asks: vec![BookLevel { price: dec!(0.605), size: dec!(1000.0) }],
+            bids: vec![BookLevel {
+                price: dec!(0.595),
+                size: dec!(1000.0),
+            }],
+            asks: vec![BookLevel {
+                price: dec!(0.605),
+                size: dec!(1000.0),
+            }],
             timestamp: now,
         };
         let mk = |id: &str, wallet: &str| SignalEvent {
@@ -350,6 +360,7 @@ mod tests {
             target_vwap: dec!(0.60),
             target_shares: dec!(200.0),
             target_notional_usdc: dec!(120.0),
+            target_reduction_pct: None,
             timestamp: now,
         };
         let _ = coordinator
@@ -357,21 +368,35 @@ mod tests {
             .await
             .unwrap();
         let prop = coordinator
-            .process_signal(mk("s2", "0xBeta"), Some(&market), &book, now + Duration::seconds(5))
+            .process_signal(
+                mk("s2", "0xBeta"),
+                Some(&market),
+                &book,
+                now + Duration::seconds(5),
+            )
             .await
             .unwrap()
             .unwrap();
         coordinator.on_order_placed("order-1".to_string(), prop.clone(), now);
         coordinator
-            .on_order_fill("order-1", "mkt-settle", "tok-yes", prop.shares, prop.limit_price, now)
+            .on_order_fill(
+                "order-1",
+                "mkt-settle",
+                "tok-yes",
+                prop.shares,
+                prop.limit_price,
+                now,
+            )
             .await;
 
         // Add the NO position directly (opposite side of the same market).
-        coordinator
-            .risk()
-            .read()
-            .await
-            .record_position_fill("mkt-settle", "tok-no", &OutcomeSide::No, dec!(300.0), dec!(0.40));
+        coordinator.risk().read().await.record_position_fill(
+            "mkt-settle",
+            "tok-no",
+            &OutcomeSide::No,
+            dec!(300.0),
+            dec!(0.40),
+        );
 
         coordinator
     }
@@ -383,19 +408,21 @@ mod tests {
             response: Mutex::new(Some(SettlementInfo {
                 closed: Some(true),
                 outcome_prices: Some(serde_json::json!(["0", "1"])), // NO wins
+                neg_risk: Some(false),
             })),
         });
         let monitor = SettlementMonitor::new(source);
 
-        let settled = monitor
-            .check_and_settle(&coordinator, None, true)
-            .await;
+        let settled = monitor.check_and_settle(&coordinator, None, true).await;
         assert_eq!(settled, vec!["mkt-settle".to_string()]);
 
         let risk = coordinator.risk().read().await;
         // NO winner realized: cash credited 300, position removed.
         let no_pos = risk.get_market_exposure("mkt-settle", &OutcomeSide::No);
-        assert!(no_pos.is_none(), "winner position must be realized and removed");
+        assert!(
+            no_pos.is_none(),
+            "winner position must be realized and removed"
+        );
         // YES loser pruned (marked 0.0).
         let yes_pos = risk.get_market_exposure("mkt-settle", &OutcomeSide::Yes);
         assert!(yes_pos.is_none(), "loser position must be pruned");
@@ -409,6 +436,7 @@ mod tests {
             response: Mutex::new(Some(SettlementInfo {
                 closed: Some(false),
                 outcome_prices: Some(serde_json::json!(["0.5", "0.5"])),
+                neg_risk: Some(false),
             })),
         });
         let monitor = SettlementMonitor::new(source);
@@ -419,9 +447,18 @@ mod tests {
 
     #[test]
     fn winner_determination_maps_prices_to_side() {
-        assert_eq!(determine_resolved_outcome(&[dec!(0.0), dec!(1.0)]), Some(OutcomeSide::No));
-        assert_eq!(determine_resolved_outcome(&[dec!(1.0), dec!(0.0)]), Some(OutcomeSide::Yes));
-        assert_eq!(determine_resolved_outcome(&[dec!(0.99), dec!(0.01)]), Some(OutcomeSide::Yes));
+        assert_eq!(
+            determine_resolved_outcome(&[dec!(0.0), dec!(1.0)]),
+            Some(OutcomeSide::No)
+        );
+        assert_eq!(
+            determine_resolved_outcome(&[dec!(1.0), dec!(0.0)]),
+            Some(OutcomeSide::Yes)
+        );
+        assert_eq!(
+            determine_resolved_outcome(&[dec!(0.99), dec!(0.01)]),
+            Some(OutcomeSide::Yes)
+        );
         assert_eq!(determine_resolved_outcome(&[dec!(0.5), dec!(0.5)]), None);
         assert_eq!(determine_resolved_outcome(&[]), None);
     }

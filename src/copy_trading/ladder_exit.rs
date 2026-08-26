@@ -200,7 +200,8 @@ impl LadderExitTracker {
                 Some(b) if b > Decimal::ZERO => b,
                 _ => continue,
             };
-            let target_price = match ladder_target_price(best_bid, exit.attempts, self.config.step) {
+            let target_price = match ladder_target_price(best_bid, exit.attempts, self.config.step)
+            {
                 Some(p) => p,
                 None => continue,
             };
@@ -236,11 +237,21 @@ impl LadderExitTracker {
             };
 
             if dry_run {
+                let order_id = format!("paper-{}", proposal.proposal_id);
+                coordinator.on_order_placed(order_id.clone(), proposal.clone(), Utc::now());
                 coordinator
-                    .risk()
-                    .read()
-                    .await
-                    .record_position_reduction(&exit.token_id, size, target_price);
+                    .on_order_fill(
+                        &order_id,
+                        &proposal.market_id,
+                        &proposal.token_id,
+                        size,
+                        target_price,
+                        Utc::now(),
+                    )
+                    .await;
+                coordinator
+                    .on_order_finalized(Some(&order_id), &proposal.proposal_id, Utc::now())
+                    .await;
                 exit.remaining_shares -= size;
                 info!(
                     market = %exit.market_id,
@@ -252,6 +263,11 @@ impl LadderExitTracker {
             } else if let Some(executor) = live_executor {
                 match executor.execute_sell(&proposal).await {
                     Ok(outcome) => {
+                        coordinator.on_order_placed(
+                            outcome.order_id.clone(),
+                            proposal.clone(),
+                            Utc::now(),
+                        );
                         if outcome.filled_shares > Decimal::ZERO {
                             coordinator
                                 .on_order_fill(
@@ -272,6 +288,13 @@ impl LadderExitTracker {
                                 "[LIVE] ladder exit leg filled"
                             );
                         }
+                        coordinator
+                            .on_order_finalized(
+                                Some(&outcome.order_id),
+                                &proposal.proposal_id,
+                                Utc::now(),
+                            )
+                            .await;
                     }
                     Err(e) => warn!(
                         market = %exit.market_id,
@@ -286,10 +309,7 @@ impl LadderExitTracker {
             placed += 1;
             if exit.remaining_shares > Decimal::ZERO {
                 let mut exits = self.exits.lock().expect("ladder exits lock poisoned");
-                exits.insert(
-                    (exit.market_id.clone(), exit.outcome.clone()),
-                    exit.clone(),
-                );
+                exits.insert((exit.market_id.clone(), exit.outcome.clone()), exit.clone());
             } else {
                 keys_to_remove.push((exit.market_id.clone(), exit.outcome.clone()));
             }

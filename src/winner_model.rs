@@ -121,6 +121,8 @@ impl ChainlinkTwapStore {
         let z = directional_margin_bps / remaining_sigma_bps.max(0.000_001);
         let probability = Decimal::try_from(normal_cdf(z).clamp(0.5, 0.9999)).unwrap_or(dec!(0.5));
         let effective_price = (input.ask_price + policy.fee_buffer).min(dec!(1));
+        let probability_edge_before_risk = probability - effective_price;
+        let required_probability = effective_price + policy.model_risk_buffer + policy.min_net_ev;
         let net_ev = probability - effective_price - policy.model_risk_buffer;
         let mut evaluation = ModelEvaluation {
             rejection: failed_checks.first().copied(),
@@ -133,6 +135,8 @@ impl ChainlinkTwapStore {
             volatility_bps_per_sqrt_second: volatility,
             probability,
             effective_price,
+            probability_edge_before_risk,
+            required_probability,
             net_ev,
             spread,
             depth_notional,
@@ -205,6 +209,8 @@ pub struct ModelEvaluation {
     pub volatility_bps_per_sqrt_second: f64,
     pub probability: Decimal,
     pub effective_price: Decimal,
+    pub probability_edge_before_risk: Decimal,
+    pub required_probability: Decimal,
     pub net_ev: Decimal,
     pub spread: Decimal,
     pub depth_notional: Decimal,
@@ -223,6 +229,8 @@ impl ModelEvaluation {
             volatility_bps_per_sqrt_second: 0.0,
             probability: dec!(0),
             effective_price: dec!(0),
+            probability_edge_before_risk: dec!(0),
+            required_probability: dec!(0),
             net_ev: dec!(0),
             spread: dec!(0),
             depth_notional: dec!(0),
@@ -237,6 +245,13 @@ impl ModelEvaluation {
 #[derive(Default)]
 pub struct WinnerConfirmationTracker {
     states: HashMap<String, ConfirmationState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WinnerConfirmationProgress {
+    pub confirmations: u32,
+    pub required: u32,
+    pub confirmed: bool,
 }
 
 pub fn attempt_allowed(
@@ -263,14 +278,14 @@ impl WinnerConfirmationTracker {
         self.states.remove(slug);
     }
 
-    pub fn confirm(
+    pub fn observe(
         &mut self,
         slug: &str,
         buy_yes: bool,
         observed_at_ms: i64,
         required: u32,
         ttl_ms: i64,
-    ) -> bool {
+    ) -> WinnerConfirmationProgress {
         let required = required.max(1);
         let state = match self.states.entry(slug.to_string()) {
             Entry::Vacant(entry) => entry.insert(ConfirmationState {
@@ -292,7 +307,11 @@ impl WinnerConfirmationTracker {
             state.last_observed_at_ms = observed_at_ms;
             state.confirmations = state.confirmations.saturating_add(1);
         }
-        state.confirmations >= required
+        WinnerConfirmationProgress {
+            confirmations: state.confirmations,
+            required,
+            confirmed: state.confirmations >= required,
+        }
     }
 }
 
@@ -528,6 +547,11 @@ mod tests {
         );
         assert!(evaluation.admitted(), "{evaluation:?}");
         assert!(evaluation.probability > evaluation.effective_price);
+        assert_eq!(
+            evaluation.probability_edge_before_risk,
+            evaluation.probability - evaluation.effective_price
+        );
+        assert_eq!(evaluation.required_probability, dec!(0.968));
         assert!(evaluation.net_ev > dec!(0));
     }
 
@@ -607,20 +631,41 @@ mod tests {
     #[test]
     fn confirmation_requires_distinct_feed_observations_and_resets_direction() {
         let mut tracker = WinnerConfirmationTracker::default();
-        assert!(!tracker.confirm("slug", true, 1_000, 2, 5_000));
-        assert!(!tracker.confirm("slug", true, 1_000, 2, 5_000));
-        assert!(tracker.confirm("slug", true, 2_000, 2, 5_000));
-        assert!(!tracker.confirm("slug", false, 3_000, 2, 5_000));
+        assert!(!tracker.observe("slug", true, 1_000, 2, 5_000).confirmed);
+        assert!(!tracker.observe("slug", true, 1_000, 2, 5_000).confirmed);
+        assert!(tracker.observe("slug", true, 2_000, 2, 5_000).confirmed);
+        assert!(!tracker.observe("slug", false, 3_000, 2, 5_000).confirmed);
         tracker.reject("slug");
-        assert!(!tracker.confirm("slug", false, 4_000, 2, 5_000));
+        assert!(!tracker.observe("slug", false, 4_000, 2, 5_000).confirmed);
+    }
+
+    #[test]
+    fn confirmation_progress_reports_distinct_observation_count() {
+        let mut tracker = WinnerConfirmationTracker::default();
+        assert_eq!(
+            tracker.observe("slug", true, 1_000, 2, 5_000),
+            WinnerConfirmationProgress {
+                confirmations: 1,
+                required: 2,
+                confirmed: false,
+            }
+        );
+        assert_eq!(
+            tracker.observe("slug", true, 2_000, 2, 5_000),
+            WinnerConfirmationProgress {
+                confirmations: 2,
+                required: 2,
+                confirmed: true,
+            }
+        );
     }
 
     #[test]
     fn confirmation_expires_after_ttl() {
         let mut tracker = WinnerConfirmationTracker::default();
-        assert!(!tracker.confirm("slug", true, 1_000, 2, 2_000));
-        assert!(!tracker.confirm("slug", true, 4_000, 2, 2_000));
-        assert!(tracker.confirm("slug", true, 5_000, 2, 2_000));
+        assert!(!tracker.observe("slug", true, 1_000, 2, 2_000).confirmed);
+        assert!(!tracker.observe("slug", true, 4_000, 2, 2_000).confirmed);
+        assert!(tracker.observe("slug", true, 5_000, 2, 2_000).confirmed);
     }
 
     #[test]

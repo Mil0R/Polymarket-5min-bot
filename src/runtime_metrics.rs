@@ -26,6 +26,7 @@ pub struct MetricsSnapshot {
     pub opportunities_admitted: u64,
     pub opportunities_rejected: u64,
     pub depth_rejections: u64,
+    pub stability_pending: u64,
     pub duplicate_signals: u64,
     pub quote_rejections: u64,
     pub risk_rejections: u64,
@@ -50,6 +51,11 @@ pub struct MetricsSnapshot {
     pub paper_pairs: u64,
     pub paper_one_sided: u64,
     pub paper_net_pnl_microusd: i64,
+    pub arbitrage_rest_shadow_samples: u64,
+    pub arbitrage_rest_shadow_both_fillable: u64,
+    pub arbitrage_rest_shadow_one_sided: u64,
+    pub arbitrage_rest_shadow_neither_fillable: u64,
+    pub arbitrage_rest_shadow_errors: u64,
     pub winner_buy_attempts: u64,
     pub winner_buy_scans: u64,
     pub winner_buy_signals: u64,
@@ -79,6 +85,10 @@ pub struct MetricsSnapshot {
     pub winner_buy_model_boundary_rejections: u64,
     pub winner_buy_model_ev_rejections: u64,
     pub winner_buy_shadow_ev_failures: u64,
+    pub winner_buy_shadow_execution_attempts: u64,
+    pub winner_buy_shadow_execution_fills: u64,
+    pub winner_buy_shadow_execution_no_fills: u64,
+    pub winner_buy_shadow_execution_failures: u64,
     pub winner_buy_awaiting_confirmation: u64,
     pub winner_buy_fills: u64,
     pub winner_buy_pending: u64,
@@ -105,6 +115,7 @@ pub struct RuntimeMetrics {
     opportunities_admitted: AtomicU64,
     opportunities_rejected: AtomicU64,
     depth_rejections: AtomicU64,
+    stability_pending: AtomicU64,
     duplicate_signals: AtomicU64,
     quote_rejections: AtomicU64,
     risk_rejections: AtomicU64,
@@ -129,6 +140,11 @@ pub struct RuntimeMetrics {
     paper_pairs: AtomicU64,
     paper_one_sided: AtomicU64,
     paper_net_pnl_microusd: AtomicI64,
+    arbitrage_rest_shadow_samples: AtomicU64,
+    arbitrage_rest_shadow_both_fillable: AtomicU64,
+    arbitrage_rest_shadow_one_sided: AtomicU64,
+    arbitrage_rest_shadow_neither_fillable: AtomicU64,
+    arbitrage_rest_shadow_errors: AtomicU64,
     winner_buy_attempts: AtomicU64,
     winner_buy_scans: AtomicU64,
     winner_buy_signals: AtomicU64,
@@ -158,6 +174,10 @@ pub struct RuntimeMetrics {
     winner_buy_model_boundary_rejections: AtomicU64,
     winner_buy_model_ev_rejections: AtomicU64,
     winner_buy_shadow_ev_failures: AtomicU64,
+    winner_buy_shadow_execution_attempts: AtomicU64,
+    winner_buy_shadow_execution_fills: AtomicU64,
+    winner_buy_shadow_execution_no_fills: AtomicU64,
+    winner_buy_shadow_execution_failures: AtomicU64,
     winner_buy_awaiting_confirmation: AtomicU64,
     winner_buy_fills: AtomicU64,
     winner_buy_pending: AtomicU64,
@@ -190,10 +210,34 @@ impl RuntimeMetrics {
     incrementer!(record_orderbook_pair, orderbook_pairs);
     incrementer!(record_admitted, opportunities_admitted);
     incrementer!(record_depth_rejection, depth_rejections);
+    incrementer!(record_stability_pending, stability_pending);
     incrementer!(record_duplicate_signal, duplicate_signals);
     incrementer!(record_quote_rejection, quote_rejections);
     incrementer!(record_risk_rejection, risk_rejections);
     incrementer!(record_balance_rejection, balance_rejections);
+
+    pub fn record_arbitrage_rest_shadow(
+        &self,
+        yes_filled: rust_decimal::Decimal,
+        no_filled: rust_decimal::Decimal,
+        has_error: bool,
+    ) {
+        self.arbitrage_rest_shadow_samples
+            .fetch_add(1, Ordering::Relaxed);
+        if has_error {
+            self.arbitrage_rest_shadow_errors
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        let counter = match (
+            yes_filled > rust_decimal::Decimal::ZERO,
+            no_filled > rust_decimal::Decimal::ZERO,
+        ) {
+            (true, true) => &self.arbitrage_rest_shadow_both_fillable,
+            (true, false) | (false, true) => &self.arbitrage_rest_shadow_one_sided,
+            (false, false) => &self.arbitrage_rest_shadow_neither_fillable,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
     incrementer!(record_trade_started, trades_started);
     incrementer!(record_trade_succeeded, trades_succeeded);
     incrementer!(record_trade_failed, trades_failed);
@@ -262,6 +306,22 @@ impl RuntimeMetrics {
     incrementer!(
         record_winner_buy_shadow_ev_failure,
         winner_buy_shadow_ev_failures
+    );
+    incrementer!(
+        record_winner_buy_shadow_execution_attempt,
+        winner_buy_shadow_execution_attempts
+    );
+    incrementer!(
+        record_winner_buy_shadow_execution_fill,
+        winner_buy_shadow_execution_fills
+    );
+    incrementer!(
+        record_winner_buy_shadow_execution_no_fill,
+        winner_buy_shadow_execution_no_fills
+    );
+    incrementer!(
+        record_winner_buy_shadow_execution_failure,
+        winner_buy_shadow_execution_failures
     );
     incrementer!(record_winner_buy_fill, winner_buy_fills);
     incrementer!(record_winner_buy_resolved, winner_buy_resolved);
@@ -464,6 +524,7 @@ impl RuntimeMetrics {
             opportunities_admitted: load(&self.opportunities_admitted),
             opportunities_rejected: load(&self.opportunities_rejected),
             depth_rejections: load(&self.depth_rejections),
+            stability_pending: load(&self.stability_pending),
             duplicate_signals: load(&self.duplicate_signals),
             quote_rejections: load(&self.quote_rejections),
             risk_rejections: load(&self.risk_rejections),
@@ -490,6 +551,13 @@ impl RuntimeMetrics {
             paper_pairs: load(&self.paper_pairs),
             paper_one_sided: load(&self.paper_one_sided),
             paper_net_pnl_microusd: self.paper_net_pnl_microusd.load(Ordering::Relaxed),
+            arbitrage_rest_shadow_samples: load(&self.arbitrage_rest_shadow_samples),
+            arbitrage_rest_shadow_both_fillable: load(&self.arbitrage_rest_shadow_both_fillable),
+            arbitrage_rest_shadow_one_sided: load(&self.arbitrage_rest_shadow_one_sided),
+            arbitrage_rest_shadow_neither_fillable: load(
+                &self.arbitrage_rest_shadow_neither_fillable,
+            ),
+            arbitrage_rest_shadow_errors: load(&self.arbitrage_rest_shadow_errors),
             winner_buy_attempts: load(&self.winner_buy_attempts),
             winner_buy_scans: load(&self.winner_buy_scans),
             winner_buy_signals: load(&self.winner_buy_signals),
@@ -525,6 +593,10 @@ impl RuntimeMetrics {
             winner_buy_model_boundary_rejections: load(&self.winner_buy_model_boundary_rejections),
             winner_buy_model_ev_rejections: load(&self.winner_buy_model_ev_rejections),
             winner_buy_shadow_ev_failures: load(&self.winner_buy_shadow_ev_failures),
+            winner_buy_shadow_execution_attempts: load(&self.winner_buy_shadow_execution_attempts),
+            winner_buy_shadow_execution_fills: load(&self.winner_buy_shadow_execution_fills),
+            winner_buy_shadow_execution_no_fills: load(&self.winner_buy_shadow_execution_no_fills),
+            winner_buy_shadow_execution_failures: load(&self.winner_buy_shadow_execution_failures),
             winner_buy_awaiting_confirmation: load(&self.winner_buy_awaiting_confirmation),
             winner_buy_fills: load(&self.winner_buy_fills),
             winner_buy_pending: load(&self.winner_buy_pending),
@@ -563,6 +635,7 @@ impl RuntimeMetrics {
                 snapshot.opportunities_rejected,
             ),
             ("depth_rejections_total", snapshot.depth_rejections),
+            ("stability_pending_total", snapshot.stability_pending),
             ("duplicate_signals_total", snapshot.duplicate_signals),
             ("quote_rejections_total", snapshot.quote_rejections),
             ("risk_rejections_total", snapshot.risk_rejections),
@@ -618,6 +691,26 @@ impl RuntimeMetrics {
             ),
             ("paper_pairs_total", snapshot.paper_pairs),
             ("paper_one_sided_total", snapshot.paper_one_sided),
+            (
+                "arbitrage_rest_shadow_samples_total",
+                snapshot.arbitrage_rest_shadow_samples,
+            ),
+            (
+                "arbitrage_rest_shadow_both_fillable_total",
+                snapshot.arbitrage_rest_shadow_both_fillable,
+            ),
+            (
+                "arbitrage_rest_shadow_one_sided_total",
+                snapshot.arbitrage_rest_shadow_one_sided,
+            ),
+            (
+                "arbitrage_rest_shadow_neither_fillable_total",
+                snapshot.arbitrage_rest_shadow_neither_fillable,
+            ),
+            (
+                "arbitrage_rest_shadow_errors_total",
+                snapshot.arbitrage_rest_shadow_errors,
+            ),
             ("winner_buy_attempts_total", snapshot.winner_buy_attempts),
             ("winner_buy_scans_total", snapshot.winner_buy_scans),
             ("winner_buy_signals_total", snapshot.winner_buy_signals),
@@ -714,6 +807,22 @@ impl RuntimeMetrics {
             (
                 "winner_buy_shadow_ev_failures_total",
                 snapshot.winner_buy_shadow_ev_failures,
+            ),
+            (
+                "winner_buy_shadow_execution_attempts_total",
+                snapshot.winner_buy_shadow_execution_attempts,
+            ),
+            (
+                "winner_buy_shadow_execution_fills_total",
+                snapshot.winner_buy_shadow_execution_fills,
+            ),
+            (
+                "winner_buy_shadow_execution_no_fills_total",
+                snapshot.winner_buy_shadow_execution_no_fills,
+            ),
+            (
+                "winner_buy_shadow_execution_failures_total",
+                snapshot.winner_buy_shadow_execution_failures,
             ),
             (
                 "winner_buy_awaiting_confirmation_total",
@@ -826,6 +935,10 @@ mod tests {
         let metrics = RuntimeMetrics::default();
         metrics.record_orderbook_pair();
         metrics.record_depth_rejection();
+        metrics.record_stability_pending();
+        metrics.record_arbitrage_rest_shadow(dec!(2), dec!(2), false);
+        metrics.record_arbitrage_rest_shadow(dec!(2), dec!(0), true);
+        metrics.record_arbitrage_rest_shadow(dec!(0), dec!(0), false);
         metrics.record_admission_rejection(AdmissionRejection::ConnectionUnhealthy);
         metrics.record_admission_rejection(AdmissionRejection::YesPriceTooLow);
         metrics.record_trade_started();
@@ -842,11 +955,21 @@ mod tests {
         metrics.record_winner_buy_rest_result(25, true);
         metrics.record_winner_buy_rest_result(40, false);
         metrics.record_winner_model_rejection(ModelRejection::StalePrice);
+        metrics.record_winner_buy_shadow_execution_attempt();
+        metrics.record_winner_buy_shadow_execution_fill();
+        metrics.record_winner_buy_shadow_execution_no_fill();
+        metrics.record_winner_buy_shadow_execution_failure();
         metrics.record_winner_buy_awaiting_confirmation();
         metrics.set_winner_buy_pending(2);
         metrics.record_paper_result(dec!(3), dec!(2), dec!(0.4), dec!(0.5));
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot.orderbook_pairs, 1);
+        assert_eq!(snapshot.stability_pending, 1);
+        assert_eq!(snapshot.arbitrage_rest_shadow_samples, 3);
+        assert_eq!(snapshot.arbitrage_rest_shadow_both_fillable, 1);
+        assert_eq!(snapshot.arbitrage_rest_shadow_one_sided, 1);
+        assert_eq!(snapshot.arbitrage_rest_shadow_neither_fillable, 1);
+        assert_eq!(snapshot.arbitrage_rest_shadow_errors, 1);
         assert_eq!(snapshot.depth_rejections, 1);
         assert_eq!(snapshot.opportunities_rejected, 2);
         assert_eq!(snapshot.rejection_connection_unhealthy, 1);
@@ -868,6 +991,10 @@ mod tests {
         assert_eq!(snapshot.winner_buy_by_asset[0].scans, 1);
         assert_eq!(snapshot.winner_buy_by_asset[0].signals, 1);
         assert_eq!(snapshot.winner_buy_model_data_rejections, 1);
+        assert_eq!(snapshot.winner_buy_shadow_execution_attempts, 1);
+        assert_eq!(snapshot.winner_buy_shadow_execution_fills, 1);
+        assert_eq!(snapshot.winner_buy_shadow_execution_no_fills, 1);
+        assert_eq!(snapshot.winner_buy_shadow_execution_failures, 1);
         assert_eq!(snapshot.winner_buy_awaiting_confirmation, 1);
         assert_eq!(snapshot.winner_buy_pending, 2);
         assert_eq!(snapshot.paper_pairs, 1);
@@ -875,8 +1002,10 @@ mod tests {
         assert_eq!(snapshot.paper_net_pnl_microusd, -200_000);
         let exposition = metrics.prometheus();
         assert!(exposition.contains("polypulse_trades_failed_total 1"));
+        assert!(exposition.contains("polypulse_arbitrage_rest_shadow_samples_total 3"));
         assert!(exposition.contains("polypulse_paper_net_pnl_usd -0.2"));
         assert!(exposition.contains("polypulse_winner_buy_pending 2"));
+        assert!(exposition.contains("polypulse_winner_buy_shadow_execution_fills_total 1"));
         assert!(exposition.contains("polypulse_winner_buy_rest_latency_ms_max 40"));
         assert!(exposition.contains("polypulse_winner_buy_asset_scans_total{asset=\"btc\"} 1"));
     }

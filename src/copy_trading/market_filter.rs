@@ -160,10 +160,12 @@ impl MarketFilterEngine {
             });
         }
 
-        let spread = book.relative_spread().ok_or(MarketFilterError::EmptyOrderBook {
-            bid_count: book.bids.len(),
-            ask_count: book.asks.len(),
-        })?;
+        let spread = book
+            .relative_spread()
+            .ok_or(MarketFilterError::EmptyOrderBook {
+                bid_count: book.bids.len(),
+                ask_count: book.asks.len(),
+            })?;
 
         if spread > self.config.max_spread {
             debug!(

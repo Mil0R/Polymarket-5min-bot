@@ -19,6 +19,7 @@ pub struct PaperFill {
     pub requested: Decimal,
     pub filled: Decimal,
     pub cost: Decimal,
+    pub fee: Decimal,
     pub average_price: Decimal,
 }
 
@@ -205,11 +206,23 @@ fn record_fills(ledger: &mut PaperLedger, yes: PaperFill, no: PaperFill) {
     ledger.total_spent += spent;
     ledger.pairs_attempted += 1;
 
-    let paired_cost = yes.average_price * paired + no.average_price * paired;
+    let yes_fee_per_share = if yes.filled > dec!(0) {
+        yes.fee / yes.filled
+    } else {
+        dec!(0)
+    };
+    let no_fee_per_share = if no.filled > dec!(0) {
+        no.fee / no.filled
+    } else {
+        dec!(0)
+    };
+    let paired_cost = (yes.average_price + yes_fee_per_share) * paired
+        + (no.average_price + no_fee_per_share) * paired;
     ledger.paired_shares += paired;
     ledger.theoretical_pnl += paired - paired_cost;
-    ledger.unmatched_cost += (yes.filled - paired).max(dec!(0)) * yes.average_price
-        + (no.filled - paired).max(dec!(0)) * no.average_price;
+    ledger.unmatched_cost += (yes.filled - paired).max(dec!(0))
+        * (yes.average_price + yes_fee_per_share)
+        + (no.filled - paired).max(dec!(0)) * (no.average_price + no_fee_per_share);
 }
 
 fn snapshot(settings: &PaperSettings, ledger: &PaperLedger) -> PaperSnapshot {
@@ -249,6 +262,7 @@ fn simulate_buy(
             requested,
             filled: dec!(0),
             cost: dec!(0),
+            fee: dec!(0),
             average_price: dec!(0),
         };
     }
@@ -277,6 +291,7 @@ fn simulate_buy(
         requested,
         filled,
         cost,
+        fee: dec!(0),
         average_price: if filled > dec!(0) {
             cost / filled
         } else {
@@ -338,6 +353,33 @@ mod tests {
     }
 
     #[test]
+    fn buy_simulation_does_not_mutate_the_paper_ledger() {
+        let engine = PaperTradingEngine::new(PaperSettings {
+            initial_balance: dec!(100),
+            liquidity_haircut: dec!(0.75),
+            second_leg_delay_ms: 0,
+        });
+        let before = {
+            let ledger = engine.ledger.lock().unwrap();
+            snapshot(&engine.settings, &ledger)
+        };
+
+        let fill = engine.simulate_buy(
+            &[level(dec!(0.95), dec!(20))],
+            dec!(0.95),
+            dec!(10),
+            &OrderType::FAK,
+        );
+
+        let after = {
+            let ledger = engine.ledger.lock().unwrap();
+            snapshot(&engine.settings, &ledger)
+        };
+        assert_eq!(fill.filled, dec!(10));
+        assert_eq!(before, after);
+    }
+
+    #[test]
     fn ledger_tracks_virtual_cash_pnl_and_unmatched_cost() {
         let engine = PaperTradingEngine::new(PaperSettings {
             initial_balance: dec!(10),
@@ -349,18 +391,49 @@ mod tests {
                 requested: dec!(3),
                 filled: dec!(3),
                 cost: dec!(1.2),
+                fee: dec!(0),
                 average_price: dec!(0.4),
             },
             PaperFill {
                 requested: dec!(3),
                 filled: dec!(2),
                 cost: dec!(1),
+                fee: dec!(0),
                 average_price: dec!(0.5),
             },
         );
         assert_eq!(snapshot.cash_remaining, dec!(9.8));
         assert_eq!(snapshot.theoretical_pnl, dec!(0.2));
         assert_eq!(snapshot.unmatched_cost, dec!(0.4));
+    }
+
+    #[test]
+    fn ledger_subtracts_both_leg_dynamic_fees_from_pair_pnl() {
+        let engine = PaperTradingEngine::new(PaperSettings {
+            initial_balance: dec!(20),
+            liquidity_haircut: dec!(1),
+            second_leg_delay_ms: 0,
+        });
+        let snapshot = engine.record_pair(
+            PaperFill {
+                requested: dec!(10),
+                filled: dec!(10),
+                cost: dec!(4.67325),
+                fee: dec!(0.17325),
+                average_price: dec!(0.45),
+            },
+            PaperFill {
+                requested: dec!(10),
+                filled: dec!(10),
+                cost: dec!(5.175),
+                fee: dec!(0.175),
+                average_price: dec!(0.50),
+            },
+        );
+
+        assert_eq!(snapshot.total_spent, dec!(9.84825));
+        assert_eq!(snapshot.theoretical_pnl, dec!(0.15175));
+        assert_eq!(snapshot.unmatched_cost, dec!(0));
     }
 
     #[test]
@@ -388,6 +461,7 @@ mod tests {
             requested: dec!(10),
             filled: dec!(10),
             cost: dec!(9.6),
+            fee: dec!(0),
             average_price: dec!(0.96),
         };
         let open = reservation.commit_winner(filled);

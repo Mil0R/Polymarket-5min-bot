@@ -186,7 +186,22 @@ pub struct DashboardState {
     pub selected_strategy: usize,
     pub arbitrage_state: StrategyDisplayState,
     pub winner_buy_state: StrategyDisplayState,
+    pub copy_trading_state: StrategyDisplayState,
     pub strategy_message: String,
+    pub arbitrage_budget: f64,
+    pub winner_buy_budget: f64,
+    pub winner_buy_exposure: f64,
+    pub copy_trading_budget: f64,
+    pub copy_whitelist_wallets: u64,
+    pub copy_signals_seen: u64,
+    pub copy_signals_rejected: u64,
+    pub copy_proposals: u64,
+    pub copy_fills: u64,
+    pub copy_open_positions: u64,
+    pub copy_nav: f64,
+    pub copy_cash: f64,
+    pub copy_last_poll_at_ms: i64,
+    pub copy_last_signal_at_ms: i64,
     pub opportunities_admitted: u64,
     pub opportunities_rejected: u64,
     pub depth_rejections: u64,
@@ -280,7 +295,22 @@ impl DashboardState {
             selected_strategy: 0,
             arbitrage_state: StrategyDisplayState::Blocked,
             winner_buy_state: StrategyDisplayState::Unavailable,
+            copy_trading_state: StrategyDisplayState::Unavailable,
             strategy_message: "initializing".into(),
+            arbitrage_budget: exposure_limit,
+            winner_buy_budget: 0.0,
+            winner_buy_exposure: 0.0,
+            copy_trading_budget: 0.0,
+            copy_whitelist_wallets: 0,
+            copy_signals_seen: 0,
+            copy_signals_rejected: 0,
+            copy_proposals: 0,
+            copy_fills: 0,
+            copy_open_positions: 0,
+            copy_nav: 0.0,
+            copy_cash: 0.0,
+            copy_last_poll_at_ms: 0,
+            copy_last_signal_at_ms: 0,
             opportunities_admitted: 0,
             opportunities_rejected: 0,
             depth_rejections: 0,
@@ -663,11 +693,49 @@ impl DashboardState {
         &mut self,
         arbitrage: StrategyDisplayState,
         winner_buy: StrategyDisplayState,
+        copy_trading: StrategyDisplayState,
         message: impl Into<String>,
     ) {
         self.arbitrage_state = arbitrage;
         self.winner_buy_state = winner_buy;
+        self.copy_trading_state = copy_trading;
         self.strategy_message = message.into();
+    }
+
+    pub fn set_strategy_budgets(&mut self, arbitrage: f64, winner_buy: f64, copy: f64) {
+        self.arbitrage_budget = arbitrage;
+        self.winner_buy_budget = winner_buy;
+        self.copy_trading_budget = copy;
+    }
+
+    pub fn set_winner_buy_exposure(&mut self, exposure: f64) {
+        self.winner_buy_exposure = exposure;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_copy_trading_metrics(
+        &mut self,
+        whitelist_wallets: u64,
+        signals_seen: u64,
+        signals_rejected: u64,
+        proposals: u64,
+        fills: u64,
+        open_positions: u64,
+        nav: f64,
+        cash: f64,
+        last_poll_at_ms: i64,
+        last_signal_at_ms: i64,
+    ) {
+        self.copy_whitelist_wallets = whitelist_wallets;
+        self.copy_signals_seen = signals_seen;
+        self.copy_signals_rejected = signals_rejected;
+        self.copy_proposals = proposals;
+        self.copy_fills = fills;
+        self.copy_open_positions = open_positions;
+        self.copy_nav = nav;
+        self.copy_cash = cash;
+        self.copy_last_poll_at_ms = last_poll_at_ms;
+        self.copy_last_signal_at_ms = last_signal_at_ms;
     }
 
     pub fn set_runtime_health(&mut self, market_ws: bool, user_ws: bool, rtds: bool, safety: bool) {
@@ -810,7 +878,7 @@ impl DashboardState {
             crossterm::event::KeyCode::Down
             | crossterm::event::KeyCode::Right
             | crossterm::event::KeyCode::Char('j') => {
-                self.selected_strategy = (self.selected_strategy + 1).min(1);
+                self.selected_strategy = (self.selected_strategy + 1).min(2);
                 DashboardAction::None
             }
             crossterm::event::KeyCode::Char('1') => {
@@ -819,6 +887,10 @@ impl DashboardState {
             }
             crossterm::event::KeyCode::Char('2') => {
                 self.selected_strategy = 1;
+                DashboardAction::None
+            }
+            crossterm::event::KeyCode::Char('3') => {
+                self.selected_strategy = 2;
                 DashboardAction::None
             }
             crossterm::event::KeyCode::Char(' ') => {
@@ -970,6 +1042,12 @@ mod tests {
         assert!(matches!(
             state.on_key(crossterm::event::KeyCode::Char(' ')),
             DashboardAction::ToggleStrategy(1)
+        ));
+        state.on_key(crossterm::event::KeyCode::Right);
+        assert_eq!(state.selected_strategy, 2);
+        assert!(matches!(
+            state.on_key(crossterm::event::KeyCode::Char(' ')),
+            DashboardAction::ToggleStrategy(2)
         ));
         assert!(matches!(
             state.on_key(crossterm::event::KeyCode::Char('p')),

@@ -15,6 +15,8 @@ pub struct ArbitrageOpportunity {
     pub profit_percentage: Decimal,
     pub yes_size: Decimal,
     pub no_size: Decimal,
+    pub yes_book_timestamp_ms: i64,
+    pub no_book_timestamp_ms: i64,
 }
 
 /// A price-positive candidate rejected only because one or both best-ask legs
@@ -39,6 +41,24 @@ pub struct ArbitrageShadowCandidate {
     pub no_book_timestamp_ms: i64,
     pub first_seen_at_ms: i64,
     pub observed_duration_ms: i64,
+}
+
+impl ArbitrageShadowCandidate {
+    pub fn as_opportunity(&self) -> ArbitrageOpportunity {
+        ArbitrageOpportunity {
+            market_id: self.market_id,
+            yes_token_id: self.yes_token_id,
+            no_token_id: self.no_token_id,
+            yes_ask_price: self.yes_ask_price,
+            no_ask_price: self.no_ask_price,
+            total_cost: self.total_price * self.common_size,
+            profit_percentage: self.profit_percentage,
+            yes_size: self.yes_ask_size,
+            no_size: self.no_ask_size,
+            yes_book_timestamp_ms: self.yes_book_timestamp_ms,
+            no_book_timestamp_ms: self.no_book_timestamp_ms,
+        }
+    }
 }
 
 /// Result of the detector's top-of-book scan, distinguishing why an opportunity
@@ -85,12 +105,17 @@ pub struct ArbitrageDetector {
     min_ask_depth_usd: Decimal,
 }
 
-/// Cumulative notional (USD) of ask levels priced at or inside `up_to_price`.
-/// The SDK contract sorts asks ascending, so this walks the top-of-book layers.
+/// Cumulative notional (USD) of non-empty ask levels priced at or inside
+/// `up_to_price`.
+///
+/// Do not rely on wire ordering here. Although the SDK documents asks as
+/// ascending, live snapshots can arrive in a different order. Stopping at the
+/// first level above the limit would then report zero depth even when the best
+/// ask itself has liquidity.
 fn cumulative_ask_depth_usd(book: &BookUpdate, up_to_price: Decimal) -> Decimal {
     book.asks
         .iter()
-        .take_while(|level| level.price <= up_to_price)
+        .filter(|level| level.size > Decimal::ZERO && level.price <= up_to_price)
         .map(|level| level.price * level.size)
         .sum()
 }
@@ -305,6 +330,8 @@ impl ArbitrageDetector {
             profit_percentage: net_profit_pct,
             yes_size,
             no_size,
+            yes_book_timestamp_ms: yes_book.timestamp,
+            no_book_timestamp_ms: no_book.timestamp,
         })
     }
 }
@@ -402,6 +429,56 @@ mod tests {
         let no = book(U256::from(2), dec!(0.499), dec!(30)); //  $14.97 depth
         let detector = ArbitrageDetector::with_min_depth(0.001, 10.0);
         assert!(detector.check_arbitrage(&yes, &no, &B256::ZERO).is_some());
+    }
+
+    #[test]
+    fn cumulative_depth_ignores_wire_order_and_empty_levels() {
+        let level = |price, size| OrderBookLevel::builder().price(price).size(size).build();
+        let book = BookUpdate::builder()
+            .asset_id(U256::from(1))
+            .market(B256::ZERO)
+            .timestamp(0)
+            .bids(Vec::new())
+            .asks(vec![
+                level(dec!(0.70), dec!(100)),
+                level(dec!(0.40), dec!(10)),
+                level(dec!(0.39), Decimal::ZERO),
+                level(dec!(0.60), dec!(50)),
+            ])
+            .build();
+
+        assert_eq!(cumulative_ask_depth_usd(&book, dec!(0.40)), dec!(4));
+    }
+
+    #[test]
+    fn admits_depth_from_descending_multi_level_books() {
+        let level = |price, size| OrderBookLevel::builder().price(price).size(size).build();
+        let yes = BookUpdate::builder()
+            .asset_id(U256::from(1))
+            .market(B256::ZERO)
+            .timestamp(0)
+            .bids(Vec::new())
+            .asks(vec![
+                level(dec!(0.80), dec!(100)),
+                level(dec!(0.40), dec!(10)),
+            ])
+            .build();
+        let no = BookUpdate::builder()
+            .asset_id(U256::from(2))
+            .market(B256::ZERO)
+            .timestamp(0)
+            .bids(Vec::new())
+            .asks(vec![
+                level(dec!(0.90), dec!(100)),
+                level(dec!(0.50), dec!(8)),
+            ])
+            .build();
+
+        let opportunity = ArbitrageDetector::with_min_depth(0.01, 3.0)
+            .check_arbitrage(&yes, &no, &B256::ZERO)
+            .expect("best-ask depth should be admitted regardless of wire order");
+        assert_eq!(opportunity.yes_ask_price, dec!(0.40));
+        assert_eq!(opportunity.no_ask_price, dec!(0.50));
     }
 
     #[test]

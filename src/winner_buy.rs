@@ -26,6 +26,30 @@ pub fn received_at_is_fresh(received_at_ms: i64, checked_at_ms: i64, max_age_ms:
         .is_some_and(|age| age >= 0 && age <= max_age_ms)
 }
 
+/// Refresh missing books unconditionally. For complete but stale WS books,
+/// REST is only needed when the cached pair still indicates a possible winner.
+/// A no-signal book cannot become a candidate without a WS update while the
+/// market stream is healthy, so this avoids refreshing both legs on every scan.
+pub fn winner_books_need_rest(
+    stream_healthy: bool,
+    yes_present: bool,
+    no_present: bool,
+    yes_fresh: bool,
+    no_fresh: bool,
+    preliminary_signal: bool,
+) -> bool {
+    if !stream_healthy {
+        return true;
+    }
+    if yes_fresh && no_fresh {
+        return false;
+    }
+    if !yes_present || !no_present {
+        return true;
+    }
+    preliminary_signal
+}
+
 #[derive(Debug, Clone, Copy)]
 struct SettlementRetry {
     attempts: u32,
@@ -161,11 +185,67 @@ pub struct WinnerEvaluation {
     pub model_observed_at_ms: Option<i64>,
     pub model_probability: Decimal,
     pub model_net_ev: Decimal,
+    #[serde(default)]
+    pub effective_entry_price: Decimal,
+    #[serde(default)]
+    pub probability_edge_before_risk: Decimal,
+    #[serde(default)]
+    pub required_probability: Decimal,
+    #[serde(default)]
+    pub reversal_margin_ratio: f64,
+    #[serde(default)]
+    pub ask_price_bucket: String,
+    #[serde(default)]
+    pub seconds_remaining_bucket: String,
+    #[serde(default)]
+    pub book_source: String,
+    #[serde(default)]
+    pub book_age_ms: i64,
     pub directional_margin_bps: f64,
     pub reversal_boundary_bps: f64,
     pub volatility_bps_per_sqrt_second: f64,
     pub spread: Decimal,
     pub depth_usdc: Decimal,
+}
+
+/// Delayed, read-only execution result for a rejected Winner Buy candidate.
+/// This is research data only: it never reserves paper cash or creates an
+/// order/position lifecycle entry.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WinnerShadowExecution {
+    pub evaluation_id: String,
+    pub slug: String,
+    pub simulated_at: DateTime<Utc>,
+    pub delay_ms: u64,
+    /// `rejected` or `awaiting_confirmation`; older records deserialize as
+    /// `rejected` so historical journals remain readable.
+    #[serde(default = "default_shadow_candidate_stage")]
+    pub candidate_stage: String,
+    pub outcome: String,
+    pub limit_price: Decimal,
+    pub requested: Decimal,
+    pub filled: Decimal,
+    /// Fee-inclusive cost and average price, matching normal paper Winner Buy.
+    pub cost: Decimal,
+    pub average_price: Decimal,
+    pub estimated_fee: Decimal,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+fn default_shadow_candidate_stage() -> String {
+    "rejected".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WinnerConfirmationObservation {
+    pub evaluation_id: String,
+    pub slug: String,
+    pub recorded_at: DateTime<Utc>,
+    pub model_observed_at_ms: i64,
+    pub confirmations: u32,
+    pub required: u32,
+    pub confirmed: bool,
 }
 
 impl WinnerEvaluation {
@@ -183,6 +263,8 @@ impl WinnerEvaluation {
         ask_price: Decimal,
         ask_size: Decimal,
         fee_per_share: Decimal,
+        book_source: String,
+        book_age_ms: i64,
         model: &ModelEvaluation,
     ) -> Self {
         Self {
@@ -209,12 +291,33 @@ impl WinnerEvaluation {
             model_observed_at_ms: model.observed_at_ms,
             model_probability: model.probability,
             model_net_ev: model.net_ev,
+            effective_entry_price: model.effective_price,
+            probability_edge_before_risk: model.probability_edge_before_risk,
+            required_probability: model.required_probability,
+            reversal_margin_ratio: if model.reversal_boundary_bps > 0.0 {
+                model.directional_margin_bps / model.reversal_boundary_bps
+            } else {
+                0.0
+            },
+            ask_price_bucket: ask_price.normalize().to_string(),
+            seconds_remaining_bucket: seconds_remaining_bucket(seconds_remaining).to_string(),
+            book_source,
+            book_age_ms,
             directional_margin_bps: model.directional_margin_bps,
             reversal_boundary_bps: model.reversal_boundary_bps,
             volatility_bps_per_sqrt_second: model.volatility_bps_per_sqrt_second,
             spread: model.spread,
             depth_usdc: model.depth_notional,
         }
+    }
+}
+
+fn seconds_remaining_bucket(seconds: i64) -> &'static str {
+    match seconds {
+        ..=20 => "00-20s",
+        21..=40 => "21-40s",
+        41..=60 => "41-60s",
+        _ => "61s+",
     }
 }
 
@@ -244,6 +347,14 @@ enum WinnerEvaluationEvent {
         won: bool,
         counterfactual_pnl_per_share: Decimal,
         resolved_at: DateTime<Utc>,
+    },
+    ShadowExecuted {
+        version: u8,
+        execution: Box<WinnerShadowExecution>,
+    },
+    ConfirmationObserved {
+        version: u8,
+        observation: Box<WinnerConfirmationObservation>,
     },
 }
 
@@ -307,6 +418,8 @@ impl WinnerEvaluationJournal {
                         unresolved.remove(&evaluation_id);
                     }
                     WinnerEvaluationEvent::MarketResolved { version: 1, .. } => {}
+                    WinnerEvaluationEvent::ShadowExecuted { version: 1, .. } => {}
+                    WinnerEvaluationEvent::ConfirmationObserved { version: 1, .. } => {}
                     _ => anyhow::bail!("unsupported Winner Buy evaluation journal version"),
                 }
             }
@@ -333,6 +446,23 @@ impl WinnerEvaluationJournal {
             .expect("Winner Buy evaluation lock poisoned")
             .insert(evaluation.evaluation_id.clone(), evaluation);
         Ok(())
+    }
+
+    pub fn record_shadow_execution(&self, execution: WinnerShadowExecution) -> Result<()> {
+        self.append(&WinnerEvaluationEvent::ShadowExecuted {
+            version: 1,
+            execution: Box::new(execution),
+        })
+    }
+
+    pub fn record_confirmation_observation(
+        &self,
+        observation: WinnerConfirmationObservation,
+    ) -> Result<()> {
+        self.append(&WinnerEvaluationEvent::ConfirmationObserved {
+            version: 1,
+            observation: Box::new(observation),
+        })
     }
 
     pub fn due_slugs(&self, now: DateTime<Utc>) -> Vec<String> {
@@ -1104,6 +1234,21 @@ pub fn fee_inclusive_capped_size(
     capped_size((price + fee_per_share).min(dec!(1)), max_order_usdc)
 }
 
+/// Cash-capped Winner Buy size additionally bounded by the currently visible
+/// best-ask quantity. The existing minimum-depth model gate remains in force;
+/// this prevents a valid but shallow book from turning a $20 request into an
+/// unintended partial fill.
+pub fn fee_inclusive_depth_capped_size(
+    price: Decimal,
+    fee_per_share: Decimal,
+    max_order_usdc: Decimal,
+    ask_size: Decimal,
+) -> Decimal {
+    let cash_capped = fee_inclusive_capped_size(price, fee_per_share, max_order_usdc);
+    let visible = (ask_size.max(dec!(0)) * dec!(100)).floor() / dec!(100);
+    cash_capped.min(visible)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1115,6 +1260,31 @@ mod tests {
         assert!(received_at_is_fresh(1_100, 1_500, 2_000));
         assert!(!received_at_is_fresh(1_100, 3_101, 2_000));
         assert!(!received_at_is_fresh(1_101, 1_100, 2_000));
+    }
+
+    #[test]
+    fn stale_complete_books_only_refresh_for_preliminary_candidates() {
+        assert!(!winner_books_need_rest(true, true, true, true, true, false));
+        assert!(!winner_books_need_rest(
+            true, true, true, false, false, false
+        ));
+        assert!(winner_books_need_rest(true, true, true, false, false, true));
+        assert!(winner_books_need_rest(
+            true, false, true, false, true, false
+        ));
+        assert!(winner_books_need_rest(
+            true, true, false, true, false, false
+        ));
+        assert!(winner_books_need_rest(false, true, true, true, true, false));
+    }
+
+    #[test]
+    fn evaluation_time_buckets_are_stable() {
+        assert_eq!(seconds_remaining_bucket(0), "00-20s");
+        assert_eq!(seconds_remaining_bucket(20), "00-20s");
+        assert_eq!(seconds_remaining_bucket(21), "21-40s");
+        assert_eq!(seconds_remaining_bucket(41), "41-60s");
+        assert_eq!(seconds_remaining_bucket(61), "61s+");
     }
 
     #[test]
@@ -1231,6 +1401,22 @@ mod tests {
     }
 
     #[test]
+    fn depth_cap_preserves_cash_cap_and_visible_top_size() {
+        assert_eq!(
+            fee_inclusive_depth_capped_size(dec!(0.97), dec!(0.002), dec!(20), dec!(12.345)),
+            dec!(12.34)
+        );
+        assert_eq!(
+            fee_inclusive_depth_capped_size(dec!(0.97), dec!(0.002), dec!(20), dec!(50)),
+            dec!(20.57)
+        );
+        assert_eq!(
+            fee_inclusive_depth_capped_size(dec!(0.97), dec!(0.002), dec!(20), dec!(-1)),
+            dec!(0)
+        );
+    }
+
+    #[test]
     fn settle_credits_win_and_debits_loss() {
         let buy = pending_buy();
         let now = Utc::now();
@@ -1333,6 +1519,14 @@ mod tests {
             model_observed_at_ms: Some(2),
             model_probability: dec!(0.94),
             model_net_ev: dec!(-0.01),
+            effective_entry_price: dec!(0.953325),
+            probability_edge_before_risk: dec!(-0.013325),
+            required_probability: dec!(0.965325),
+            reversal_margin_ratio: 10.0,
+            ask_price_bucket: "0.95".into(),
+            seconds_remaining_bucket: "00-20s".into(),
+            book_source: "rest".into(),
+            book_age_ms: 0,
             directional_margin_bps: 100.0,
             reversal_boundary_bps: 10.0,
             volatility_bps_per_sqrt_second: 1.0,
@@ -1342,6 +1536,34 @@ mod tests {
         {
             let journal = WinnerEvaluationJournal::open(&path).unwrap();
             journal.record(evaluation).unwrap();
+            journal
+                .record_confirmation_observation(WinnerConfirmationObservation {
+                    evaluation_id: "eval-1".into(),
+                    slug: "btc-updown-5m-1".into(),
+                    recorded_at: now,
+                    model_observed_at_ms: 2,
+                    confirmations: 1,
+                    required: 2,
+                    confirmed: false,
+                })
+                .unwrap();
+            journal
+                .record_shadow_execution(WinnerShadowExecution {
+                    evaluation_id: "eval-1".into(),
+                    slug: "btc-updown-5m-1".into(),
+                    simulated_at: now,
+                    delay_ms: 250,
+                    candidate_stage: "rejected".into(),
+                    outcome: "filled".into(),
+                    limit_price: dec!(0.95),
+                    requested: dec!(20),
+                    filled: dec!(7.5),
+                    cost: dec!(7.1499375),
+                    average_price: dec!(0.953325),
+                    estimated_fee: dec!(0.0249375),
+                    error: None,
+                })
+                .unwrap();
             assert_eq!(journal.due_slugs(now), vec!["btc-updown-5m-1"]);
         }
         let journal = WinnerEvaluationJournal::open(&path).unwrap();
@@ -1358,6 +1580,11 @@ mod tests {
             .due_slugs(now)
             .is_empty());
         let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("\"action\":\"shadow_executed\""));
+        assert!(contents.contains("\"action\":\"confirmation_observed\""));
+        assert!(contents.contains("\"candidate_stage\":\"rejected\""));
+        assert!(contents.contains("\"delay_ms\":250"));
+        assert!(contents.contains("\"outcome\":\"filled\""));
         assert!(contents.contains("\"action\":\"market_resolved\""));
         assert!(contents.contains("\"evaluation_count\":1"));
         std::fs::remove_file(path).unwrap();

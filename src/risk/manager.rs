@@ -63,7 +63,7 @@ impl RiskManager {
             pending_pairs: DashMap::new(),
             owned_orders: std::sync::Arc::new(OwnedOrderRegistry::default()),
             position_tracker: std::sync::Arc::new(PositionTracker::new(
-                Decimal::try_from(config.risk_max_exposure_usdc).unwrap_or(dec!(1000.0)),
+                Decimal::try_from(config.arbitrage_budget_usdc).unwrap_or(dec!(1000.0)),
             )),
             recovery_strategy: RecoveryStrategy::new(
                 config.risk_imbalance_threshold,

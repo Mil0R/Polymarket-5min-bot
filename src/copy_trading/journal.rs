@@ -149,10 +149,28 @@ fn rotate_log_file(path: &Path, max_bytes: u64, retention: usize) -> Result<()> 
 /// (`LOG_FILE`, defaulting to `default_log_file`). Safe to call once per process.
 pub fn init_copy_trader_logging(default_log_file: &str) -> Result<()> {
     dotenvy::dotenv().ok();
-    let env_filter = EnvFilter::try_from_default_env()
+    let mut env_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,polypulse=debug"));
 
-    let log_path = std::env::var("LOG_FILE").unwrap_or_else(|_| default_log_file.to_string());
+    // The public APIs add response fields ahead of SDK releases. The SDK
+    // accepts those fields but emits one WARN per field, which can turn a
+    // healthy startup into thousands of misleading lines. Keep actual SDK
+    // errors visible and suppress only this compatibility target, including
+    // when a shell-level `RUST_LOG=info` overrides the .env filter.
+    let show_sdk_schema_warnings = std::env::var("COPY_SHOW_SDK_SCHEMA_WARNINGS")
+        .map(|v| v.trim().eq_ignore_ascii_case("true") || v.trim() == "1")
+        .unwrap_or(false);
+    if !show_sdk_schema_warnings {
+        env_filter = env_filter.add_directive(
+            "polymarket_client_sdk::serde_helpers=error"
+                .parse()
+                .map_err(anyhow::Error::msg)?,
+        );
+    }
+
+    let log_path = std::env::var("COPY_TRADING_LOG_FILE")
+        .or_else(|_| std::env::var("LOG_FILE"))
+        .unwrap_or_else(|_| default_log_file.to_string());
     let file_writer = RotatingFileWriter::new(&log_path)?;
 
     let stdout_layer = tracing_subscriber::fmt::layer().with_ansi(true);
@@ -166,6 +184,9 @@ pub fn init_copy_trader_logging(default_log_file: &str) -> Result<()> {
         .with(env_filter)
         .init();
     info!(log_file = %log_path, "File logging enabled");
+    if !show_sdk_schema_warnings {
+        info!("SDK schema compatibility warnings suppressed; set COPY_SHOW_SDK_SCHEMA_WARNINGS=true to diagnose API field changes");
+    }
     Ok(())
 }
 
@@ -204,10 +225,7 @@ impl CopyTradeJournal {
 
     /// Whether a results file is currently open.
     pub fn is_enabled(&self) -> bool {
-        self.events
-            .lock()
-            .expect("journal lock poisoned")
-            .is_some()
+        self.events.lock().expect("journal lock poisoned").is_some()
     }
 
     /// Writes one event line: `{"ts":..., "runId":..., "type":..., ...fields}`.
@@ -251,7 +269,13 @@ impl CopyTradeJournal {
     }
 
     /// Periodic NAV snapshot for equity-curve regression analysis.
-    pub fn record_nav_snapshot(&self, nav: rust_decimal::Decimal, cash: rust_decimal::Decimal, open_positions: usize, whitelist_wallets: usize) {
+    pub fn record_nav_snapshot(
+        &self,
+        nav: rust_decimal::Decimal,
+        cash: rust_decimal::Decimal,
+        open_positions: usize,
+        whitelist_wallets: usize,
+    ) {
         self.record(
             "nav_snapshot",
             json!({
@@ -337,7 +361,10 @@ mod tests {
 
         assert!(rotated_path(&path, 1).exists(), "rotated file must exist");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "0123456789tail");
-        assert_eq!(std::fs::read_to_string(rotated_path(&path, 1)).unwrap(), "0123456789");
+        assert_eq!(
+            std::fs::read_to_string(rotated_path(&path, 1)).unwrap(),
+            "0123456789"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

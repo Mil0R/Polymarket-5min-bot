@@ -70,7 +70,27 @@ pub struct ExecutionQuote {
     pub no_price: Decimal,
     pub size: Decimal,
     pub total_cost: Decimal,
+    pub gross_edge_per_share: Decimal,
+    pub yes_fee_per_share: Decimal,
+    pub no_fee_per_share: Decimal,
     pub edge_per_share: Decimal,
+    pub fee_rate: Decimal,
+    pub fee_exponent: u32,
+    pub minimum_order_size: Decimal,
+}
+
+impl ExecutionQuote {
+    pub fn fee_per_share(&self, price: Decimal) -> Decimal {
+        fee_per_share(self.fee_rate, self.fee_exponent, price)
+    }
+
+    pub fn net_edge_at(&self, yes_price: Decimal, no_price: Decimal) -> Decimal {
+        dec!(1)
+            - yes_price
+            - no_price
+            - self.fee_per_share(yes_price)
+            - self.fee_per_share(no_price)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -80,6 +100,23 @@ pub struct WinnerBuyExecution {
     pub cost: Decimal,
     pub average_price: Decimal,
     pub estimated_fee: Decimal,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ArbitrageRestSnapshot {
+    pub observed_at_ms: i64,
+    pub request_latency_ms: u64,
+    pub yes_book_updated_at_ms: Option<i64>,
+    pub no_book_updated_at_ms: Option<i64>,
+    pub yes_fill: PaperFill,
+    pub no_fill: PaperFill,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ArbitrageRestTierSnapshot {
+    pub max_leg_notional_usdc: Decimal,
+    pub snapshot: ArbitrageRestSnapshot,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -102,12 +139,7 @@ pub struct WinnerFeePolicy {
 
 impl WinnerFeePolicy {
     pub fn fee_per_share(self, price: Decimal) -> Decimal {
-        if self.rate <= dec!(0) || price <= dec!(0) || price >= dec!(1) {
-            return dec!(0);
-        }
-        let base = price * (dec!(1) - price);
-        let factor = (0..self.exponent).fold(dec!(1), |value, _| value * base);
-        self.rate * factor
+        fee_per_share(self.rate, self.exponent, price)
     }
 }
 
@@ -121,6 +153,24 @@ struct QuoteRequest<'a> {
     fee_buffer: Decimal,
     yes_tick: Decimal,
     no_tick: Decimal,
+    market_rules: ArbitrageMarketRules,
+    enforce_min_order_size: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ArbitrageMarketRules {
+    pub fee_rate: Decimal,
+    pub fee_exponent: u32,
+    pub minimum_order_size: Decimal,
+}
+
+fn fee_per_share(rate: Decimal, exponent: u32, price: Decimal) -> Decimal {
+    if rate <= dec!(0) || price <= dec!(0) || price >= dec!(1) {
+        return dec!(0);
+    }
+    let base = price * (dec!(1) - price);
+    let factor = (0..exponent).fold(dec!(1), |value, _| value * base);
+    rate * factor
 }
 
 fn calculate_execution_quote(request: QuoteRequest<'_>) -> Result<ExecutionQuote> {
@@ -132,16 +182,35 @@ fn calculate_execution_quote(request: QuoteRequest<'_>) -> Result<ExecutionQuote
         request.opportunity.no_ask_price + request.no_slippage,
         request.no_tick,
     )?;
-    let required_edge =
-        request.min_profit_threshold.max(request.execution_spread) + request.fee_buffer;
-    let edge_per_share = dec!(1) - yes_price - no_price;
-    if edge_per_share < required_edge {
+    let gross_edge_per_share = dec!(1) - yes_price - no_price;
+    if gross_edge_per_share < request.execution_spread {
         anyhow::bail!(
-            "final quote is not profitable: YES {} + NO {} leaves {}, required {}",
+            "final quote gross edge is too small: YES {} + NO {} leaves {}, required {}",
             yes_price,
             no_price,
+            gross_edge_per_share,
+            request.execution_spread
+        );
+    }
+    let yes_fee_per_share = fee_per_share(
+        request.market_rules.fee_rate,
+        request.market_rules.fee_exponent,
+        yes_price,
+    );
+    let no_fee_per_share = fee_per_share(
+        request.market_rules.fee_rate,
+        request.market_rules.fee_exponent,
+        no_price,
+    );
+    let edge_per_share = gross_edge_per_share - yes_fee_per_share - no_fee_per_share;
+    let required_net_edge = request.min_profit_threshold + request.fee_buffer;
+    if edge_per_share < required_net_edge {
+        anyhow::bail!(
+            "final quote net edge is insufficient after dynamic fees: gross {}, fees {}, net {}, required {}",
+            gross_edge_per_share,
+            yes_fee_per_share + no_fee_per_share,
             edge_per_share,
-            required_edge
+            required_net_edge
         );
     }
     let affordable_yes = request.max_order_notional / yes_price;
@@ -156,6 +225,13 @@ fn calculate_execution_quote(request: QuoteRequest<'_>) -> Result<ExecutionQuote
     if size <= dec!(0) {
         anyhow::bail!("final order size is zero after notional and precision limits");
     }
+    if request.enforce_min_order_size && size < request.market_rules.minimum_order_size {
+        anyhow::bail!(
+            "order size {} is below CLOB minimum {} shares",
+            size,
+            request.market_rules.minimum_order_size
+        );
+    }
     let yes_cost = yes_price * size;
     let no_cost = no_price * size;
     if yes_cost <= dec!(1) || no_cost <= dec!(1) {
@@ -169,9 +245,38 @@ fn calculate_execution_quote(request: QuoteRequest<'_>) -> Result<ExecutionQuote
         yes_price,
         no_price,
         size,
-        total_cost: yes_cost + no_cost,
+        total_cost: yes_cost + no_cost + (yes_fee_per_share + no_fee_per_share) * size,
+        gross_edge_per_share,
+        yes_fee_per_share,
+        no_fee_per_share,
         edge_per_share,
+        fee_rate: request.market_rules.fee_rate,
+        fee_exponent: request.market_rules.fee_exponent,
+        minimum_order_size: request.market_rules.minimum_order_size,
     })
+}
+
+fn shadow_requested_size(
+    opportunity: &ArbitrageOpportunity,
+    quote: &ExecutionQuote,
+    max_leg_notional: Decimal,
+) -> Decimal {
+    if max_leg_notional <= dec!(0) {
+        return dec!(0);
+    }
+    let raw_size = (max_leg_notional / quote.yes_price)
+        .min(max_leg_notional / quote.no_price)
+        .min(opportunity.yes_size)
+        .min(opportunity.no_size);
+    (raw_size * dec!(100)).floor() / dec!(100)
+}
+
+fn apply_dynamic_fee(mut fill: PaperFill, quote: &ExecutionQuote) -> PaperFill {
+    if fill.filled > dec!(0) {
+        fill.fee = quote.fee_per_share(fill.average_price) * fill.filled;
+        fill.cost += fill.fee;
+    }
+    fill
 }
 
 fn round_buy_price_to_tick(price: Decimal, tick: Decimal) -> Result<Decimal> {
@@ -195,10 +300,11 @@ pub struct TradingExecutor {
     arbitrage_order_type: OrderType,
     dry_run: bool,
     paper_winner_buy_delay_ms: u64,
-    paper: PaperTradingEngine,
+    arbitrage_paper: PaperTradingEngine,
+    winner_paper: PaperTradingEngine,
     /// token_id -> minimum tick size, cached to avoid an HTTP round-trip per quote.
     tick_cache: DashMap<U256, Decimal>,
-    winner_fee_cache: DashMap<B256, WinnerFeePolicy>,
+    market_rules_cache: DashMap<B256, ArbitrageMarketRules>,
 }
 
 #[derive(Debug, Clone)]
@@ -211,8 +317,10 @@ pub struct ExecutionPolicy {
     pub gtd_expiration_secs: u64,
     pub order_type: OrderType,
     pub dry_run: bool,
-    pub paper_initial_balance_usdc: f64,
+    pub arbitrage_budget_usdc: f64,
+    pub winner_buy_budget_usdc: f64,
     pub paper_liquidity_haircut: f64,
+    pub arbitrage_paper_liquidity_haircut: f64,
     pub paper_second_leg_delay_ms: u64,
     pub paper_winner_buy_delay_ms: u64,
 }
@@ -303,15 +411,22 @@ impl TradingExecutor {
             arbitrage_order_type: policy.order_type,
             dry_run: policy.dry_run,
             paper_winner_buy_delay_ms: policy.paper_winner_buy_delay_ms,
-            paper: PaperTradingEngine::new(PaperSettings {
-                initial_balance: Decimal::try_from(policy.paper_initial_balance_usdc)
+            arbitrage_paper: PaperTradingEngine::new(PaperSettings {
+                initial_balance: Decimal::try_from(policy.arbitrage_budget_usdc)
+                    .unwrap_or(dec!(50)),
+                liquidity_haircut: Decimal::try_from(policy.arbitrage_paper_liquidity_haircut)
+                    .unwrap_or(dec!(0.75)),
+                second_leg_delay_ms: policy.paper_second_leg_delay_ms,
+            }),
+            winner_paper: PaperTradingEngine::new(PaperSettings {
+                initial_balance: Decimal::try_from(policy.winner_buy_budget_usdc)
                     .unwrap_or(dec!(50)),
                 liquidity_haircut: Decimal::try_from(policy.paper_liquidity_haircut)
                     .unwrap_or(dec!(0.75)),
                 second_leg_delay_ms: policy.paper_second_leg_delay_ms,
             }),
             tick_cache: DashMap::new(),
-            winner_fee_cache: DashMap::new(),
+            market_rules_cache: DashMap::new(),
         }
     }
 
@@ -348,8 +463,8 @@ impl TradingExecutor {
         }))
     }
 
-    pub async fn winner_fee_policy(&self, condition_id: B256) -> Result<WinnerFeePolicy> {
-        if let Some(cached) = self.winner_fee_cache.get(&condition_id) {
+    pub async fn arbitrage_market_rules(&self, condition_id: B256) -> Result<ArbitrageMarketRules> {
+        if let Some(cached) = self.market_rules_cache.get(&condition_id) {
             return Ok(*cached);
         }
         let condition = condition_id.to_string();
@@ -361,14 +476,26 @@ impl TradingExecutor {
         })
         .await?;
         let details = info.fee_details.ok_or_else(|| {
-            anyhow::anyhow!("CLOB V2 fee_details missing for Winner Buy condition {condition_id}")
+            anyhow::anyhow!("CLOB V2 fee_details missing for condition {condition_id}")
         })?;
-        let policy = WinnerFeePolicy {
-            rate: details.rate,
-            exponent: details.exponent,
+        if info.min_order_size <= dec!(0) {
+            anyhow::bail!("CLOB minimum order size is invalid for condition {condition_id}");
+        }
+        let rules = ArbitrageMarketRules {
+            fee_rate: details.rate,
+            fee_exponent: details.exponent,
+            minimum_order_size: info.min_order_size,
         };
-        self.winner_fee_cache.insert(condition_id, policy);
-        Ok(policy)
+        self.market_rules_cache.insert(condition_id, rules);
+        Ok(rules)
+    }
+
+    pub async fn winner_fee_policy(&self, condition_id: B256) -> Result<WinnerFeePolicy> {
+        let rules = self.arbitrage_market_rules(condition_id).await?;
+        Ok(WinnerFeePolicy {
+            rate: rules.fee_rate,
+            exponent: rules.fee_exponent,
+        })
     }
 
     /// Conservative cash/risk reservation for a Winner Buy. Live fills use
@@ -393,24 +520,21 @@ impl TradingExecutor {
         fee_per_share: Decimal,
     ) -> Result<WinnerBuyExecution> {
         if self.dry_run {
-            let reservation =
-                self.paper
-                    .reserve(self.winner_planned_cost(limit_price, size, fee_per_share))?;
-            if self.paper_winner_buy_delay_ms > 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(
-                    self.paper_winner_buy_delay_ms,
-                ))
-                .await;
-            }
-            let book = self.live_paper_book(token_id).await?;
-            let mut fill =
-                self.paper
-                    .simulate_buy(&book.asks, limit_price, size, &self.arbitrage_order_type);
-            let estimated_fee = fill.filled * fee_per_share;
-            if fill.filled > dec!(0) {
-                fill.cost += estimated_fee;
-                fill.average_price = fill.cost / fill.filled;
-            }
+            let reservation = self.winner_paper.reserve(self.winner_planned_cost(
+                limit_price,
+                size,
+                fee_per_share,
+            ))?;
+            let execution = self
+                .simulate_delayed_winner(token_id, limit_price, size, fee_per_share)
+                .await?;
+            let fill = PaperFill {
+                requested: execution.requested,
+                filled: execution.filled,
+                cost: execution.cost,
+                fee: execution.estimated_fee,
+                average_price: execution.average_price,
+            };
             let paper = reservation.commit_winner(fill);
             info!(target: "polypulse::strategy::winner_buy",
                 filled = %fill.filled,
@@ -420,13 +544,7 @@ impl TradingExecutor {
                 winner_positions_open = paper.winner_positions_open,
                 "PAPER winner-buy cash committed"
             );
-            return Ok(WinnerBuyExecution {
-                requested: size,
-                filled: fill.filled,
-                cost: fill.cost,
-                average_price: fill.average_price,
-                estimated_fee,
-            });
+            return Ok(execution);
         }
         let expiration = Utc::now() + chrono::Duration::seconds(self.gtd_expiration_secs as i64);
         let signed = self
@@ -460,6 +578,58 @@ impl TradingExecutor {
         })
     }
 
+    /// Re-read the live book after the configured paper delay and simulate a
+    /// Winner Buy without reserving cash or mutating the paper ledger. This is
+    /// intentionally unavailable in live mode and is used only to measure the
+    /// executability of rejected candidates.
+    pub async fn shadow_buy_winner(
+        &self,
+        token_id: U256,
+        limit_price: Decimal,
+        size: Decimal,
+        fee_per_share: Decimal,
+    ) -> Result<WinnerBuyExecution> {
+        if !self.dry_run {
+            anyhow::bail!("winner shadow execution is available only in dry-run mode");
+        }
+        self.simulate_delayed_winner(token_id, limit_price, size, fee_per_share)
+            .await
+    }
+
+    async fn simulate_delayed_winner(
+        &self,
+        token_id: U256,
+        limit_price: Decimal,
+        size: Decimal,
+        fee_per_share: Decimal,
+    ) -> Result<WinnerBuyExecution> {
+        if self.paper_winner_buy_delay_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(
+                self.paper_winner_buy_delay_ms,
+            ))
+            .await;
+        }
+        let book = self.live_paper_book(token_id).await?;
+        let mut fill = self.winner_paper.simulate_buy(
+            &book.asks,
+            limit_price,
+            size,
+            &self.arbitrage_order_type,
+        );
+        let estimated_fee = fill.filled * fee_per_share;
+        if fill.filled > dec!(0) {
+            fill.cost += estimated_fee;
+            fill.average_price = fill.cost / fill.filled;
+        }
+        Ok(WinnerBuyExecution {
+            requested: size,
+            filled: fill.filled,
+            cost: fill.cost,
+            average_price: fill.average_price,
+            estimated_fee,
+        })
+    }
+
     pub fn restore_paper_winner_history(
         &self,
         pending_cost: Decimal,
@@ -468,7 +638,7 @@ impl TradingExecutor {
         open_positions: u64,
     ) -> Option<PaperSnapshot> {
         self.dry_run.then(|| {
-            self.paper.restore_winner_history(
+            self.winner_paper.restore_winner_history(
                 pending_cost,
                 total_spent,
                 realized_pnl,
@@ -478,7 +648,8 @@ impl TradingExecutor {
     }
 
     pub fn settle_paper_winner(&self, cost: Decimal, payout: Decimal) -> Option<PaperSnapshot> {
-        self.dry_run.then(|| self.paper.settle_winner(cost, payout))
+        self.dry_run
+            .then(|| self.winner_paper.settle_winner(cost, payout))
     }
 
     /// Cancel only active orders whose token belongs to the target window.
@@ -543,8 +714,8 @@ impl TradingExecutor {
         }
     }
 
-    /// Build the exact prices and size that will be sent to CLOB. The profitability
-    /// check deliberately happens after slippage and includes a fee/rounding buffer.
+    /// Build the exact prices and size that will be sent to CLOB. Profitability is
+    /// checked after slippage, dynamic market fees, and the extra safety buffer.
     pub async fn execution_quote(
         &self,
         opp: &ArbitrageOpportunity,
@@ -553,12 +724,14 @@ impl TradingExecutor {
     ) -> Result<ExecutionQuote> {
         let yes_token = U256::from_str(&opp.yes_token_id.to_string())?;
         let no_token = U256::from_str(&opp.no_token_id.to_string())?;
-        let (yes_tick, no_tick) = tokio::join!(
+        let (yes_tick, no_tick, market_rules) = tokio::join!(
             self.cached_tick_size(yes_token),
-            self.cached_tick_size(no_token)
+            self.cached_tick_size(no_token),
+            self.arbitrage_market_rules(opp.market_id),
         );
         let yes_tick = yes_tick?;
         let no_tick = no_tick?;
+        let market_rules = market_rules?;
         calculate_execution_quote(QuoteRequest {
             opportunity: opp,
             yes_slippage: self.slippage_for_direction(yes_dir),
@@ -569,6 +742,37 @@ impl TradingExecutor {
             fee_buffer: self.fee_buffer,
             yes_tick,
             no_tick,
+            market_rules,
+            enforce_min_order_size: true,
+        })
+    }
+
+    pub async fn shadow_execution_quote(
+        &self,
+        opp: &ArbitrageOpportunity,
+        yes_dir: &str,
+        no_dir: &str,
+        max_order_notional: Decimal,
+    ) -> Result<ExecutionQuote> {
+        let yes_token = U256::from_str(&opp.yes_token_id.to_string())?;
+        let no_token = U256::from_str(&opp.no_token_id.to_string())?;
+        let (yes_tick, no_tick, market_rules) = tokio::join!(
+            self.cached_tick_size(yes_token),
+            self.cached_tick_size(no_token),
+            self.arbitrage_market_rules(opp.market_id),
+        );
+        calculate_execution_quote(QuoteRequest {
+            opportunity: opp,
+            yes_slippage: self.slippage_for_direction(yes_dir),
+            no_slippage: self.slippage_for_direction(no_dir),
+            max_order_notional,
+            min_profit_threshold: self.min_profit_threshold,
+            execution_spread: self.execution_spread,
+            fee_buffer: self.fee_buffer,
+            yes_tick: yes_tick?,
+            no_tick: no_tick?,
+            market_rules: market_rules?,
+            enforce_min_order_size: false,
         })
     }
 
@@ -671,6 +875,100 @@ impl TradingExecutor {
         .await
     }
 
+    /// Fetch one coherent REST book pair and evaluate multiple per-leg notionals
+    /// against that same response. This avoids introducing cross-request timing
+    /// noise while measuring whether an edge exists only at very small size.
+    pub async fn shadow_arbitrage_ladder(
+        &self,
+        opp: &ArbitrageOpportunity,
+        quote: &ExecutionQuote,
+        notionals_usdc: &[Decimal],
+    ) -> Result<Vec<ArbitrageRestTierSnapshot>> {
+        if !self.dry_run {
+            anyhow::bail!("arbitrage REST shadow sampling is available only in dry-run mode");
+        }
+        let yes_token = U256::from_str(&opp.yes_token_id.to_string())?;
+        let no_token = U256::from_str(&opp.no_token_id.to_string())?;
+        let started = Instant::now();
+        let (yes_book, no_book) = tokio::join!(
+            self.live_paper_book(yes_token),
+            self.live_paper_book(no_token),
+        );
+        let request_latency_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+        let (yes_book, yes_book_updated_at_ms, yes_error) = match yes_book {
+            Ok(book) => {
+                let timestamp = Some(book.timestamp.timestamp_millis());
+                (Some(book), timestamp, None)
+            }
+            Err(error) => (None, None, Some(format!("YES REST book: {error}"))),
+        };
+        let (no_book, no_book_updated_at_ms, no_error) = match no_book {
+            Ok(book) => {
+                let timestamp = Some(book.timestamp.timestamp_millis());
+                (Some(book), timestamp, None)
+            }
+            Err(error) => (None, None, Some(format!("NO REST book: {error}"))),
+        };
+        let error = [yes_error, no_error]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        let error = (!error.is_empty()).then(|| error.join("; "));
+
+        let mut tiers = Vec::with_capacity(notionals_usdc.len());
+        for notional in notionals_usdc.iter().copied() {
+            if notional <= dec!(0) {
+                continue;
+            }
+            let requested = shadow_requested_size(opp, quote, notional);
+            if requested <= dec!(0) {
+                continue;
+            }
+            let empty_fill = || PaperFill {
+                requested,
+                filled: dec!(0),
+                cost: dec!(0),
+                fee: dec!(0),
+                average_price: dec!(0),
+            };
+            let yes_fill = yes_book.as_ref().map_or_else(empty_fill, |book| {
+                apply_dynamic_fee(
+                    self.arbitrage_paper.simulate_buy(
+                        &book.asks,
+                        quote.yes_price,
+                        requested,
+                        &self.arbitrage_order_type,
+                    ),
+                    quote,
+                )
+            });
+            let no_fill = no_book.as_ref().map_or_else(empty_fill, |book| {
+                apply_dynamic_fee(
+                    self.arbitrage_paper.simulate_buy(
+                        &book.asks,
+                        quote.no_price,
+                        requested,
+                        &self.arbitrage_order_type,
+                    ),
+                    quote,
+                )
+            });
+            tiers.push(ArbitrageRestTierSnapshot {
+                max_leg_notional_usdc: notional,
+                snapshot: ArbitrageRestSnapshot {
+                    observed_at_ms: Utc::now().timestamp_millis(),
+                    request_latency_ms,
+                    yes_book_updated_at_ms,
+                    no_book_updated_at_ms,
+                    yes_fill,
+                    no_fill,
+                    error: error.clone(),
+                },
+            });
+        }
+        Ok(tiers)
+    }
+
     async fn execute_paper_pair(
         &self,
         opp: &ArbitrageOpportunity,
@@ -679,7 +977,6 @@ impl TradingExecutor {
         no_token_id: U256,
         pair_id: String,
     ) -> Result<OrderPairResult> {
-        let paper_reservation = self.paper.reserve(quote.total_cost)?;
         let first_leg = harder_leg(opp, quote);
         let (first_token, first_limit, second_token, second_limit) = match first_leg {
             OutcomeLeg::Yes => (yes_token_id, quote.yes_price, no_token_id, quote.no_price),
@@ -696,49 +993,61 @@ impl TradingExecutor {
             self.live_paper_book(second_token),
         );
         let (first_book_pre, second_book_pre) = (first_book_pre?, second_book_pre?);
-        let first_pre = self.paper.simulate_buy(
+        let first_pre = self.arbitrage_paper.simulate_buy(
             &first_book_pre.asks,
             first_limit,
             quote.size,
             &self.arbitrage_order_type,
         );
-        let second_pre = self.paper.simulate_buy(
+        let second_pre = self.arbitrage_paper.simulate_buy(
             &second_book_pre.asks,
             second_limit,
             quote.size,
             &self.arbitrage_order_type,
         );
-        if first_pre.filled <= dec!(0) || second_pre.filled <= dec!(0) {
+        let full_size_fillable = first_pre.filled >= quote.size && second_pre.filled >= quote.size;
+        let paired_edge = quote.net_edge_at(first_pre.average_price, second_pre.average_price);
+        let required_edge = self.min_profit_threshold + self.fee_buffer;
+        if !full_size_fillable || paired_edge < required_edge {
             warn!(
                 ?first_leg,
                 first_fill = %first_pre.filled,
                 second_fill = %second_pre.filled,
-                "PAPER pre-flight: opportunity evaporated before execution; skipping to avoid one-sided exposure"
+                %paired_edge,
+                %required_edge,
+                "PAPER pre-flight: full-size two-leg edge unavailable; skipping to avoid one-sided exposure"
             );
             return Err(anyhow::anyhow!(
-                "opportunity disappeared before execution (pre-flight depth check)"
+                "opportunity disappeared before execution (full-size REST pre-flight)"
             ));
         }
+        let paper_reservation = self.arbitrage_paper.reserve(quote.total_cost)?;
 
         // First leg consumes the pre-flight book so the simulated fill matches
         // what the pre-flight check approved.
-        let first_fill = self.paper.simulate_buy(
-            &first_book_pre.asks,
-            first_limit,
-            quote.size,
-            &self.arbitrage_order_type,
+        let first_fill = apply_dynamic_fee(
+            self.arbitrage_paper.simulate_buy(
+                &first_book_pre.asks,
+                first_limit,
+                quote.size,
+                &self.arbitrage_order_type,
+            ),
+            quote,
         );
         let second_fill = if first_fill.filled > dec!(0) {
             tokio::time::sleep(std::time::Duration::from_millis(
-                self.paper.second_leg_delay_ms(),
+                self.arbitrage_paper.second_leg_delay_ms(),
             ))
             .await;
             match self.live_paper_book(second_token).await {
-                Ok(second_book) => self.paper.simulate_buy(
-                    &second_book.asks,
-                    second_limit,
-                    first_fill.filled,
-                    &self.arbitrage_order_type,
+                Ok(second_book) => apply_dynamic_fee(
+                    self.arbitrage_paper.simulate_buy(
+                        &second_book.asks,
+                        second_limit,
+                        first_fill.filled,
+                        &self.arbitrage_order_type,
+                    ),
+                    quote,
                 ),
                 Err(error) => {
                     warn!(%error, "PAPER opposite book refresh failed; recording one-sided virtual fill");
@@ -746,6 +1055,7 @@ impl TradingExecutor {
                         requested: first_fill.filled,
                         filled: dec!(0),
                         cost: dec!(0),
+                        fee: dec!(0),
                         average_price: dec!(0),
                     }
                 }
@@ -755,6 +1065,7 @@ impl TradingExecutor {
                 requested: dec!(0),
                 filled: dec!(0),
                 cost: dec!(0),
+                fee: dec!(0),
                 average_price: dec!(0),
             }
         };
@@ -937,27 +1248,28 @@ impl TradingExecutor {
                 return Err(anyhow::anyhow!("pre-flight book query failed; aborting"));
             }
         };
-        let first_depth: Decimal = first_book_pre
+        let first_fillable_size: Decimal = first_book_pre
             .asks
             .iter()
-            .take_while(|level| level.price <= first_price)
-            .map(|level| level.price * level.size)
+            .filter(|level| level.price <= first_price)
+            .map(|level| level.size)
             .sum();
-        let second_depth: Decimal = second_book_pre
+        let second_fillable_size: Decimal = second_book_pre
             .asks
             .iter()
-            .take_while(|level| level.price <= second_price)
-            .map(|level| level.price * level.size)
+            .filter(|level| level.price <= second_price)
+            .map(|level| level.size)
             .sum();
-        if first_depth <= dec!(0) || second_depth <= dec!(0) {
+        if first_fillable_size < order_size || second_fillable_size < order_size {
             warn!(
                 ?first_leg,
-                %first_depth,
-                %second_depth,
-                "Pre-flight: opposite leg liquidity gone; skipping to avoid one-sided exposure"
+                %first_fillable_size,
+                %second_fillable_size,
+                %order_size,
+                "Pre-flight: full-size two-leg liquidity unavailable; skipping to avoid one-sided exposure"
             );
             return Err(anyhow::anyhow!(
-                "opportunity disappeared before execution (pre-flight depth check)"
+                "opportunity disappeared before execution (full-size REST pre-flight)"
             ));
         }
 
@@ -1295,6 +1607,8 @@ mod tests {
             profit_percentage: dec!(5),
             yes_size: dec!(100),
             no_size: dec!(100),
+            yes_book_timestamp_ms: 0,
+            no_book_timestamp_ms: 0,
         }
     }
 
@@ -1311,6 +1625,12 @@ mod tests {
             fee_buffer: dec!(0.002),
             yes_tick: dec!(0.01),
             no_tick: dec!(0.01),
+            market_rules: ArbitrageMarketRules {
+                fee_rate: dec!(0),
+                fee_exponent: 1,
+                minimum_order_size: dec!(1),
+            },
+            enforce_min_order_size: true,
         });
         assert!(result.is_err());
     }
@@ -1328,11 +1648,126 @@ mod tests {
             fee_buffer: dec!(0.002),
             yes_tick: dec!(0.01),
             no_tick: dec!(0.01),
+            market_rules: ArbitrageMarketRules {
+                fee_rate: dec!(0),
+                fee_exponent: 1,
+                minimum_order_size: dec!(1),
+            },
+            enforce_min_order_size: true,
         })
         .unwrap();
         assert!(quote.yes_price * quote.size <= dec!(10));
         assert!(quote.no_price * quote.size <= dec!(10));
         assert_eq!(quote.size, dec!(20));
+    }
+
+    #[test]
+    fn dynamic_two_leg_fees_reject_nominal_four_percent_edge() {
+        let mut opportunity = opportunity();
+        opportunity.yes_ask_price = dec!(0.44);
+        opportunity.no_ask_price = dec!(0.52);
+        let result = calculate_execution_quote(QuoteRequest {
+            opportunity: &opportunity,
+            yes_slippage: dec!(0.005),
+            no_slippage: dec!(0),
+            max_order_notional: dec!(10),
+            min_profit_threshold: dec!(0.001),
+            execution_spread: dec!(0.03),
+            fee_buffer: dec!(0.002),
+            yes_tick: dec!(0.001),
+            no_tick: dec!(0.001),
+            market_rules: ArbitrageMarketRules {
+                fee_rate: dec!(0.07),
+                fee_exponent: 1,
+                minimum_order_size: dec!(5),
+            },
+            enforce_min_order_size: true,
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn dynamic_fees_are_included_in_edge_and_reserved_cost() {
+        let mut opportunity = opportunity();
+        opportunity.yes_ask_price = dec!(0.44);
+        opportunity.no_ask_price = dec!(0.50);
+        let quote = calculate_execution_quote(QuoteRequest {
+            opportunity: &opportunity,
+            yes_slippage: dec!(0),
+            no_slippage: dec!(0),
+            max_order_notional: dec!(10),
+            min_profit_threshold: dec!(0.001),
+            execution_spread: dec!(0.03),
+            fee_buffer: dec!(0.002),
+            yes_tick: dec!(0.001),
+            no_tick: dec!(0.001),
+            market_rules: ArbitrageMarketRules {
+                fee_rate: dec!(0.07),
+                fee_exponent: 1,
+                minimum_order_size: dec!(5),
+            },
+            enforce_min_order_size: true,
+        })
+        .unwrap();
+        assert_eq!(quote.gross_edge_per_share, dec!(0.06));
+        assert_eq!(quote.yes_fee_per_share, dec!(0.017248));
+        assert_eq!(quote.no_fee_per_share, dec!(0.0175));
+        assert_eq!(quote.edge_per_share, dec!(0.025252));
+        assert!(quote.total_cost > (quote.yes_price + quote.no_price) * quote.size);
+    }
+
+    #[test]
+    fn clob_minimum_order_size_is_enforced_after_notional_sizing() {
+        let mut opportunity = opportunity();
+        opportunity.yes_ask_price = dec!(0.44);
+        opportunity.no_ask_price = dec!(0.50);
+        let result = calculate_execution_quote(QuoteRequest {
+            opportunity: &opportunity,
+            yes_slippage: dec!(0),
+            no_slippage: dec!(0),
+            max_order_notional: dec!(2),
+            min_profit_threshold: dec!(0.001),
+            execution_spread: dec!(0.03),
+            fee_buffer: dec!(0.002),
+            yes_tick: dec!(0.001),
+            no_tick: dec!(0.001),
+            market_rules: ArbitrageMarketRules {
+                fee_rate: dec!(0.07),
+                fee_exponent: 1,
+                minimum_order_size: dec!(5),
+            },
+            enforce_min_order_size: true,
+        });
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("below CLOB minimum"));
+    }
+
+    #[test]
+    fn shadow_ladder_sizes_each_tier_without_using_execution_cap() {
+        let opportunity = opportunity();
+        let quote = ExecutionQuote {
+            yes_price: dec!(0.45),
+            no_price: dec!(0.50),
+            size: dec!(4),
+            total_cost: dec!(3.8),
+            gross_edge_per_share: dec!(0.05),
+            yes_fee_per_share: dec!(0),
+            no_fee_per_share: dec!(0),
+            edge_per_share: dec!(0.05),
+            fee_rate: dec!(0),
+            fee_exponent: 1,
+            minimum_order_size: dec!(1),
+        };
+        assert_eq!(
+            shadow_requested_size(&opportunity, &quote, dec!(1)),
+            dec!(2)
+        );
+        assert_eq!(
+            shadow_requested_size(&opportunity, &quote, dec!(5)),
+            dec!(10)
+        );
     }
 
     #[test]
@@ -1367,7 +1802,13 @@ mod tests {
             no_price: dec!(0.25),
             size: dec!(10),
             total_cost: dec!(9.5),
+            gross_edge_per_share: dec!(0.05),
+            yes_fee_per_share: dec!(0),
+            no_fee_per_share: dec!(0),
             edge_per_share: dec!(0.05),
+            fee_rate: dec!(0),
+            fee_exponent: 1,
+            minimum_order_size: dec!(1),
         };
 
         opportunity.yes_size = dec!(4);
@@ -1387,7 +1828,13 @@ mod tests {
             no_price: dec!(0.25),
             size: dec!(10),
             total_cost: dec!(9.5),
+            gross_edge_per_share: dec!(0.05),
+            yes_fee_per_share: dec!(0),
+            no_fee_per_share: dec!(0),
             edge_per_share: dec!(0.05),
+            fee_rate: dec!(0),
+            fee_exponent: 1,
+            minimum_order_size: dec!(1),
         };
 
         assert_eq!(harder_leg(&opportunity, &quote), OutcomeLeg::No);

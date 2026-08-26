@@ -32,6 +32,10 @@ pub struct WhitelistManager {
 }
 
 impl WhitelistManager {
+    fn address_key(address: &str) -> String {
+        address.trim().to_ascii_lowercase()
+    }
+
     pub fn new(config: CopyTradingConfig) -> Self {
         Self {
             config,
@@ -69,7 +73,7 @@ impl WhitelistManager {
         match serde_json::from_str::<HashMap<String, WalletProfile>>(&raw) {
             Ok(profiles) => {
                 for (addr, profile) in profiles {
-                    self.wallets.insert(addr.clone(), profile);
+                    self.wallets.insert(Self::address_key(&addr), profile);
                 }
                 info!(
                     path = %path.display(),
@@ -117,9 +121,16 @@ impl WhitelistManager {
     }
 
     /// Returns the persisted profile if the loaded state is fresh enough.
-    pub fn get_fresh_profile(&self, address: &str, max_age_days: i64, now: DateTime<Utc>) -> Option<WalletProfile> {
+    pub fn get_fresh_profile(
+        &self,
+        address: &str,
+        max_age_days: i64,
+        now: DateTime<Utc>,
+    ) -> Option<WalletProfile> {
         let profile = self.get_wallet(address)?;
-        let age = now.signed_duration_since(profile.last_evaluated_at).num_days();
+        let age = now
+            .signed_duration_since(profile.last_evaluated_at)
+            .num_days();
         (age <= max_age_days).then_some(profile)
     }
 
@@ -137,7 +148,8 @@ impl WhitelistManager {
         let mut failure_reasons = Vec::new();
 
         // Filter settled records only
-        let settled: Vec<&WalletTradeRecord> = records.iter().filter(|r| r.settled_at.is_some()).collect();
+        let settled: Vec<&WalletTradeRecord> =
+            records.iter().filter(|r| r.settled_at.is_some()).collect();
         let total_settled = settled.len();
 
         // 1. Check settled event count (>= 50)
@@ -164,6 +176,8 @@ impl WhitelistManager {
         let mut total_notional = Decimal::ZERO;
         let mut sum_price_weight = Decimal::ZERO;
         let mut total_maker_vol = Decimal::ZERO;
+        let mut behavior_known_notional = Decimal::ZERO;
+        let mut behavior_known_count = 0usize;
         let mut arbitrage_trade_count = 0;
         let mut positive_pnl_sum = Decimal::ZERO;
         let mut max_single_profit = Decimal::ZERO;
@@ -187,12 +201,15 @@ impl WhitelistManager {
             total_notional += notional;
             sum_price_weight += r.entry_price * notional;
 
-            if r.is_maker {
-                total_maker_vol += notional;
-            }
-
-            if r.is_arbitrage_leg {
-                arbitrage_trade_count += 1;
+            if r.behavior_data_known {
+                behavior_known_notional += notional;
+                behavior_known_count += 1;
+                if r.is_maker {
+                    total_maker_vol += notional;
+                }
+                if r.is_arbitrage_leg {
+                    arbitrage_trade_count += 1;
+                }
             }
 
             total_pnl += r.pnl_usdc;
@@ -201,16 +218,18 @@ impl WhitelistManager {
                 if r.pnl_usdc > max_single_profit {
                     max_single_profit = r.pnl_usdc;
                 }
-                win_count += 1;
             }
 
             // Domain breakdown
-            *domain_volumes.entry(r.domain.clone()).or_insert(Decimal::ZERO) += notional;
+            *domain_volumes
+                .entry(r.domain.clone())
+                .or_insert(Decimal::ZERO) += notional;
 
             // Brier Score calculation for binary outcomes
             // BS = (f - o)^2 where f = entry_price (implied prob), o = 1 if won else 0
             if let Some(resolved) = &r.resolved_outcome {
                 let outcome_val = if &r.outcome_bought == resolved {
+                    win_count += 1;
                     Decimal::ONE
                 } else {
                     Decimal::ZERO
@@ -227,7 +246,9 @@ impl WhitelistManager {
             Decimal::ZERO
         };
 
-        if avg_entry_price < self.config.min_avg_entry_price || avg_entry_price > self.config.max_avg_entry_price {
+        if avg_entry_price < self.config.min_avg_entry_price
+            || avg_entry_price > self.config.max_avg_entry_price
+        {
             failure_reasons.push(format!(
                 "Average entry price out of range [{}, {}]: {:.4}",
                 self.config.min_avg_entry_price, self.config.max_avg_entry_price, avg_entry_price
@@ -241,7 +262,8 @@ impl WhitelistManager {
             Decimal::ONE
         };
 
-        let is_single_strike_survivor = max_single_profit_ratio > self.config.max_single_profit_ratio;
+        let is_single_strike_survivor =
+            max_single_profit_ratio > self.config.max_single_profit_ratio;
         if is_single_strike_survivor {
             hard_blacklist = true;
             failure_reasons.push(format!(
@@ -252,8 +274,8 @@ impl WhitelistManager {
         }
 
         // 5. Blacklist filter: Maker ratio (> 90% is hard rejected)
-        let maker_volume_ratio = if total_notional > Decimal::ZERO {
-            total_maker_vol / total_notional
+        let maker_volume_ratio = if behavior_known_notional > Decimal::ZERO {
+            total_maker_vol / behavior_known_notional
         } else {
             Decimal::ZERO
         };
@@ -269,7 +291,8 @@ impl WhitelistManager {
         }
 
         // 6. Blacklist filter: Arbitrageur / Multi-leg wash trader
-        let is_arbitrageur = arbitrage_trade_count > (total_settled / 5); // > 20% arbitrage legs
+        let is_arbitrageur =
+            behavior_known_count > 0 && arbitrage_trade_count > (behavior_known_count / 5); // > 20% known legs
         if is_arbitrageur {
             hard_blacklist = true;
             failure_reasons.push(format!(
@@ -344,20 +367,26 @@ impl WhitelistManager {
 
         // Preserve the 3-strike counter across re-evaluations so a wallet cannot
         // wipe its strike history by simply being re-evaluated.
+        let key = Self::address_key(address);
         let prev_strikes = self
             .wallets
-            .get(address)
+            .get(&key)
             .map(|p| p.consecutive_major_direction_errors)
             .unwrap_or(0);
 
         let profile = WalletProfile {
-            address: address.to_string(),
+            address: key,
             tier,
             total_settled_events: total_settled,
             active_span_days,
             avg_entry_price,
             max_single_profit_ratio,
             maker_volume_ratio,
+            behavior_data_coverage: if total_notional > Decimal::ZERO {
+                behavior_known_notional / total_notional
+            } else {
+                Decimal::ZERO
+            },
             is_arbitrageur,
             is_single_strike_survivor,
             primary_domain,
@@ -380,8 +409,10 @@ impl WhitelistManager {
 
     /// Registers or updates an evaluated wallet profile.
     pub fn upsert_wallet(&self, profile: WalletProfile) {
-        let addr = profile.address.clone();
+        let addr = Self::address_key(&profile.address);
         let tier = profile.tier;
+        let mut profile = profile;
+        profile.address = addr.clone();
         self.wallets.insert(addr.clone(), profile);
         self.save_state();
         info!(address = %addr, tier = ?tier, "Upserted wallet profile in whitelist store");
@@ -389,19 +420,28 @@ impl WhitelistManager {
 
     /// Retrieves an active wallet profile if present.
     pub fn get_wallet(&self, address: &str) -> Option<WalletProfile> {
-        self.wallets.get(address).map(|w| w.value().clone())
+        self.wallets
+            .get(&Self::address_key(address))
+            .map(|w| w.value().clone())
     }
 
     /// Checks if a wallet is an authorized signal source in a specific domain.
-    pub fn is_authorized_in_domain(&self, address: &str, domain: &DomainTag) -> (bool, Option<WalletTier>) {
-        if let Some(profile) = self.wallets.get(address) {
+    pub fn is_authorized_in_domain(
+        &self,
+        address: &str,
+        domain: &DomainTag,
+    ) -> (bool, Option<WalletTier>) {
+        if let Some(profile) = self.wallets.get(&Self::address_key(address)) {
             if profile.tier != WalletTier::TierS && profile.tier != WalletTier::TierA {
                 return (false, Some(profile.tier));
             }
 
             // Verify domain specialization matches
             let matches_domain = &profile.primary_domain == domain
-                || profile.domain_shares.iter().any(|(d, share)| d == domain && *share >= dec!(0.30));
+                || profile
+                    .domain_shares
+                    .iter()
+                    .any(|(d, share)| d == domain && *share >= dec!(0.30));
 
             if matches_domain {
                 (true, Some(profile.tier))
@@ -423,7 +463,7 @@ impl WhitelistManager {
     /// Enforces the 3-strike rule.
     pub fn record_direction_result(&self, address: &str, is_major_error: bool) {
         let mut changed = false;
-        if let Some(mut entry) = self.wallets.get_mut(address) {
+        if let Some(mut entry) = self.wallets.get_mut(&Self::address_key(address)) {
             if is_major_error {
                 entry.consecutive_major_direction_errors += 1;
                 warn!(
@@ -432,7 +472,9 @@ impl WhitelistManager {
                     "Recorded major direction error for wallet"
                 );
 
-                if entry.consecutive_major_direction_errors >= self.config.max_consecutive_direction_errors {
+                if entry.consecutive_major_direction_errors
+                    >= self.config.max_consecutive_direction_errors
+                {
                     entry.tier = WalletTier::Blacklisted;
                     entry.rejection_reason = Some(format!(
                         "Disqualified: {} consecutive major direction errors",
@@ -489,7 +531,12 @@ mod tests {
                     return_pct: dec!(0.2),
                     is_maker: false,
                     is_arbitrage_leg: false,
-                    resolved_outcome: Some(if won { OutcomeSide::Yes } else { OutcomeSide::No }),
+                    behavior_data_known: true,
+                    resolved_outcome: Some(if won {
+                        OutcomeSide::Yes
+                    } else {
+                        OutcomeSide::No
+                    }),
                     opened_at: Utc::now() - chrono::Duration::days(days_ago),
                     settled_at: Some(Utc::now() - chrono::Duration::days(days_ago - 1)),
                 }
@@ -517,7 +564,10 @@ mod tests {
         let reader = WhitelistManager::new_with_state(CopyTradingConfig::default(), path.clone());
         let profile = reader.get_wallet("0xExpert").expect("profile persisted");
         assert_eq!(profile.tier, WalletTier::TierA);
-        assert_eq!(profile.consecutive_major_direction_errors, 2, "strikes must survive restart");
+        assert_eq!(
+            profile.consecutive_major_direction_errors, 2,
+            "strikes must survive restart"
+        );
 
         // Warm-start helper: fresh profile is reusable, old one is not.
         assert!(reader.get_fresh_profile("0xExpert", 7, now).is_some());
@@ -535,7 +585,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(&path, "{{{not json").unwrap();
         let manager = WhitelistManager::new_with_state(CopyTradingConfig::default(), path.clone());
-        assert!(manager.list_active_whitelist().is_empty(), "corrupt state must not panic");
+        assert!(
+            manager.list_active_whitelist().is_empty(),
+            "corrupt state must not panic"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

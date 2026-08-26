@@ -79,6 +79,9 @@ pub struct WalletTradeRecord {
     pub return_pct: Decimal,
     pub is_maker: bool,
     pub is_arbitrage_leg: bool,
+    /// Whether maker/arbitrage classifications are sourced rather than defaulted.
+    #[serde(default)]
+    pub behavior_data_known: bool,
     pub resolved_outcome: Option<OutcomeSide>,
     pub opened_at: DateTime<Utc>,
     pub settled_at: Option<DateTime<Utc>>,
@@ -94,6 +97,8 @@ pub struct WalletProfile {
     pub avg_entry_price: Decimal,
     pub max_single_profit_ratio: Decimal,
     pub maker_volume_ratio: Decimal,
+    #[serde(default)]
+    pub behavior_data_coverage: Decimal,
     pub is_arbitrageur: bool,
     pub is_single_strike_survivor: bool,
     pub primary_domain: DomainTag,
@@ -157,9 +162,7 @@ impl OrderBookSnapshot {
 
     pub fn relative_spread(&self) -> Option<Decimal> {
         match (self.best_bid(), self.best_ask(), self.mid_price()) {
-            (Some(bid), Some(ask), Some(mid)) if mid > Decimal::ZERO => {
-                Some((ask - bid) / mid)
-            }
+            (Some(bid), Some(ask), Some(mid)) if mid > Decimal::ZERO => Some((ask - bid) / mid),
             _ => None,
         }
     }
@@ -203,6 +206,11 @@ pub struct SignalEvent {
     pub target_vwap: Decimal,
     pub target_shares: Decimal,
     pub target_notional_usdc: Decimal,
+    /// Fraction of the source wallet's pre-trade token position that was sold.
+    /// Present for observed SELL signals; None means the feed could not establish
+    /// a reliable position denominator.
+    #[serde(default)]
+    pub target_reduction_pct: Option<Decimal>,
     pub timestamp: DateTime<Utc>,
 }
 
@@ -275,40 +283,46 @@ pub struct ExecutionOrderState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CopyTradingConfig {
     // 1. Whitelist Funnel Filters
-    pub min_settled_events: usize,          // >= 50
-    pub min_active_days: u32,               // >= 90
-    pub min_avg_entry_price: Decimal,       // 0.20
-    pub max_avg_entry_price: Decimal,       // 0.80
-    pub max_single_profit_ratio: Decimal,   // 0.25 (25%)
-    pub max_maker_ratio: Decimal,           // 0.90 (90%)
-    pub domain_volume_threshold: Decimal,   // 0.60 (60% to get tagged)
+    pub min_settled_events: usize,        // >= 50
+    pub min_active_days: u32,             // >= 90
+    pub min_avg_entry_price: Decimal,     // 0.20
+    pub max_avg_entry_price: Decimal,     // 0.80
+    pub max_single_profit_ratio: Decimal, // 0.25 (25%)
+    pub max_maker_ratio: Decimal,         // 0.90 (90%)
+    pub domain_volume_threshold: Decimal, // 0.60 (60% to get tagged)
 
     // 2. Market Filters
-    pub max_spread: Decimal,                // 0.02 (2%)
-    pub min_24h_volume_usdc: Decimal,       // $50,000
-    pub min_hours_to_expiry: Decimal,       // 72.0 hours
-    pub isolate_multi_outcome: bool,        // true (isolate >= 3 outcomes)
+    pub max_spread: Decimal,          // 0.02 (2%)
+    pub min_24h_volume_usdc: Decimal, // $50,000
+    pub min_hours_to_expiry: Decimal, // 72.0 hours
+    pub isolate_multi_outcome: bool,  // true (isolate >= 3 outcomes)
 
     // 3. Execution & Price Protection
-    pub max_slippage_pct: Decimal,          // 0.015 (1.5%)
-    pub max_price_offset_usd: Decimal,      // $0.015
-    pub default_ttl_seconds: u64,           // 45 seconds (30..60s)
-    pub max_top5_depth_pct: Decimal,        // 0.10 (10%)
-    pub min_order_notional_usdc: Decimal,   // $5.00
+    pub max_slippage_pct: Decimal,        // 0.015 (1.5%)
+    pub max_price_offset_usd: Decimal,    // $0.015
+    pub default_ttl_seconds: u64,         // 45 seconds (30..60s)
+    pub max_top5_depth_pct: Decimal,      // 0.10 (10%)
+    pub min_order_notional_usdc: Decimal, // $5.00
 
     // 4. Position Sizing & Risk Management
     pub single_trade_allocation_pct: Decimal, // 0.02 (2% of total portfolio)
     pub max_single_market_exposure_pct: Decimal, // 0.10 (10% max per market)
-    pub max_total_exposure_pct: Decimal,    // 0.30 (30% max aggregate across all markets)
-    pub daily_max_drawdown_pct: Decimal,    // 0.05 (5% daily killswitch)
-    pub circuit_breaker_cooldown_hours: u32, // 24 hours
+    pub max_total_exposure_pct: Decimal,      // 0.30 (30% max aggregate across all markets)
+    pub daily_max_drawdown_pct: Decimal,      // 0.05 (5% daily killswitch)
+    pub circuit_breaker_cooldown_hours: u32,  // 24 hours
 
     // 5. Consensus & Closed-Loop
-    pub consensus_window_hours: i64,        // 12 hours
-    pub min_consensus_wallets: usize,       // 2 wallets
-    pub min_signal_notional_usdc: Decimal,  // $100 minimum signal size for consensus counting
-    pub min_signal_vwap: Decimal,           // 0.05 sanity floor for consensus VWAP
-    pub max_signal_vwap: Decimal,           // 0.95 sanity ceiling for consensus VWAP
+    pub consensus_window_hours: i64,       // 12 hours
+    pub min_consensus_wallets: usize,      // 2 wallets
+    pub min_signal_notional_usdc: Decimal, // $100 minimum signal size for consensus counting
+    /// PAPER-only research floor: smaller observations are shadowed but never
+    /// enter consensus or reserve strategy capital.
+    pub shadow_min_signal_notional_usdc: Decimal,
+    pub min_signal_vwap: Decimal, // 0.05 sanity floor for consensus VWAP
+    pub max_signal_vwap: Decimal, // 0.95 sanity ceiling for consensus VWAP
+    pub max_signal_age_seconds: i64, // reject stale/replayed observations
+    /// Delay before a PAPER proposal re-reads the live book and simulates a fill.
+    pub paper_execution_delay_ms: u64,
     pub exit_trigger_reduction_pct: Decimal, // 0.30 (30% exit threshold)
     pub max_acceptable_brier_score: Decimal, // 0.25
     pub max_consecutive_direction_errors: u32, // 3 strikes
@@ -350,8 +364,11 @@ impl Default for CopyTradingConfig {
             consensus_window_hours: 12,
             min_consensus_wallets: 2,
             min_signal_notional_usdc: dec!(100.0),
+            shadow_min_signal_notional_usdc: dec!(10.0),
             min_signal_vwap: dec!(0.05),
             max_signal_vwap: dec!(0.95),
+            max_signal_age_seconds: 120,
+            paper_execution_delay_ms: 500,
             exit_trigger_reduction_pct: dec!(0.30),
             max_acceptable_brier_score: dec!(0.25),
             max_consecutive_direction_errors: 3,
@@ -360,6 +377,49 @@ impl Default for CopyTradingConfig {
 }
 
 impl CopyTradingConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        let fraction = |name: &str, value: Decimal| {
+            (value > Decimal::ZERO && value <= Decimal::ONE)
+                .then_some(())
+                .ok_or_else(|| format!("{name} must be in (0, 1], got {value}"))
+        };
+        fraction(
+            "single_trade_allocation_pct",
+            self.single_trade_allocation_pct,
+        )?;
+        fraction(
+            "max_single_market_exposure_pct",
+            self.max_single_market_exposure_pct,
+        )?;
+        fraction("max_total_exposure_pct", self.max_total_exposure_pct)?;
+        fraction("daily_max_drawdown_pct", self.daily_max_drawdown_pct)?;
+        fraction("max_top5_depth_pct", self.max_top5_depth_pct)?;
+        if self.single_trade_allocation_pct > self.max_single_market_exposure_pct {
+            return Err("single trade allocation exceeds per-market cap".to_string());
+        }
+        if self.max_single_market_exposure_pct > self.max_total_exposure_pct {
+            return Err("per-market cap exceeds portfolio cap".to_string());
+        }
+        if self.min_signal_vwap <= Decimal::ZERO
+            || self.max_signal_vwap >= Decimal::ONE
+            || self.min_signal_vwap >= self.max_signal_vwap
+        {
+            return Err("signal VWAP bounds must satisfy 0 < min < max < 1".to_string());
+        }
+        if self.min_consensus_wallets == 0 || self.default_ttl_seconds == 0 {
+            return Err("consensus wallet count and TTL must be positive".to_string());
+        }
+        if self.shadow_min_signal_notional_usdc <= Decimal::ZERO
+            || self.shadow_min_signal_notional_usdc > self.min_signal_notional_usdc
+        {
+            return Err(
+                "shadow signal notional must be positive and cannot exceed live minimum"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
     /// Loads configuration from environment variables, falling back to defaults.
     pub fn from_env() -> Self {
         let mut cfg = Self::default();
@@ -464,6 +524,11 @@ impl CopyTradingConfig {
                 cfg.min_signal_notional_usdc = val;
             }
         }
+        if let Ok(v) = std::env::var("COPY_SHADOW_MIN_SIGNAL_NOTIONAL_USDC") {
+            if let Ok(val) = v.trim().parse::<Decimal>() {
+                cfg.shadow_min_signal_notional_usdc = val;
+            }
+        }
         if let Ok(v) = std::env::var("COPY_MIN_SIGNAL_VWAP") {
             if let Ok(val) = v.trim().parse::<Decimal>() {
                 cfg.min_signal_vwap = val;
@@ -472,6 +537,16 @@ impl CopyTradingConfig {
         if let Ok(v) = std::env::var("COPY_MAX_SIGNAL_VWAP") {
             if let Ok(val) = v.trim().parse::<Decimal>() {
                 cfg.max_signal_vwap = val;
+            }
+        }
+        if let Ok(v) = std::env::var("COPY_MAX_SIGNAL_AGE_SECONDS") {
+            if let Ok(val) = v.trim().parse::<i64>() {
+                cfg.max_signal_age_seconds = val.max(1);
+            }
+        }
+        if let Ok(v) = std::env::var("COPY_PAPER_EXECUTION_DELAY_MS") {
+            if let Ok(val) = v.trim().parse::<u64>() {
+                cfg.paper_execution_delay_ms = val.min(30_000);
             }
         }
         if let Ok(v) = std::env::var("COPY_EXIT_TRIGGER_REDUCTION_PCT") {

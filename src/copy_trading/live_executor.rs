@@ -15,16 +15,19 @@
 //!   COPY_ORDER_TYPE      = FAK (default) | FOK | GTC | GTD
 //!   COPY_FEE_BUFFER_PCT  = 0.01 (fraction of notional reserved for fees)
 
-use crate::clob_v2::{create_authenticated_clob_client, parse_signature_type, AuthenticatedClobClient, CLOB_API_URL_DEFAULT};
+use crate::clob_v2::{
+    create_authenticated_clob_client, parse_signature_type, AuthenticatedClobClient,
+    CLOB_API_URL_DEFAULT,
+};
 use crate::copy_trading::types::{ExecutionOrderProposal, OutcomeSide};
-use anyhow::{Context, Result};
 use alloy::signers::local::LocalSigner;
 use alloy::signers::Signer;
+use anyhow::{Context, Result};
 use dashmap::DashMap;
 use polymarket_client_sdk_v2::clob::types::request::BalanceAllowanceRequest;
 use polymarket_client_sdk_v2::clob::types::response::FeeDetails;
 use polymarket_client_sdk_v2::clob::types::{AssetType, OrderType, Side, SignedOrder};
-use polymarket_client_sdk_v2::types::{Address, B256, Decimal, U256};
+use polymarket_client_sdk_v2::types::{Address, Decimal, B256, U256};
 use polymarket_client_sdk_v2::POLYGON;
 use rust_decimal_macros::dec;
 use std::str::FromStr;
@@ -76,16 +79,23 @@ impl CopyTradeExecutor {
         let signature_type = parse_signature_type(
             &std::env::var("SIGNATURE_TYPE").unwrap_or_else(|_| "Poly1271".to_string()),
         );
-        let clob_url = std::env::var("CLOB_API_URL").unwrap_or_else(|_| CLOB_API_URL_DEFAULT.to_string());
+        let clob_url =
+            std::env::var("CLOB_API_URL").unwrap_or_else(|_| CLOB_API_URL_DEFAULT.to_string());
 
         let v2_proxy = proxy_raw
             .as_deref()
-            .map(|s| s.parse::<Address>().context("invalid POLYMARKET_PROXY_ADDRESS"))
+            .map(|s| {
+                s.parse::<Address>()
+                    .context("invalid POLYMARKET_PROXY_ADDRESS")
+            })
             .transpose()?;
 
-        let client = create_authenticated_clob_client(&private_key, &clob_url, v2_proxy, signature_type)
-            .await
-            .context("CLOB authentication failed (check POLYMARKET_PRIVATE_KEY / proxy / network)")?;
+        let client =
+            create_authenticated_clob_client(&private_key, &clob_url, v2_proxy, signature_type)
+                .await
+                .context(
+                    "CLOB authentication failed (check POLYMARKET_PRIVATE_KEY / proxy / network)",
+                )?;
 
         let order_type = match std::env::var("COPY_ORDER_TYPE")
             .unwrap_or_else(|_| "FAK".to_string())
@@ -93,8 +103,10 @@ impl CopyTradeExecutor {
             .as_str()
         {
             "FOK" => OrderType::FOK,
-            "GTC" => OrderType::GTC,
-            "GTD" => OrderType::GTD,
+            "GTC" | "GTD" => anyhow::bail!(
+                "COPY_ORDER_TYPE={} is disabled until durable resting-order reconciliation is configured; use FAK or FOK",
+                std::env::var("COPY_ORDER_TYPE").unwrap_or_default()
+            ),
             _ => OrderType::FAK,
         };
 
@@ -138,6 +150,11 @@ impl CopyTradeExecutor {
         Ok(self.client.balance_allowance(request).await?.balance)
     }
 
+    pub async fn token_balance_str(&self, token_id: &str) -> Result<Decimal> {
+        self.token_balance(token_id.parse().context("invalid token id")?)
+            .await
+    }
+
     /// V2 taker fee per share: `rate * (p*(1-p))^exponent` (same formula the main
     /// bot uses). Highest at p=0.5, lowest near 0/1 — a flat percentage buffer
     /// wastes capital at extreme prices and can overflow at mid prices.
@@ -161,16 +178,25 @@ impl CopyTradeExecutor {
             .await
             .map_err(|e| anyhow::anyhow!("fee policy fetch failed for {}: {}", condition_id, e))?;
         let details = info.fee_details.ok_or_else(|| {
-            anyhow::anyhow!("no fee_details in market info for condition {}", condition_id)
+            anyhow::anyhow!(
+                "no fee_details in market info for condition {}",
+                condition_id
+            )
         })?;
-        self.fee_cache.insert(condition_id.to_string(), details.clone());
+        self.fee_cache
+            .insert(condition_id.to_string(), details.clone());
         Ok(details)
     }
 
     /// Computes the fee-buffered size: the largest share count whose notional
     /// PLUS expected taker fee stays inside the proposal's budget.
     /// Falls back to the flat `COPY_FEE_BUFFER_PCT` when fee details are missing.
-    async fn fee_buffered_size(&self, condition_id: &str, price: Decimal, shares: Decimal) -> Decimal {
+    async fn fee_buffered_size(
+        &self,
+        condition_id: &str,
+        price: Decimal,
+        shares: Decimal,
+    ) -> Decimal {
         let fee_per_share = match self.fee_policy(condition_id).await {
             Ok(policy) => Self::fee_per_share(policy.rate, policy.exponent, price),
             Err(e) => {
@@ -194,7 +220,10 @@ impl CopyTradeExecutor {
     /// The order size is fee-buffered so the total spend (notional + fee) stays
     /// inside the allocated budget. USDC balance is checked first. FAK/FOK never
     /// leave a resting remainder; GTC/GTD rely on the coordinator's TTL cancel.
-    pub async fn execute_buy(&self, proposal: &ExecutionOrderProposal) -> Result<OrderExecutionOutcome> {
+    pub async fn execute_buy(
+        &self,
+        proposal: &ExecutionOrderProposal,
+    ) -> Result<OrderExecutionOutcome> {
         let token_id: U256 = proposal
             .token_id
             .parse()
@@ -204,7 +233,10 @@ impl CopyTradeExecutor {
             .fee_buffered_size(&proposal.market_id, proposal.limit_price, proposal.shares)
             .await;
         if size <= Decimal::ZERO {
-            anyhow::bail!("buy size zero after fee buffer for proposal {}", proposal.proposal_id);
+            anyhow::bail!(
+                "buy size zero after fee buffer for proposal {}",
+                proposal.proposal_id
+            );
         }
 
         let projected_cost = proposal.limit_price * size;
@@ -233,14 +265,11 @@ impl CopyTradeExecutor {
             .build_and_sign(token_id, Side::Buy, proposal.limit_price, size)
             .await?;
         let response = self.client.post_order(signed).await.map_err(|e| {
-            anyhow::anyhow!(
-                "CLOB buy order failed for {}: {}",
-                proposal.proposal_id,
-                e
-            )
+            anyhow::anyhow!("CLOB buy order failed for {}: {}", proposal.proposal_id, e)
         })?;
 
-        let filled = outcome_shares_filled(&Side::Buy, response.making_amount, response.taking_amount);
+        let filled =
+            outcome_shares_filled(&Side::Buy, response.making_amount, response.taking_amount);
         let spent = response.making_amount.max(Decimal::ZERO);
         let avg_price = if filled > Decimal::ZERO && spent > Decimal::ZERO {
             spent / filled
@@ -281,7 +310,10 @@ impl CopyTradeExecutor {
     }
 
     /// Executes a SELL proposal as a real CLOB order, verifying token holdings first.
-    pub async fn execute_sell(&self, proposal: &ExecutionOrderProposal) -> Result<OrderExecutionOutcome> {
+    pub async fn execute_sell(
+        &self,
+        proposal: &ExecutionOrderProposal,
+    ) -> Result<OrderExecutionOutcome> {
         let token_id: U256 = proposal
             .token_id
             .parse()
@@ -291,7 +323,10 @@ impl CopyTradeExecutor {
             .fee_buffered_size(&proposal.market_id, proposal.limit_price, proposal.shares)
             .await;
         if size <= Decimal::ZERO {
-            anyhow::bail!("sell size zero after fee buffer for proposal {}", proposal.proposal_id);
+            anyhow::bail!(
+                "sell size zero after fee buffer for proposal {}",
+                proposal.proposal_id
+            );
         }
 
         // Best-effort token-balance pre-check (advisory; exchange enforces).
@@ -316,14 +351,11 @@ impl CopyTradeExecutor {
             .build_and_sign(token_id, Side::Sell, proposal.limit_price, size)
             .await?;
         let response = self.client.post_order(signed).await.map_err(|e| {
-            anyhow::anyhow!(
-                "CLOB sell order failed for {}: {}",
-                proposal.proposal_id,
-                e
-            )
+            anyhow::anyhow!("CLOB sell order failed for {}: {}", proposal.proposal_id, e)
         })?;
 
-        let filled = outcome_shares_filled(&Side::Sell, response.making_amount, response.taking_amount);
+        let filled =
+            outcome_shares_filled(&Side::Sell, response.making_amount, response.taking_amount);
         let proceeds = response.taking_amount.max(Decimal::ZERO);
         let avg_price = if filled > Decimal::ZERO && proceeds > Decimal::ZERO {
             proceeds / filled
@@ -480,8 +512,14 @@ mod tests {
         // overflow at mid prices and waste capital at extremes.
         assert!(mid_fee > extreme_fee * dec!(2));
         // Boundary sanity.
-        assert_eq!(CopyTradeExecutor::fee_per_share(dec!(0.07), 1, dec!(1.0)), Decimal::ZERO);
-        assert_eq!(CopyTradeExecutor::fee_per_share(Decimal::ZERO, 1, dec!(0.5)), Decimal::ZERO);
+        assert_eq!(
+            CopyTradeExecutor::fee_per_share(dec!(0.07), 1, dec!(1.0)),
+            Decimal::ZERO
+        );
+        assert_eq!(
+            CopyTradeExecutor::fee_per_share(Decimal::ZERO, 1, dec!(0.5)),
+            Decimal::ZERO
+        );
     }
 
     #[tokio::test]
@@ -497,6 +535,12 @@ mod tests {
         let fee = CopyTradeExecutor::fee_per_share(dec!(0.07), 1, price); // 0.0175
         let buffered = floor2((shares * price) / (price + fee));
         assert!(buffered < shares);
-        assert!(buffered * (price + fee) <= budget, "{} x {} must stay in {}", buffered, price + fee, budget);
+        assert!(
+            buffered * (price + fee) <= budget,
+            "{} x {} must stay in {}",
+            buffered,
+            price + fee,
+            budget
+        );
     }
 }

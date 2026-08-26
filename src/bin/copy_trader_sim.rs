@@ -68,7 +68,10 @@ async fn main() -> Result<()> {
     let wallet_b = "0xSimTraderB00000000000000000000000000000002";
     enroll_macro_wallet(&coordinator, wallet_a, now)?;
     enroll_macro_wallet(&coordinator, wallet_b, now)?;
-    info!("Whitelisted sim wallets: {} (TierA), {} (TierA)", wallet_a, wallet_b);
+    info!(
+        "Whitelisted sim wallets: {} (TierA), {} (TierA)",
+        wallet_a, wallet_b
+    );
 
     // 2. Real market metadata via Gamma.
     let meta_fetcher = MarketMetadataFetcher::new()?;
@@ -78,10 +81,7 @@ async fn main() -> Result<()> {
         .with_context(|| format!("Gamma returned no market for {}", condition_id))?;
     info!(
         "Market: {} | end {} | vol24h ${} | active {}",
-        market.question,
-        market.settlement_time,
-        market.volume_24h_usdc,
-        market.is_active
+        market.question, market.settlement_time, market.volume_24h_usdc, market.is_active
     );
 
     // 3. Real order book via CLOB (need the YES/NO token ids from Gamma).
@@ -92,8 +92,12 @@ async fn main() -> Result<()> {
     let mid = book.mid_price().unwrap_or(dec!(0.50));
     info!(
         "Book: best_bid {} best_ask {} mid {} ({} bids, {} asks)",
-        book.best_bid().map(|d| d.to_string()).unwrap_or_else(|| "-".into()),
-        book.best_ask().map(|d| d.to_string()).unwrap_or_else(|| "-".into()),
+        book.best_bid()
+            .map(|d| d.to_string())
+            .unwrap_or_else(|| "-".into()),
+        book.best_ask()
+            .map(|d| d.to_string())
+            .unwrap_or_else(|| "-".into()),
         mid,
         book.bids.len(),
         book.asks.len()
@@ -105,14 +109,34 @@ async fn main() -> Result<()> {
         .process_signal(sig_a.clone(), Some(&market), &book, now)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    info!("Signal A processed: {}", if prop1.is_some() { "proposal generated" } else { "waiting for consensus partner" });
+    info!(
+        "Signal A processed: {}",
+        if prop1.is_some() {
+            "proposal generated"
+        } else {
+            "waiting for consensus partner"
+        }
+    );
 
-    let sig_b = buy_signal(wallet_b, &market, &yes_token, mid, now + Duration::seconds(30));
+    let sig_b = buy_signal(
+        wallet_b,
+        &market,
+        &yes_token,
+        mid,
+        now + Duration::seconds(30),
+    );
     let prop2 = coordinator
-        .process_signal(sig_b.clone(), Some(&market), &book, now + Duration::seconds(30))
+        .process_signal(
+            sig_b.clone(),
+            Some(&market),
+            &book,
+            now + Duration::seconds(30),
+        )
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let proposal = prop2.context("consensus buy produced no proposal — check market filter / risk / execution logs")?;
+    let proposal = prop2.context(
+        "consensus buy produced no proposal — check market filter / risk / execution logs",
+    )?;
     info!(
         "CONSENSUS BUY: {} shares @ ${} = ${:.2} (limit, TTL {}s)",
         proposal.shares, proposal.limit_price, proposal.notional_usdc, proposal.ttl_seconds
@@ -121,7 +145,14 @@ async fn main() -> Result<()> {
     let order_id = format!("sim-buy-{}", proposal.proposal_id);
     coordinator.on_order_placed(order_id.clone(), proposal.clone(), now);
     coordinator
-        .on_order_fill(&order_id, &proposal.market_id, &proposal.token_id, proposal.shares, proposal.limit_price, now)
+        .on_order_fill(
+            &order_id,
+            &proposal.market_id,
+            &proposal.token_id,
+            proposal.shares,
+            proposal.limit_price,
+            now,
+        )
         .await;
     let risk = coordinator.risk().read().await;
     let exposure = risk
@@ -130,7 +161,11 @@ async fn main() -> Result<()> {
     let nav = risk.calculate_total_nav();
     info!(
         "PAPER POSITION: {} shares YES @ avg ${:.4} | NAV ${:.2} (cash {} + position ${:.2})",
-        exposure.shares, exposure.avg_entry_price, nav, nav - exposure.notional_usdc, exposure.notional_usdc
+        exposure.shares,
+        exposure.avg_entry_price,
+        nav,
+        nav - exposure.notional_usdc,
+        exposure.notional_usdc
     );
     drop(risk);
 
@@ -140,7 +175,11 @@ async fn main() -> Result<()> {
         sleep(TokioDuration::from_secs(5)).await;
         let book = book_fetcher.fetch(&yes_token, &market.market_id).await?;
         if let Some(new_mid) = book.mid_price() {
-            coordinator.risk().read().await.update_mark_price(&yes_token, new_mid);
+            coordinator
+                .risk()
+                .read()
+                .await
+                .update_mark_price(&yes_token, new_mid);
         }
         let risk = coordinator.risk().read().await;
         let nav = risk.calculate_total_nav();
@@ -165,6 +204,7 @@ async fn main() -> Result<()> {
         target_vwap: mid,
         target_shares: dec!(500.0),
         target_notional_usdc: (mid * dec!(500.0)).round_dp(2),
+        target_reduction_pct: Some(Decimal::ONE),
         timestamp: now + Duration::minutes(2),
     };
     let exit_prop = coordinator
@@ -221,13 +261,18 @@ fn buy_signal(
         target_vwap: vwap,
         target_shares: dec!(500.0),
         target_notional_usdc: (vwap * dec!(500.0)).round_dp(2),
+        target_reduction_pct: None,
         timestamp: ts,
     }
 }
 
 /// Enrolls a wallet as TierA in the Macro domain by evaluating generated records
 /// (a deterministic test double; the funnel logic itself is unit-tested).
-fn enroll_macro_wallet(coordinator: &CopyTradingCoordinator, addr: &str, now: chrono::DateTime<Utc>) -> Result<()> {
+fn enroll_macro_wallet(
+    coordinator: &CopyTradingCoordinator,
+    addr: &str,
+    now: chrono::DateTime<Utc>,
+) -> Result<()> {
     let mut records = Vec::new();
     for i in 0..60 {
         let days_ago = 120 - (i as i64 * 2);
@@ -245,6 +290,7 @@ fn enroll_macro_wallet(coordinator: &CopyTradingCoordinator, addr: &str, now: ch
             return_pct: pnl / dec!(100.0),
             is_maker: false,
             is_arbitrage_leg: false,
+            behavior_data_known: true,
             resolved_outcome: if won {
                 Some(OutcomeSide::Yes)
             } else {
@@ -256,7 +302,10 @@ fn enroll_macro_wallet(coordinator: &CopyTradingCoordinator, addr: &str, now: ch
     }
     let res = coordinator.whitelist().evaluate_wallet(addr, &records, now);
     if !res.is_accepted {
-        warn!("Sim wallet {} rejected by funnel: {:?}", addr, res.failure_reasons);
+        warn!(
+            "Sim wallet {} rejected by funnel: {:?}",
+            addr, res.failure_reasons
+        );
     }
     coordinator.whitelist().upsert_wallet(res.profile);
     Ok(())
@@ -297,13 +346,7 @@ async fn fetch_market_tokens(condition_id: &str) -> Result<(String, String)> {
         })
         .context("gamma response missing clobTokenIds")?;
 
-    let yes = tokens
-        .first()
-        .cloned()
-        .context("clobTokenIds[0] missing")?;
-    let no = tokens
-        .get(1)
-        .cloned()
-        .context("clobTokenIds[1] missing")?;
+    let yes = tokens.first().cloned().context("clobTokenIds[0] missing")?;
+    let no = tokens.get(1).cloned().context("clobTokenIds[1] missing")?;
     Ok((yes, no))
 }

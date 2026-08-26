@@ -338,26 +338,38 @@ fn draw_mobile_markets(frame: &mut Frame, area: Rect, app: &DashboardState) {
 fn draw_desktop_strategies(frame: &mut Frame, area: Rect, app: &DashboardState) {
     let panels = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .constraints([
+            Constraint::Percentage(34),
+            Constraint::Percentage(33),
+            Constraint::Percentage(33),
+        ])
         .split(area);
     draw_arbitrage(frame, panels[0], app);
     draw_winner_buy(frame, panels[1], app);
+    draw_copy_trading(frame, panels[2], app);
 }
 
 fn draw_medium_strategies(frame: &mut Frame, area: Rect, app: &DashboardState) {
     let panels = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .constraints([
+            Constraint::Percentage(34),
+            Constraint::Percentage(33),
+            Constraint::Percentage(33),
+        ])
         .split(area);
     draw_arbitrage_compact(frame, panels[0], app);
     draw_winner_buy_compact(frame, panels[1], app);
+    draw_copy_trading_compact(frame, panels[2], app);
 }
 
 fn draw_selected_strategy(frame: &mut Frame, area: Rect, app: &DashboardState) {
     if app.selected_strategy == 0 {
         draw_arbitrage_compact(frame, area, app);
-    } else {
+    } else if app.selected_strategy == 1 {
         draw_winner_buy_compact(frame, area, app);
+    } else {
+        draw_copy_trading_compact(frame, area, app);
     }
 }
 
@@ -553,6 +565,13 @@ fn draw_winner_buy(frame: &mut Frame, area: Rect, app: &DashboardState) {
                 pnl_style(app.winner_buy_realized_pnl),
             ),
         ]),
+        Line::from(vec![
+            Span::styled(format!("{:<13}", "Budget"), muted()),
+            Span::raw(format!(
+                "${:.2} / ${:.2}",
+                app.winner_buy_exposure, app.winner_buy_budget
+            )),
+        ]),
     ];
     frame.render_widget(
         Paragraph::new(lines)
@@ -615,6 +634,10 @@ fn draw_winner_buy_compact(frame: &mut Frame, area: Rect, app: &DashboardState) 
                 pnl_style(app.winner_buy_realized_pnl),
             ),
         ]),
+        Line::from(format!(
+            "Exposure ${:.2} / ${:.2}",
+            app.winner_buy_exposure, app.winner_buy_budget
+        )),
     ];
     frame.render_widget(
         Paragraph::new(lines)
@@ -627,6 +650,97 @@ fn draw_winner_buy_compact(frame: &mut Frame, area: Rect, app: &DashboardState) 
             .wrap(Wrap { trim: true }),
         area,
     );
+}
+
+fn draw_copy_trading(frame: &mut Frame, area: Rect, app: &DashboardState) {
+    let lines = vec![
+        metric_line(
+            "Wallets",
+            app.copy_whitelist_wallets,
+            "Signals",
+            app.copy_signals_seen,
+        ),
+        metric_line(
+            "Rejected",
+            app.copy_signals_rejected,
+            "Proposals",
+            app.copy_proposals,
+        ),
+        metric_line(
+            "Fills",
+            app.copy_fills,
+            "Positions",
+            app.copy_open_positions,
+        ),
+        Line::from(vec![
+            Span::styled(format!("{:<13}", "Budget"), muted()),
+            Span::raw(format!("${:.2}", app.copy_trading_budget)),
+        ]),
+        Line::from(vec![
+            Span::styled(format!("{:<13}", "NAV / Cash"), muted()),
+            Span::raw(format!("${:.2} / ${:.2}", app.copy_nav, app.copy_cash)),
+        ]),
+        Line::from(vec![
+            Span::styled(format!("{:<13}", "Last poll"), muted()),
+            Span::raw(age_label(app.copy_last_poll_at_ms)),
+        ]),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(strategy_block(
+                "3",
+                "COPY TRADING",
+                app.copy_trading_state,
+                app.selected_strategy == 2,
+            ))
+            .wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
+fn draw_copy_trading_compact(frame: &mut Frame, area: Rect, app: &DashboardState) {
+    let lines = vec![
+        compact_metric(
+            "Wallets",
+            app.copy_whitelist_wallets,
+            "Signals",
+            app.copy_signals_seen,
+        ),
+        compact_metric(
+            "Reject",
+            app.copy_signals_rejected,
+            "Proposal",
+            app.copy_proposals,
+        ),
+        compact_metric("Fills", app.copy_fills, "Open", app.copy_open_positions),
+        Line::from(format!(
+            "Budget ${:.2}  NAV ${:.2}  Cash ${:.2}",
+            app.copy_trading_budget, app.copy_nav, app.copy_cash
+        )),
+        Line::from(format!("Last poll {}", age_label(app.copy_last_poll_at_ms))),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(strategy_block(
+                "3",
+                "COPY TRADING",
+                app.copy_trading_state,
+                app.selected_strategy == 2,
+            ))
+            .wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
+fn age_label(timestamp_ms: i64) -> String {
+    if timestamp_ms <= 0 {
+        return "waiting".into();
+    }
+    let age = chrono::Utc::now()
+        .timestamp_millis()
+        .saturating_sub(timestamp_ms)
+        / 1000;
+    format!("{}s ago", age.max(0))
 }
 
 fn compact_metric(left: &str, left_value: u64, right: &str, right_value: u64) -> Line<'static> {
@@ -675,6 +789,7 @@ fn draw_events(frame: &mut Frame, area: Rect, app: &DashboardState) {
 fn draw_footer(frame: &mut Frame, area: Rect, app: &DashboardState, mobile: bool) {
     let warning = if app.arbitrage_state == StrategyDisplayState::Blocked
         || app.winner_buy_state == StrategyDisplayState::Blocked
+        || app.copy_trading_state == StrategyDisplayState::Blocked
     {
         format!("  Blocked: {}", app.strategy_message)
     } else {
@@ -683,7 +798,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &DashboardState, mobile: bool
     if mobile {
         frame.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled("1/2 ", Style::default().fg(Color::Cyan)),
+                Span::styled("1/2/3 ", Style::default().fg(Color::Cyan)),
                 Span::raw("View  "),
                 Span::styled("Space ", Style::default().fg(Color::Cyan)),
                 Span::raw("Toggle  "),
@@ -786,7 +901,7 @@ mod tests {
         assert!(arbitrage.contains("MARKETS"));
         assert!(arbitrage.contains("SPREAD ARBITRAGE"));
         assert!(!arbitrage.contains("WINNER BUY"));
-        assert!(arbitrage.contains("1/2"));
+        assert!(arbitrage.contains("1/2/3"));
         assert!(arbitrage.contains("Space"));
 
         state.selected_strategy = 1;
@@ -794,6 +909,11 @@ mod tests {
         assert!(winner.contains("WINNER BUY"));
         assert!(!winner.contains("SPREAD ARBITRAGE"));
         assert!(winner.contains("Pending"));
+
+        state.selected_strategy = 2;
+        let copy = rendered_state(40, 22, &state);
+        assert!(copy.contains("COPY TRADING"));
+        assert!(!copy.contains("SPREAD ARBITRAGE"));
     }
 
     #[test]
@@ -807,6 +927,7 @@ mod tests {
         let medium = rendered_state(70, 32, &state);
         assert!(medium.contains("SPREAD ARBITRAGE"));
         assert!(medium.contains("WINNER BUY"));
+        assert!(medium.contains("COPY TRADING"));
 
         let short_wide = rendered_state(120, 31, &state);
         assert!(short_wide.contains("SPREAD ARBITRAGE"));

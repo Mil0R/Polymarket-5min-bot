@@ -17,8 +17,8 @@
 //!   is conservatively treated as `false` (binary-only filter still applies).
 
 use crate::copy_trading::types::{
-    BookLevel, DomainTag, MarketMetadata, OrderBookSnapshot, OutcomeSide, SignalAction, SignalEvent,
-    WalletTradeRecord,
+    BookLevel, DomainTag, MarketMetadata, OrderBookSnapshot, OutcomeSide, SignalAction,
+    SignalEvent, WalletTradeRecord,
 };
 use crate::network_retry::{retry_read, ReadRetryPolicy};
 use anyhow::{Context, Result};
@@ -34,7 +34,7 @@ use polymarket_client_sdk::gamma::Client as GammaClient;
 use polymarket_client_sdk::types::{Address, B256};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
@@ -80,33 +80,138 @@ impl DomainClassifier {
         let t = text.to_ascii_lowercase();
 
         let macro_kw = [
-            "fed", "interest rate", "rate cut", "rate hike", "cpi", "inflation", "ecb", "central bank",
-            "unemployment", "gdp", "recession", "jobs report", "fomc", "powell", "treasury", "yield",
+            "fed",
+            "interest rate",
+            "rate cut",
+            "rate hike",
+            "cpi",
+            "inflation",
+            "ecb",
+            "central bank",
+            "unemployment",
+            "gdp",
+            "recession",
+            "jobs report",
+            "fomc",
+            "powell",
+            "treasury",
+            "yield",
         ];
         let geo_kw = [
-            "war", "ceasefire", "invasion", "nato", "russia", "ukraine", "israel", "iran", "gaza",
-            "china", "taiwan", "border", "sanction", "missile", "nuclear", "military",
+            "war",
+            "ceasefire",
+            "invasion",
+            "nato",
+            "russia",
+            "ukraine",
+            "israel",
+            "iran",
+            "gaza",
+            "china",
+            "taiwan",
+            "border",
+            "sanction",
+            "missile",
+            "nuclear",
+            "military",
         ];
         let tech_kw = [
-            "sec", "regul", "law", "bill", "court", "lawsuit", "antitrust", "congress", "senate",
-            "ban", "approval", "fda", "tiktok", "openai", "google", "meta", "apple", "nvidia", "ai",
+            "sec",
+            "regul",
+            "law",
+            "bill",
+            "court",
+            "lawsuit",
+            "antitrust",
+            "congress",
+            "senate",
+            "ban",
+            "approval",
+            "fda",
+            "tiktok",
+            "openai",
+            "google",
+            "meta",
+            "apple",
+            "nvidia",
+            "ai",
         ];
         let crypto_kw = [
-            "bitcoin", "btc", "ethereum", "eth", "solana", "sol", "xrp", "crypto", "stablecoin",
-            "usdc", "etf", "halving", "coinbase", "binance", "blockchain", "defi",
+            "bitcoin",
+            "btc",
+            "ethereum",
+            "eth",
+            "solana",
+            "sol",
+            "xrp",
+            "crypto",
+            "stablecoin",
+            "usdc",
+            "etf",
+            "halving",
+            "coinbase",
+            "binance",
+            "blockchain",
+            "defi",
         ];
         let election_kw = [
-            "elect", "primary", "poll", "president", "senator", "governor", "mayor", "candidate",
-            "debate", "nominee", "trump", "harris", "vance", "walz",
+            "elect",
+            "primary",
+            "poll",
+            "president",
+            "senator",
+            "governor",
+            "mayor",
+            "candidate",
+            "debate",
+            "nominee",
+            "trump",
+            "harris",
+            "vance",
+            "walz",
         ];
         let science_kw = [
-            "launch", "nasa", "spacex", "rocket", "satellite", "mars", "moon", "climate", "temperature",
-            "weather", "hurricane", "earthquake", "volcano", "pandemic", "vaccine", "covid",
+            "launch",
+            "nasa",
+            "spacex",
+            "rocket",
+            "satellite",
+            "mars",
+            "moon",
+            "climate",
+            "temperature",
+            "weather",
+            "hurricane",
+            "earthquake",
+            "volcano",
+            "pandemic",
+            "vaccine",
+            "covid",
         ];
         let sports_kw = [
-            "nba", "nfl", "mlb", "nhl", "soccer", "football", "basketball", "tennis", "f1", "super bowl",
-            "world cup", "championship", "draft", "goal", "match", "game", "series", "olympics",
-            "oscar", "grammy", "box office", "movie", "album",
+            "nba",
+            "nfl",
+            "mlb",
+            "nhl",
+            "soccer",
+            "football",
+            "basketball",
+            "tennis",
+            "f1",
+            "super bowl",
+            "world cup",
+            "championship",
+            "draft",
+            "goal",
+            "match",
+            "game",
+            "series",
+            "olympics",
+            "oscar",
+            "grammy",
+            "box office",
+            "movie",
+            "album",
         ];
 
         let has = |kws: &[&str]| kws.iter().any(|k| t.contains(k));
@@ -151,7 +256,10 @@ impl MarketMetadataFetcher {
 
     pub async fn fetch_by_condition(&self, condition_id: &str) -> Result<Option<MarketMetadata>> {
         let cond: B256 = condition_id.parse().context("invalid condition id")?;
-        let request = MarketsRequest::builder().condition_ids(vec![cond]).limit(1).build();
+        let request = MarketsRequest::builder()
+            .condition_ids(vec![cond])
+            .limit(1)
+            .build();
         let markets = self
             .gamma
             .markets(&request)
@@ -165,7 +273,6 @@ fn gamma_market_to_metadata(m: &GammaMarket) -> MarketMetadata {
     let outcomes = m.outcomes.clone().unwrap_or_default();
     let is_active = m.active.unwrap_or(false) && !m.closed.unwrap_or(false);
     let condition = condition_id_str(&m.condition_id.unwrap_or_default());
-    // NegRisk is not exposed by gamma; conservative false (binary check still applies).
     MarketMetadata {
         market_id: condition.clone(),
         condition_id: condition,
@@ -176,7 +283,7 @@ fn gamma_market_to_metadata(m: &GammaMarket) -> MarketMetadata {
             m.slug.clone().unwrap_or_default()
         )),
         outcome_count: outcomes.len().max(2),
-        is_neg_risk: false,
+        is_neg_risk: m.neg_risk.unwrap_or(false),
         settlement_time: m.end_date.unwrap_or_else(Utc::now),
         volume_24h_usdc: m.volume_24hr.unwrap_or(dec!(0.0)),
         is_active,
@@ -294,21 +401,29 @@ impl BookFetcher {
 pub struct TradeFeed {
     data: DataClient,
     seen: Arc<DashMap<String, HashSet<String>>>,
+    max_signal_age_seconds: i64,
 }
 
 impl TradeFeed {
     pub fn new() -> Result<Self> {
+        Self::with_max_signal_age_seconds(120)
+    }
+
+    /// Creates a feed that seeds its deduplication state from the latest API
+    /// page while only emitting observations that are still actionable. This
+    /// prevents every process restart from replaying up to 100 historical
+    /// trades per wallet through Gamma and CLOB.
+    pub fn with_max_signal_age_seconds(max_signal_age_seconds: i64) -> Result<Self> {
         Ok(Self {
             data: DataClient::default(),
             seen: Arc::new(DashMap::new()),
+            max_signal_age_seconds: max_signal_age_seconds.max(1),
         })
     }
 
     /// Fetches the most recent trades for a wallet and returns only NEW signals.
     pub async fn poll_wallet(&self, wallet: &str, now: DateTime<Utc>) -> Result<Vec<SignalEvent>> {
-        let user: Address = wallet
-            .parse()
-            .context("invalid target wallet address")?;
+        let user: Address = wallet.parse().context("invalid target wallet address")?;
         let request = TradesRequest::builder()
             .user(user)
             .limit(100)
@@ -321,26 +436,84 @@ impl TradeFeed {
             .await
             .context("data-api trades request failed")?;
 
-        let mut fresh = Vec::new();
-        let mut seen_set = self
-            .seen
-            .entry(wallet.to_string())
-            .or_default();
+        let mut seen_set = self.seen.entry(wallet.to_string()).or_default();
 
         // Cap the seen-set so it cannot grow without bound over long runs.
         if seen_set.len() > 2000 {
             seen_set.clear();
         }
+        let new_trades: Vec<_> = trades
+            .iter()
+            .filter(|trade| seen_set.insert(trade_dedup_key(trade)))
+            .cloned()
+            .collect();
+        drop(seen_set);
 
-        for t in &trades {
-            let key = trade_dedup_key(t);
-            if seen_set.insert(key) {
-                if let Some(sig) = self.trade_to_signal(t, now) {
+        // Only query positions when an unseen SELL is still fresh enough to
+        // affect the strategy. Previously any historical SELL in the latest
+        // 100 rows caused a positions request on every poll, even when there
+        // was no new activity, creating avoidable rate limits.
+        let has_actionable_sell = new_trades.iter().any(|trade| {
+            is_actionable_sell(
+                &trade.side,
+                trade.timestamp,
+                now,
+                self.max_signal_age_seconds,
+            )
+        });
+
+        // For actionable SELLs, compare the observed sale with the wallet's
+        // remaining token balance. This turns an ambiguous trade into a
+        // proportional reduction instead of treating every sell as a full
+        // liquidation.
+        let (current_positions, sell_positions_available): (HashMap<String, Decimal>, bool) =
+            if has_actionable_sell {
+                let request = PositionsRequest::builder().user(user).build();
+                match self.data.positions(&request).await {
+                    Ok(positions) => (
+                        positions
+                            .into_iter()
+                            .map(|p| (token_id_str(&p.asset), p.size))
+                            .collect(),
+                        true,
+                    ),
+                    Err(e) => {
+                        warn!(wallet = %wallet, error = %e, "Could not size target SELL proportion; exits will be skipped safely");
+                        (HashMap::new(), false)
+                    }
+                }
+            } else {
+                (HashMap::new(), true)
+            };
+
+        let mut fresh = Vec::new();
+        let mut stale_seeded = 0usize;
+        let mut skipped_unsized_sells = 0usize;
+
+        for trade in &new_trades {
+            let remaining = current_positions.get(&token_id_str(&trade.asset)).copied();
+            if let Some(sig) = self.trade_to_signal(trade, now, remaining) {
+                let age = now.signed_duration_since(sig.timestamp).num_seconds();
+                if age > self.max_signal_age_seconds || age < -30 {
+                    // Keep the id in `seen`: this is startup baseline data,
+                    // not a live event that should be retried next poll.
+                    stale_seeded += 1;
+                } else if trade.side == Side::Sell && !sell_positions_available {
+                    skipped_unsized_sells += 1;
+                } else {
                     fresh.push(sig);
                 }
             }
         }
-        drop(seen_set);
+
+        if stale_seeded > 0 {
+            info!(
+                wallet = %wallet,
+                stale_signals = stale_seeded,
+                max_age_seconds = self.max_signal_age_seconds,
+                "Seeded stale wallet history without replaying it"
+            );
+        }
 
         if !fresh.is_empty() {
             info!(
@@ -349,11 +522,23 @@ impl TradeFeed {
                 "Trade feed produced new signals for wallet"
             );
         }
+        if skipped_unsized_sells > 0 {
+            warn!(
+                wallet = %wallet,
+                skipped_signals = skipped_unsized_sells,
+                "Skipped fresh SELL signals because target position sizing was unavailable"
+            );
+        }
 
         Ok(fresh)
     }
 
-    fn trade_to_signal(&self, t: &Trade, now: DateTime<Utc>) -> Option<SignalEvent> {
+    fn trade_to_signal(
+        &self,
+        t: &Trade,
+        now: DateTime<Utc>,
+        remaining_position: Option<Decimal>,
+    ) -> Option<SignalEvent> {
         let price = t.price;
         let size = t.size;
         if price <= Decimal::ZERO || size <= Decimal::ZERO {
@@ -372,15 +557,20 @@ impl TradeFeed {
             Side::Sell => SignalAction::CloseSell,
             _ => return None, // Unknown / future side values
         };
+        let target_reduction_pct = if t.side == Side::Sell {
+            remaining_position.and_then(|remaining| {
+                let before = remaining.max(Decimal::ZERO) + size;
+                (before > Decimal::ZERO).then_some((size / before).min(Decimal::ONE))
+            })
+        } else {
+            None
+        };
 
         let timestamp = DateTime::from_timestamp(t.timestamp, 0).unwrap_or(now);
         let domain = DomainClassifier::classify(&format!("{} {}", t.title, t.slug));
 
         Some(SignalEvent {
-            signal_id: format!(
-                "sig-{:x}-{}-{}",
-                t.transaction_hash, t.asset, t.timestamp
-            ),
+            signal_id: format!("sig-{:x}-{}-{}", t.transaction_hash, t.asset, t.timestamp),
             source_wallet: wallet_str(&t.proxy_wallet),
             market_id: condition_id_str(&t.condition_id),
             token_id: token_id_str(&t.asset),
@@ -390,13 +580,31 @@ impl TradeFeed {
             target_vwap: price,
             target_shares: size,
             target_notional_usdc: notional,
+            target_reduction_pct,
             timestamp,
         })
     }
 }
 
 fn trade_dedup_key(t: &Trade) -> String {
-    format!("{:x}-{}-{}-{}", t.transaction_hash, t.asset, t.size, t.price)
+    format!(
+        "{:x}-{}-{}-{}",
+        t.transaction_hash, t.asset, t.size, t.price
+    )
+}
+
+fn is_actionable_sell(
+    side: &Side,
+    timestamp_seconds: i64,
+    now: DateTime<Utc>,
+    max_age_seconds: i64,
+) -> bool {
+    if *side != Side::Sell {
+        return false;
+    }
+    let timestamp = DateTime::from_timestamp(timestamp_seconds, 0).unwrap_or(now);
+    let age = now.signed_duration_since(timestamp).num_seconds();
+    age >= -30 && age <= max_age_seconds.max(1)
 }
 
 fn wallet_str(addr: &polymarket_client_sdk::types::Address) -> String {
@@ -471,6 +679,17 @@ pub struct WalletHistoryFetcher {
     http: reqwest::Client,
 }
 
+fn closed_position_page_offsets(
+    offset: i32,
+    page_size: i32,
+    concurrency: i32,
+    cap: i32,
+) -> Vec<i32> {
+    (offset..(offset + concurrency * page_size).min(cap))
+        .step_by(page_size as usize)
+        .collect()
+}
+
 impl WalletHistoryFetcher {
     pub fn new() -> Result<Self> {
         Ok(Self {
@@ -525,7 +744,9 @@ impl WalletHistoryFetcher {
         let mut offset = 0i32;
         while offset < SAFETY_CAP {
             let mut handles = Vec::new();
-            for page_offset in offset..(offset + CONCURRENCY * PAGE_SIZE).min(SAFETY_CAP) {
+            for page_offset in
+                closed_position_page_offsets(offset, PAGE_SIZE, CONCURRENCY, SAFETY_CAP)
+            {
                 let url = format!(
                     "{}/closed-positions?user={}&limit={}&offset={}",
                     DATA_API_URL, wallet, PAGE_SIZE, page_offset
@@ -542,11 +763,8 @@ impl WalletHistoryFetcher {
                         let client = client.clone();
                         let url = url.clone();
                         async move {
-                            let resp = client
-                                .get(&url)
-                                .send()
-                                .await
-                                .map_err(anyhow::Error::from)?;
+                            let resp =
+                                client.get(&url).send().await.map_err(anyhow::Error::from)?;
                             resp.error_for_status()
                                 .map_err(anyhow::Error::from)?
                                 .json::<Vec<RawClosedPosition>>()
@@ -560,33 +778,42 @@ impl WalletHistoryFetcher {
 
             let results = futures::future::join_all(handles).await;
             let mut got_any = false;
+            let mut reached_end = false;
             for (i, r) in results.into_iter().enumerate() {
                 match r {
                     Ok(Ok(page)) => {
                         if !page.is_empty() {
                             got_any = true;
+                            reached_end |= page.len() < PAGE_SIZE as usize;
                             out.extend(page);
+                        } else {
+                            reached_end = true;
                         }
                     }
-                    Ok(Err(e)) => warn!(wallet = %wallet, offset = offset + i as i32 * PAGE_SIZE, error = %e, "closed-positions page failed after retries"),
+                    Ok(Err(e)) => {
+                        warn!(wallet = %wallet, offset = offset + i as i32 * PAGE_SIZE, error = %e, "closed-positions page failed after retries")
+                    }
                     Err(e) => warn!(wallet = %wallet, "closed-positions task panicked: {e}"),
                 }
             }
-            if !got_any {
+            if !got_any || reached_end {
                 break;
             }
             offset += CONCURRENCY * PAGE_SIZE;
         }
+        // Be defensive against an upstream page changing while we paginate.
+        // Duplicate history rows would otherwise inflate every whitelist metric.
+        let mut seen = HashSet::new();
+        out.retain(|cp| seen.insert(format!("{}:{}:{}", cp.condition_id, cp.asset, cp.timestamp)));
         Ok(out)
     }
 
-    /// Discovers candidate wallets from the builders leaderboard (the classic
-    /// profit leaderboard endpoint was removed from data-api; builders is the
-    /// closest public source of active wallet addresses).
-    /// Manual `COPY_TARGET_WALLETS` configuration remains the recommended path.
+    /// Discovers candidate wallets from the official weekly-volume leaderboard.
+    /// These are candidates only: the normal settled-history funnel still has
+    /// to approve every wallet before it can produce a signal.
     pub async fn discover_candidates(&self, limit: usize) -> Result<Vec<String>> {
         let url = format!(
-            "{}/v1/builders/leaderboard?limit={}",
+            "{}/v1/leaderboard?category=OVERALL&timePeriod=WEEK&orderBy=VOL&limit={}",
             DATA_API_URL, limit
         );
         let resp = reqwest::Client::new()
@@ -603,9 +830,15 @@ impl WalletHistoryFetcher {
         let mut candidates = Vec::new();
         if let Some(arr) = resp.as_array() {
             for item in arr {
-                // `builderCode` is the referrer wallet address (0x hex).
-                if let Some(addr) = item.get("builderCode").and_then(|v| v.as_str()) {
-                    candidates.push(addr.to_string());
+                if let Some(addr) = item.get("proxyWallet").and_then(|v| v.as_str()) {
+                    let normalized = addr.trim().to_ascii_lowercase();
+                    if normalized.len() == 42
+                        && normalized.starts_with("0x")
+                        && normalized[2..].chars().all(|c| c.is_ascii_hexdigit())
+                        && !candidates.contains(&normalized)
+                    {
+                        candidates.push(normalized);
+                    }
                 }
             }
         }
@@ -619,15 +852,18 @@ impl WalletHistoryFetcher {
         let realized_pnl = cp.realized_pnl.0;
         let cur_price = cp.cur_price.0;
         let notional = (total_bought * avg_price).round_dp(2);
-        let won = realized_pnl > Decimal::ZERO;
-        // Outcome proxy: realized P&L > 0 → bought side resolved favorably.
-        let resolved_outcome = if won {
+        // A closed position is not necessarily a resolved prediction: the wallet
+        // may simply have sold early. Only terminal prices are valid labels for
+        // Brier/win-rate evaluation; P&L sign is never an outcome oracle.
+        let resolved_outcome = if cur_price >= dec!(0.99) {
             Some(outcome.clone())
-        } else {
+        } else if cur_price <= dec!(0.01) {
             Some(outcome_from_label(&cp.opposite_outcome))
+        } else {
+            None
         };
+        let is_resolved = resolved_outcome.is_some();
         let settled_at = DateTime::from_timestamp(cp.timestamp, 0).unwrap_or_else(Utc::now);
-        let opened_at = settled_at - Duration::hours(12);
 
         WalletTradeRecord {
             trade_id: format!("cp-{}-{}-{}", cp.condition_id, cp.asset, cp.timestamp),
@@ -645,9 +881,12 @@ impl WalletHistoryFetcher {
             },
             is_maker: false,
             is_arbitrage_leg: false,
+            behavior_data_known: false,
             resolved_outcome,
-            opened_at,
-            settled_at: Some(settled_at),
+            // The closed-position endpoint does not expose an actual open time.
+            // Keep the observable activity timestamp instead of fabricating one.
+            opened_at: settled_at,
+            settled_at: is_resolved.then_some(settled_at),
         }
     }
 
@@ -665,6 +904,7 @@ impl WalletHistoryFetcher {
             return_pct: p.percent_pnl,
             is_maker: false,
             is_arbitrage_leg: false,
+            behavior_data_known: false,
             resolved_outcome: None,
             opened_at: Utc::now() - Duration::days(30),
             settled_at: None,
@@ -678,11 +918,26 @@ mod tests {
 
     #[test]
     fn classifier_detects_major_domains() {
-        assert_eq!(DomainClassifier::classify("Will the Fed cut rates in September?"), DomainTag::MacroInterestRate);
-        assert_eq!(DomainClassifier::classify("Will Russia declare a ceasefire?"), DomainTag::Geopolitics);
-        assert_eq!(DomainClassifier::classify("Will Bitcoin reach $100k by June?"), DomainTag::Crypto);
-        assert_eq!(DomainClassifier::classify("Who will win the 2026 midterm election?"), DomainTag::Elections);
-        assert_eq!(DomainClassifier::classify("Will the Lakers win the NBA championship?"), DomainTag::PopCultureSports);
+        assert_eq!(
+            DomainClassifier::classify("Will the Fed cut rates in September?"),
+            DomainTag::MacroInterestRate
+        );
+        assert_eq!(
+            DomainClassifier::classify("Will Russia declare a ceasefire?"),
+            DomainTag::Geopolitics
+        );
+        assert_eq!(
+            DomainClassifier::classify("Will Bitcoin reach $100k by June?"),
+            DomainTag::Crypto
+        );
+        assert_eq!(
+            DomainClassifier::classify("Who will win the 2026 midterm election?"),
+            DomainTag::Elections
+        );
+        assert_eq!(
+            DomainClassifier::classify("Will the Lakers win the NBA championship?"),
+            DomainTag::PopCultureSports
+        );
     }
 
     #[test]
@@ -693,7 +948,10 @@ mod tests {
         assert_eq!(outcome_from_label("Up"), OutcomeSide::Yes);
         assert_eq!(outcome_from_label("down"), OutcomeSide::No);
         // Categorical outcomes stay Other (rejected by the binary-only filter).
-        assert_eq!(outcome_from_label("Over"), OutcomeSide::Other("over".to_string()));
+        assert_eq!(
+            outcome_from_label("Over"),
+            OutcomeSide::Other("over".to_string())
+        );
     }
 
     #[test]
@@ -704,7 +962,7 @@ mod tests {
                 "asset":"1234",
                 "conditionId":"0x00000000000000000000000000000000000000000000000000000000000000aa",
                 "avgPrice":"0.60","totalBought":"100","realizedPnl":"35.00",
-                "curPrice":"0.95","timestamp":1710000000,
+                "curPrice":"1.0","timestamp":1710000000,
                 "title":"Will the Fed cut rates?","slug":"fed-cut","icon":"","eventSlug":"fed",
                 "outcome":"Yes","outcomeIndex":0,"oppositeOutcome":"No","oppositeAsset":"1235",
                 "endDate":"2024-03-01T00:00:00Z"
@@ -728,7 +986,7 @@ mod tests {
                 "asset":"1234",
                 "conditionId":"0x00000000000000000000000000000000000000000000000000000000000000aa",
                 "avgPrice":"0.60","totalBought":"100","realizedPnl":"-40.00",
-                "curPrice":"0.20","timestamp":1710000000,
+                "curPrice":"0.0","timestamp":1710000000,
                 "title":"Will the Fed cut rates?","slug":"fed-cut","icon":"","eventSlug":"fed",
                 "outcome":"Yes","outcomeIndex":0,"oppositeOutcome":"No","oppositeAsset":"1235",
                 "endDate":"2024-03-01T00:00:00Z"
@@ -747,5 +1005,35 @@ mod tests {
             .unwrap();
         let s = condition_id_str(&cond);
         assert!(s.starts_with("0x") && s.len() == 66, "got {}", s);
+    }
+
+    #[test]
+    fn history_pagination_uses_non_overlapping_offsets() {
+        assert_eq!(
+            closed_position_page_offsets(0, 50, 4, 5_000),
+            vec![0, 50, 100, 150]
+        );
+        assert_eq!(
+            closed_position_page_offsets(4_900, 50, 4, 5_000),
+            vec![4_900, 4_950]
+        );
+    }
+
+    #[test]
+    fn positions_are_needed_only_for_fresh_unseen_sell_candidates() {
+        let now = Utc::now();
+        assert!(is_actionable_sell(
+            &Side::Sell,
+            (now - Duration::seconds(299)).timestamp(),
+            now,
+            300
+        ));
+        assert!(!is_actionable_sell(
+            &Side::Sell,
+            (now - Duration::seconds(301)).timestamp(),
+            now,
+            300
+        ));
+        assert!(!is_actionable_sell(&Side::Buy, now.timestamp(), now, 300));
     }
 }

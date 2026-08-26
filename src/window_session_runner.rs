@@ -23,15 +23,37 @@ pub struct MarketTick {
     pub market_symbol: String,
     pub opportunity: Option<ArbitrageOpportunity>,
     pub shadow_candidate: Option<ArbitrageShadowCandidate>,
+    pub rest_shadow_candidate: Option<ArbitrageRestShadowCandidate>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ArbitrageRestShadowCandidate {
+    pub source: &'static str,
+    pub opportunity: ArbitrageOpportunity,
+    pub observed_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StableCandidate {
+    first_observed_at_ms: i64,
+    last_yes_book_timestamp_ms: i64,
+    last_no_book_timestamp_ms: i64,
+    observations: u32,
 }
 
 pub struct WindowSessionRunner {
     markets: HashMap<B256, MarketInfo>,
     last_prices: DashMap<B256, (Decimal, Decimal)>,
-    shadow_observations: DashMap<B256, (Decimal, Decimal, i64, i64)>,
+    /// First/last observation time for a market that remains continuously in
+    /// the price-positive but depth-rejected state. Quote prices may change
+    /// while the underlying state persists.
+    shadow_observations: DashMap<B256, (i64, i64)>,
+    stable_candidates: DashMap<B256, StableCandidate>,
     detector: ArbitrageDetector,
     admission: OpportunityAdmissionService,
     deduplicator: SignalDeduplicator,
+    shadow_deduplicator: SignalDeduplicator,
+    signal_confirmation_ms: u64,
     max_book_age_ms: i64,
     max_book_skew_ms: i64,
     metrics: Arc<RuntimeMetrics>,
@@ -47,12 +69,17 @@ impl WindowSessionRunner {
                 .collect(),
             last_prices: DashMap::new(),
             shadow_observations: DashMap::new(),
+            stable_candidates: DashMap::new(),
             detector: ArbitrageDetector::with_min_depth(
                 config.min_profit_threshold,
                 config.min_ask_depth_usdc,
             ),
             admission: OpportunityAdmissionService::from_config(config),
             deduplicator: SignalDeduplicator::new(Duration::from_millis(config.signal_cooldown_ms)),
+            shadow_deduplicator: SignalDeduplicator::new(Duration::from_millis(
+                config.signal_cooldown_ms,
+            )),
+            signal_confirmation_ms: config.arbitrage_signal_confirmation_ms,
             max_book_age_ms: config.max_book_age_ms,
             max_book_skew_ms: config.max_book_skew_ms,
             metrics,
@@ -67,13 +94,17 @@ impl WindowSessionRunner {
         connection_healthy: bool,
         unresolved_state: bool,
     ) -> anyhow::Result<MarketTick> {
-        validate_book_timestamps(
+        if let Err(error) = validate_book_timestamps(
             pair.yes_book.timestamp,
             pair.no_book.timestamp,
             now_ms,
             self.max_book_age_ms,
             self.max_book_skew_ms,
-        )?;
+        ) {
+            self.stable_candidates.remove(&pair.market_id);
+            self.shadow_observations.remove(&pair.market_id);
+            return Err(error);
+        }
         self.metrics.record_orderbook_pair();
         let yes_best_ask = best_ask(&pair.yes_book).map(|level| (level.price, level.size));
         let no_best_ask = best_ask(&pair.no_book).map(|level| (level.price, level.size));
@@ -92,6 +123,7 @@ impl WindowSessionRunner {
             format!("{market_symbol} prediction market")
         };
         let mut shadow_candidate = None;
+        let mut rest_shadow_candidate = None;
         let opportunity = (|| {
             let total_price = total_ask_price?;
             let scan = self.detector.check_arbitrage_reasoned(
@@ -102,36 +134,54 @@ impl WindowSessionRunner {
             let opportunity = match scan {
                 ArbitrageScan::Opportunity(opportunity) => {
                     self.shadow_observations.remove(&pair.market_id);
+                    if self.shadow_deduplicator.admit(
+                        opportunity.market_id,
+                        opportunity.yes_ask_price,
+                        opportunity.no_ask_price,
+                        Instant::now(),
+                    ) {
+                        rest_shadow_candidate = Some(ArbitrageRestShadowCandidate {
+                            source: "full_depth",
+                            opportunity: opportunity.clone(),
+                            observed_at_ms: now_ms,
+                        });
+                    }
                     opportunity
                 }
                 ArbitrageScan::DepthRejected(mut candidate) => {
+                    self.stable_candidates.remove(&pair.market_id);
                     self.metrics.record_depth_rejection();
                     let first_seen_at_ms = self
                         .shadow_observations
                         .get(&pair.market_id)
                         .filter(|previous| {
-                            previous.0 == candidate.yes_ask_price
-                                && previous.1 == candidate.no_ask_price
-                                && now_ms.saturating_sub(previous.3) <= self.max_book_age_ms
+                            now_ms.saturating_sub(previous.1) <= self.max_book_age_ms
                         })
-                        .map(|previous| previous.2)
+                        .map(|previous| previous.0)
                         .unwrap_or(now_ms);
                     candidate.first_seen_at_ms = first_seen_at_ms;
                     candidate.observed_duration_ms = now_ms.saturating_sub(first_seen_at_ms);
-                    self.shadow_observations.insert(
-                        pair.market_id,
-                        (
-                            candidate.yes_ask_price,
-                            candidate.no_ask_price,
-                            first_seen_at_ms,
-                            now_ms,
-                        ),
-                    );
+                    self.shadow_observations
+                        .insert(pair.market_id, (first_seen_at_ms, now_ms));
+                    let opportunity = candidate.as_opportunity();
+                    if self.shadow_deduplicator.admit(
+                        opportunity.market_id,
+                        opportunity.yes_ask_price,
+                        opportunity.no_ask_price,
+                        Instant::now(),
+                    ) {
+                        rest_shadow_candidate = Some(ArbitrageRestShadowCandidate {
+                            source: "depth_rejected",
+                            opportunity,
+                            observed_at_ms: now_ms,
+                        });
+                    }
                     shadow_candidate = Some(candidate);
                     return None;
                 }
                 ArbitrageScan::NoEdge => {
                     self.shadow_observations.remove(&pair.market_id);
+                    self.stable_candidates.remove(&pair.market_id);
                     return None;
                 }
             };
@@ -150,6 +200,11 @@ impl WindowSessionRunner {
             );
             if let Err(reason) = result {
                 self.metrics.record_admission_rejection(reason);
+                self.stable_candidates.remove(&opportunity.market_id);
+                return None;
+            }
+            if !self.confirmation_admits(&opportunity, now_ms) {
+                self.metrics.record_stability_pending();
                 return None;
             }
             if !self.deduplicator.admit(
@@ -174,7 +229,47 @@ impl WindowSessionRunner {
             market_symbol,
             opportunity,
             shadow_candidate,
+            rest_shadow_candidate,
         })
+    }
+
+    fn confirmation_admits(&self, opportunity: &ArbitrageOpportunity, now_ms: i64) -> bool {
+        if self.signal_confirmation_ms == 0 {
+            return true;
+        }
+        if let Some(mut previous) = self.stable_candidates.get_mut(&opportunity.market_id) {
+            let independent_update = previous.last_yes_book_timestamp_ms
+                != opportunity.yes_book_timestamp_ms
+                || previous.last_no_book_timestamp_ms != opportunity.no_book_timestamp_ms;
+            if independent_update {
+                previous.last_yes_book_timestamp_ms = opportunity.yes_book_timestamp_ms;
+                previous.last_no_book_timestamp_ms = opportunity.no_book_timestamp_ms;
+                previous.observations = previous.observations.saturating_add(1);
+            }
+            return previous.observations >= 2
+                && now_ms.saturating_sub(previous.first_observed_at_ms)
+                    >= i64::try_from(self.signal_confirmation_ms).unwrap_or(i64::MAX);
+        }
+        self.stable_candidates.insert(
+            opportunity.market_id,
+            StableCandidate {
+                first_observed_at_ms: now_ms,
+                last_yes_book_timestamp_ms: opportunity.yes_book_timestamp_ms,
+                last_no_book_timestamp_ms: opportunity.no_book_timestamp_ms,
+                observations: 1,
+            },
+        );
+        false
+    }
+
+    /// A transport reconnect invalidates all cross-message assumptions. Fresh
+    /// books from both legs must arrive before a candidate can be rebuilt.
+    pub fn invalidate_transient_state(&self) {
+        self.last_prices.clear();
+        self.shadow_observations.clear();
+        self.stable_candidates.clear();
+        self.deduplicator.clear();
+        self.shadow_deduplicator.clear();
     }
 
     fn directions(
@@ -244,9 +339,12 @@ mod tests {
             markets: HashMap::from([(market_id, market)]),
             last_prices: DashMap::new(),
             shadow_observations: DashMap::new(),
+            stable_candidates: DashMap::new(),
             detector: ArbitrageDetector::new(0.001),
             admission: OpportunityAdmissionService::new(dec!(0.99), dec!(0), dec!(0), 0, false),
             deduplicator: SignalDeduplicator::new(Duration::from_secs(3)),
+            shadow_deduplicator: SignalDeduplicator::new(Duration::from_secs(3)),
+            signal_confirmation_ms: 0,
             max_book_age_ms: 2_000,
             max_book_skew_ms: 1_000,
             metrics,
@@ -287,6 +385,75 @@ mod tests {
     }
 
     #[test]
+    fn confirms_continuous_edge_across_distinct_book_updates() {
+        let market_id = B256::repeat_byte(10);
+        let metrics = Arc::new(RuntimeMetrics::default());
+        let mut runner = runner(market_id, metrics.clone());
+        runner.signal_confirmation_ms = 100;
+        let now_ms = Utc::now().timestamp_millis();
+        let pair = OrderBookPair {
+            yes_book: book(1, market_id, now_ms, dec!(0.45)),
+            no_book: book(2, market_id, now_ms, dec!(0.50)),
+            market_id,
+        };
+
+        let first = runner
+            .process_pair(&pair, now_ms, false, true, false)
+            .unwrap();
+        assert!(first.opportunity.is_none());
+        assert!(first.rest_shadow_candidate.is_some());
+        let early_pair = OrderBookPair {
+            yes_book: book(1, market_id, now_ms + 50, dec!(0.44)),
+            no_book: book(2, market_id, now_ms + 50, dec!(0.50)),
+            market_id,
+        };
+        let early = runner
+            .process_pair(&early_pair, now_ms + 50, false, true, false)
+            .unwrap();
+        assert!(early.opportunity.is_none());
+        let confirmed_pair = OrderBookPair {
+            yes_book: book(1, market_id, now_ms + 100, dec!(0.43)),
+            no_book: book(2, market_id, now_ms + 100, dec!(0.51)),
+            market_id,
+        };
+        let confirmed = runner
+            .process_pair(&confirmed_pair, now_ms + 100, false, true, false)
+            .unwrap();
+        assert!(confirmed.opportunity.is_some());
+        assert_eq!(metrics.snapshot().stability_pending, 2);
+    }
+
+    #[test]
+    fn reconnect_invalidation_requires_fresh_confirmation() {
+        let market_id = B256::repeat_byte(11);
+        let metrics = Arc::new(RuntimeMetrics::default());
+        let mut runner = runner(market_id, metrics);
+        runner.signal_confirmation_ms = 100;
+        let now_ms = Utc::now().timestamp_millis();
+        let first = OrderBookPair {
+            yes_book: book(1, market_id, now_ms, dec!(0.45)),
+            no_book: book(2, market_id, now_ms, dec!(0.50)),
+            market_id,
+        };
+        assert!(runner
+            .process_pair(&first, now_ms, false, true, false)
+            .unwrap()
+            .opportunity
+            .is_none());
+        runner.invalidate_transient_state();
+        let after_reconnect = OrderBookPair {
+            yes_book: book(1, market_id, now_ms + 200, dec!(0.45)),
+            no_book: book(2, market_id, now_ms + 200, dec!(0.50)),
+            market_id,
+        };
+        assert!(runner
+            .process_pair(&after_reconnect, now_ms + 200, false, true, false)
+            .unwrap()
+            .opportunity
+            .is_none());
+    }
+
+    #[test]
     fn rejects_stale_pair_before_counting_it() {
         let market_id = B256::repeat_byte(8);
         let metrics = Arc::new(RuntimeMetrics::default());
@@ -301,5 +468,61 @@ mod tests {
             .process_pair(&stale, now_ms, false, true, false)
             .is_err());
         assert_eq!(metrics.snapshot().orderbook_pairs, 0);
+    }
+
+    #[test]
+    fn shadow_duration_tracks_continuous_state_across_quote_changes() {
+        let market_id = B256::repeat_byte(9);
+        let metrics = Arc::new(RuntimeMetrics::default());
+        let mut runner = runner(market_id, metrics);
+        runner.detector = ArbitrageDetector::with_min_depth(0.001, 10.0);
+        let now_ms = Utc::now().timestamp_millis();
+
+        let first = OrderBookPair {
+            yes_book: book(1, market_id, now_ms, dec!(0.45)),
+            no_book: book(2, market_id, now_ms, dec!(0.50)),
+            market_id,
+        };
+        let first_tick = runner
+            .process_pair(&first, now_ms, false, true, false)
+            .unwrap();
+        let first_shadow = first_tick.shadow_candidate.unwrap();
+        assert_eq!(first_shadow.observed_duration_ms, 0);
+
+        let changed = OrderBookPair {
+            yes_book: book(1, market_id, now_ms + 300, dec!(0.44)),
+            no_book: book(2, market_id, now_ms + 300, dec!(0.50)),
+            market_id,
+        };
+        let changed_tick = runner
+            .process_pair(&changed, now_ms + 300, false, true, false)
+            .unwrap();
+        let changed_shadow = changed_tick.shadow_candidate.unwrap();
+        assert_eq!(changed_shadow.first_seen_at_ms, now_ms);
+        assert_eq!(changed_shadow.observed_duration_ms, 300);
+
+        let no_edge = OrderBookPair {
+            yes_book: book(1, market_id, now_ms + 600, dec!(0.60)),
+            no_book: book(2, market_id, now_ms + 600, dec!(0.50)),
+            market_id,
+        };
+        assert!(runner
+            .process_pair(&no_edge, now_ms + 600, false, true, false)
+            .unwrap()
+            .shadow_candidate
+            .is_none());
+
+        let restarted = OrderBookPair {
+            yes_book: book(1, market_id, now_ms + 900, dec!(0.45)),
+            no_book: book(2, market_id, now_ms + 900, dec!(0.50)),
+            market_id,
+        };
+        let restarted_shadow = runner
+            .process_pair(&restarted, now_ms + 900, false, true, false)
+            .unwrap()
+            .shadow_candidate
+            .unwrap();
+        assert_eq!(restarted_shadow.first_seen_at_ms, now_ms + 900);
+        assert_eq!(restarted_shadow.observed_duration_ms, 0);
     }
 }

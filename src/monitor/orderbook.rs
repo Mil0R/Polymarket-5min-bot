@@ -246,6 +246,13 @@ impl OrderBookMonitor {
         }
     }
 
+    /// Drop cached snapshots while preserving the active subscription map.
+    /// This prevents pairing a pre-reconnect leg with a post-reconnect leg.
+    pub fn invalidate_books(&self) {
+        self.books.clear();
+        self.book_received_at_ms.clear();
+    }
+
     /// Clear all subscriptions
     pub fn clear(&mut self) {
         self.books.clear();

@@ -1,7 +1,7 @@
 use crate::copy_trading::risk::RiskController;
 use crate::copy_trading::types::{
-    CopyTradingConfig, ExecutionOrderProposal, OrderSide, OutcomeSide, SignalAction, SignalEvent,
-    OrderBookSnapshot,
+    CopyTradingConfig, ExecutionOrderProposal, OrderBookSnapshot, OrderSide, OutcomeSide,
+    SignalAction, SignalEvent,
 };
 use crate::copy_trading::whitelist::WhitelistManager;
 use chrono::{DateTime, Utc};
@@ -50,20 +50,25 @@ impl ExitEngine {
             return None;
         }
 
-        // 1b. Dust gate: ignore exit signals below the minimum signal notional so
-        //     a 1-share sell by a target wallet cannot force us to dump a position.
-        if signal.target_notional_usdc < self.config.min_signal_notional_usdc {
+        // A SELL without a reliable pre-trade position denominator is ambiguous:
+        // it could be a 1% trim or a full liquidation. Fail closed instead of
+        // guessing. ReversePosition remains an explicit full-exit instruction.
+        if matches!(
+            signal.action,
+            SignalAction::CloseSell | SignalAction::ScaleOut
+        ) && signal.target_reduction_pct.is_none()
+        {
             debug!(
                 wallet = %signal.source_wallet,
-                notional = %signal.target_notional_usdc,
-                min_notional = %self.config.min_signal_notional_usdc,
-                "Exit signal ignored: below minimum signal notional"
+                "Exit signal ignored: source position reduction ratio unavailable"
             );
             return None;
         }
 
         // 2. Signal source must be an authorized whitelisted wallet in this domain.
-        let (is_auth, _) = self.whitelist.is_authorized_in_domain(&signal.source_wallet, &signal.domain);
+        let (is_auth, _) = self
+            .whitelist
+            .is_authorized_in_domain(&signal.source_wallet, &signal.domain);
         if !is_auth {
             debug!(
                 wallet = %signal.source_wallet,
@@ -89,8 +94,14 @@ impl ExitEngine {
 
         // 5. Calculate desired exit shares based on reduction fraction.
         let desired_shares = match signal.action {
-            SignalAction::CloseSell | SignalAction::ReversePosition => exposure.shares,
-            SignalAction::ScaleOut => (exposure.shares * self.config.exit_trigger_reduction_pct).min(exposure.shares),
+            SignalAction::ReversePosition => exposure.shares,
+            SignalAction::CloseSell | SignalAction::ScaleOut => {
+                let ratio = signal
+                    .target_reduction_pct
+                    .unwrap_or(self.config.exit_trigger_reduction_pct)
+                    .clamp(Decimal::ZERO, Decimal::ONE);
+                (exposure.shares * ratio).min(exposure.shares)
+            }
             _ => Decimal::ZERO,
         };
 
@@ -167,7 +178,8 @@ impl ExitEngine {
             // Major direction misjudgment rule: bought at high implied probability (> 0.70) but lost
             let is_major_error = !won && *entry_price >= dec!(0.70);
 
-            self.whitelist.record_direction_result(address, is_major_error);
+            self.whitelist
+                .record_direction_result(address, is_major_error);
 
             info!(
                 address = %address,
