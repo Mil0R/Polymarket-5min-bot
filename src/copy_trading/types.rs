@@ -321,6 +321,9 @@ pub struct CopyTradingConfig {
     pub min_signal_vwap: Decimal, // 0.05 sanity floor for consensus VWAP
     pub max_signal_vwap: Decimal, // 0.95 sanity ceiling for consensus VWAP
     pub max_signal_age_seconds: i64, // reject stale/replayed observations
+    /// PAPER-only observation window. Signals older than the executable limit
+    /// can still be shadowed without entering consensus or reserving capital.
+    pub shadow_max_signal_age_seconds: i64,
     /// Delay before a PAPER proposal re-reads the live book and simulates a fill.
     pub paper_execution_delay_ms: u64,
     pub exit_trigger_reduction_pct: Decimal, // 0.30 (30% exit threshold)
@@ -368,6 +371,7 @@ impl Default for CopyTradingConfig {
             min_signal_vwap: dec!(0.05),
             max_signal_vwap: dec!(0.95),
             max_signal_age_seconds: 120,
+            shadow_max_signal_age_seconds: 300,
             paper_execution_delay_ms: 500,
             exit_trigger_reduction_pct: dec!(0.30),
             max_acceptable_brier_score: dec!(0.25),
@@ -415,6 +419,13 @@ impl CopyTradingConfig {
             return Err(
                 "shadow signal notional must be positive and cannot exceed live minimum"
                     .to_string(),
+            );
+        }
+        if self.max_signal_age_seconds <= 0
+            || self.shadow_max_signal_age_seconds < self.max_signal_age_seconds
+        {
+            return Err(
+                "shadow signal age must be >= the positive executable signal age".to_string(),
             );
         }
         Ok(())
@@ -542,6 +553,11 @@ impl CopyTradingConfig {
         if let Ok(v) = std::env::var("COPY_MAX_SIGNAL_AGE_SECONDS") {
             if let Ok(val) = v.trim().parse::<i64>() {
                 cfg.max_signal_age_seconds = val.max(1);
+            }
+        }
+        if let Ok(v) = std::env::var("COPY_SHADOW_MAX_SIGNAL_AGE_SECONDS") {
+            if let Ok(val) = v.trim().parse::<i64>() {
+                cfg.shadow_max_signal_age_seconds = val.max(1);
             }
         }
         if let Ok(v) = std::env::var("COPY_PAPER_EXECUTION_DELAY_MS") {

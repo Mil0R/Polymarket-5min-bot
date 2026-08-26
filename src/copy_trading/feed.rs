@@ -737,7 +737,7 @@ impl WalletHistoryFetcher {
     /// comes back empty.
     async fn fetch_closed_positions_paged(&self, wallet: &str) -> Result<Vec<RawClosedPosition>> {
         const PAGE_SIZE: i32 = 50;
-        const CONCURRENCY: i32 = 4;
+        const CONCURRENCY: i32 = 2;
         const SAFETY_CAP: i32 = 5000;
 
         let mut out = Vec::new();
@@ -755,9 +755,9 @@ impl WalletHistoryFetcher {
                 handles.push(tokio::spawn(async move {
                     // 429-aware retry (data-api rate limits): back off up to ~6s.
                     let policy = ReadRetryPolicy {
-                        max_attempts: 4,
+                        max_attempts: 5,
                         initial_delay: std::time::Duration::from_secs(1),
-                        max_delay: std::time::Duration::from_secs(6),
+                        max_delay: std::time::Duration::from_secs(10),
                     };
                     retry_read(policy, || {
                         let client = client.clone();
@@ -779,6 +779,7 @@ impl WalletHistoryFetcher {
             let results = futures::future::join_all(handles).await;
             let mut got_any = false;
             let mut reached_end = false;
+            let mut page_errors = Vec::new();
             for (i, r) in results.into_iter().enumerate() {
                 match r {
                     Ok(Ok(page)) => {
@@ -791,10 +792,21 @@ impl WalletHistoryFetcher {
                         }
                     }
                     Ok(Err(e)) => {
-                        warn!(wallet = %wallet, offset = offset + i as i32 * PAGE_SIZE, error = %e, "closed-positions page failed after retries")
+                        let failed_offset = offset + i as i32 * PAGE_SIZE;
+                        warn!(wallet = %wallet, offset = failed_offset, error = %e, "closed-positions page failed after retries");
+                        page_errors.push(format!("offset {failed_offset}: {e}"));
                     }
-                    Err(e) => warn!(wallet = %wallet, "closed-positions task panicked: {e}"),
+                    Err(e) => {
+                        warn!(wallet = %wallet, "closed-positions task panicked: {e}");
+                        page_errors.push(format!("task failure: {e}"));
+                    }
                 }
+            }
+            if !page_errors.is_empty() {
+                anyhow::bail!(
+                    "incomplete closed-position history for {wallet}: {}",
+                    page_errors.join("; ")
+                );
             }
             if !got_any || reached_end {
                 break;

@@ -5,8 +5,9 @@
 //! recent trades and resolved positions, applies hard admission gates, and
 //! writes reproducible CSV/NDJSON/PAPER-env artifacts.
 
-use super::feed::{BookFetcher, WalletHistoryFetcher, DATA_API_URL};
-use super::types::{DomainTag, WalletTradeRecord};
+use super::feed::{BookFetcher, MarketMetadataFetcher, WalletHistoryFetcher, DATA_API_URL};
+use super::types::{CopyTradingConfig, DomainTag, WalletTradeRecord};
+use super::whitelist::WhitelistManager;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use rust_decimal::prelude::ToPrimitive;
@@ -47,6 +48,7 @@ pub struct ScoutConfig {
     pub order_by: Vec<String>,
     pub leaderboard_limit: usize,
     pub max_candidates: usize,
+    pub candidate_offset: usize,
     pub top: usize,
     pub lookback_days: i64,
     pub recent_days: i64,
@@ -64,6 +66,8 @@ pub struct ScoutConfig {
     pub copy_notional_usdc: f64,
     pub max_live_spread: f64,
     pub min_live_execution_fit: f64,
+    pub min_compatible_market_ratio: f64,
+    pub min_actionable_signal_ratio: f64,
     pub output_dir: PathBuf,
     pub explicit_wallets: Vec<String>,
 }
@@ -85,6 +89,7 @@ impl ScoutConfig {
             order_by: vec!["PNL".into(), "VOL".into()],
             leaderboard_limit: 10,
             max_candidates: 50,
+            candidate_offset: 0,
             top: 20,
             lookback_days: 90,
             recent_days: 30,
@@ -102,6 +107,8 @@ impl ScoutConfig {
             copy_notional_usdc: 50.0,
             max_live_spread: 0.02,
             min_live_execution_fit: 0.60,
+            min_compatible_market_ratio: 0.70,
+            min_actionable_signal_ratio: 0.10,
             output_dir: PathBuf::from("results/copy-candidates"),
             explicit_wallets: Vec::new(),
         }
@@ -121,6 +128,8 @@ impl ScoutConfig {
         config.max_single_profit_ratio = 0.35;
         config.min_profitable_windows = 2;
         config.min_live_execution_fit = 0.30;
+        config.min_compatible_market_ratio = 0.30;
+        config.min_actionable_signal_ratio = 0.0;
         config
     }
 
@@ -164,6 +173,14 @@ impl ScoutConfig {
             ("max-drawdown", self.max_drawdown),
             ("max-single-profit-ratio", self.max_single_profit_ratio),
             ("min-live-execution-fit", self.min_live_execution_fit),
+            (
+                "min-compatible-market-ratio",
+                self.min_compatible_market_ratio,
+            ),
+            (
+                "min-actionable-signal-ratio",
+                self.min_actionable_signal_ratio,
+            ),
         ] {
             if !(0.0..=1.0).contains(&value) {
                 anyhow::bail!("{name} must be in 0..=1");
@@ -229,6 +246,17 @@ pub struct CandidateEvaluation {
     pub consistency_score: f64,
     pub activity_score: f64,
     pub execution_score: Option<f64>,
+    pub compatible_market_ratio: Option<f64>,
+    pub market_metadata_coverage: f64,
+    pub buy_signals_sampled: usize,
+    pub median_buy_notional_usdc: Option<f64>,
+    pub actionable_signal_ratio: f64,
+    pub runtime_compatible: bool,
+    pub runtime_tier: String,
+    pub runtime_avg_entry_price: f64,
+    pub runtime_brier_score: f64,
+    pub runtime_active_span_days: u32,
+    pub runtime_failure_reasons: Vec<String>,
     pub rejection_reasons: Vec<String>,
     pub warnings: Vec<String>,
 }
@@ -248,6 +276,8 @@ struct RecentTrade {
     event_slug: String,
     timestamp: DateTime<Utc>,
     size: f64,
+    price: f64,
+    side: String,
 }
 
 #[derive(Debug, Clone)]
@@ -256,6 +286,8 @@ pub struct CandidateScout {
     http: reqwest::Client,
     history: WalletHistoryFetcher,
     books: BookFetcher,
+    metadata: MarketMetadataFetcher,
+    runtime_config: CopyTradingConfig,
 }
 
 impl CandidateScout {
@@ -269,6 +301,8 @@ impl CandidateScout {
                 .context("failed to build scout HTTP client")?,
             history: WalletHistoryFetcher::new()?,
             books: BookFetcher::new()?,
+            metadata: MarketMetadataFetcher::new()?,
+            runtime_config: CopyTradingConfig::from_env(),
         })
     }
 
@@ -291,11 +325,16 @@ impl CandidateScout {
                 .cmp(&a.1.leaderboard_hits)
                 .then(a.0.cmp(&b.0))
         });
-        ranked.truncate(self.config.max_candidates);
+        let ranked = ranked
+            .into_iter()
+            .skip(self.config.candidate_offset)
+            .take(self.config.max_candidates)
+            .collect::<Vec<_>>();
 
         let mut candidates = Vec::new();
+        let evaluation_count = ranked.len();
         for (index, (address, seed)) in ranked.into_iter().enumerate() {
-            info!(wallet = %address, current = index + 1, total = discovered.min(self.config.max_candidates), "Evaluating copy candidate");
+            info!(wallet = %address, current = index + 1, total = evaluation_count, offset = self.config.candidate_offset, "Evaluating copy candidate");
             match self.evaluate(&address, &seed, now).await {
                 Ok(candidate) => candidates.push(candidate),
                 Err(error) => partial_failures.push(format!("{address}: {error:#}")),
@@ -373,6 +412,8 @@ impl CandidateScout {
         now: DateTime<Utc>,
     ) -> Result<CandidateEvaluation> {
         let records = self.history.fetch_records(address).await?;
+        let runtime_evaluation = WhitelistManager::new(self.runtime_config.clone())
+            .evaluate_wallet(address, &records, now);
         let (trades, trade_history_truncated) = self.fetch_recent_trades(address).await?;
         let category_filter: HashSet<_> = self
             .config
@@ -428,6 +469,24 @@ impl CandidateScout {
             .map(|t| t.timestamp.date_naive())
             .collect::<HashSet<NaiveDate>>()
             .len();
+        let mut buy_notionals = recent
+            .iter()
+            .filter(|trade| trade.side.eq_ignore_ascii_case("BUY"))
+            .map(|trade| trade.size * trade.price)
+            .filter(|notional| notional.is_finite() && *notional > 0.0)
+            .collect::<Vec<_>>();
+        buy_notionals.sort_by(|left, right| left.partial_cmp(right).unwrap_or(Ordering::Equal));
+        let median_buy_notional_usdc = median(&buy_notionals);
+        let runtime_min_signal = self
+            .runtime_config
+            .min_signal_notional_usdc
+            .to_f64()
+            .unwrap_or(100.0);
+        let actionable_buy_signals = buy_notionals
+            .iter()
+            .filter(|notional| **notional >= runtime_min_signal)
+            .count();
+        let actionable_signal_ratio = ratio(actionable_buy_signals, buy_notionals.len());
         let last_trade_at = trades
             .iter()
             .zip(classified.iter())
@@ -471,6 +530,8 @@ impl CandidateScout {
         };
         let stats = performance_stats(&stats_records, now);
         let (live_execution_fit, live_book_coverage) = self.live_execution_fit(&recent).await;
+        let (compatible_market_ratio, market_metadata_coverage) =
+            self.market_compatibility(&recent).await;
 
         let activity_score = mean(&[
             bounded_ratio(recent.len(), self.config.min_recent_trades),
@@ -517,6 +578,9 @@ impl CandidateScout {
         }
         if !sub_filter.is_empty() {
             warnings.push("subcategory_profit_metrics_use_primary_category_history: closed-position records do not expose a stable tag taxonomy".into());
+        }
+        if compatible_market_ratio.is_none() {
+            warnings.push("market_compatibility_not_measured: no Gamma metadata available".into());
         }
 
         let mut rejection_reasons = Vec::new();
@@ -611,6 +675,32 @@ impl CandidateScout {
         } else if self.config.profile == ScoutProfile::Conservative {
             rejection_reasons.push("live_execution_fit_unavailable".into());
         }
+        if let Some(ratio) = compatible_market_ratio {
+            gate(
+                &mut rejection_reasons,
+                ratio >= self.config.min_compatible_market_ratio,
+                "runtime_market_compatibility_ratio_below_threshold",
+                round4(ratio),
+                self.config.min_compatible_market_ratio,
+            );
+        } else if self.config.profile == ScoutProfile::Conservative {
+            rejection_reasons.push("market_compatibility_unavailable".into());
+        }
+        gate(
+            &mut rejection_reasons,
+            actionable_signal_ratio >= self.config.min_actionable_signal_ratio,
+            "actionable_signal_ratio_below_threshold",
+            round4(actionable_signal_ratio),
+            self.config.min_actionable_signal_ratio,
+        );
+        if !runtime_evaluation.is_accepted {
+            rejection_reasons.extend(
+                runtime_evaluation
+                    .failure_reasons
+                    .iter()
+                    .map(|reason| format!("runtime_funnel: {reason}")),
+            );
+        }
         let accepted = rejection_reasons.is_empty();
         let tier = if !accepted {
             "REJECT"
@@ -651,6 +741,29 @@ impl CandidateScout {
             consistency_score: round4(consistency_score),
             activity_score: round4(activity_score),
             execution_score: execution_score.map(round4),
+            compatible_market_ratio: compatible_market_ratio.map(round4),
+            market_metadata_coverage: round4(market_metadata_coverage),
+            buy_signals_sampled: buy_notionals.len(),
+            median_buy_notional_usdc: median_buy_notional_usdc.map(round2),
+            actionable_signal_ratio: round4(actionable_signal_ratio),
+            runtime_compatible: runtime_evaluation.is_accepted,
+            runtime_tier: format!("{:?}", runtime_evaluation.tier),
+            runtime_avg_entry_price: round4(
+                runtime_evaluation
+                    .profile
+                    .avg_entry_price
+                    .to_f64()
+                    .unwrap_or_default(),
+            ),
+            runtime_brier_score: round4(
+                runtime_evaluation
+                    .profile
+                    .brier_score
+                    .to_f64()
+                    .unwrap_or_default(),
+            ),
+            runtime_active_span_days: runtime_evaluation.profile.active_span_days,
+            runtime_failure_reasons: runtime_evaluation.failure_reasons,
             rejection_reasons,
             warnings,
         })
@@ -704,14 +817,16 @@ impl CandidateScout {
         if self.config.live_book_sample == 0 {
             return (None, 0.0);
         }
-        let mut unique = BTreeMap::new();
+        let mut seen = HashSet::new();
+        let mut selected = Vec::new();
         for trade in recent {
-            unique.entry(trade.asset.clone()).or_insert(*trade);
+            if seen.insert(trade.asset.clone()) {
+                selected.push(*trade);
+            }
+            if selected.len() >= self.config.live_book_sample {
+                break;
+            }
         }
-        let selected: Vec<_> = unique
-            .into_values()
-            .take(self.config.live_book_sample)
-            .collect();
         if selected.is_empty() {
             return (None, 0.0);
         }
@@ -740,6 +855,61 @@ impl CandidateScout {
         ((measured > 0).then(|| ratio(passed, measured)), coverage)
     }
 
+    async fn market_compatibility(&self, recent: &[&RecentTrade]) -> (Option<f64>, f64) {
+        let sample_size = self.config.live_book_sample.max(1);
+        let mut seen = HashSet::new();
+        let mut selected = Vec::new();
+        for trade in recent {
+            if seen.insert(trade.condition_id.clone()) {
+                selected.push(*trade);
+            }
+            if selected.len() >= sample_size {
+                break;
+            }
+        }
+        if selected.is_empty() {
+            return (None, 0.0);
+        }
+        let attempted = selected.len();
+        let mut measured = 0usize;
+        let mut compatible = 0usize;
+        for trade in selected {
+            match self.metadata.fetch_by_condition(&trade.condition_id).await {
+                Ok(Some(market)) => {
+                    measured += 1;
+                    let hours_to_expiry = market
+                        .settlement_time
+                        .signed_duration_since(trade.timestamp)
+                        .num_seconds() as f64
+                        / 3600.0;
+                    if market.outcome_count == 2
+                        && (!self.runtime_config.isolate_multi_outcome || !market.is_neg_risk)
+                        && hours_to_expiry
+                            >= self
+                                .runtime_config
+                                .min_hours_to_expiry
+                                .to_f64()
+                                .unwrap_or_default()
+                        && market.volume_24h_usdc >= self.runtime_config.min_24h_volume_usdc
+                    {
+                        compatible += 1;
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => warn!(
+                    market = %trade.condition_id,
+                    error = %error,
+                    "Could not sample market compatibility for candidate"
+                ),
+            }
+        }
+        let coverage = ratio(measured, attempted);
+        (
+            (measured > 0).then(|| ratio(compatible, measured)),
+            coverage,
+        )
+    }
+
     fn write_outputs(&self, report: &ScoutReport) -> Result<()> {
         std::fs::create_dir_all(&self.config.output_dir)?;
         let details = self.config.output_dir.join("candidate-details.ndjson");
@@ -764,10 +934,10 @@ impl CandidateScout {
             .join("\n");
         atomic_write(&rejections, &(rejection_lines + "\n"))?;
 
-        let mut csv_text = "rank,address,accepted,tier,score,category,subcategory,last_trade_age_hours,recent_trades,active_days,resolved_markets,net_roi,profit_factor,max_drawdown,live_execution_fit,rejection_reasons\n".to_string();
+        let mut csv_text = "rank,address,accepted,tier,score,category,subcategory,last_trade_age_hours,recent_trades,active_days,resolved_markets,net_roi,profit_factor,max_drawdown,live_execution_fit,compatible_market_ratio,market_metadata_coverage,median_buy_notional_usdc,actionable_signal_ratio,runtime_compatible,runtime_tier,runtime_avg_entry_price,runtime_brier_score,runtime_active_span_days,runtime_failure_reasons,rejection_reasons\n".to_string();
         for (rank, c) in report.candidates.iter().enumerate() {
             csv_text.push_str(&format!(
-                "{},{},{},{},{:.2},{},{},{},{},{},{},{:.4},{:.4},{:.4},{},{}\n",
+                "{},{},{},{},{:.2},{},{},{},{},{},{},{:.4},{:.4},{:.4},{},{},{:.4},{},{:.4},{},{},{:.4},{:.4},{},{},{}\n",
                 rank + 1,
                 c.address,
                 c.accepted,
@@ -787,6 +957,20 @@ impl CandidateScout {
                 c.live_execution_fit
                     .map(|v| format!("{v:.4}"))
                     .unwrap_or_default(),
+                c.compatible_market_ratio
+                    .map(|v| format!("{v:.4}"))
+                    .unwrap_or_default(),
+                c.market_metadata_coverage,
+                c.median_buy_notional_usdc
+                    .map(|v| format!("{v:.2}"))
+                    .unwrap_or_default(),
+                c.actionable_signal_ratio,
+                c.runtime_compatible,
+                csv_escape(&c.runtime_tier),
+                c.runtime_avg_entry_price,
+                c.runtime_brier_score,
+                c.runtime_active_span_days,
+                csv_escape(&c.runtime_failure_reasons.join(";")),
                 csv_escape(&c.rejection_reasons.join(";"))
             ))
         }
@@ -901,6 +1085,12 @@ fn parse_recent_trade(row: &Value) -> Option<RecentTrade> {
             .to_string(),
         timestamp: DateTime::from_timestamp(timestamp, 0)?,
         size: value_f64(row.get("size")?)?,
+        price: value_f64(row.get("price")?)?,
+        side: row
+            .get("side")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_uppercase(),
     })
 }
 
@@ -1122,6 +1312,15 @@ fn mean(values: &[f64]) -> f64 {
         0.0
     } else {
         values.iter().sum::<f64>() / values.len() as f64
+    }
+}
+fn median(values: &[f64]) -> Option<f64> {
+    if values.is_empty() {
+        None
+    } else if values.len() % 2 == 1 {
+        Some(values[values.len() / 2])
+    } else {
+        Some((values[values.len() / 2 - 1] + values[values.len() / 2]) / 2.0)
     }
 }
 fn scale_positive(value: f64, floor: f64, strong: f64) -> f64 {

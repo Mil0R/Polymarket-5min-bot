@@ -19,6 +19,7 @@ pub use proxy_relay::{
 };
 
 pub mod copy_trading;
+pub mod maker_liquidity;
 pub mod merge;
 pub mod positions;
 pub mod redeem;

@@ -337,6 +337,13 @@ impl WhitelistManager {
             dec!(0.50) // neutral default
         };
 
+        if brier_score > self.config.max_acceptable_brier_score {
+            failure_reasons.push(format!(
+                "Brier score too high: {:.4} > {:.4}",
+                brier_score, self.config.max_acceptable_brier_score
+            ));
+        }
+
         let win_rate = if total_settled > 0 {
             Decimal::from(win_count) / Decimal::from(total_settled)
         } else {
@@ -590,5 +597,49 @@ mod tests {
             "corrupt state must not panic"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn high_brier_rejection_always_has_an_explanation() {
+        let now = Utc::now();
+        let records = (0..60)
+            .map(|i| {
+                let days_ago = 120 - (i as i64 * 2);
+                let won = i % 2 == 0;
+                WalletTradeRecord {
+                    trade_id: format!("brier-{i}"),
+                    market_id: format!("brier-market-{i}"),
+                    domain: DomainTag::MacroInterestRate,
+                    outcome_bought: OutcomeSide::Yes,
+                    entry_price: dec!(0.80),
+                    exit_price: Some(if won { dec!(1.0) } else { dec!(0.0) }),
+                    notional_usdc: dec!(100.0),
+                    // Keep profitability independent from this calibration fixture.
+                    pnl_usdc: dec!(1.0),
+                    return_pct: dec!(0.01),
+                    is_maker: false,
+                    is_arbitrage_leg: false,
+                    behavior_data_known: true,
+                    resolved_outcome: Some(if won {
+                        OutcomeSide::Yes
+                    } else {
+                        OutcomeSide::No
+                    }),
+                    opened_at: now - chrono::Duration::days(days_ago),
+                    settled_at: Some(now - chrono::Duration::days(days_ago - 1)),
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let result = WhitelistManager::new(CopyTradingConfig::default()).evaluate_wallet(
+            "0xPoorCalibration",
+            &records,
+            now,
+        );
+        assert!(!result.is_accepted);
+        assert!(result
+            .failure_reasons
+            .iter()
+            .any(|reason| reason.starts_with("Brier score too high:")));
     }
 }

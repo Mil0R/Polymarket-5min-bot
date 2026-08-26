@@ -17,6 +17,7 @@ DISCOVERY:
   --order LIST                     PNL,VOL (default: PNL,VOL)
   --leaderboard-limit N            Rows per leaderboard slice, 1..50
   --max-candidates N               Maximum wallets enriched after union/dedup
+  --candidate-offset N             Skip this many ranked wallets before enrichment
   --wallets LIST                   Explicit addresses; may be used with leaderboard discovery
 
 HARD GATES:
@@ -38,6 +39,8 @@ EXECUTION FIT:
   --copy-notional-usdc FLOAT       Required Top-5 ask depth (default: 50)
   --max-live-spread FLOAT
   --min-live-execution-fit FLOAT
+  --min-compatible-market-ratio FLOAT  Share passing binary/NegRisk/expiry/volume gates
+  --min-actionable-signal-ratio FLOAT  Recent BUY share above COPY_MIN_SIGNAL_NOTIONAL_USDC
 
 OUTPUT:
   --top N                          Accepted wallets written to recommended PAPER env
@@ -108,6 +111,10 @@ async fn main() -> Result<()> {
                 config.max_candidates = parse(value()?, flag)?;
                 index += 2;
             }
+            "--candidate-offset" => {
+                config.candidate_offset = parse(value()?, flag)?;
+                index += 2;
+            }
             "--top" => {
                 config.top = parse(value()?, flag)?;
                 index += 2;
@@ -174,6 +181,14 @@ async fn main() -> Result<()> {
             }
             "--min-live-execution-fit" => {
                 config.min_live_execution_fit = parse(value()?, flag)?;
+                index += 2;
+            }
+            "--min-compatible-market-ratio" => {
+                config.min_compatible_market_ratio = parse(value()?, flag)?;
+                index += 2;
+            }
+            "--min-actionable-signal-ratio" => {
+                config.min_actionable_signal_ratio = parse(value()?, flag)?;
                 index += 2;
             }
             "--output" => {

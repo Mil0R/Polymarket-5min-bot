@@ -157,6 +157,7 @@ async fn run_copy_trader(
     );
     info!(
         max_signal_age_seconds = config.max_signal_age_seconds,
+        shadow_max_signal_age_seconds = config.shadow_max_signal_age_seconds,
         min_signal_notional = %config.min_signal_notional_usdc,
         shadow_min_signal_notional = %config.shadow_min_signal_notional_usdc,
         min_consensus_wallets = config.min_consensus_wallets,
@@ -189,6 +190,7 @@ async fn run_copy_trader(
             "dryRun": dry_run,
             "targetWallets": env::var("COPY_TARGET_WALLETS").unwrap_or_default(),
             "maxSignalAgeSeconds": config.max_signal_age_seconds,
+            "shadowMaxSignalAgeSeconds": config.shadow_max_signal_age_seconds,
             "minSignalNotional": config.min_signal_notional_usdc.to_string(),
             "shadowMinSignalNotional": config.shadow_min_signal_notional_usdc.to_string(),
             "minConsensusWallets": config.min_consensus_wallets,
@@ -244,9 +246,11 @@ async fn run_copy_trader(
     }
 
     // 3. Live data infrastructure
-    let feed = Arc::new(TradeFeed::with_max_signal_age_seconds(
-        config.max_signal_age_seconds,
-    )?);
+    let feed = Arc::new(TradeFeed::with_max_signal_age_seconds(if dry_run {
+        config.shadow_max_signal_age_seconds
+    } else {
+        config.max_signal_age_seconds
+    })?);
     let history = Arc::new(WalletHistoryFetcher::new()?);
     let meta_fetcher = Arc::new(MarketMetadataFetcher::new()?);
     let book_fetcher = Arc::new(BookFetcher::new()?);
@@ -369,6 +373,59 @@ async fn run_copy_trader(
         }
     }
 
+    let target_keys = target_wallets
+        .iter()
+        .map(|address| address.to_ascii_lowercase())
+        .collect::<std::collections::HashSet<_>>();
+    let active_profiles = coordinator
+        .whitelist()
+        .list_active_whitelist()
+        .into_iter()
+        .filter(|profile| target_keys.contains(&profile.address.to_ascii_lowercase()))
+        .collect::<Vec<_>>();
+    let tier_s_wallets = active_profiles
+        .iter()
+        .filter(|profile| profile.tier == polypulse::copy_trading::WalletTier::TierS)
+        .count();
+    let mut domain_sources = HashMap::<String, usize>::new();
+    for profile in &active_profiles {
+        *domain_sources
+            .entry(profile.primary_domain.to_string())
+            .or_default() += 1;
+    }
+    let consensus_capable_domains = domain_sources
+        .iter()
+        .filter(|(_, count)| **count >= config.min_consensus_wallets)
+        .map(|(domain, count)| format!("{domain}:{count}"))
+        .collect::<Vec<_>>();
+    let direct_or_consensus_capable = tier_s_wallets > 0 || !consensus_capable_domains.is_empty();
+    journal.record(
+        "strategy_readiness",
+        serde_json::json!({
+            "configuredWallets": target_wallets.len(),
+            "activeWallets": active_profiles.len(),
+            "tierSWallets": tier_s_wallets,
+            "minConsensusWallets": config.min_consensus_wallets,
+            "domainSources": domain_sources,
+            "consensusCapableDomains": consensus_capable_domains,
+            "directOrConsensusCapable": direct_or_consensus_capable,
+        }),
+    );
+    if !direct_or_consensus_capable {
+        warn!(
+            active_wallets = active_profiles.len(),
+            tier_s_wallets,
+            min_consensus_wallets = config.min_consensus_wallets,
+            "Copy-trading cannot currently produce an entry: no TierS source and no domain has enough independent wallets"
+        );
+    } else if active_profiles.len() < target_wallets.len() {
+        warn!(
+            configured_wallets = target_wallets.len(),
+            active_wallets = active_profiles.len(),
+            "Copy-trading wallet funnel has low coverage; review wallet_rejected events"
+        );
+    }
+
     info!(
         "Strategy coordinator initialized. Polling live wallet trades every {}s...",
         poll_interval.as_secs()
@@ -389,7 +446,7 @@ async fn run_copy_trader(
     let signal_config = config.clone();
     runtime.set_initialized(true);
     runtime.set_healthy(true);
-    runtime.set_whitelist_wallets(coordinator.whitelist().list_active_whitelist().len());
+    runtime.set_whitelist_wallets(active_profiles.len());
     let runtime_for_loop = runtime.clone();
     let runner_handle = tokio::spawn(async move {
         let mut loop_count: u64 = 0;
@@ -637,7 +694,7 @@ async fn handle_signal(ctx: &SignalContext, mut signal: SignalEvent) {
             );
             debug!(signal = %signal.signal_id, reason, "Signal ignored by preflight filter");
             if ctx.dry_run
-                && reason == "below-minimum-notional"
+                && (reason == "below-minimum-notional" || reason == "execution-stale-shadow-only")
                 && signal.action == SignalAction::OpenBuy
                 && signal.target_notional_usdc >= ctx.config.shadow_min_signal_notional_usdc
             {
@@ -1166,13 +1223,16 @@ fn signal_prefilter_reason(
     config: &CopyTradingConfig,
 ) -> Option<&'static str> {
     let age = now.signed_duration_since(signal.timestamp).num_seconds();
-    if age > config.max_signal_age_seconds {
+    if age > config.shadow_max_signal_age_seconds {
         return Some("stale");
     }
     if age < -30 {
         return Some("future-dated");
     }
     if signal.action == SignalAction::OpenBuy {
+        if age > config.max_signal_age_seconds {
+            return Some("execution-stale-shadow-only");
+        }
         if signal.target_notional_usdc < config.min_signal_notional_usdc {
             return Some("below-minimum-notional");
         }
@@ -1304,10 +1364,15 @@ mod tests {
     }
 
     #[test]
-    fn prefilter_rejects_stale_signal_before_upstream_io() {
+    fn prefilter_routes_execution_stale_signal_to_shadow_research() {
         let now = Utc::now();
         let mut sig = signal(now, SignalAction::OpenBuy);
         sig.timestamp = now - ChronoDuration::seconds(121);
+        assert_eq!(
+            signal_prefilter_reason(&sig, now, &CopyTradingConfig::default()),
+            Some("execution-stale-shadow-only")
+        );
+        sig.timestamp = now - ChronoDuration::seconds(301);
         assert_eq!(
             signal_prefilter_reason(&sig, now, &CopyTradingConfig::default()),
             Some("stale")
