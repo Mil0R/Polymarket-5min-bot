@@ -1,13 +1,18 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use dashmap::{DashMap, DashSet};
 use futures::{stream, StreamExt};
+use polymarket_client_sdk::clob::ws::{types::response::BookUpdate, Client as WsClient};
+use polymarket_client_sdk::types::U256;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
+use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::str::FromStr;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use super::config::MakerResearchConfig;
 use super::model::{
@@ -19,6 +24,9 @@ use super::model::{
 pub struct MakerResearchClient {
     http: reqwest::Client,
     config: MakerResearchConfig,
+    trade_cache: Arc<DashMap<String, (Instant, Vec<MarketTrade>)>>,
+    book_cache: Arc<DashMap<String, BookSnapshot>>,
+    websocket_subscribed_tokens: Arc<DashSet<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -166,7 +174,13 @@ impl MakerResearchClient {
             .timeout(Duration::from_secs(15))
             .build()
             .context("failed to build maker research HTTP client")?;
-        Ok(Self { http, config })
+        Ok(Self {
+            http,
+            config,
+            trade_cache: Arc::new(DashMap::new()),
+            book_cache: Arc::new(DashMap::new()),
+            websocket_subscribed_tokens: Arc::new(DashSet::new()),
+        })
     }
 
     pub fn config(&self) -> &MakerResearchConfig {
@@ -221,18 +235,21 @@ impl MakerResearchClient {
     }
 
     pub async fn fetch_book(&self, token_id: &str) -> Result<BookSnapshot> {
+        if let Some(book) = self.book_cache.get(token_id) {
+            let age_ms = Utc::now()
+                .signed_duration_since(book.observed_at)
+                .num_milliseconds();
+            if age_ms <= self.config.websocket_book_max_age_ms {
+                return Ok(book.clone());
+            }
+        }
         let response: ClobBookResponse = self
-            .http
-            .get(format!("{}/book", self.config.clob_url))
-            .query(&[("token_id", token_id)])
-            .send()
-            .await
-            .context("maker CLOB book request failed")?
-            .error_for_status()
-            .context("maker CLOB book returned non-success")?
-            .json()
-            .await
-            .context("maker CLOB book response is invalid")?;
+            .get_json(
+                format!("{}/book", self.config.clob_url),
+                vec![("token_id".to_string(), token_id.to_string())],
+                "maker CLOB book",
+            )
+            .await?;
         let mut bids = parse_levels(response.bids);
         let mut asks = parse_levels(response.asks);
         bids.sort_by_key(|level| std::cmp::Reverse(level.price));
@@ -249,23 +266,23 @@ impl MakerResearchClient {
     /// Fetch recent taker trades for one condition. A taker SELL at or below
     /// a hypothetical bid is public evidence that the bid was at least touched.
     pub async fn fetch_market_trades(&self, condition_id: &str) -> Result<Vec<MarketTrade>> {
+        if let Some(cached) = self.trade_cache.get(condition_id) {
+            if cached.value().0.elapsed() <= Duration::from_secs(self.config.trade_cache_secs) {
+                return Ok(cached.value().1.clone());
+            }
+        }
         let response: Vec<DataTrade> = self
-            .http
-            .get(format!("{}/trades", self.config.data_url))
-            .query(&[
-                ("market", condition_id),
-                ("limit", "1000"),
-                ("takerOnly", "true"),
-            ])
-            .send()
-            .await
-            .context("maker Data API trades request failed")?
-            .error_for_status()
-            .context("maker Data API trades returned non-success")?
-            .json()
-            .await
-            .context("maker Data API trades response is invalid")?;
-        Ok(response
+            .get_json(
+                format!("{}/trades", self.config.data_url),
+                vec![
+                    ("market".to_string(), condition_id.to_string()),
+                    ("limit".to_string(), "1000".to_string()),
+                    ("takerOnly".to_string(), "true".to_string()),
+                ],
+                "maker Data API trades",
+            )
+            .await?;
+        let trades = response
             .into_iter()
             .filter_map(|trade| {
                 let price = decimal_value(&trade.price);
@@ -279,7 +296,61 @@ impl MakerResearchClient {
                     transaction_hash: trade.transaction_hash,
                 })
             })
-            .collect())
+            .collect::<Vec<_>>();
+        self.trade_cache
+            .insert(condition_id.to_string(), (Instant::now(), trades.clone()));
+        Ok(trades)
+    }
+
+    pub fn start_book_stream(&self, selections: &[MarketSelection]) {
+        if !self.config.websocket_books {
+            return;
+        }
+        let mut token_ids = Vec::new();
+        for token in selections.iter().flat_map(|selection| {
+            [
+                selection.market.yes_token_id.as_str(),
+                selection.market.no_token_id.as_str(),
+            ]
+        }) {
+            if self.websocket_subscribed_tokens.insert(token.to_string()) {
+                match U256::from_str(token) {
+                    Ok(token_id) => token_ids.push(token_id),
+                    Err(error) => {
+                        tracing::warn!(%error, token, "Maker WebSocket token id is invalid")
+                    }
+                }
+            }
+        }
+        if token_ids.is_empty() {
+            return;
+        }
+        let cache = Arc::clone(&self.book_cache);
+        let retry_base_ms = self.config.retry_base_ms;
+        tokio::spawn(async move {
+            loop {
+                let client = WsClient::default();
+                match client.subscribe_orderbook(token_ids.clone()) {
+                    Ok(stream) => {
+                        futures::pin_mut!(stream);
+                        while let Some(update) = stream.next().await {
+                            match update {
+                                Ok(book) => {
+                                    let snapshot = websocket_book_snapshot(book);
+                                    cache.insert(snapshot.token_id.clone(), snapshot);
+                                }
+                                Err(error) => {
+                                    tracing::warn!(%error, "Maker WebSocket orderbook stream error");
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => tracing::warn!(%error, "Maker WebSocket subscription failed"),
+                }
+                tokio::time::sleep(Duration::from_millis(retry_base_ms.max(250))).await;
+            }
+        });
     }
 
     async fn fetch_reward_markets(&self) -> Result<Vec<RewardMarket>> {
@@ -287,21 +358,17 @@ impl MakerResearchClient {
         let mut cursor: Option<String> = None;
         let mut seen = HashSet::new();
         for _ in 0..self.config.discovery_pages {
-            let mut request = self
-                .http
-                .get(format!("{}/rewards/markets/current", self.config.clob_url));
+            let mut query = Vec::new();
             if let Some(value) = cursor.as_deref() {
-                request = request.query(&[("next_cursor", value)]);
+                query.push(("next_cursor".to_string(), value.to_string()));
             }
-            let page: RewardPage = request
-                .send()
-                .await
-                .context("maker reward market request failed")?
-                .error_for_status()
-                .context("maker reward market request returned non-success")?
-                .json()
-                .await
-                .context("maker reward market response is invalid")?;
+            let page: RewardPage = self
+                .get_json(
+                    format!("{}/rewards/markets/current", self.config.clob_url),
+                    query,
+                    "maker reward market",
+                )
+                .await?;
             for market in page.data {
                 if seen.insert(market.condition_id.clone()) {
                     all.push(market);
@@ -317,18 +384,81 @@ impl MakerResearchClient {
 
     async fn fetch_gamma_market(&self, condition_id: &str) -> Result<Option<GammaMarket>> {
         let markets: Vec<GammaMarket> = self
-            .http
-            .get(format!("{}/markets", self.config.gamma_url))
-            .query(&[("condition_ids", condition_id), ("limit", "1")])
-            .send()
-            .await
-            .context("maker Gamma market request failed")?
-            .error_for_status()
-            .context("maker Gamma market request returned non-success")?
-            .json()
-            .await
-            .context("maker Gamma market response is invalid")?;
+            .get_json(
+                format!("{}/markets", self.config.gamma_url),
+                vec![
+                    ("condition_ids".to_string(), condition_id.to_string()),
+                    ("limit".to_string(), "1".to_string()),
+                ],
+                "maker Gamma market",
+            )
+            .await?;
         Ok(markets.into_iter().next())
+    }
+
+    async fn get_json<T>(&self, url: String, query: Vec<(String, String)>, label: &str) -> Result<T>
+    where
+        T: DeserializeOwned,
+    {
+        let mut last_error = None;
+        for attempt in 0..self.config.http_max_retries {
+            let result = async {
+                self.http
+                    .get(&url)
+                    .query(&query)
+                    .send()
+                    .await
+                    .with_context(|| format!("{label} request failed"))?
+                    .error_for_status()
+                    .with_context(|| format!("{label} returned non-success"))?
+                    .json::<T>()
+                    .await
+                    .with_context(|| format!("{label} response is invalid"))
+            }
+            .await;
+            match result {
+                Ok(value) => return Ok(value),
+                Err(error) => last_error = Some(error),
+            }
+            if attempt + 1 < self.config.http_max_retries {
+                let multiplier = 1_u64 << attempt.min(10);
+                tokio::time::sleep(Duration::from_millis(
+                    self.config.retry_base_ms.saturating_mul(multiplier),
+                ))
+                .await;
+            }
+        }
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("{label} request failed")))
+    }
+}
+
+fn websocket_book_snapshot(book: BookUpdate) -> BookSnapshot {
+    let mut bids = book
+        .bids
+        .into_iter()
+        .filter(|level| level.price > Decimal::ZERO && level.size > Decimal::ZERO)
+        .map(|level| BookLevel {
+            price: level.price,
+            size: level.size,
+        })
+        .collect::<Vec<_>>();
+    let mut asks = book
+        .asks
+        .into_iter()
+        .filter(|level| level.price > Decimal::ZERO && level.size > Decimal::ZERO)
+        .map(|level| BookLevel {
+            price: level.price,
+            size: level.size,
+        })
+        .collect::<Vec<_>>();
+    bids.sort_by_key(|level| std::cmp::Reverse(level.price));
+    asks.sort_by_key(|level| level.price);
+    BookSnapshot {
+        token_id: book.asset_id.to_string(),
+        observed_at: Utc::now(),
+        exchange_timestamp_ms: Some(book.timestamp),
+        bids,
+        asks,
     }
 }
 

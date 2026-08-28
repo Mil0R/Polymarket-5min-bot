@@ -99,6 +99,16 @@ pub struct ShadowQuote {
     pub yes_bid: Decimal,
     pub no_bid: Decimal,
     pub size_shares: Decimal,
+    #[serde(default)]
+    pub base_quote_half_spread: Decimal,
+    #[serde(default = "default_true")]
+    pub yes_active: bool,
+    #[serde(default = "default_true")]
+    pub no_active: bool,
+    #[serde(default)]
+    pub inventory_net_before: Decimal,
+    #[serde(default)]
+    pub quote_mode: String,
     /// Resting bid size ahead of the shadow quote at better or equal prices.
     #[serde(default)]
     pub yes_queue_ahead_shares: Decimal,
@@ -235,6 +245,15 @@ pub fn rank_candidates(
         .filter(|market| market.daily_reward_usdc >= config.min_daily_reward_usdc)
         .filter(|market| market.rewards_min_size <= config.max_rewards_min_size)
         .filter(|market| market.liquidity_usdc >= config.min_liquidity_usdc)
+        .filter(|market| {
+            let required_volume = if market.fee_rate >= config.high_fee_threshold {
+                config.min_volume_24h_usdc * config.high_fee_volume_multiplier
+            } else {
+                config.min_volume_24h_usdc
+            };
+            market.volume_24h_usdc >= required_volume
+        })
+        .filter(|market| market.fee_rate <= config.max_fee_rate)
         .filter(|market| market.observed_spread <= config.max_observed_spread)
         .filter(|market| {
             market.yes_reference_price >= config.min_midpoint
@@ -292,32 +311,81 @@ pub fn generate_shadow_quote(
     config: &MakerResearchConfig,
     now: DateTime<Utc>,
 ) -> Result<ShadowQuote> {
-    let yes_mid = yes_book
-        .midpoint()
-        .ok_or_else(|| anyhow::anyhow!("YES book is not two-sided"))?;
-    let no_mid = no_book
-        .midpoint()
-        .ok_or_else(|| anyhow::anyhow!("NO book is not two-sided"))?;
-    let fair_yes = ((yes_mid + dec!(1) - no_mid) / dec!(2)).clamp(dec!(0.001), dec!(0.999));
-    let fair_no = dec!(1) - fair_yes;
+    generate_shadow_quote_controlled(
+        selection,
+        yes_book,
+        no_book,
+        config,
+        now,
+        config.quote_half_spread,
+        Decimal::ZERO,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn generate_shadow_quote_controlled(
+    selection: &MarketSelection,
+    yes_book: &BookSnapshot,
+    no_book: &BookSnapshot,
+    config: &MakerResearchConfig,
+    now: DateTime<Utc>,
+    base_quote_half_spread: Decimal,
+    inventory_net: Decimal,
+) -> Result<ShadowQuote> {
+    let (fair_yes, fair_no) = fair_prices(yes_book, no_book)?;
+    let yes_mid = yes_book.midpoint().expect("fair_prices validated YES book");
+    let no_mid = no_book.midpoint().expect("fair_prices validated NO book");
     let reward_max_distance = selection.market.rewards_max_spread_cents / dec!(100);
     if reward_max_distance <= Decimal::ZERO {
         bail!("market reward distance is zero");
     }
-    let desired_distance = config
-        .quote_half_spread
+    let book_spread = yes_book
+        .best_ask()
+        .zip(yes_book.best_bid())
+        .map(|(ask, bid)| (ask - bid).max(Decimal::ZERO))
+        .into_iter()
+        .chain(
+            no_book
+                .best_ask()
+                .zip(no_book.best_bid())
+                .map(|(ask, bid)| (ask - bid).max(Decimal::ZERO)),
+        )
+        .max()
+        .unwrap_or_default();
+    let dynamic_padding = if config.dynamic_quote_distance {
+        book_spread / dec!(4)
+    } else {
+        Decimal::ZERO
+    };
+    let desired_distance = (base_quote_half_spread + dynamic_padding)
         .min(reward_max_distance * config.reward_band_fraction);
+    let inventory_skew = (inventory_net.abs() * config.inventory_skew_per_share)
+        .min(reward_max_distance * dec!(0.4));
+    let minimum_distance = selection.market.tick_size.max(dec!(0.001));
+    let (yes_distance_target, no_distance_target) = if inventory_net > Decimal::ZERO {
+        (
+            desired_distance + inventory_skew,
+            (desired_distance - inventory_skew).max(minimum_distance),
+        )
+    } else {
+        (
+            (desired_distance - inventory_skew).max(minimum_distance),
+            desired_distance + inventory_skew,
+        )
+    };
+    let yes_active = inventory_net < config.max_inventory_shares;
+    let no_active = inventory_net > -config.max_inventory_shares;
     let tick = selection.market.tick_size.max(dec!(0.001));
     let yes_bid = maker_bid(
         fair_yes,
-        desired_distance,
+        yes_distance_target,
         yes_book.best_bid(),
         yes_book.best_ask(),
         tick,
     )?;
     let no_bid = maker_bid(
         fair_no,
-        desired_distance,
+        no_distance_target,
         no_book.best_bid(),
         no_book.best_ask(),
         tick,
@@ -329,17 +397,32 @@ pub fn generate_shadow_quote(
         .max(selection.market.rewards_min_size);
     let yes_distance = (fair_yes - yes_bid).abs();
     let no_distance = (fair_no - no_bid).abs();
-    let yes_reward_score = reward_score(reward_max_distance, yes_distance, size_shares);
-    let no_reward_score = reward_score(reward_max_distance, no_distance, size_shares);
+    let yes_reward_score = if yes_active {
+        reward_score(reward_max_distance, yes_distance, size_shares)
+    } else {
+        Decimal::ZERO
+    };
+    let no_reward_score = if no_active {
+        reward_score(reward_max_distance, no_distance, size_shares)
+    } else {
+        Decimal::ZERO
+    };
     let two_sided_reward_score = yes_reward_score.min(no_reward_score);
-    if two_sided_reward_score <= Decimal::ZERO {
+    if (yes_active && yes_reward_score <= Decimal::ZERO)
+        || (no_active && no_reward_score <= Decimal::ZERO)
+    {
         bail!("the proposed two-sided quote is outside the reward scoring band");
     }
     let visible_yes_competition = visible_reward_score(yes_book, fair_yes, reward_max_distance);
     let visible_no_competition = visible_reward_score(no_book, fair_no, reward_max_distance);
     let visible_competition_reward_score = visible_yes_competition.min(visible_no_competition);
-    let estimated_visible_reward_share = two_sided_reward_score
-        / (two_sided_reward_score + visible_competition_reward_score).max(two_sided_reward_score);
+    let estimated_visible_reward_share = if yes_active && no_active {
+        two_sided_reward_score
+            / (two_sided_reward_score + visible_competition_reward_score)
+                .max(two_sided_reward_score)
+    } else {
+        Decimal::ZERO
+    };
     let estimated_daily_liquidity_reward_usdc =
         selection.market.daily_reward_usdc * estimated_visible_reward_share;
     let yes_rebate_if_filled = fee_per_share(
@@ -365,6 +448,18 @@ pub fn generate_shadow_quote(
         yes_bid,
         no_bid,
         size_shares,
+        base_quote_half_spread,
+        yes_active,
+        no_active,
+        inventory_net_before: inventory_net,
+        quote_mode: if yes_active && no_active {
+            "two-sided"
+        } else if yes_active {
+            "yes-only"
+        } else {
+            "no-only"
+        }
+        .to_string(),
         yes_queue_ahead_shares,
         no_queue_ahead_shares,
         yes_distance,
@@ -376,13 +471,26 @@ pub fn generate_shadow_quote(
         visible_competition_reward_score,
         estimated_visible_reward_share,
         estimated_daily_liquidity_reward_usdc,
-        quoted_capital_usdc: (yes_bid + no_bid) * size_shares,
+        quoted_capital_usdc: (if yes_active { yes_bid } else { Decimal::ZERO }
+            + if no_active { no_bid } else { Decimal::ZERO })
+            * size_shares,
         complete_set_discount_per_share: dec!(1) - yes_bid - no_bid,
         yes_rebate_if_filled,
         no_rebate_if_filled,
         initial_yes_mid: yes_mid,
         initial_no_mid: no_mid,
     })
+}
+
+pub fn fair_prices(yes_book: &BookSnapshot, no_book: &BookSnapshot) -> Result<(Decimal, Decimal)> {
+    let yes_mid = yes_book
+        .midpoint()
+        .ok_or_else(|| anyhow::anyhow!("YES book is not two-sided"))?;
+    let no_mid = no_book
+        .midpoint()
+        .ok_or_else(|| anyhow::anyhow!("NO book is not two-sided"))?;
+    let fair_yes = ((yes_mid + dec!(1) - no_mid) / dec!(2)).clamp(dec!(0.001), dec!(0.999));
+    Ok((fair_yes, dec!(1) - fair_yes))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -402,8 +510,10 @@ pub fn markout_observation(
     let no_mid = no_book
         .midpoint()
         .ok_or_else(|| anyhow::anyhow!("NO markout book is not two-sided"))?;
-    let yes_book_crossed = yes_book.best_ask().is_some_and(|ask| ask <= quote.yes_bid);
-    let no_book_crossed = no_book.best_ask().is_some_and(|ask| ask <= quote.no_bid);
+    let yes_book_crossed =
+        quote.yes_active && yes_book.best_ask().is_some_and(|ask| ask <= quote.yes_bid);
+    let no_book_crossed =
+        quote.no_active && no_book.best_ask().is_some_and(|ask| ask <= quote.no_bid);
     let quote_timestamp = quote.created_at.timestamp();
     let eligible_trades = trades
         .iter()
@@ -417,10 +527,11 @@ pub fn markout_observation(
     let mut yes_trade_through = false;
     let mut no_trade_through = false;
     for trade in eligible_trades {
-        if trade.asset == quote.yes_token_id && trade.price <= quote.yes_bid {
+        if quote.yes_active && trade.asset == quote.yes_token_id && trade.price <= quote.yes_bid {
             yes_volume += trade.size;
             yes_trade_through |= trade.price < quote.yes_bid;
-        } else if trade.asset == quote.no_token_id && trade.price <= quote.no_bid {
+        } else if quote.no_active && trade.asset == quote.no_token_id && trade.price <= quote.no_bid
+        {
             no_volume += trade.size;
             no_trade_through |= trade.price < quote.no_bid;
         }
@@ -484,6 +595,10 @@ pub fn markout_observation(
                     * yes_fill_proxy_shares.min(no_fill_proxy_shares),
             ),
     })
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn queue_ahead(book: &BookSnapshot, quote_bid: Decimal) -> Decimal {
@@ -606,12 +721,27 @@ mod tests {
             min_daily_reward_usdc: dec!(1),
             max_rewards_min_size: dec!(100),
             min_liquidity_usdc: dec!(1),
+            min_volume_24h_usdc: dec!(1),
+            max_fee_rate: dec!(0.1),
+            high_fee_threshold: dec!(0.04),
+            high_fee_volume_multiplier: dec!(2),
             max_observed_spread: dec!(0.1),
             min_midpoint: dec!(0.1),
             max_midpoint: dec!(0.9),
             market_filter: None,
             quote_size_shares: dec!(20),
             quote_half_spread: dec!(0.01),
+            quote_half_spread_grid: vec![dec!(0.01), dec!(0.02)],
+            dynamic_quote_distance: false,
+            max_midpoint_move: dec!(0.02),
+            midpoint_move_window_secs: 30,
+            min_trades_1h: 0,
+            book_activity_window_secs: 300,
+            min_book_updates: 0,
+            max_inventory_shares: dec!(40),
+            inventory_skew_per_share: dec!(0.00025),
+            max_consecutive_negative_markouts: 3,
+            max_quotes_per_market_hour: 120,
             reward_band_fraction: dec!(0.8),
             book_poll_secs: 5,
             quote_interval_secs: 30,
@@ -619,6 +749,11 @@ mod tests {
             market_cooldown_secs: 1800,
             max_consecutive_market_errors: 6,
             min_time_to_end_secs: 1800,
+            http_max_retries: 3,
+            retry_base_ms: 250,
+            trade_cache_secs: 5,
+            websocket_books: false,
+            websocket_book_max_age_ms: 15_000,
             markout_horizons_secs: vec![1, 5, 30, 60],
             duration_secs: 0,
         }
@@ -639,6 +774,38 @@ mod tests {
         assert!(quote.two_sided_reward_score > Decimal::ZERO);
         assert_eq!(quote.size_shares, dec!(20));
         assert_eq!(quote.complete_set_discount_per_share, dec!(0.02));
+    }
+
+    #[test]
+    fn inventory_limit_switches_to_risk_reducing_one_sided_quote() {
+        let config = config();
+        let quote = generate_shadow_quote_controlled(
+            &selection(),
+            &book("1", dec!(0.48), dec!(0.52)),
+            &book("2", dec!(0.48), dec!(0.52)),
+            &config,
+            Utc::now(),
+            dec!(0.01),
+            config.max_inventory_shares,
+        )
+        .unwrap();
+        assert!(!quote.yes_active);
+        assert!(quote.no_active);
+        assert_eq!(quote.quote_mode, "no-only");
+        assert_eq!(quote.estimated_visible_reward_share, Decimal::ZERO);
+    }
+
+    #[test]
+    fn high_fee_markets_require_extra_volume() {
+        let mut config = config();
+        config.min_volume_24h_usdc = dec!(1000);
+        config.high_fee_threshold = dec!(0.04);
+        config.high_fee_volume_multiplier = dec!(2);
+        let mut candidate = selection().market;
+        candidate.volume_24h_usdc = dec!(1500);
+        assert!(rank_candidates(vec![candidate.clone()], &config).is_empty());
+        candidate.volume_24h_usdc = dec!(2000);
+        assert_eq!(rank_candidates(vec![candidate], &config).len(), 1);
     }
 
     #[test]

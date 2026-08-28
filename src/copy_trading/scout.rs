@@ -1277,11 +1277,7 @@ fn normalize_address(value: &str) -> Result<String> {
     }
 }
 fn normalize_label(value: &str) -> String {
-    value
-        .trim()
-        .to_ascii_lowercase()
-        .replace('_', "-")
-        .replace(' ', "-")
+    value.trim().to_ascii_lowercase().replace(['_', ' '], "-")
 }
 fn mode(values: impl Iterator<Item = String>) -> Option<String> {
     let mut counts = BTreeMap::<String, usize>::new();

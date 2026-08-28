@@ -1,10 +1,10 @@
 use anyhow::{bail, Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Timelike, Utc};
 use futures::{stream, StreamExt};
 use rust_decimal::Decimal;
 use serde::Serialize;
 use serde_json::json;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
@@ -15,16 +15,17 @@ use tokio::time::{interval, MissedTickBehavior};
 use super::client::MakerResearchClient;
 use super::config::MakerResearchConfig;
 use super::model::{
-    generate_shadow_quote, markout_observation, BookSnapshot, MarketSelection, MarketTrade,
-    ShadowMarkout, ShadowQuote,
+    fair_prices, generate_shadow_quote_controlled, markout_observation, BookSnapshot,
+    MarketSelection, MarketTrade, ShadowMarkout, ShadowQuote,
 };
 
 struct ResearchJournal {
     writer: Mutex<File>,
+    run_id: String,
 }
 
 impl ResearchJournal {
-    fn open(path: &Path) -> Result<Self> {
+    fn open(path: &Path, run_id: String) -> Result<Self> {
         if let Some(parent) = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -34,6 +35,7 @@ impl ResearchJournal {
         let writer = OpenOptions::new().create(true).append(true).open(path)?;
         Ok(Self {
             writer: Mutex::new(writer),
+            run_id,
         })
     }
 
@@ -41,6 +43,7 @@ impl ResearchJournal {
         let event = json!({
             "action": action,
             "version": 2,
+            "run_id": self.run_id,
             "timestamp": Utc::now(),
             "data": data,
         });
@@ -56,6 +59,8 @@ struct PendingQuote {
     quote: ShadowQuote,
     active_until: Option<DateTime<Utc>>,
     observed_horizons: HashSet<u64>,
+    accounted_yes_fill_shares: Decimal,
+    accounted_no_fill_shares: Decimal,
 }
 
 struct MarketState {
@@ -65,12 +70,23 @@ struct MarketState {
     consecutive_quote_rejections: u32,
     pending: Vec<PendingQuote>,
     recent_trades: Vec<MarketTrade>,
+    last_fair_yes: Option<(Decimal, DateTime<Utc>)>,
+    last_book_versions: Option<(Option<i64>, Option<i64>)>,
+    book_updates: VecDeque<DateTime<Utc>>,
+    virtual_yes_inventory: Decimal,
+    virtual_no_inventory: Decimal,
+    consecutive_negative_markouts: u32,
+    experiment_index: usize,
+    quote_times: VecDeque<DateTime<Utc>>,
 }
 
 pub async fn run_market_scan(client: &MakerResearchClient) -> Result<Vec<MarketSelection>> {
     let selected = client.discover().await?;
     print_selections(&selected);
-    let journal = ResearchJournal::open(&client.config().results_file)?;
+    let journal = ResearchJournal::open(
+        &client.config().results_file,
+        format!("scan-{}", uuid::Uuid::new_v4()),
+    )?;
     journal.record(
         "market_scan",
         &json!({
@@ -99,6 +115,35 @@ struct HorizonSummary {
     filled_capital_usdc: Decimal,
 }
 
+impl HorizonSummary {
+    fn observe(&mut self, markout: &ShadowMarkout, quote: Option<&ShadowQuote>) {
+        self.observations += 1;
+        self.trade_data_observations += u64::from(markout.trade_data_available);
+        self.touched_legs += u64::from(markout.yes_touched) + u64::from(markout.no_touched);
+        self.trade_through_legs +=
+            u64::from(markout.yes_trade_through) + u64::from(markout.no_trade_through);
+        self.fill_proxy_shares += markout.yes_fill_proxy_shares + markout.no_fill_proxy_shares;
+        self.inventory_markout_usdc += markout.inventory_markout_usdc;
+        self.estimated_rebate_usdc += markout.estimated_rebate_usdc;
+        self.combined_usdc += markout.markout_plus_rebate_usdc;
+        self.paired_locked_pnl_usdc += markout.paired_locked_pnl_usdc.unwrap_or_default();
+        if markout.yes_fill_proxy_shares + markout.no_fill_proxy_shares > Decimal::ZERO {
+            self.filled_quote_ids.insert(markout.quote_id.clone());
+            if let Some(quote) = quote {
+                self.filled_capital_usdc += quote.yes_bid * markout.yes_fill_proxy_shares
+                    + quote.no_bid * markout.no_fill_proxy_shares;
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct RunSummary {
+    started: u64,
+    stopped: u64,
+    horizons: BTreeMap<u64, HorizonSummary>,
+}
+
 pub fn run_report(path: &Path) -> Result<()> {
     let reader = BufReader::new(
         File::open(path).with_context(|| format!("failed to open {}", path.display()))?,
@@ -112,6 +157,13 @@ pub fn run_report(path: &Path) -> Result<()> {
     let mut visible_daily_reward_sum = Decimal::ZERO;
     let mut v2_quote_count = 0_u64;
     let mut horizons = BTreeMap::<u64, HorizonSummary>::new();
+    let mut runs = BTreeMap::<String, RunSummary>::new();
+    let mut market_metadata = HashMap::<String, (String, String)>::new();
+    let mut category_horizons = BTreeMap::<(u64, String), HorizonSummary>::new();
+    let mut market_horizons = BTreeMap::<(u64, String), HorizonSummary>::new();
+    let mut experiment_horizons = BTreeMap::<(u64, Decimal), HorizonSummary>::new();
+    let mut price_horizons = BTreeMap::<(u64, String), HorizonSummary>::new();
+    let mut hour_horizons = BTreeMap::<(u64, String), HorizonSummary>::new();
     for (line_number, line) in reader.lines().enumerate() {
         let line = line.with_context(|| format!("failed reading line {}", line_number + 1))?;
         if line.trim().is_empty() {
@@ -122,13 +174,34 @@ pub fn run_report(path: &Path) -> Result<()> {
         if let Some(version) = event.get("version").and_then(serde_json::Value::as_u64) {
             schema_versions.insert(version);
         }
+        let run_id = event
+            .get("run_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("legacy")
+            .to_string();
         match event.get("action").and_then(serde_json::Value::as_str) {
+            Some("run_started") => runs.entry(run_id).or_default().started += 1,
+            Some("run_stopped") => runs.entry(run_id).or_default().stopped += 1,
             Some("market_selected") => {
                 if let Some(id) = event
                     .pointer("/data/condition_id")
                     .and_then(serde_json::Value::as_str)
                 {
                     selected.insert(id.to_string());
+                }
+                if let (Some(id), Some(category), Some(slug)) = (
+                    event
+                        .pointer("/data/condition_id")
+                        .and_then(serde_json::Value::as_str),
+                    event
+                        .pointer("/data/category")
+                        .and_then(serde_json::Value::as_str),
+                    event
+                        .pointer("/data/slug")
+                        .and_then(serde_json::Value::as_str),
+                ) {
+                    market_metadata
+                        .insert(id.to_string(), (category.to_string(), slug.to_string()));
                 }
             }
             Some("shadow_quote") => {
@@ -146,27 +219,45 @@ pub fn run_report(path: &Path) -> Result<()> {
             Some("markout") => {
                 let markout: ShadowMarkout = serde_json::from_value(event["data"].clone())
                     .with_context(|| format!("invalid markout at line {}", line_number + 1))?;
-                let summary = horizons.entry(markout.target_horizon_secs).or_default();
-                summary.observations += 1;
-                summary.trade_data_observations += u64::from(markout.trade_data_available);
-                summary.touched_legs +=
-                    u64::from(markout.yes_touched) + u64::from(markout.no_touched);
-                summary.trade_through_legs +=
-                    u64::from(markout.yes_trade_through) + u64::from(markout.no_trade_through);
-                summary.fill_proxy_shares +=
-                    markout.yes_fill_proxy_shares + markout.no_fill_proxy_shares;
-                summary.inventory_markout_usdc += markout.inventory_markout_usdc;
-                summary.estimated_rebate_usdc += markout.estimated_rebate_usdc;
-                summary.combined_usdc += markout.markout_plus_rebate_usdc;
-                summary.paired_locked_pnl_usdc +=
-                    markout.paired_locked_pnl_usdc.unwrap_or_default();
-                let fill_shares = markout.yes_fill_proxy_shares + markout.no_fill_proxy_shares;
-                if fill_shares > Decimal::ZERO {
-                    summary.filled_quote_ids.insert(markout.quote_id.clone());
-                    if let Some(quote) = quote_details.get(&markout.quote_id) {
-                        summary.filled_capital_usdc += quote.yes_bid
-                            * markout.yes_fill_proxy_shares
-                            + quote.no_bid * markout.no_fill_proxy_shares;
+                let quote = quote_details.get(&markout.quote_id);
+                horizons
+                    .entry(markout.target_horizon_secs)
+                    .or_default()
+                    .observe(&markout, quote);
+                runs.entry(run_id)
+                    .or_default()
+                    .horizons
+                    .entry(markout.target_horizon_secs)
+                    .or_default()
+                    .observe(&markout, quote);
+                if let Some(quote) = quote {
+                    experiment_horizons
+                        .entry((markout.target_horizon_secs, quote.base_quote_half_spread))
+                        .or_default()
+                        .observe(&markout, Some(quote));
+                    price_horizons
+                        .entry((
+                            markout.target_horizon_secs,
+                            midpoint_bucket(quote.fair_yes).to_string(),
+                        ))
+                        .or_default()
+                        .observe(&markout, Some(quote));
+                    hour_horizons
+                        .entry((
+                            markout.target_horizon_secs,
+                            format!("{:02}:00Z", quote.created_at.hour()),
+                        ))
+                        .or_default()
+                        .observe(&markout, Some(quote));
+                    if let Some((category, slug)) = market_metadata.get(&markout.condition_id) {
+                        category_horizons
+                            .entry((markout.target_horizon_secs, category.clone()))
+                            .or_default()
+                            .observe(&markout, Some(quote));
+                        market_horizons
+                            .entry((markout.target_horizon_secs, slug.clone()))
+                            .or_default()
+                            .observe(&markout, Some(quote));
                     }
                 }
             }
@@ -184,7 +275,8 @@ pub fn run_report(path: &Path) -> Result<()> {
     println!(
         "horizon  obs  fills  trade_data  touched  through  proxy_shares  capital  combined  roi_pct  paired"
     );
-    for (horizon, summary) in horizons {
+    let analysis_horizon = horizons.keys().next_back().copied();
+    for (horizon, summary) in &horizons {
         println!(
             "{:>6}s {:>5} {:>6} {:>11} {:>8} {:>8} {:>13} {:>8} {:>9} {:>8} {:>7}",
             horizon,
@@ -204,6 +296,39 @@ pub fn run_report(path: &Path) -> Result<()> {
             .round_dp(4),
             summary.paired_locked_pnl_usdc.round_dp(4),
         );
+    }
+    println!("runs={}", runs.len());
+    for (run_id, run) in &runs {
+        let final_summary = analysis_horizon.and_then(|horizon| run.horizons.get(&horizon));
+        println!(
+            "run={} started={} stopped={} final_fills={} final_combined={}",
+            run_id,
+            run.started,
+            run.stopped,
+            final_summary.map_or(0, |summary| summary.filled_quote_ids.len()),
+            final_summary
+                .map_or(Decimal::ZERO, |summary| summary.combined_usdc)
+                .round_dp(4),
+        );
+    }
+    if let Some(horizon) = analysis_horizon {
+        print_dimension("category", horizon, &category_horizons, false);
+        print_dimension("market", horizon, &market_horizons, true);
+        print_dimension("midpoint_bucket", horizon, &price_horizons, false);
+        print_dimension("hour_utc", horizon, &hour_horizons, false);
+        println!("experiment @ {}s:", horizon);
+        for ((group_horizon, distance), summary) in &experiment_horizons {
+            if *group_horizon == horizon {
+                println!(
+                    "  distance={} obs={} fills={} combined={} roi={}%,",
+                    distance,
+                    summary.observations,
+                    summary.filled_quote_ids.len(),
+                    summary.combined_usdc.round_dp(4),
+                    summary_roi(summary).round_dp(4),
+                );
+            }
+        }
     }
     if v2_quote_count > 0 {
         let denominator = Decimal::from(v2_quote_count);
@@ -226,6 +351,54 @@ pub fn run_report(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn summary_roi(summary: &HorizonSummary) -> Decimal {
+    if summary.filled_capital_usdc > Decimal::ZERO {
+        summary.combined_usdc / summary.filled_capital_usdc * Decimal::from(100)
+    } else {
+        Decimal::ZERO
+    }
+}
+
+fn midpoint_bucket(midpoint: Decimal) -> &'static str {
+    if midpoint < Decimal::new(2, 1) {
+        "[0.0,0.2)"
+    } else if midpoint < Decimal::new(4, 1) {
+        "[0.2,0.4)"
+    } else if midpoint < Decimal::new(6, 1) {
+        "[0.4,0.6)"
+    } else if midpoint < Decimal::new(8, 1) {
+        "[0.6,0.8)"
+    } else {
+        "[0.8,1.0]"
+    }
+}
+
+fn print_dimension(
+    label: &str,
+    horizon: u64,
+    summaries: &BTreeMap<(u64, String), HorizonSummary>,
+    fills_only: bool,
+) {
+    let mut rows = summaries
+        .iter()
+        .filter(|((group_horizon, _), summary)| {
+            *group_horizon == horizon && (!fills_only || !summary.filled_quote_ids.is_empty())
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by_key(|(_, summary)| std::cmp::Reverse(summary.combined_usdc));
+    println!("{} @ {}s:", label, horizon);
+    for ((_, name), summary) in rows.into_iter().take(20) {
+        println!(
+            "  {} obs={} fills={} combined={} roi={}%,",
+            name,
+            summary.observations,
+            summary.filled_quote_ids.len(),
+            summary.combined_usdc.round_dp(4),
+            summary_roi(summary).round_dp(4),
+        );
+    }
+}
+
 pub async fn run_shadow_maker(client: MakerResearchClient) -> Result<()> {
     let config = client.config().clone();
     let selections = client.discover().await?;
@@ -233,11 +406,14 @@ pub async fn run_shadow_maker(client: MakerResearchClient) -> Result<()> {
         bail!("no reward markets passed Maker Liquidity research filters");
     }
     print_selections(&selections);
-    let journal = ResearchJournal::open(&config.results_file)?;
+    client.start_book_stream(&selections);
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let journal = ResearchJournal::open(&config.results_file, run_id.clone())?;
     journal.record(
         "run_started",
         &json!({
             "mode": "shadow",
+            "run_id": run_id,
             "selected_count": selections.len(),
             "config": config_summary(&config),
         }),
@@ -254,6 +430,14 @@ pub async fn run_shadow_maker(client: MakerResearchClient) -> Result<()> {
             consecutive_quote_rejections: 0,
             pending: Vec::new(),
             recent_trades: Vec::new(),
+            last_fair_yes: None,
+            last_book_versions: None,
+            book_updates: VecDeque::new(),
+            virtual_yes_inventory: Decimal::ZERO,
+            virtual_no_inventory: Decimal::ZERO,
+            consecutive_negative_markouts: 0,
+            experiment_index: 0,
+            quote_times: VecDeque::new(),
         })
         .collect::<Vec<_>>();
     let started_at = Utc::now();
@@ -372,6 +556,7 @@ pub async fn run_shadow_maker(client: MakerResearchClient) -> Result<()> {
                 }
             };
             let state = &mut states[index];
+            record_book_activity(state, &yes_book, &no_book, now, &config);
             if trade_data_available {
                 merge_recent_trades(state, trades, now, &config);
             }
@@ -386,6 +571,39 @@ pub async fn run_shadow_maker(client: MakerResearchClient) -> Result<()> {
                 &mut markout_count,
                 &mut error_count,
             )?;
+            if state.consecutive_negative_markouts >= config.max_consecutive_negative_markouts {
+                cool_down_market(
+                    &state.selection.market.condition_id,
+                    state.consecutive_negative_markouts,
+                    "negative_markout",
+                    &config,
+                    now,
+                    &mut cooldowns,
+                    &journal,
+                )?;
+                continue;
+            }
+            let (fair_yes, _) = fair_prices(&yes_book, &no_book)?;
+            let midpoint_moved = state.last_fair_yes.is_some_and(|(previous, observed_at)| {
+                now.signed_duration_since(observed_at).num_seconds()
+                    <= i64::try_from(config.midpoint_move_window_secs).unwrap_or(i64::MAX)
+                    && (fair_yes - previous).abs() > config.max_midpoint_move
+            });
+            state.last_fair_yes = Some((fair_yes, now));
+            if midpoint_moved {
+                cancel_open_quote(state, now, &journal, "midpoint_move_protection")?;
+                state.last_quote_attempt_at = Some(now);
+                journal.record(
+                    "quote_paused",
+                    &json!({
+                        "condition_id": state.selection.market.condition_id,
+                        "reason": "midpoint_move_protection",
+                        "max_midpoint_move": config.max_midpoint_move,
+                        "window_secs": config.midpoint_move_window_secs,
+                    }),
+                )?;
+                continue;
+            }
             let should_quote = state.last_quote_attempt_at.is_none_or(|last| {
                 now.signed_duration_since(last).num_seconds()
                     >= i64::try_from(config.quote_interval_secs).unwrap_or(i64::MAX)
@@ -393,7 +611,56 @@ pub async fn run_shadow_maker(client: MakerResearchClient) -> Result<()> {
             if should_quote {
                 cancel_open_quote(state, now, &journal, "replaced_or_expired")?;
                 state.last_quote_attempt_at = Some(now);
-                match generate_shadow_quote(&state.selection, &yes_book, &no_book, &config, now) {
+                let recent_trade_count = state
+                    .recent_trades
+                    .iter()
+                    .filter(|trade| trade.timestamp >= now.timestamp() - 3_600)
+                    .count();
+                while state
+                    .quote_times
+                    .front()
+                    .is_some_and(|quoted_at| *quoted_at < now - chrono::Duration::hours(1))
+                {
+                    state.quote_times.pop_front();
+                }
+                let pause_reason =
+                    if fair_yes < config.min_midpoint || fair_yes > config.max_midpoint {
+                        Some("runtime_midpoint_out_of_range")
+                    } else if recent_trade_count < config.min_trades_1h {
+                        Some("insufficient_recent_trades")
+                    } else if state.book_updates.len() < config.min_book_updates {
+                        Some("insufficient_book_updates")
+                    } else if state.quote_times.len() >= config.max_quotes_per_market_hour {
+                        Some("quote_rate_limit")
+                    } else {
+                        None
+                    };
+                if let Some(reason) = pause_reason {
+                    journal.record(
+                        "quote_paused",
+                        &json!({
+                            "condition_id": state.selection.market.condition_id,
+                            "reason": reason,
+                            "recent_trades_1h": recent_trade_count,
+                            "book_updates_in_window": state.book_updates.len(),
+                            "fair_yes": fair_yes,
+                        }),
+                    )?;
+                    continue;
+                }
+                let base_distance = config.quote_half_spread_grid
+                    [state.experiment_index % config.quote_half_spread_grid.len()];
+                state.experiment_index = state.experiment_index.saturating_add(1);
+                let inventory_net = state.virtual_yes_inventory - state.virtual_no_inventory;
+                match generate_shadow_quote_controlled(
+                    &state.selection,
+                    &yes_book,
+                    &no_book,
+                    &config,
+                    now,
+                    base_distance,
+                    inventory_net,
+                ) {
                     Ok(quote) => {
                         state.consecutive_quote_rejections = 0;
                         journal.record("shadow_quote", &quote)?;
@@ -406,13 +673,19 @@ pub async fn run_shadow_maker(client: MakerResearchClient) -> Result<()> {
                             visible_reward_share = %quote.estimated_visible_reward_share,
                             estimated_daily_reward = %quote.estimated_daily_liquidity_reward_usdc,
                             pair_discount = %quote.complete_set_discount_per_share,
+                            quote_mode = %quote.quote_mode,
+                            base_distance = %quote.base_quote_half_spread,
+                            inventory_net = %quote.inventory_net_before,
                             "Shadow maker quote"
                         );
                         state.pending.push(PendingQuote {
                             quote,
                             active_until: None,
                             observed_horizons: HashSet::new(),
+                            accounted_yes_fill_shares: Decimal::ZERO,
+                            accounted_no_fill_shares: Decimal::ZERO,
                         });
+                        state.quote_times.push_back(now);
                         quote_count += 1;
                     }
                     Err(error) => {
@@ -478,6 +751,10 @@ fn observe_pending_markouts(
     error_count: &mut u64,
 ) -> Result<()> {
     let recent_trades = &state.recent_trades;
+    let final_horizon = config.markout_horizons_secs.last().copied();
+    let mut inventory_yes_delta = Decimal::ZERO;
+    let mut inventory_no_delta = Decimal::ZERO;
+    let mut negative_markout_updates = Vec::new();
     for pending in &mut state.pending {
         let age_secs = now
             .signed_duration_since(pending.quote.created_at)
@@ -498,6 +775,27 @@ fn observe_pending_markouts(
                 now,
             ) {
                 Ok(markout) => {
+                    let yes_delta = (markout.yes_fill_proxy_shares
+                        - pending.accounted_yes_fill_shares)
+                        .max(Decimal::ZERO);
+                    let no_delta = (markout.no_fill_proxy_shares
+                        - pending.accounted_no_fill_shares)
+                        .max(Decimal::ZERO);
+                    pending.accounted_yes_fill_shares = pending
+                        .accounted_yes_fill_shares
+                        .max(markout.yes_fill_proxy_shares);
+                    pending.accounted_no_fill_shares = pending
+                        .accounted_no_fill_shares
+                        .max(markout.no_fill_proxy_shares);
+                    inventory_yes_delta += yes_delta;
+                    inventory_no_delta += no_delta;
+                    if Some(*horizon) == final_horizon
+                        && markout.yes_fill_proxy_shares + markout.no_fill_proxy_shares
+                            > Decimal::ZERO
+                    {
+                        negative_markout_updates
+                            .push(markout.markout_plus_rebate_usdc < Decimal::ZERO);
+                    }
                     journal.record("markout", &markout)?;
                     pending.observed_horizons.insert(*horizon);
                     *markout_count += 1;
@@ -517,6 +815,29 @@ fn observe_pending_markouts(
                 }
             }
         }
+    }
+    state.virtual_yes_inventory += inventory_yes_delta;
+    state.virtual_no_inventory += inventory_no_delta;
+    for negative in negative_markout_updates {
+        if negative {
+            state.consecutive_negative_markouts =
+                state.consecutive_negative_markouts.saturating_add(1);
+        } else {
+            state.consecutive_negative_markouts = 0;
+        }
+    }
+    if inventory_yes_delta > Decimal::ZERO || inventory_no_delta > Decimal::ZERO {
+        journal.record(
+            "virtual_inventory_updated",
+            &json!({
+                "condition_id": state.selection.market.condition_id,
+                "yes_delta": inventory_yes_delta,
+                "no_delta": inventory_no_delta,
+                "yes_inventory": state.virtual_yes_inventory,
+                "no_inventory": state.virtual_no_inventory,
+                "net_inventory": state.virtual_yes_inventory - state.virtual_no_inventory,
+            }),
+        )?;
     }
     let horizon_count = config.markout_horizons_secs.len();
     state
@@ -589,6 +910,27 @@ fn maybe_cool_down_market(
     if consecutive_errors < config.max_consecutive_market_errors {
         return Ok(());
     }
+    cool_down_market(
+        condition_id,
+        consecutive_errors,
+        reason,
+        config,
+        now,
+        cooldowns,
+        journal,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cool_down_market(
+    condition_id: &str,
+    trigger_count: u32,
+    reason: &'static str,
+    config: &MakerResearchConfig,
+    now: DateTime<Utc>,
+    cooldowns: &mut HashMap<String, DateTime<Utc>>,
+    journal: &ResearchJournal,
+) -> Result<()> {
     if cooldowns.contains_key(condition_id) {
         return Ok(());
     }
@@ -599,11 +941,39 @@ fn maybe_cool_down_market(
         "market_cooled_down",
         &json!({
             "condition_id": condition_id,
-            "consecutive_errors": consecutive_errors,
+            "trigger_count": trigger_count,
             "reason": reason,
             "cooldown_until": until,
         }),
     )
+}
+
+fn record_book_activity(
+    state: &mut MarketState,
+    yes_book: &BookSnapshot,
+    no_book: &BookSnapshot,
+    now: DateTime<Utc>,
+    config: &MakerResearchConfig,
+) {
+    let versions = (
+        yes_book.exchange_timestamp_ms,
+        no_book.exchange_timestamp_ms,
+    );
+    if state.last_book_versions != Some(versions) {
+        state.last_book_versions = Some(versions);
+        state.book_updates.push_back(now);
+    }
+    let cutoff = now
+        - chrono::Duration::seconds(
+            i64::try_from(config.book_activity_window_secs).unwrap_or(i64::MAX),
+        );
+    while state
+        .book_updates
+        .front()
+        .is_some_and(|observed_at| *observed_at < cutoff)
+    {
+        state.book_updates.pop_front();
+    }
 }
 
 async fn refresh_market_states(
@@ -614,6 +984,7 @@ async fn refresh_market_states(
 ) -> Result<()> {
     let excluded = cooldowns.keys().cloned().collect::<HashSet<_>>();
     let selections = client.discover_excluding(&excluded).await?;
+    client.start_book_stream(&selections);
     let mut old = states
         .drain(..)
         .map(|state| (state.selection.market.condition_id.clone(), state))
@@ -633,6 +1004,14 @@ async fn refresh_market_states(
                 consecutive_quote_rejections: 0,
                 pending: Vec::new(),
                 recent_trades: Vec::new(),
+                last_fair_yes: None,
+                last_book_versions: None,
+                book_updates: VecDeque::new(),
+                virtual_yes_inventory: Decimal::ZERO,
+                virtual_no_inventory: Decimal::ZERO,
+                consecutive_negative_markouts: 0,
+                experiment_index: 0,
+                quote_times: VecDeque::new(),
             });
         }
     }
@@ -679,7 +1058,8 @@ fn merge_recent_trades(
         .copied()
         .unwrap_or_default()
         .saturating_add(config.quote_interval_secs)
-        .saturating_add(5);
+        .saturating_add(5)
+        .max(3_600);
     let cutoff = now.timestamp() - i64::try_from(retention_secs).unwrap_or(i64::MAX);
     state
         .recent_trades
@@ -720,11 +1100,26 @@ fn config_summary(config: &MakerResearchConfig) -> serde_json::Value {
         "min_daily_reward_usdc": config.min_daily_reward_usdc,
         "max_rewards_min_size": config.max_rewards_min_size,
         "min_liquidity_usdc": config.min_liquidity_usdc,
+        "min_volume_24h_usdc": config.min_volume_24h_usdc,
+        "max_fee_rate": config.max_fee_rate,
+        "high_fee_threshold": config.high_fee_threshold,
+        "high_fee_volume_multiplier": config.high_fee_volume_multiplier,
         "max_observed_spread": config.max_observed_spread,
         "midpoint_range": [config.min_midpoint, config.max_midpoint],
         "market_filter": config.market_filter,
         "quote_size_shares": config.quote_size_shares,
         "quote_half_spread": config.quote_half_spread,
+        "quote_half_spread_grid": config.quote_half_spread_grid,
+        "dynamic_quote_distance": config.dynamic_quote_distance,
+        "max_midpoint_move": config.max_midpoint_move,
+        "midpoint_move_window_secs": config.midpoint_move_window_secs,
+        "min_trades_1h": config.min_trades_1h,
+        "book_activity_window_secs": config.book_activity_window_secs,
+        "min_book_updates": config.min_book_updates,
+        "max_inventory_shares": config.max_inventory_shares,
+        "inventory_skew_per_share": config.inventory_skew_per_share,
+        "max_consecutive_negative_markouts": config.max_consecutive_negative_markouts,
+        "max_quotes_per_market_hour": config.max_quotes_per_market_hour,
         "reward_band_fraction": config.reward_band_fraction,
         "book_poll_secs": config.book_poll_secs,
         "quote_interval_secs": config.quote_interval_secs,
@@ -732,6 +1127,11 @@ fn config_summary(config: &MakerResearchConfig) -> serde_json::Value {
         "market_cooldown_secs": config.market_cooldown_secs,
         "max_consecutive_market_errors": config.max_consecutive_market_errors,
         "min_time_to_end_secs": config.min_time_to_end_secs,
+        "http_max_retries": config.http_max_retries,
+        "retry_base_ms": config.retry_base_ms,
+        "trade_cache_secs": config.trade_cache_secs,
+        "websocket_books": config.websocket_books,
+        "websocket_book_max_age_ms": config.websocket_book_max_age_ms,
         "markout_horizons_secs": config.markout_horizons_secs,
         "duration_secs": config.duration_secs,
     })

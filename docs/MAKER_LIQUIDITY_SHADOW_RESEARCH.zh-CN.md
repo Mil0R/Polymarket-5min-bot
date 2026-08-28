@@ -5,7 +5,13 @@
 ## 已实现范围
 
 - 市场筛选器：从当前有 Liquidity Rewards 的市场开始，按每日奖励、最低报价份额、流动性、价差、价格区间、活跃度和竞争强度排序。
+- 默认优先选择 24 小时成交量至少 `$1,000`、流动性至少 `$300`、观察价差不超过 6%、费率不超过 5% 的市场；可通过 `.env` 调整。
 - Shadow Maker：同时构造 YES/NO post-only bid，限制在奖励计分带内，并记录假设占用资金、完整份额折价和理论 maker rebate。
+- 报价距离会根据当前两腿盘口价差动态增加保护边际；短窗口内公平价移动超过阈值时暂停报价，避免主动承接快速逆向行情。
+- 按 `MAKER_QUOTE_HALF_SPREAD_GRID` 轮换实验报价距离，报告会分别汇总各实验组，不再需要启动三个进程。
+- 运行时要求最近一小时有足够成交且盘口在观察窗口内持续更新；静态盘口只记录 `quote_paused`，不会生成虚假可行报价。
+- 维护 queue-aware 虚拟库存；库存偏离时自动偏移两侧报价，到达上限后只保留降低净敞口的一侧。连续负 60 秒 markout 会冷却并替换市场。
+- WebSocket 提供实时盘口，过期或断线时自动回退到带指数退避的 HTTP；Data API 交易请求带短时缓存。
 - 成交代理：读取公开 taker trades。相同 token 的主动 `SELL` 在 shadow bid 或更低成交，记为触价成交代理；低于 bid 的成交另记为 `trade_through` 强证据。
 - Markout：在 1/5/30/60 秒等时间点计算库存 markout、按推定成交份额折算的 rebate，以及双腿均成交时的配对锁定收益。
 - NDJSON 研究日志和离线汇总报告。
@@ -40,7 +46,7 @@ cargo build --release --bin maker_liquidity
 新一轮修正后的默认结果文件为：
 
 ```bash
-./target/release/maker_liquidity report results/maker-liquidity/shadow-run-002/events.ndjson
+./target/release/maker_liquidity report results/maker-liquidity/shadow-run-003/events.ndjson
 ```
 
 ## Shadow v2 的保守成交口径
@@ -53,6 +59,21 @@ cargo build --release --bin maker_liquidity
 市场会按 `MAKER_MARKET_REFRESH_SECS` 周期重新筛选；连续盘口/报价异常达到
 `MAKER_MAX_CONSECUTIVE_MARKET_ERRORS` 后，会按 `MAKER_MARKET_COOLDOWN_SECS`
 暂时排除，并自动寻找替代市场。`MAKER_MIN_TIME_TO_END_SECS` 用于排除临近结束的市场。
+
+当公平价在 `MAKER_MIDPOINT_MOVE_WINDOW_SECS` 内移动超过
+`MAKER_MAX_MIDPOINT_MOVE`，日志会记录 `quote_paused`，该轮不会生成新报价。
+`MAKER_QUOTE_HALF_SPREAD` 是基础距离，`MAKER_DYNAMIC_QUOTE_DISTANCE=true` 时会按当前盘口价差增加动态边际。
+
+## Shadow v3 风控和实验
+
+- 每次启动生成独立 `run_id`；即使多次运行追加到同一文件，`report` 也会显示每个运行是否正常 `stopped`，不会再把重启误认为一段连续运行。
+- `MAKER_QUOTE_HALF_SPREAD_GRID=0.01,0.02,0.03` 按轮次均匀切换实验距离，`shadow_quote.base_quote_half_spread` 保存实验组。
+- `MAKER_MIN_TRADES_1H` 和 `MAKER_MIN_BOOK_UPDATES` 同时约束交易活跃度与盘口活跃度。
+- 高费率市场需要满足 `MAKER_MIN_VOLUME_24H_USDC × MAKER_HIGH_FEE_VOLUME_MULTIPLIER` 的额外成交量门槛。
+- `MAKER_MAX_INVENTORY_SHARES` 限制净 YES/NO 虚拟库存；超过上限时转为 `yes-only` 或 `no-only` 风险缩减模式，并将理论 Liquidity Rewards 记为 0。
+- `MAKER_MAX_QUOTES_PER_MARKET_HOUR` 限制单市场每小时报价次数，避免低质量市场占用全部研究预算。
+- 最长 markout 周期连续负收益达到 `MAKER_MAX_CONSECUTIVE_NEGATIVE_MARKOUTS` 后，市场进入冷却并触发重新筛选。
+- `report` 除总体结果外，还会按 run、市场分类、市场、价格区间、UTC 小时和报价距离实验组汇总。
 
 建议至少积累 100 个 60 秒周期的 queue-aware 独立成交报价，且保守返佣后的
 60 秒 markout 为正，再考虑下一阶段；在拿到实际 Liquidity Rewards 分配并校准
