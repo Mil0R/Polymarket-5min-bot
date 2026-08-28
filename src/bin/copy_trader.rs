@@ -75,6 +75,7 @@ async fn run_copy_trader(
     }
     let runtime_lock = std::fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&lock_path)

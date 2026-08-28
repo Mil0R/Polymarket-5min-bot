@@ -113,6 +113,9 @@ pub struct PendingWinnerBuy {
     /// Links the actual order lifecycle to its counterfactual model evaluation.
     #[serde(default)]
     pub evaluation_id: String,
+    /// `production` or `hybrid_paper`; empty for legacy journal records.
+    #[serde(default)]
+    pub candidate_stage: String,
     /// Asset bucket used by the independent per-asset loss circuit breaker.
     #[serde(default)]
     pub asset: String,
@@ -252,7 +255,7 @@ pub struct WinnerConfirmationObservation {
     pub confirmations: u32,
     pub required: u32,
     pub confirmed: bool,
-    /// `production` or `rejected_shadow`; legacy records deserialize empty.
+    /// `production`, `hybrid_paper`, or `rejected_shadow`; legacy records deserialize empty.
     #[serde(default)]
     pub candidate_stage: String,
 }
@@ -341,9 +344,9 @@ pub fn winner_research_cohorts(
             .to_string()
             .replace('.', "_")
     ));
-    let preferred_price = (dec!(0.96)..=dec!(0.97)).contains(&evaluation.ask_price);
+    let preferred_price = (dec!(0.96)..=dec!(0.98)).contains(&evaluation.ask_price);
     if preferred_price {
-        cohorts.push("price_096_097".to_string());
+        cohorts.push("price_096_098".to_string());
     }
     let has_chainlink_model = evaluation.opening_twap.is_some()
         && evaluation.current_twap.is_some()
@@ -352,8 +355,11 @@ pub fn winner_research_cohorts(
     if direction_agrees {
         cohorts.push("chainlink_direction_agrees".to_string());
     }
+    let positive_win_payoff =
+        evaluation.effective_entry_price < dec!(1) && evaluation.fee_per_share >= dec!(0);
     if preferred_price
         && direction_agrees
+        && positive_win_payoff
         && evaluation.spread <= max_spread
         && evaluation.depth_usdc >= min_depth_usdc
     {
@@ -1359,6 +1365,7 @@ mod tests {
         PendingWinnerBuy {
             position_id: "winner-1".into(),
             evaluation_id: "evaluation-1".into(),
+            candidate_stage: "production".into(),
             asset: "btc".into(),
             slug: "btc-updown-5m-1".into(),
             condition_id: "0x0000000000000000000000000000000000000000000000000000000000000001"
@@ -1592,7 +1599,7 @@ mod tests {
         assert!(cohorts
             .iter()
             .any(|cohort| cohort == "chainlink_direction_agrees"));
-        assert!(!cohorts.iter().any(|cohort| cohort == "price_096_097"));
+        assert!(!cohorts.iter().any(|cohort| cohort == "price_096_098"));
         assert!(!cohorts.iter().any(|cohort| cohort == "production_model"));
         let mut production_evaluation = evaluation.clone();
         production_evaluation.ask_price = dec!(0.97);
@@ -1606,6 +1613,17 @@ mod tests {
         assert!(production_cohorts
             .iter()
             .any(|cohort| cohort == "production_model"));
+
+        let mut upper_bound = production_evaluation.clone();
+        upper_bound.ask_price = dec!(0.98);
+        upper_bound.effective_entry_price = dec!(0.985);
+        assert!(winner_research_cohorts(&upper_bound, dec!(0.03), dec!(5))
+            .iter()
+            .any(|cohort| cohort == "hybrid_chainlink_veto"));
+        upper_bound.effective_entry_price = dec!(1);
+        assert!(!winner_research_cohorts(&upper_bound, dec!(0.03), dec!(5))
+            .iter()
+            .any(|cohort| cohort == "hybrid_chainlink_veto"));
         {
             let journal = WinnerEvaluationJournal::open(&path).unwrap();
             journal.record(evaluation).unwrap();

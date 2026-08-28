@@ -10,12 +10,15 @@ pub struct BayesianArbConfig {
     pub gamma_url: String,
     pub clob_url: String,
     pub results_file: PathBuf,
+    pub summary_file: PathBuf,
+    pub semantic_review_file: PathBuf,
     pub event_pages: usize,
     pub events_per_page: usize,
     pub max_relationships: usize,
     pub max_partition_legs: usize,
     pub request_concurrency: usize,
     pub poll_seconds: u64,
+    pub full_scan_seconds: u64,
     pub unchanged_log_seconds: u64,
     pub relationship_refresh_seconds: u64,
     pub summary_seconds: u64,
@@ -25,7 +28,13 @@ pub struct BayesianArbConfig {
     pub size_ladder_shares: Vec<Decimal>,
     pub min_bundle_notional_usdc: Decimal,
     pub min_net_edge: Decimal,
+    pub near_miss_edge: Decimal,
     pub execution_buffer_pct: Decimal,
+    pub execution_buffer_curve_pct: Vec<Decimal>,
+    pub near_miss_log_seconds: u64,
+    pub ordinary_log_seconds: u64,
+    pub websocket_books: bool,
+    pub websocket_book_max_age_ms: i64,
     pub semantic_allowlist: Vec<String>,
 }
 
@@ -37,14 +46,22 @@ impl BayesianArbConfig {
             clob_url: env::var("CLOB_API_URL")
                 .unwrap_or_else(|_| "https://clob.polymarket.com".into()),
             results_file: PathBuf::from(env::var("BAYESIAN_RESULTS_FILE").unwrap_or_else(|_| {
-                "results/bayesian-arbitrage/shadow-run-002/events.ndjson".into()
+                "results/bayesian-arbitrage/shadow-run-003/events.ndjson".into()
             })),
+            summary_file: PathBuf::from(env::var("BAYESIAN_SUMMARY_FILE").unwrap_or_else(|_| {
+                "results/bayesian-arbitrage/shadow-run-003/summary.ndjson".into()
+            })),
+            semantic_review_file: PathBuf::from(
+                env::var("BAYESIAN_SEMANTIC_REVIEW_FILE")
+                    .unwrap_or_else(|_| "data/bayesian-semantic-reviews.json".into()),
+            ),
             event_pages: parse("BAYESIAN_EVENT_PAGES", "10")?,
             events_per_page: parse("BAYESIAN_EVENTS_PER_PAGE", "100")?,
             max_relationships: parse("BAYESIAN_MAX_RELATIONSHIPS", "500")?,
             max_partition_legs: parse("BAYESIAN_MAX_PARTITION_LEGS", "12")?,
             request_concurrency: parse("BAYESIAN_REQUEST_CONCURRENCY", "12")?,
             poll_seconds: parse("BAYESIAN_POLL_SECONDS", "10")?,
+            full_scan_seconds: parse("BAYESIAN_FULL_SCAN_SECONDS", "60")?,
             unchanged_log_seconds: parse("BAYESIAN_UNCHANGED_LOG_SECONDS", "600")?,
             relationship_refresh_seconds: parse("BAYESIAN_RELATIONSHIP_REFRESH_SECONDS", "300")?,
             summary_seconds: parse("BAYESIAN_SUMMARY_SECONDS", "600")?,
@@ -57,7 +74,16 @@ impl BayesianArbConfig {
             )?,
             min_bundle_notional_usdc: decimal_env("BAYESIAN_MIN_BUNDLE_NOTIONAL_USDC", dec!(1))?,
             min_net_edge: decimal_env("BAYESIAN_MIN_NET_EDGE", dec!(0.01))?,
+            near_miss_edge: decimal_env("BAYESIAN_NEAR_MISS_EDGE", dec!(-0.03))?,
             execution_buffer_pct: decimal_env("BAYESIAN_EXECUTION_BUFFER_PCT", dec!(0.003))?,
+            execution_buffer_curve_pct: parse_decimal_list_allow_zero(
+                "BAYESIAN_EXECUTION_BUFFER_CURVE_PCT",
+                "0,0.003,0.005,0.01",
+            )?,
+            near_miss_log_seconds: parse("BAYESIAN_NEAR_MISS_LOG_SECONDS", "60")?,
+            ordinary_log_seconds: parse("BAYESIAN_ORDINARY_LOG_SECONDS", "3600")?,
+            websocket_books: parse("BAYESIAN_WEBSOCKET_BOOKS", "true")?,
+            websocket_book_max_age_ms: parse("BAYESIAN_WEBSOCKET_BOOK_MAX_AGE_MS", "15000")?,
             semantic_allowlist: parse_string_list("BAYESIAN_SEMANTIC_ALLOWLIST"),
         };
         config.validate()?;
@@ -85,6 +111,9 @@ impl BayesianArbConfig {
         }
         if self.poll_seconds == 0 || self.poll_seconds > 3_600 {
             bail!("BAYESIAN_POLL_SECONDS must be in [1, 3600]");
+        }
+        if self.full_scan_seconds < self.poll_seconds || self.full_scan_seconds > 86_400 {
+            bail!("BAYESIAN_FULL_SCAN_SECONDS must be >= poll interval and <= 86400");
         }
         if self.unchanged_log_seconds < self.poll_seconds {
             bail!("BAYESIAN_UNCHANGED_LOG_SECONDS must be >= BAYESIAN_POLL_SECONDS");
@@ -116,8 +145,33 @@ impl BayesianArbConfig {
         if self.min_net_edge < Decimal::ZERO || self.min_net_edge >= dec!(1) {
             bail!("BAYESIAN_MIN_NET_EDGE must be in [0, 1)");
         }
+        if self.near_miss_edge < dec!(-1) || self.near_miss_edge >= self.min_net_edge {
+            bail!("BAYESIAN_NEAR_MISS_EDGE must be in [-1, BAYESIAN_MIN_NET_EDGE)");
+        }
         if self.execution_buffer_pct < Decimal::ZERO || self.execution_buffer_pct >= dec!(0.25) {
             bail!("BAYESIAN_EXECUTION_BUFFER_PCT must be in [0, 0.25)");
+        }
+        if self.execution_buffer_curve_pct.is_empty()
+            || self
+                .execution_buffer_curve_pct
+                .iter()
+                .any(|value| *value < Decimal::ZERO || *value >= dec!(0.25))
+        {
+            bail!("BAYESIAN_EXECUTION_BUFFER_CURVE_PCT values must be in [0, 0.25)");
+        }
+        if !self
+            .execution_buffer_curve_pct
+            .contains(&self.execution_buffer_pct)
+        {
+            bail!("BAYESIAN_EXECUTION_BUFFER_CURVE_PCT must include BAYESIAN_EXECUTION_BUFFER_PCT");
+        }
+        if self.near_miss_log_seconds < self.poll_seconds
+            || self.ordinary_log_seconds < self.near_miss_log_seconds
+        {
+            bail!("Bayesian detail log intervals are invalid");
+        }
+        if self.websocket_book_max_age_ms <= 0 || self.websocket_book_max_age_ms > 300_000 {
+            bail!("BAYESIAN_WEBSOCKET_BOOK_MAX_AGE_MS must be in [1, 300000]");
         }
         Ok(())
     }
@@ -163,6 +217,17 @@ fn parse_decimal_list(name: &str, default: &str) -> Result<Vec<Decimal>> {
         .map(|value| Decimal::from_str(value.trim()).with_context(|| format!("{name} is invalid")))
         .collect::<Result<Vec<_>>>()?;
     values.retain(|value| *value > Decimal::ZERO);
+    values.sort();
+    values.dedup();
+    Ok(values)
+}
+
+fn parse_decimal_list_allow_zero(name: &str, default: &str) -> Result<Vec<Decimal>> {
+    let mut values = env::var(name)
+        .unwrap_or_else(|_| default.to_string())
+        .split(',')
+        .map(|value| Decimal::from_str(value.trim()).with_context(|| format!("{name} is invalid")))
+        .collect::<Result<Vec<_>>>()?;
     values.sort();
     values.dedup();
     Ok(values)

@@ -43,7 +43,7 @@ results/
 - Spread Arbitrage `opportunities.ndjson`：达到机会初筛门槛的数据，不代表最终可成交或已经下单。
 - Spread Arbitrage `shadow-candidates.ndjson`：只在 `DRY_RUN=true` 下写入研究数据，不会改变准入或触发订单。`action=depth_rejected` 记录浅深度候选；`action=admission_rejected` 记录准入拒绝原因及滑点、tick、动态手续费后的反事实净边际；`action=rest_shadow` 记录不同延迟和名义金额下的 REST 双腿可成交情况。可通过 `admission_rejection`、`passes_gross_edge`、`passes_net_edge` 区分固定门槛和真实费用影响。
 - Winner Buy `orders.ndjson`：订单和结算事实，也是风险熔断与重启恢复的数据源。
-- Winner Buy `evaluations.ndjson`：包括拒绝和未成交候选、生产/拒绝-shadow 的连续确认进度、只读研究 cohort 与延迟撮合结果，用于阈值校准并避免幸存者偏差。拒绝候选只有完成与生产一致的连续确认后才进行 shadow 撮合。
+- Winner Buy `evaluations.ndjson`：包括拒绝和未成交候选、`production` / `hybrid_paper` / `rejected_shadow` 的连续确认进度、只读研究 cohort 与延迟撮合结果，用于阈值校准并避免幸存者偏差。拒绝候选只有完成与生产一致的连续确认后才进行 shadow 撮合；启用 PAPER 混合路径时，符合 `hybrid_chainlink_veto` 的候选还会进入正常模拟订单日志。
 
 ## 配置规则
 

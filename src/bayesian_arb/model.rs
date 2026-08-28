@@ -117,6 +117,18 @@ pub struct SizeEvaluation {
     pub rejection_reason: Option<String>,
     /// Average execution price for each relationship leg, in relationship order.
     pub leg_average_prices: Vec<Decimal>,
+    #[serde(default)]
+    pub buffer_evaluations: Vec<BufferEvaluation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BufferEvaluation {
+    pub execution_buffer_pct: Decimal,
+    pub execution_buffer_usdc: Decimal,
+    pub total_cost_usdc: Decimal,
+    pub net_profit_usdc: Decimal,
+    pub net_edge: Decimal,
+    pub qualifies: bool,
 }
 
 struct FillQuote {
@@ -132,6 +144,29 @@ pub fn evaluate_relationship(
     min_bundle_notional: Decimal,
     min_net_edge: Decimal,
     execution_buffer_pct: Decimal,
+    now: DateTime<Utc>,
+) -> RelationshipEvaluation {
+    evaluate_relationship_with_buffers(
+        relationship,
+        books,
+        size_ladder,
+        min_bundle_notional,
+        min_net_edge,
+        execution_buffer_pct,
+        &[execution_buffer_pct],
+        now,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_relationship_with_buffers(
+    relationship: &MarketRelationship,
+    books: &HashMap<String, BookSnapshot>,
+    size_ladder: &[Decimal],
+    min_bundle_notional: Decimal,
+    min_net_edge: Decimal,
+    execution_buffer_pct: Decimal,
+    execution_buffer_curve_pct: &[Decimal],
     now: DateTime<Utc>,
 ) -> RelationshipEvaluation {
     let mut best: Option<RelationshipEvaluation> = None;
@@ -180,6 +215,7 @@ pub fn evaluate_relationship(
                 qualifies: false,
                 rejection_reason: Some(last_failure.clone()),
                 leg_average_prices: Vec::new(),
+                buffer_evaluations: Vec::new(),
             });
             continue;
         }
@@ -201,6 +237,27 @@ pub fn evaluate_relationship(
         } else {
             Some("net_edge_below_threshold".into())
         };
+        let buffer_evaluations = execution_buffer_curve_pct
+            .iter()
+            .map(|buffer_pct| {
+                let scenario_buffer = payout * *buffer_pct;
+                let scenario_total = raw_cost + taker_fee + scenario_buffer;
+                let scenario_profit = payout - scenario_total;
+                let scenario_edge = if payout > Decimal::ZERO {
+                    scenario_profit / payout
+                } else {
+                    Decimal::ZERO
+                };
+                BufferEvaluation {
+                    execution_buffer_pct: *buffer_pct,
+                    execution_buffer_usdc: scenario_buffer,
+                    total_cost_usdc: scenario_total,
+                    net_profit_usdc: scenario_profit,
+                    net_edge: scenario_edge,
+                    qualifies: enough_notional && scenario_edge >= min_net_edge,
+                }
+            })
+            .collect();
         size_evaluations.push(SizeEvaluation {
             size_shares: *size,
             guaranteed_payout_usdc: payout,
@@ -214,6 +271,7 @@ pub fn evaluate_relationship(
             qualifies,
             rejection_reason: rejection_reason.clone(),
             leg_average_prices: legs.iter().map(|leg| leg.average_price).collect(),
+            buffer_evaluations,
         });
         let candidate = RelationshipEvaluation {
             relationship_id: relationship.relationship_id.clone(),
@@ -494,5 +552,41 @@ mod tests {
             .rejection_reason
             .as_deref()
             .is_some_and(|reason| reason.starts_with("insufficient_ask_depth:")));
+    }
+
+    #[test]
+    fn execution_buffer_curve_is_recorded_without_changing_primary_decision() {
+        let relation = MarketRelationship {
+            relationship_id: "buffer-curve".into(),
+            event_id: "e".into(),
+            event_slug: "e".into(),
+            event_title: "e".into(),
+            kind: RelationshipKind::DeadlineImplication,
+            semantic_status: "test".into(),
+            evidence: vec![],
+            minimum_payout_per_share: dec!(1),
+            live_eligible: false,
+            legs: vec![leg("a", "a", Outcome::Yes), leg("b", "b", Outcome::No)],
+        };
+        let books = HashMap::from([
+            ("a".into(), book("a", dec!(0.48), dec!(10))),
+            ("b".into(), book("b", dec!(0.48), dec!(10))),
+        ]);
+        let result = evaluate_relationship_with_buffers(
+            &relation,
+            &books,
+            &[dec!(10)],
+            dec!(1),
+            dec!(0.01),
+            dec!(0.003),
+            &[dec!(0), dec!(0.003), dec!(0.01)],
+            Utc::now(),
+        );
+        let curve = &result.size_evaluations[0].buffer_evaluations;
+        assert_eq!(curve.len(), 3);
+        assert!(curve[0].net_edge > curve[1].net_edge);
+        assert!(curve[1].net_edge > curve[2].net_edge);
+        assert_eq!(result.net_edge, Some(curve[1].net_edge));
+        assert!(result.qualifies);
     }
 }

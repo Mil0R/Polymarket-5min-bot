@@ -93,8 +93,11 @@ struct ArbitrageRestShadowRecord {
     signal_net_edge_per_share: String,
     required_gross_edge_per_share: String,
     required_net_edge_per_share: String,
+    required_dynamic_gross_edge_per_share: String,
     passes_gross_edge: bool,
     passes_net_edge: bool,
+    dynamic_fee_gate_active: bool,
+    passes_active_gate: bool,
     max_leg_notional_usdc: String,
     requested_size: String,
     yes_filled: String,
@@ -150,8 +153,11 @@ struct ArbitrageAdmissionShadowRecord {
     signal_net_edge_per_share: String,
     required_gross_edge_per_share: String,
     required_net_edge_per_share: String,
+    required_dynamic_gross_edge_per_share: String,
     passes_gross_edge: bool,
     passes_net_edge: bool,
+    dynamic_fee_gate_active: bool,
+    passes_active_gate: bool,
     fee_rate: String,
     fee_exponent: u32,
     minimum_order_size: String,
@@ -255,8 +261,13 @@ pub fn log_arbitrage_rest_shadow(
         signal_net_edge_per_share: quote.edge_per_share.to_string(),
         required_gross_edge_per_share: assessment.required_gross_edge_per_share.to_string(),
         required_net_edge_per_share: assessment.required_net_edge_per_share.to_string(),
+        required_dynamic_gross_edge_per_share: assessment
+            .required_dynamic_gross_edge_per_share
+            .to_string(),
         passes_gross_edge: assessment.passes_gross_edge,
         passes_net_edge: assessment.passes_net_edge,
+        dynamic_fee_gate_active: assessment.dynamic_fee_gate_active,
+        passes_active_gate: assessment.passes_active_gate,
         max_leg_notional_usdc: max_leg_notional_usdc.to_string(),
         requested_size: snapshot.yes_fill.requested.to_string(),
         yes_filled: snapshot.yes_fill.filled.to_string(),
@@ -327,8 +338,13 @@ pub fn log_arbitrage_admission_shadow(
         signal_net_edge_per_share: quote.edge_per_share.to_string(),
         required_gross_edge_per_share: assessment.required_gross_edge_per_share.to_string(),
         required_net_edge_per_share: assessment.required_net_edge_per_share.to_string(),
+        required_dynamic_gross_edge_per_share: assessment
+            .required_dynamic_gross_edge_per_share
+            .to_string(),
         passes_gross_edge: assessment.passes_gross_edge,
         passes_net_edge: assessment.passes_net_edge,
+        dynamic_fee_gate_active: assessment.dynamic_fee_gate_active,
+        passes_active_gate: assessment.passes_active_gate,
         fee_rate: quote.fee_rate.to_string(),
         fee_exponent: quote.fee_exponent,
         minimum_order_size: quote.minimum_order_size.to_string(),
@@ -497,8 +513,11 @@ mod tests {
             },
             required_gross_edge_per_share: dec!(0.03),
             required_net_edge_per_share: dec!(0.003),
+            required_dynamic_gross_edge_per_share: dec!(0.003),
             passes_gross_edge: true,
             passes_net_edge: true,
+            dynamic_fee_gate_active: true,
+            passes_active_gate: true,
         };
         let snapshot = ArbitrageRestSnapshot {
             observed_at_ms: 10_180,
@@ -551,6 +570,9 @@ mod tests {
         assert_eq!(record["paired_size"], "8");
         assert_eq!(record["signal_net_edge_per_share"], "0.05");
         assert_eq!(record["required_gross_edge_per_share"], "0.03");
+        assert_eq!(record["required_dynamic_gross_edge_per_share"], "0.003");
+        assert_eq!(record["dynamic_fee_gate_active"], true);
+        assert_eq!(record["passes_active_gate"], true);
         assert_eq!(record["passes_net_edge"], true);
         std::fs::remove_file(path).unwrap();
     }
@@ -590,8 +612,11 @@ mod tests {
             },
             required_gross_edge_per_share: dec!(0.03),
             required_net_edge_per_share: dec!(0.003),
+            required_dynamic_gross_edge_per_share: dec!(0.033),
             passes_gross_edge: false,
             passes_net_edge: false,
+            dynamic_fee_gate_active: true,
+            passes_active_gate: false,
         };
         log_arbitrage_admission_shadow(
             AdmissionRejection::ExecutionSpread,

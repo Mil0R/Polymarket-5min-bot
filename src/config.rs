@@ -131,6 +131,9 @@ pub struct Config {
     pub arbitrage_execution_spread: f64, // Execute arbitrage when yes+no <= 1 - this spread
     /// Additional net-edge safety/model/rounding buffer applied after exact dynamic fees.
     pub arbitrage_fee_buffer: f64,
+    /// PAPER-only research mode: replace the fixed gross-edge gate with the
+    /// exact dynamic-fee net-edge gate. Live execution always keeps both gates.
+    pub arbitrage_dynamic_fee_gate_paper: bool,
     /// Slippage [first, second]: down-only uses second, up/flat uses first. e.g. "-0.02,0.0"
     pub slippage: [f64; 2],
     pub gtd_expiration_secs: u64, // GTD order expiry (seconds), default 300 (5 min); only when arbitrage_order_type=GTD
@@ -152,6 +155,9 @@ pub struct Config {
     pub winner_buy_min_price: f64,
     /// Do not buy above this price (edge < 1 - max_price becomes too thin).
     pub winner_buy_max_price: f64,
+    /// PAPER-only research path: allow the evidence-backed Chainlink-direction
+    /// veto cohort through the normal simulated order lifecycle.
+    pub winner_buy_hybrid_paper_enabled: bool,
     /// Max notional (USDC) per winner buy.
     pub winner_buy_max_order_usdc: f64,
     /// Max winner buys per window (0 = unlimited).
@@ -317,6 +323,7 @@ impl Config {
             hedge_stop_loss_pct: env_parse("HEDGE_STOP_LOSS_PCT", "0.05")?,
             arbitrage_execution_spread: env_parse("ARBITRAGE_EXECUTION_SPREAD", "0.01")?,
             arbitrage_fee_buffer: env_parse("ARBITRAGE_FEE_BUFFER", "0.002")?,
+            arbitrage_dynamic_fee_gate_paper: env_bool("ARBITRAGE_DYNAMIC_FEE_GATE_PAPER", false)?,
             slippage: parse_slippage(
                 &env::var("SLIPPAGE").unwrap_or_else(|_| "0,0.01".to_string()),
             )?,
@@ -333,6 +340,7 @@ impl Config {
             winner_buy_before_end_secs: env_parse("WINNER_BUY_BEFORE_END_SECS", "30")?,
             winner_buy_min_price: env_parse("WINNER_BUY_MIN_PRICE", "0.95")?,
             winner_buy_max_price: env_parse("WINNER_BUY_MAX_PRICE", "0.99")?,
+            winner_buy_hybrid_paper_enabled: env_bool("WINNER_BUY_HYBRID_PAPER_ENABLED", false)?,
             winner_buy_max_order_usdc: env_parse("WINNER_BUY_MAX_ORDER_USDC", "50.0")?,
             winner_buy_max_per_window: env_parse("WINNER_BUY_MAX_PER_WINDOW", "1")?,
             winner_buy_max_strategy_loss_usdc: env_parse(
@@ -571,8 +579,22 @@ impl Config {
         if self.max_order_size_usdc > self.arbitrage_budget_usdc {
             bail!("MAX_ORDER_SIZE_USDC cannot exceed ARBITRAGE_BUDGET_USDC");
         }
+        if self.arbitrage_dynamic_fee_gate_paper && !self.dry_run {
+            bail!("ARBITRAGE_DYNAMIC_FEE_GATE_PAPER can only be enabled with DRY_RUN=true");
+        }
         if self.winner_buy_max_order_usdc > self.winner_buy_budget_usdc {
             bail!("WINNER_BUY_MAX_ORDER_USDC cannot exceed WINNER_BUY_BUDGET_USDC");
+        }
+        if !self.winner_buy_min_price.is_finite()
+            || !self.winner_buy_max_price.is_finite()
+            || self.winner_buy_min_price <= 0.0
+            || self.winner_buy_min_price > self.winner_buy_max_price
+            || self.winner_buy_max_price >= 1.0
+        {
+            bail!("Winner Buy prices require 0 < WINNER_BUY_MIN_PRICE <= WINNER_BUY_MAX_PRICE < 1");
+        }
+        if self.winner_buy_hybrid_paper_enabled && !self.dry_run {
+            bail!("WINNER_BUY_HYBRID_PAPER_ENABLED can only be enabled with DRY_RUN=true");
         }
         if self.canary_max_pairs_per_window == 0
             || self.canary_max_pairs_per_window > 1

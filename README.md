@@ -113,6 +113,7 @@ Get these from Polymarket → Settings → Builder.
 | `WINNER_BUY_MIN_MARGIN_BPS` / `WINNER_BUY_REVERSAL_SIGMA` | `3.0` / `2.0` | Directional TWAP margin and remaining-time reversal boundary |
 | `WINNER_BUY_MAX_SPREAD` / `WINNER_BUY_MIN_DEPTH_USDC` | `0.03` / `10.0` | Selected outcome book-quality filters |
 | `WINNER_BUY_MIN_NET_EV` | `0.002` | Minimum `p_model - effective_price - model_risk_buffer` |
+| `WINNER_BUY_HYBRID_PAPER_ENABLED` | `false` | PAPER-only research path for price `0.96–0.98`, positive winner payoff, Chainlink-direction agreement, and normal spread/depth/confirmation gates; live mode rejects this setting |
 | `ARBITRAGE_ENABLED` / `WINNER_BUY_ENABLED` | `true` / `false` | Initial strategy states; the TUI can pause/resume entries for the current process |
 | `PAPER_INITIAL_BALANCE_USDC` | `50.0` | Independent virtual cash budget for Dry-run |
 | `PAPER_LIQUIDITY_HAIRCUT` | `0.75` | Fraction of displayed depth treated as executable in paper fills |

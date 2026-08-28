@@ -131,6 +131,10 @@ async fn main() -> Result<()> {
         max_book_age_ms = config.max_book_age_ms,
         max_book_skew_ms = config.max_book_skew_ms,
         signal_confirmation_ms = config.arbitrage_signal_confirmation_ms,
+        dynamic_fee_gate_paper = config.arbitrage_dynamic_fee_gate_paper,
+        fixed_gross_edge = config.arbitrage_execution_spread,
+        fee_buffer = config.arbitrage_fee_buffer,
+        max_order_size_usdc = config.max_order_size_usdc,
         rest_shadow_delays_ms = ?config.arbitrage_rest_shadow_delays_ms,
         rest_shadow_notionals_usdc = ?config.arbitrage_rest_shadow_notionals_usdc,
         enabled = config.arbitrage_enabled,
@@ -299,6 +303,7 @@ async fn main() -> Result<()> {
             min_profit_threshold: config.min_profit_threshold,
             execution_spread: config.arbitrage_execution_spread,
             fee_buffer: config.arbitrage_fee_buffer,
+            dynamic_fee_gate_paper: config.arbitrage_dynamic_fee_gate_paper,
             gtd_expiration_secs: config.gtd_expiration_secs,
             order_type: config.arbitrage_order_type.clone(),
             dry_run: config.dry_run,
@@ -694,6 +699,7 @@ async fn main() -> Result<()> {
                 before_end_secs = config.winner_buy_before_end_secs,
                 min_price = config.winner_buy_min_price,
                 max_price = config.winner_buy_max_price,
+                hybrid_paper_enabled = config.winner_buy_hybrid_paper_enabled,
                 max_order_usdc = config.winner_buy_max_order_usdc,
                 max_book_age_ms = config.winner_buy_max_book_age_ms,
                 confirmation_observations = config.winner_buy_confirmation_observations,
@@ -2140,6 +2146,12 @@ async fn main() -> Result<()> {
                                 .expect("validated winner-buy minimum depth"),
                             );
                             let research_cohorts = evaluation.research_cohorts.clone();
+                            let hybrid_paper_admitted = !model.admitted()
+                                && config.winner_buy_hybrid_paper_enabled
+                                && config.dry_run
+                                && research_cohorts
+                                    .iter()
+                                    .any(|cohort| cohort == "hybrid_chainlink_veto");
                             if let Err(error) = winner_evaluation_journal
                                 .as_ref()
                                 .expect("Winner Buy evaluation journal initialized")
@@ -2170,10 +2182,12 @@ async fn main() -> Result<()> {
                                 net_ev = %model.net_ev,
                                 "Winner Buy candidate evaluation persisted"
                             );
-                            if !model.admitted() {
-                                runtime_metrics.record_winner_model_rejection(
-                                    model.rejection.expect("rejected model has reason"),
-                                );
+                            if let Some(rejection) = model.rejection {
+                                // Preserve the strict-model funnel even when a
+                                // PAPER-only hybrid candidate proceeds to simulation.
+                                runtime_metrics.record_winner_model_rejection(rejection);
+                            }
+                            if !model.admitted() && !hybrid_paper_admitted {
                                 winner_confirmations.reject(&market.slug);
                                 debug!(target: "polypulse::strategy::winner_buy",
                                     market = %market.crypto_symbol,
@@ -2267,6 +2281,22 @@ async fn main() -> Result<()> {
                                 }
                                 continue;
                             }
+                            let candidate_stage = if hybrid_paper_admitted {
+                                info!(target: "polypulse::strategy::winner_buy",
+                                    %evaluation_id,
+                                    market = %market.crypto_symbol,
+                                    ask_price = %signal.price,
+                                    effective_price = %model.effective_price,
+                                    spread = %model.spread,
+                                    depth_usdc = %model.depth_notional,
+                                    margin_bps = model.directional_margin_bps,
+                                    failed_checks = ?model.failed_checks,
+                                    "Winner Buy PAPER hybrid candidate admitted"
+                                );
+                                "hybrid_paper"
+                            } else {
+                                "production"
+                            };
                             winner_shadow_confirmations.reject(&market.slug);
                             let observed_at_ms = model
                                 .observed_at_ms
@@ -2286,7 +2316,7 @@ async fn main() -> Result<()> {
                                 confirmations: confirmation.confirmations,
                                 required: confirmation.required,
                                 confirmed: confirmation.confirmed,
-                                candidate_stage: "production".to_string(),
+                                candidate_stage: candidate_stage.to_string(),
                             };
                             if let Err(error) = winner_evaluation_journal
                                 .as_ref()
@@ -2380,6 +2410,7 @@ async fn main() -> Result<()> {
                             let attempt = PendingWinnerBuy {
                                 position_id,
                                 evaluation_id,
+                                candidate_stage: candidate_stage.to_string(),
                                 asset: market.crypto_symbol.clone(),
                                 slug: market.slug.clone(),
                                 condition_id: market.market_id.to_string(),
@@ -2443,6 +2474,7 @@ async fn main() -> Result<()> {
                             let side = if signal.buy_yes { "YES" } else { "NO" };
                             info!(target: "polypulse::strategy::winner_buy",
                                 market = %market.crypto_symbol,
+                                stage = %candidate_stage,
                                 %side,
                                 price = %signal.price,
                                 opening_twap = %model.opening_twap.expect("admitted model has opening TWAP"),

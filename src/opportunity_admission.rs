@@ -44,6 +44,7 @@ pub struct OpportunityAdmissionService {
     min_no_price: Decimal,
     stop_before_end_seconds: i64,
     dry_run: bool,
+    dynamic_fee_gate_paper: bool,
 }
 
 impl OpportunityAdmissionService {
@@ -53,6 +54,7 @@ impl OpportunityAdmissionService {
         min_no_price: Decimal,
         stop_before_end_seconds: i64,
         dry_run: bool,
+        dynamic_fee_gate_paper: bool,
     ) -> Self {
         Self {
             execution_threshold,
@@ -60,6 +62,7 @@ impl OpportunityAdmissionService {
             min_no_price,
             stop_before_end_seconds,
             dry_run,
+            dynamic_fee_gate_paper,
         }
     }
 
@@ -70,6 +73,7 @@ impl OpportunityAdmissionService {
             Decimal::try_from(config.min_no_price_threshold).unwrap_or(dec!(0)),
             config.stop_arbitrage_before_end_minutes as i64 * 60,
             config.dry_run,
+            config.arbitrage_dynamic_fee_gate_paper,
         )
     }
 
@@ -78,7 +82,9 @@ impl OpportunityAdmissionService {
         opportunity: &ArbitrageOpportunity,
         context: AdmissionContext,
     ) -> Result<(), AdmissionRejection> {
-        if context.total_price > self.execution_threshold {
+        if !(self.dry_run && self.dynamic_fee_gate_paper)
+            && context.total_price > self.execution_threshold
+        {
             return Err(AdmissionRejection::ExecutionSpread);
         }
         if context.trading_paused {
@@ -129,7 +135,7 @@ mod tests {
     }
 
     fn service() -> OpportunityAdmissionService {
-        OpportunityAdmissionService::new(dec!(0.99), dec!(0.10), dec!(0.10), 60, false)
+        OpportunityAdmissionService::new(dec!(0.99), dec!(0.10), dec!(0.10), 60, false, false)
     }
 
     fn context(now: DateTime<Utc>) -> AdmissionContext {
@@ -176,5 +182,18 @@ mod tests {
             service().evaluate(&low, context(now)),
             Err(AdmissionRejection::YesPriceTooLow)
         );
+    }
+
+    #[test]
+    fn paper_dynamic_fee_mode_defers_fixed_spread_to_exact_quote() {
+        let service =
+            OpportunityAdmissionService::new(dec!(0.97), dec!(0.10), dec!(0.10), 60, true, true);
+        let now = Utc::now();
+        let mut candidate = opportunity();
+        candidate.yes_ask_price = dec!(0.49);
+        candidate.no_ask_price = dec!(0.50);
+        let mut candidate_context = context(now);
+        candidate_context.total_price = dec!(0.99);
+        assert_eq!(service.evaluate(&candidate, candidate_context), Ok(()));
     }
 }

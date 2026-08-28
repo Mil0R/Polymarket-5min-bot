@@ -13,14 +13,17 @@ use tokio::time::{interval, MissedTickBehavior};
 
 use super::client::{BayesianResearchClient, DiscoveryDiagnostics};
 use super::config::BayesianArbConfig;
-use super::model::{evaluate_relationship, MarketRelationship, RelationshipEvaluation};
+use super::model::{
+    evaluate_relationship_with_buffers, MarketRelationship, RelationshipEvaluation,
+};
 
 struct ResearchJournal {
     writer: Mutex<RotatingJournalWriter>,
+    run_id: String,
 }
 
 impl ResearchJournal {
-    fn open(path: &Path, max_bytes: u64, retention: usize) -> Result<Self> {
+    fn open(path: &Path, max_bytes: u64, retention: usize, run_id: String) -> Result<Self> {
         if let Some(parent) = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -33,6 +36,7 @@ impl ResearchJournal {
                 max_bytes,
                 retention,
             )?),
+            run_id,
         })
     }
 
@@ -40,6 +44,7 @@ impl ResearchJournal {
         let event = json!({
             "action": action,
             "version": 2,
+            "run_id": self.run_id,
             "timestamp": Utc::now(),
             "data": data,
         });
@@ -120,10 +125,12 @@ fn rotate_result_files(path: &Path, retention: usize) -> Result<()> {
 
 pub async fn run_scan(client: &BayesianResearchClient) -> Result<Vec<RelationshipEvaluation>> {
     let config = client.config();
+    let run_id = format!("scan-{}", uuid::Uuid::new_v4());
     let journal = ResearchJournal::open(
         &config.results_file,
         config.results_max_bytes,
         config.results_retention_files,
+        run_id,
     )?;
     let discovery = client.discover_snapshot().await?;
     let relationships = discovery.relationships;
@@ -165,20 +172,39 @@ pub async fn run_shadow(client: BayesianResearchClient) -> Result<()> {
     if relationships.is_empty() {
         bail!("no Bayesian coherence relationships were discovered");
     }
+    let run_id = uuid::Uuid::new_v4().to_string();
     let journal = ResearchJournal::open(
         &config.results_file,
         config.results_max_bytes,
         config.results_retention_files,
+        run_id.clone(),
+    )?;
+    let summary_journal = ResearchJournal::open(
+        &config.summary_file,
+        config.results_max_bytes,
+        config.results_retention_files,
+        run_id.clone(),
     )?;
     journal.record(
         "run_started",
         &json!({
             "mode": "continuous_shadow",
+            "run_id": run_id,
+            "relationship_count": relationships.len(),
+            "config": config_summary(&config),
+        }),
+    )?;
+    summary_journal.record(
+        "run_started",
+        &json!({
+            "mode": "continuous_shadow",
+            "run_id": run_id,
             "relationship_count": relationships.len(),
             "config": config_summary(&config),
         }),
     )?;
     journal.record("discovery_summary", &discovery.diagnostics)?;
+    summary_journal.record("discovery_summary", &discovery.diagnostics)?;
     for relationship in &relationships {
         journal.record("relationship_discovered", relationship)?;
     }
@@ -195,12 +221,16 @@ pub async fn run_shadow(client: BayesianResearchClient) -> Result<()> {
     let mut ticker = interval(Duration::from_secs(config.poll_seconds));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut last_logged = HashMap::<String, (String, DateTime<Utc>)>::new();
+    let mut near_miss_relationships = HashSet::<String>::new();
+    let mut last_book_signatures = HashMap::<String, String>::new();
     let mut cycles = 0_u64;
     let mut evaluations_seen = 0_u64;
     let mut evaluations_logged = 0_u64;
     let mut opportunities_logged = 0_u64;
     let mut last_relationship_refresh = started_at;
     let mut last_summary = started_at;
+    let mut last_full_scan = started_at
+        - chrono::Duration::seconds(i64::try_from(config.full_scan_seconds).unwrap_or(i64::MAX));
 
     loop {
         tokio::select! {
@@ -222,8 +252,14 @@ pub async fn run_shadow(client: BayesianResearchClient) -> Result<()> {
             .num_seconds()
             >= i64::try_from(config.relationship_refresh_seconds).unwrap_or(i64::MAX)
         {
-            match refresh_relationships(&client, &mut relationships, &mut last_logged, &journal)
-                .await
+            match refresh_relationships(
+                &client,
+                &mut relationships,
+                &mut last_logged,
+                &journal,
+                &summary_journal,
+            )
+            .await
             {
                 Ok(()) => {}
                 Err(error) => {
@@ -236,7 +272,19 @@ pub async fn run_shadow(client: BayesianResearchClient) -> Result<()> {
             last_relationship_refresh = now;
         }
         cycles += 1;
-        let evaluations = evaluate_cycle(&client, &relationships).await;
+        let force_full_scan = now.signed_duration_since(last_full_scan).num_seconds()
+            >= i64::try_from(config.full_scan_seconds).unwrap_or(i64::MAX);
+        let (evaluations, book_signatures) = evaluate_changed_cycle(
+            &client,
+            &relationships,
+            &last_book_signatures,
+            force_full_scan,
+        )
+        .await;
+        last_book_signatures = book_signatures;
+        if force_full_scan {
+            last_full_scan = now;
+        }
         evaluations_seen += evaluations.len() as u64;
         let cycle_best_edge = evaluations.iter().filter_map(|item| item.net_edge).max();
         let cycle_complete = evaluations
@@ -246,13 +294,44 @@ pub async fn run_shadow(client: BayesianResearchClient) -> Result<()> {
         let cycle_missing_or_shallow = evaluations.len().saturating_sub(cycle_complete);
         for evaluation in evaluations {
             let signature = evaluation_signature(&evaluation);
+            let is_near_miss = !evaluation.qualifies
+                && evaluation
+                    .net_edge
+                    .is_some_and(|edge| edge >= config.near_miss_edge);
+            let was_near_miss = near_miss_relationships.contains(&evaluation.relationship_id);
+            if is_near_miss != was_near_miss {
+                let action = if is_near_miss {
+                    near_miss_relationships.insert(evaluation.relationship_id.clone());
+                    "near_miss_entered"
+                } else {
+                    near_miss_relationships.remove(&evaluation.relationship_id);
+                    "near_miss_exited"
+                };
+                journal.record(action, &evaluation)?;
+                summary_journal.record(
+                    action,
+                    &json!({
+                        "relationship_id": &evaluation.relationship_id,
+                        "kind": evaluation.kind,
+                        "semantic_status": &evaluation.semantic_status,
+                        "net_edge": evaluation.net_edge,
+                        "size_shares": evaluation.size_shares,
+                    }),
+                )?;
+            }
+            let heartbeat_seconds = if is_near_miss || evaluation.qualifies {
+                config.near_miss_log_seconds
+            } else {
+                config.ordinary_log_seconds
+            };
             let should_log =
                 last_logged
                     .get(&evaluation.relationship_id)
                     .is_none_or(|(previous, logged_at)| {
-                        previous != &signature
+                        (is_near_miss && previous != &signature)
+                            || evaluation.qualifies
                             || now.signed_duration_since(*logged_at).num_seconds()
-                                >= i64::try_from(config.unchanged_log_seconds).unwrap_or(i64::MAX)
+                                >= i64::try_from(heartbeat_seconds).unwrap_or(i64::MAX)
                     });
             if !should_log {
                 continue;
@@ -285,6 +364,21 @@ pub async fn run_shadow(client: BayesianResearchClient) -> Result<()> {
                     "cycle_complete_evaluations": cycle_complete,
                     "cycle_missing_or_shallow": cycle_missing_or_shallow,
                     "cycle_best_edge": cycle_best_edge,
+                    "near_miss_relationships": near_miss_relationships.len(),
+                    "evaluations_seen": evaluations_seen,
+                    "evaluations_logged": evaluations_logged,
+                    "opportunities_logged": opportunities_logged,
+                }),
+            )?;
+            summary_journal.record(
+                "cycle_summary",
+                &json!({
+                    "cycles": cycles,
+                    "relationships": relationships.len(),
+                    "cycle_complete_evaluations": cycle_complete,
+                    "cycle_missing_or_shallow": cycle_missing_or_shallow,
+                    "cycle_best_edge": cycle_best_edge,
+                    "near_miss_relationships": near_miss_relationships.len(),
                     "evaluations_seen": evaluations_seen,
                     "evaluations_logged": evaluations_logged,
                     "opportunities_logged": opportunities_logged,
@@ -304,6 +398,17 @@ pub async fn run_shadow(client: BayesianResearchClient) -> Result<()> {
             "opportunities_logged": opportunities_logged,
         }),
     )?;
+    summary_journal.record(
+        "run_stopped",
+        &json!({
+            "started_at": started_at,
+            "stopped_at": Utc::now(),
+            "cycles": cycles,
+            "evaluations_seen": evaluations_seen,
+            "evaluations_logged": evaluations_logged,
+            "opportunities_logged": opportunities_logged,
+        }),
+    )?;
     Ok(())
 }
 
@@ -312,22 +417,77 @@ async fn evaluate_cycle(
     relationships: &[MarketRelationship],
 ) -> Vec<RelationshipEvaluation> {
     let books = client.fetch_books(relationships).await;
+    evaluate_relationships(client, relationships.iter(), &books)
+}
+
+async fn evaluate_changed_cycle(
+    client: &BayesianResearchClient,
+    relationships: &[MarketRelationship],
+    previous_signatures: &HashMap<String, String>,
+    force_full_scan: bool,
+) -> (Vec<RelationshipEvaluation>, HashMap<String, String>) {
+    let books = client.fetch_books(relationships).await;
+    let signatures = books
+        .iter()
+        .map(|(token_id, book)| (token_id.clone(), book_signature(book)))
+        .collect::<HashMap<_, _>>();
+    let mut changed_tokens = signatures
+        .iter()
+        .filter(|(token_id, signature)| previous_signatures.get(*token_id) != Some(*signature))
+        .map(|(token_id, _)| token_id.clone())
+        .collect::<HashSet<_>>();
+    // A disappeared snapshot is also a material change. Re-evaluate now so
+    // the relationship fails closed instead of retaining a stale complete
+    // evaluation until the next forced full scan.
+    changed_tokens.extend(
+        previous_signatures
+            .keys()
+            .filter(|token_id| !signatures.contains_key(*token_id))
+            .cloned(),
+    );
+    let selected = relationships.iter().filter(|relationship| {
+        force_full_scan
+            || relationship
+                .legs
+                .iter()
+                .any(|leg| changed_tokens.contains(&leg.token_id))
+    });
+    (evaluate_relationships(client, selected, &books), signatures)
+}
+
+fn evaluate_relationships<'a>(
+    client: &BayesianResearchClient,
+    relationships: impl Iterator<Item = &'a MarketRelationship>,
+    books: &HashMap<String, super::model::BookSnapshot>,
+) -> Vec<RelationshipEvaluation> {
     let config = client.config();
     let now = Utc::now();
     relationships
-        .iter()
         .map(|relationship| {
-            evaluate_relationship(
+            evaluate_relationship_with_buffers(
                 relationship,
-                &books,
+                books,
                 &config.size_ladder_shares,
                 config.min_bundle_notional_usdc,
                 config.min_net_edge,
                 config.execution_buffer_pct,
+                &config.execution_buffer_curve_pct,
                 now,
             )
         })
         .collect()
+}
+
+fn book_signature(book: &super::model::BookSnapshot) -> String {
+    // Only executable ask depth is material to this buy-only bundle. Ignore
+    // observation/exchange timestamps so HTTP polling cannot manufacture a
+    // false change, but retain every level because deep ladder sizes may walk
+    // beyond the first few asks.
+    book.asks
+        .iter()
+        .map(|level| format!("{}@{}", level.size, level.price))
+        .collect::<Vec<_>>()
+        .join("|")
 }
 
 fn evaluation_signature(evaluation: &RelationshipEvaluation) -> String {
@@ -368,9 +528,11 @@ async fn refresh_relationships(
     relationships: &mut Vec<MarketRelationship>,
     last_logged: &mut HashMap<String, (String, DateTime<Utc>)>,
     journal: &ResearchJournal,
+    summary_journal: &ResearchJournal,
 ) -> Result<()> {
     let snapshot = client.discover_snapshot().await?;
     journal.record("discovery_summary", &snapshot.diagnostics)?;
+    summary_journal.record("discovery_summary", &snapshot.diagnostics)?;
     if snapshot.relationships.is_empty() {
         journal.record(
             "relationship_refresh_rejected",
@@ -412,17 +574,28 @@ async fn refresh_relationships(
             "removed": removed,
         }),
     )?;
+    summary_journal.record(
+        "relationship_refresh",
+        &json!({
+            "relationships": relationships.len(),
+            "added": added,
+            "removed": removed,
+        }),
+    )?;
     Ok(())
 }
 
 fn config_summary(config: &BayesianArbConfig) -> serde_json::Value {
     json!({
         "results_file": config.results_file,
+        "summary_file": config.summary_file,
+        "semantic_review_file": config.semantic_review_file,
         "event_pages": config.event_pages,
         "events_per_page": config.events_per_page,
         "max_relationships": config.max_relationships,
         "max_partition_legs": config.max_partition_legs,
         "poll_seconds": config.poll_seconds,
+        "full_scan_seconds": config.full_scan_seconds,
         "unchanged_log_seconds": config.unchanged_log_seconds,
         "relationship_refresh_seconds": config.relationship_refresh_seconds,
         "summary_seconds": config.summary_seconds,
@@ -432,7 +605,13 @@ fn config_summary(config: &BayesianArbConfig) -> serde_json::Value {
         "size_ladder_shares": config.size_ladder_shares,
         "min_bundle_notional_usdc": config.min_bundle_notional_usdc,
         "min_net_edge": config.min_net_edge,
+        "near_miss_edge": config.near_miss_edge,
         "execution_buffer_pct": config.execution_buffer_pct,
+        "execution_buffer_curve_pct": config.execution_buffer_curve_pct,
+        "near_miss_log_seconds": config.near_miss_log_seconds,
+        "ordinary_log_seconds": config.ordinary_log_seconds,
+        "websocket_books": config.websocket_books,
+        "websocket_book_max_age_ms": config.websocket_book_max_age_ms,
         "semantic_allowlist": config.semantic_allowlist,
         "execution": "read_only_shadow_never_submits_orders",
     })
@@ -486,6 +665,14 @@ struct SizeReportSummary {
     max_edge: Option<Decimal>,
 }
 
+#[derive(Default)]
+struct BufferReportSummary {
+    observations: u64,
+    opportunities: u64,
+    positive: u64,
+    max_edge: Option<Decimal>,
+}
+
 pub fn run_report(path: &Path) -> Result<()> {
     let report_paths = report_input_paths(path);
     if report_paths.is_empty() {
@@ -493,10 +680,13 @@ pub fn run_report(path: &Path) -> Result<()> {
     }
     let mut relationships = HashSet::new();
     let mut by_kind = BTreeMap::<String, ReportSummary>::new();
+    let mut by_semantic = BTreeMap::<String, ReportSummary>::new();
     let mut by_size = BTreeMap::<Decimal, SizeReportSummary>::new();
+    let mut by_buffer = BTreeMap::<Decimal, BufferReportSummary>::new();
     let mut rejections = BTreeMap::<String, u64>::new();
     let mut latest_discovery: Option<DiscoveryDiagnostics> = None;
     let mut discovery_summaries = 0_u64;
+    let mut near_miss_entries = 0_u64;
     for input_path in &report_paths {
         let reader = BufReader::new(
             File::open(input_path)
@@ -521,6 +711,7 @@ pub fn run_report(path: &Path) -> Result<()> {
                 )
             })?;
             match event.get("action").and_then(serde_json::Value::as_str) {
+                Some("near_miss_entered") => near_miss_entries += 1,
                 Some("discovery_summary") => {
                     latest_discovery = Some(serde_json::from_value(event["data"].clone())?);
                     discovery_summaries += 1;
@@ -550,6 +741,15 @@ pub fn run_report(path: &Path) -> Result<()> {
                     {
                         summary.total_positive_profit += profit;
                     }
+                    let semantic = by_semantic
+                        .entry(evaluation.semantic_status.clone())
+                        .or_default();
+                    semantic.evaluations += 1;
+                    semantic.opportunities += u64::from(evaluation.qualifies);
+                    if let Some(edge) = evaluation.net_edge {
+                        semantic.max_edge =
+                            Some(semantic.max_edge.map_or(edge, |current| current.max(edge)));
+                    }
                     if let Some(reason) = evaluation.rejection_reason {
                         *rejections.entry(reason).or_default() += 1;
                     }
@@ -570,6 +770,21 @@ pub fn run_report(path: &Path) -> Result<()> {
                                 .raw_cost_usdc
                                 .is_some_and(|cost| cost < point.guaranteed_payout_usdc),
                         );
+                        for scenario in point.buffer_evaluations {
+                            let buffer_summary =
+                                by_buffer.entry(scenario.execution_buffer_pct).or_default();
+                            buffer_summary.observations += 1;
+                            buffer_summary.opportunities += u64::from(scenario.qualifies);
+                            buffer_summary.positive +=
+                                u64::from(scenario.net_profit_usdc > Decimal::ZERO);
+                            buffer_summary.max_edge = Some(
+                                buffer_summary
+                                    .max_edge
+                                    .map_or(scenario.net_edge, |current| {
+                                        current.max(scenario.net_edge)
+                                    }),
+                            );
+                        }
                     }
                 }
                 _ => {}
@@ -583,6 +798,7 @@ pub fn run_report(path: &Path) -> Result<()> {
         relationships.len(),
         discovery_summaries,
     );
+    println!("near_miss_entries={near_miss_entries}");
     println!("kind                          evals  opportunities  max_edge  positive_profit_sum");
     for (kind, summary) in by_kind {
         println!(
@@ -594,6 +810,18 @@ pub fn run_report(path: &Path) -> Result<()> {
                 .map(|value| format!("{:.2}%", value * Decimal::ONE_HUNDRED))
                 .unwrap_or_else(|| "-".into()),
             summary.total_positive_profit.round_dp(4),
+        );
+    }
+    println!("semantic_status:");
+    for (status, summary) in by_semantic {
+        println!(
+            "  {status}: evals={} opportunities={} max_edge={}",
+            summary.evaluations,
+            summary.opportunities,
+            summary
+                .max_edge
+                .map(|value| format!("{:.2}%", value * Decimal::ONE_HUNDRED))
+                .unwrap_or_else(|| "-".into()),
         );
     }
     println!("rejections:");
@@ -611,6 +839,23 @@ pub fn run_report(path: &Path) -> Result<()> {
                 summary.complete,
                 summary.opportunities,
                 summary.raw_positive,
+                summary
+                    .max_edge
+                    .map(|value| format!("{:.2}%", value * Decimal::ONE_HUNDRED))
+                    .unwrap_or_else(|| "-".into()),
+            );
+        }
+    }
+    if !by_buffer.is_empty() {
+        println!("execution_buffer_curve:");
+        println!("  buffer_pct  observations  positive  opportunities  max_edge");
+        for (buffer, summary) in by_buffer {
+            println!(
+                "  {:>10} {:>13} {:>9} {:>14} {:>9}",
+                format!("{:.2}%", buffer * Decimal::ONE_HUNDRED),
+                summary.observations,
+                summary.positive,
+                summary.opportunities,
                 summary
                     .max_edge
                     .map(|value| format!("{:.2}%", value * Decimal::ONE_HUNDRED))
@@ -653,7 +898,7 @@ fn report_input_paths(path: &Path) -> Vec<std::path::PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::model::RelationshipKind;
+    use super::super::model::{BookLevel, BookSnapshot, RelationshipKind};
     use super::*;
 
     #[test]
@@ -711,5 +956,24 @@ mod tests {
         assert!(rotated_result_path(&path, 1).exists());
         assert!(rotated_result_path(&path, 2).exists());
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn book_signature_ignores_timestamps_but_tracks_depth_changes() {
+        let mut book = BookSnapshot {
+            token_id: "1".into(),
+            observed_at: Utc::now(),
+            exchange_timestamp_ms: Some(100),
+            asks: vec![BookLevel {
+                price: Decimal::new(45, 2),
+                size: Decimal::TEN,
+            }],
+        };
+        let original = book_signature(&book);
+        book.observed_at = Utc::now() + chrono::Duration::seconds(1);
+        book.exchange_timestamp_ms = Some(101);
+        assert_eq!(original, book_signature(&book));
+        book.asks[0].size = Decimal::new(11, 0);
+        assert_ne!(original, book_signature(&book));
     }
 }

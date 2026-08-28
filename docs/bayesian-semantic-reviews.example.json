@@ -1,0 +1,9 @@
+{
+  "deadline:event-id:early-condition:late-condition": {
+    "status": "rules_equivalent",
+    "reviewed_at": "2026-08-28T12:00:00Z",
+    "notes": [
+      "Same resolution source and event definition; only the deadline differs."
+    ]
+  }
+}

@@ -1,12 +1,16 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use dashmap::{DashMap, DashSet};
 use futures::{stream, StreamExt};
+use polymarket_client_sdk::clob::ws::{types::response::BookUpdate, Client as WsClient};
+use polymarket_client_sdk::types::U256;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::config::BayesianArbConfig;
@@ -18,6 +22,8 @@ use super::model::{
 pub struct BayesianResearchClient {
     http: reqwest::Client,
     config: BayesianArbConfig,
+    book_cache: Arc<DashMap<String, BookSnapshot>>,
+    websocket_subscribed_tokens: Arc<DashSet<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -129,6 +135,15 @@ struct TradableMarket {
     fee: FeePolicy,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct SemanticReview {
+    status: String,
+    #[serde(default)]
+    notes: Vec<String>,
+    #[serde(default)]
+    reviewed_at: Option<String>,
+}
+
 impl BayesianResearchClient {
     pub fn new(config: BayesianArbConfig) -> Result<Self> {
         let http = reqwest::Client::builder()
@@ -137,7 +152,12 @@ impl BayesianResearchClient {
             .timeout(Duration::from_secs(20))
             .build()
             .context("failed to build Bayesian research HTTP client")?;
-        Ok(Self { http, config })
+        Ok(Self {
+            http,
+            config,
+            book_cache: Arc::new(DashMap::new()),
+            websocket_subscribed_tokens: Arc::new(DashSet::new()),
+        })
     }
 
     pub fn config(&self) -> &BayesianArbConfig {
@@ -209,8 +229,18 @@ impl BayesianResearchClient {
             RelationshipKind::NegRiskCompleteSetYes | RelationshipKind::NegRiskCompleteSetNo => 0,
             RelationshipKind::DeadlineImplication => 1,
         });
+        let semantic_reviews = load_semantic_reviews(&self.config.semantic_review_file)?;
         for relationship in &mut relationships {
-            if self
+            if let Some(review) = semantic_reviews.get(&relationship.relationship_id) {
+                relationship.semantic_status = normalize_review_status(&review.status).to_string();
+                relationship.evidence.extend(review.notes.iter().cloned());
+                if let Some(reviewed_at) = &review.reviewed_at {
+                    relationship
+                        .evidence
+                        .push(format!("Semantic review recorded at {reviewed_at}."));
+                }
+                relationship.live_eligible = false;
+            } else if self
                 .config
                 .semantic_allowlist
                 .contains(&relationship.relationship_id)
@@ -237,6 +267,7 @@ impl BayesianResearchClient {
         &self,
         relationships: &[MarketRelationship],
     ) -> HashMap<String, BookSnapshot> {
+        self.start_book_stream(relationships);
         let token_ids = relationships
             .iter()
             .flat_map(|relationship| relationship.legs.iter().map(|leg| leg.token_id.clone()))
@@ -299,6 +330,14 @@ impl BayesianResearchClient {
     }
 
     async fn fetch_book(&self, token_id: &str) -> Result<BookSnapshot> {
+        if let Some(book) = self.book_cache.get(token_id) {
+            let age_ms = Utc::now()
+                .signed_duration_since(book.observed_at)
+                .num_milliseconds();
+            if age_ms <= self.config.websocket_book_max_age_ms {
+                return Ok(book.clone());
+            }
+        }
         let response: ClobBookResponse = self
             .http
             .get(format!("{}/book", self.config.clob_url))
@@ -327,6 +366,94 @@ impl BayesianResearchClient {
             exchange_timestamp_ms: response.timestamp.as_ref().and_then(value_i64),
             asks,
         })
+    }
+
+    fn start_book_stream(&self, relationships: &[MarketRelationship]) {
+        if !self.config.websocket_books {
+            return;
+        }
+        let mut token_ids = Vec::new();
+        for token in relationships
+            .iter()
+            .flat_map(|relationship| relationship.legs.iter().map(|leg| leg.token_id.as_str()))
+        {
+            if self.websocket_subscribed_tokens.insert(token.to_string()) {
+                match U256::from_str(token) {
+                    Ok(token_id) => token_ids.push(token_id),
+                    Err(error) => {
+                        tracing::warn!(%error, token, "Bayesian WebSocket token id is invalid")
+                    }
+                }
+            }
+        }
+        if token_ids.is_empty() {
+            return;
+        }
+        let cache = Arc::clone(&self.book_cache);
+        tokio::spawn(async move {
+            loop {
+                let client = WsClient::default();
+                match client.subscribe_orderbook(token_ids.clone()) {
+                    Ok(stream) => {
+                        futures::pin_mut!(stream);
+                        while let Some(update) = stream.next().await {
+                            match update {
+                                Ok(book) => {
+                                    let snapshot = websocket_book_snapshot(book);
+                                    cache.insert(snapshot.token_id.clone(), snapshot);
+                                }
+                                Err(error) => {
+                                    tracing::warn!(%error, "Bayesian WebSocket orderbook stream error");
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "Bayesian WebSocket subscription failed")
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        });
+    }
+}
+
+fn websocket_book_snapshot(book: BookUpdate) -> BookSnapshot {
+    let mut asks = book
+        .asks
+        .into_iter()
+        .filter(|level| level.price > Decimal::ZERO && level.size > Decimal::ZERO)
+        .map(|level| BookLevel {
+            price: level.price,
+            size: level.size,
+        })
+        .collect::<Vec<_>>();
+    asks.sort_by_key(|level| level.price);
+    BookSnapshot {
+        token_id: book.asset_id.to_string(),
+        observed_at: Utc::now(),
+        exchange_timestamp_ms: Some(book.timestamp),
+        asks,
+    }
+}
+
+fn load_semantic_reviews(path: &std::path::Path) -> Result<HashMap<String, SemanticReview>> {
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("failed to read semantic review file {}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("invalid semantic review file {}", path.display()))
+}
+
+fn normalize_review_status(status: &str) -> &'static str {
+    match status.trim().to_ascii_lowercase().as_str() {
+        "rules_equivalent" => "rules_equivalent",
+        "manually_approved" => "manually_approved",
+        "rejected_semantic_mismatch" => "rejected_semantic_mismatch",
+        _ => "review_status_invalid_fail_closed",
     }
 }
 
@@ -709,5 +836,25 @@ mod tests {
         assert!(discover_deadline_relationships(&event).is_empty());
         assert!(looks_like_deadline_label("June 30, 2027"));
         assert!(!looks_like_deadline_label("France"));
+    }
+
+    #[test]
+    fn semantic_review_statuses_are_normalized_fail_closed() {
+        assert_eq!(
+            normalize_review_status(" RULES_EQUIVALENT "),
+            "rules_equivalent"
+        );
+        assert_eq!(
+            normalize_review_status("manually_approved"),
+            "manually_approved"
+        );
+        assert_eq!(
+            normalize_review_status("rejected_semantic_mismatch"),
+            "rejected_semantic_mismatch"
+        );
+        assert_eq!(
+            normalize_review_status("approved_typo"),
+            "review_status_invalid_fail_closed"
+        );
     }
 }
