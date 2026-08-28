@@ -432,6 +432,29 @@ impl WhitelistManager {
             .map(|w| w.value().clone())
     }
 
+    /// Removes a source from entry authorization without erasing its history.
+    /// Existing positions remain managed by the risk/exit engines.
+    pub fn quarantine_wallet(&self, address: &str, reason: impl Into<String>) -> bool {
+        let key = Self::address_key(address);
+        let reason = reason.into();
+        let changed = if let Some(mut profile) = self.wallets.get_mut(&key) {
+            if matches!(profile.tier, WalletTier::TierS | WalletTier::TierA) {
+                profile.tier = WalletTier::Probation;
+                profile.rejection_reason = Some(reason.clone());
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if changed {
+            self.save_state();
+            warn!(address = %key, %reason, "Wallet moved to probation by runtime quality audit");
+        }
+        changed
+    }
+
     /// Checks if a wallet is an authorized signal source in a specific domain.
     pub fn is_authorized_in_domain(
         &self,
@@ -513,6 +536,27 @@ impl WhitelistManager {
             .filter(|entry| entry.tier == WalletTier::TierS || entry.tier == WalletTier::TierA)
             .map(|entry| entry.value().clone())
             .collect()
+    }
+
+    /// Sources awaiting a valid same-domain replacement. They remain stored so
+    /// a later atomically-refreshed scout report can fill the vacancy.
+    pub fn list_probation_wallets(&self) -> Vec<WalletProfile> {
+        self.wallets
+            .iter()
+            .filter(|entry| entry.tier == WalletTier::Probation)
+            .map(|entry| entry.value().clone())
+            .collect()
+    }
+
+    pub fn remove_wallet(&self, address: &str) -> Option<WalletProfile> {
+        let removed = self
+            .wallets
+            .remove(&Self::address_key(address))
+            .map(|(_, profile)| profile);
+        if removed.is_some() {
+            self.save_state();
+        }
+        removed
     }
 }
 
@@ -597,6 +641,24 @@ mod tests {
             "corrupt state must not panic"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn runtime_quarantine_preserves_profile_but_revokes_authorization() {
+        let manager = WhitelistManager::new(CopyTradingConfig::default());
+        let result = manager.evaluate_wallet("0xRotate", &qualified_records(), Utc::now());
+        assert!(result.is_accepted);
+        let domain = result.profile.primary_domain.clone();
+        manager.upsert_wallet(result.profile);
+        assert!(manager.is_authorized_in_domain("0xRotate", &domain).0);
+        assert!(manager.quarantine_wallet("0xRotate", "poor runtime quality"));
+        let profile = manager.get_wallet("0xRotate").unwrap();
+        assert_eq!(profile.tier, WalletTier::Probation);
+        assert_eq!(
+            profile.rejection_reason.as_deref(),
+            Some("poor runtime quality")
+        );
+        assert!(!manager.is_authorized_in_domain("0xRotate", &domain).0);
     }
 
     #[test]

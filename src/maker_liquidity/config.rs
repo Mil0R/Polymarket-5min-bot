@@ -27,6 +27,10 @@ pub struct MakerResearchConfig {
     pub reward_band_fraction: Decimal,
     pub book_poll_secs: u64,
     pub quote_interval_secs: u64,
+    pub market_refresh_secs: u64,
+    pub market_cooldown_secs: u64,
+    pub max_consecutive_market_errors: u32,
+    pub min_time_to_end_secs: u64,
     pub markout_horizons_secs: Vec<u64>,
     pub duration_secs: u64,
 }
@@ -62,6 +66,10 @@ impl MakerResearchConfig {
             reward_band_fraction: decimal_env("MAKER_REWARD_BAND_FRACTION", dec!(0.8))?,
             book_poll_secs: parse("MAKER_BOOK_POLL_SECS", "5")?,
             quote_interval_secs: parse("MAKER_QUOTE_INTERVAL_SECS", "30")?,
+            market_refresh_secs: parse("MAKER_MARKET_REFRESH_SECS", "300")?,
+            market_cooldown_secs: parse("MAKER_MARKET_COOLDOWN_SECS", "1800")?,
+            max_consecutive_market_errors: parse("MAKER_MAX_CONSECUTIVE_MARKET_ERRORS", "6")?,
+            min_time_to_end_secs: parse("MAKER_MIN_TIME_TO_END_SECS", "1800")?,
             markout_horizons_secs: parse_horizons(
                 &env::var("MAKER_MARKOUT_HORIZONS_SECS")
                     .unwrap_or_else(|_| "1,5,30,60".to_string()),
@@ -122,6 +130,16 @@ impl MakerResearchConfig {
             || self.quote_interval_secs > 3_600
         {
             bail!("maker polling/quote intervals are invalid");
+        }
+        if self.market_refresh_secs < self.quote_interval_secs
+            || self.market_refresh_secs > 86_400
+            || self.market_cooldown_secs < self.market_refresh_secs
+            || self.market_cooldown_secs > 604_800
+        {
+            bail!("maker market refresh/cooldown intervals are invalid");
+        }
+        if self.max_consecutive_market_errors == 0 || self.max_consecutive_market_errors > 1_000 {
+            bail!("MAKER_MAX_CONSECUTIVE_MARKET_ERRORS must be in [1, 1000]");
         }
         if self
             .markout_horizons_secs

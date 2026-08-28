@@ -6,8 +6,9 @@ use polypulse::copy_trading::{
     init_copy_trader_logging, BookFetcher, CopyTradeExecutor, CopyTradeJournal, CopyTradingConfig,
     CopyTradingCoordinator, CopyTradingRuntime, ExecutionOrderProposal, GammaSettlementSource,
     LadderExitConfig, LadderExitTracker, MarketMetadata, MarketMetadataFetcher, OnChainTradeFeed,
-    OrderBookSnapshot, OrderSide, ProcessedSignalStore, SettlementMonitor, SignalAction,
-    SignalEvent, TradeFeed, WalletHistoryFetcher,
+    OrderBookSnapshot, OrderSide, ProcessedSignalStore, ScoutReport, SettlementMonitor,
+    SignalAction, SignalEvent, TradeFeed, WalletHistoryFetcher, WalletProfile, WalletQualityPolicy,
+    WalletQualityTracker,
 };
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -112,6 +113,24 @@ async fn run_copy_trader(
     );
     let wallet_reevaluation_loops =
         (Duration::from_secs(24 * 60 * 60).as_secs() / poll_interval.as_secs()).max(1);
+    let quality_audit_minutes = env::var("COPY_WALLET_QUALITY_AUDIT_MINUTES")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(360)
+        .clamp(10, 24 * 60);
+    let quality_audit_loops = (Duration::from_secs(quality_audit_minutes * 60).as_secs()
+        / poll_interval.as_secs())
+    .max(1);
+    let auto_rotation = dry_run
+        && env::var("COPY_AUTO_ROTATION_ENABLED")
+            .map(|value| value.trim() == "1" || value.trim().eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+    let rotation_report = env::var("COPY_ROTATION_CANDIDATE_REPORT")
+        .unwrap_or_else(|_| "results/copy-candidates/rotation-current/report.json".to_string());
+    let quality_policy = WalletQualityPolicy::from_env();
+    let quality_state_file = env::var("COPY_WALLET_QUALITY_STATE_FILE")
+        .unwrap_or_else(|_| "data/copy-wallet-quality.json".to_string());
+    let quality_tracker = WalletQualityTracker::new_with_state(&quality_state_file);
 
     // Live execution engine (only constructed when actually going live).
     let live_executor: Option<Arc<CopyTradeExecutor>> = if dry_run {
@@ -195,6 +214,10 @@ async fn run_copy_trader(
             "shadowMinSignalNotional": config.shadow_min_signal_notional_usdc.to_string(),
             "minConsensusWallets": config.min_consensus_wallets,
             "paperExecutionDelayMs": config.paper_execution_delay_ms,
+            "autoRotation": auto_rotation,
+            "qualityAuditMinutes": quality_audit_minutes,
+            "rotationCandidateReport": rotation_report,
+            "qualityStateFile": quality_state_file,
         }),
     );
 
@@ -444,6 +467,9 @@ async fn run_copy_trader(
     let executor_for_loop = live_executor.clone();
     let onchain_for_loop = onchain_feed.clone();
     let signal_config = config.clone();
+    let quality_for_loop = quality_tracker.clone();
+    let quality_policy_for_loop = quality_policy.clone();
+    let rotation_report_for_loop = rotation_report.clone();
     runtime.set_initialized(true);
     runtime.set_healthy(true);
     runtime.set_whitelist_wallets(active_profiles.len());
@@ -517,6 +543,7 @@ async fn run_copy_trader(
                 processed_signals: processed_signals.clone(),
                 config: signal_config.clone(),
                 runtime: runtime_for_loop.clone(),
+                quality: quality_for_loop.clone(),
             };
             for sig in signals {
                 if runtime_for_loop.shutdown_requested() {
@@ -572,6 +599,9 @@ async fn run_copy_trader(
                 runtime_for_loop.set_whitelist_wallets(active_whitelist.len());
                 runtime_for_loop.set_portfolio(nav, cash, open);
                 journal_for_loop.record_nav_snapshot(nav, cash, open, active_whitelist.len());
+                if let Err(error) = quality_for_loop.save() {
+                    warn!(%error, "Copy-trading wallet quality state persistence failed");
+                }
                 info!(
                     "Status Update [{}]: NAV: ${:.2} | Open positions: {} | Whitelist: {} wallets | Mode: {}",
                     status_time.format("%Y-%m-%d %H:%M:%S UTC"),
@@ -586,6 +616,7 @@ async fn run_copy_trader(
             // decay into probation without requiring a process restart.
             if loop_count > 0 && loop_count.is_multiple_of(wallet_reevaluation_loops) {
                 let profiles = coordinator_clone.whitelist().list_active_whitelist();
+                let mut historically_degraded = Vec::new();
                 for profile in profiles {
                     match history_for_loop.fetch_records(&profile.address).await {
                         Ok(records) => {
@@ -607,11 +638,90 @@ async fn run_copy_trader(
                                     "tier": format!("{:?}", tier),
                                 }),
                             );
+                            if auto_rotation && !accepted {
+                                historically_degraded.push(profile);
+                            }
                         }
                         Err(e) => {
                             warn!(wallet = %profile.address, error = %e, "Periodic wallet reevaluation failed")
                         }
                     }
+                }
+                if auto_rotation && !historically_degraded.is_empty() {
+                    rotate_wallets_from_report(
+                        &historically_degraded,
+                        &rotation_report_for_loop,
+                        &coordinator_clone,
+                        &history_for_loop,
+                        &journal_for_loop,
+                    )
+                    .await;
+                }
+            }
+
+            // 6. PAPER-only runtime source quality audit. A wallet is judged
+            // only after enough observations, then moved to probation before
+            // an independently-scanned candidate is enrolled.
+            if loop_count > 0 && loop_count.is_multiple_of(quality_audit_loops) {
+                let active_by_address = coordinator_clone
+                    .whitelist()
+                    .list_active_whitelist()
+                    .into_iter()
+                    .map(|profile| (profile.address.to_ascii_lowercase(), profile))
+                    .collect::<HashMap<_, _>>();
+                let mut degraded = Vec::new();
+                for (address, sample) in quality_for_loop.snapshots() {
+                    let reasons = quality_policy_for_loop.rejection_reasons(&sample);
+                    journal_for_loop.record(
+                        "wallet_quality_audit",
+                        serde_json::json!({
+                            "address": address,
+                            "sample": sample,
+                            "reasons": reasons,
+                            "eligibleForRotation": !reasons.is_empty(),
+                            "autoRotation": auto_rotation,
+                        }),
+                    );
+                    if auto_rotation && !reasons.is_empty() {
+                        if let Some(profile) = active_by_address.get(&address) {
+                            let reason = format!("runtime quality: {}", reasons.join("; "));
+                            if coordinator_clone
+                                .whitelist()
+                                .quarantine_wallet(&address, reason.clone())
+                            {
+                                journal_for_loop.record(
+                                    "wallet_quarantined",
+                                    serde_json::json!({
+                                        "address": address,
+                                        "domain": profile.primary_domain.to_string(),
+                                        "reason": reason,
+                                    }),
+                                );
+                                degraded.push(profile.clone());
+                            }
+                        }
+                    }
+                }
+                for profile in coordinator_clone.whitelist().list_probation_wallets() {
+                    if !degraded
+                        .iter()
+                        .any(|existing| existing.address.eq_ignore_ascii_case(&profile.address))
+                    {
+                        degraded.push(profile);
+                    }
+                }
+                if auto_rotation && !degraded.is_empty() {
+                    rotate_wallets_from_report(
+                        &degraded,
+                        &rotation_report_for_loop,
+                        &coordinator_clone,
+                        &history_for_loop,
+                        &journal_for_loop,
+                    )
+                    .await;
+                }
+                if let Err(error) = quality_for_loop.save() {
+                    warn!(%error, "Copy-trading wallet quality state persistence failed");
                 }
             }
 
@@ -624,9 +734,175 @@ async fn run_copy_trader(
     });
 
     runner_handle.await?;
+    if let Err(error) = quality_tracker.save() {
+        warn!(%error, "Final copy-trading wallet quality state persistence failed");
+    }
     runtime.set_healthy(false);
     info!("Copy-trading system safely terminated.");
     Ok(())
+}
+
+async fn rotate_wallets_from_report(
+    degraded: &[WalletProfile],
+    report_path: &str,
+    coordinator: &Arc<CopyTradingCoordinator>,
+    history: &Arc<WalletHistoryFetcher>,
+    journal: &CopyTradeJournal,
+) {
+    let report = match std::fs::read(report_path)
+        .ok()
+        .and_then(|raw| serde_json::from_slice::<ScoutReport>(&raw).ok())
+    {
+        Some(report) => report,
+        None => {
+            journal.record(
+                "wallet_rotation_unavailable",
+                serde_json::json!({
+                    "report": report_path,
+                    "reason": "candidate report missing or invalid",
+                }),
+            );
+            warn!(report = %report_path, "Wallet rotation candidate report missing or invalid");
+            return;
+        }
+    };
+    let max_report_age_hours = env::var("COPY_ROTATION_MAX_REPORT_AGE_HOURS")
+        .ok()
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .unwrap_or(24)
+        .max(1);
+    let report_age_hours = Utc::now()
+        .signed_duration_since(report.generated_at)
+        .num_hours()
+        .max(0);
+    if !report.partial_failures.is_empty() || report_age_hours > max_report_age_hours {
+        journal.record(
+            "wallet_rotation_unavailable",
+            serde_json::json!({
+                "report": report_path,
+                "reason": if !report.partial_failures.is_empty() { "candidate scan has partial failures" } else { "candidate report is stale" },
+                "reportAgeHours": report_age_hours,
+                "maxReportAgeHours": max_report_age_hours,
+                "partialFailures": report.partial_failures,
+            }),
+        );
+        warn!(
+            report = %report_path,
+            report_age_hours,
+            partial_failures = report.partial_failures.len(),
+            "Wallet rotation candidate report failed freshness/completeness checks"
+        );
+        return;
+    }
+    let mut candidates = report
+        .candidates
+        .into_iter()
+        .filter(|candidate| candidate.accepted && candidate.runtime_compatible)
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        right
+            .score
+            .partial_cmp(&left.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut unavailable = coordinator
+        .whitelist()
+        .list_active_whitelist()
+        .into_iter()
+        .map(|profile| profile.address.to_ascii_lowercase())
+        .collect::<std::collections::HashSet<_>>();
+    unavailable.extend(
+        degraded
+            .iter()
+            .map(|profile| profile.address.to_ascii_lowercase()),
+    );
+
+    for old in degraded {
+        let mut replacement = None;
+        for candidate in &candidates {
+            let key = candidate.address.to_ascii_lowercase();
+            if unavailable.contains(&key) {
+                continue;
+            }
+            unavailable.insert(key.clone());
+            let records = match history.fetch_records(&candidate.address).await {
+                Ok(records) => records,
+                Err(error) => {
+                    journal.record(
+                        "wallet_rotation_candidate_rejected",
+                        serde_json::json!({
+                            "address": candidate.address,
+                            "replaces": old.address,
+                            "reason": format!("history fetch failed: {error}"),
+                        }),
+                    );
+                    continue;
+                }
+            };
+            let evaluation =
+                coordinator
+                    .whitelist()
+                    .evaluate_wallet(&candidate.address, &records, Utc::now());
+            let covers_domain = evaluation.profile.primary_domain == old.primary_domain
+                || evaluation
+                    .profile
+                    .domain_shares
+                    .iter()
+                    .any(|(domain, share)| *domain == old.primary_domain && *share >= dec!(0.30));
+            if !evaluation.is_accepted || !covers_domain {
+                journal.record(
+                    "wallet_rotation_candidate_rejected",
+                    serde_json::json!({
+                        "address": candidate.address,
+                        "replaces": old.address,
+                        "requiredDomain": old.primary_domain.to_string(),
+                        "candidateDomain": evaluation.profile.primary_domain.to_string(),
+                        "runtimeAccepted": evaluation.is_accepted,
+                        "failureReasons": evaluation.failure_reasons,
+                    }),
+                );
+                continue;
+            }
+            replacement = Some(evaluation.profile);
+            break;
+        }
+        if let Some(profile) = replacement {
+            let replacement_address = profile.address.clone();
+            let replacement_tier = profile.tier;
+            coordinator.whitelist().upsert_wallet(profile);
+            coordinator.whitelist().remove_wallet(&old.address);
+            journal.record(
+                "wallet_rotated",
+                serde_json::json!({
+                    "removed": old.address,
+                    "replacement": replacement_address,
+                    "domain": old.primary_domain.to_string(),
+                    "tier": format!("{replacement_tier:?}"),
+                    "candidateReport": report_path,
+                }),
+            );
+            info!(
+                removed = %old.address,
+                replacement = %replacement_address,
+                domain = %old.primary_domain,
+                "Copy-trading wallet source rotated"
+            );
+        } else {
+            journal.record(
+                "wallet_rotation_no_candidate",
+                serde_json::json!({
+                    "removed": old.address,
+                    "domain": old.primary_domain.to_string(),
+                    "candidateReport": report_path,
+                }),
+            );
+            warn!(
+                removed = %old.address,
+                domain = %old.primary_domain,
+                "No independently-scanned replacement wallet was available"
+            );
+        }
+    }
 }
 
 /// Shared execution context for processing a single live signal.
@@ -643,6 +919,7 @@ struct SignalContext {
     processed_signals: ProcessedSignalStore,
     config: CopyTradingConfig,
     runtime: CopyTradingRuntime,
+    quality: WalletQualityTracker,
 }
 
 /// Routes a single live signal through the full coordinator pipeline and
@@ -652,7 +929,6 @@ async fn handle_signal(ctx: &SignalContext, mut signal: SignalEvent) {
     let now = Utc::now();
     ctx.runtime
         .record_signal(signal.timestamp.timestamp_millis());
-
     if signal.action == SignalAction::OpenBuy && !ctx.runtime.entry_enabled() {
         let dedup_key = durable_signal_key(&signal);
         if ctx.processed_signals.check_and_record(&dedup_key) {
@@ -667,6 +943,13 @@ async fn handle_signal(ctx: &SignalContext, mut signal: SignalEvent) {
         }
         ctx.runtime.record_rejection();
         return;
+    }
+    if signal.action == SignalAction::OpenBuy {
+        let age_seconds = now.signed_duration_since(signal.timestamp).num_seconds();
+        ctx.quality.record_buy(
+            &signal.source_wallet,
+            (0..=ctx.config.max_signal_age_seconds).contains(&age_seconds),
+        );
     }
 
     // Reject observations that can never influence the strategy before making
@@ -698,10 +981,13 @@ async fn handle_signal(ctx: &SignalContext, mut signal: SignalEvent) {
                 && signal.action == SignalAction::OpenBuy
                 && signal.target_notional_usdc >= ctx.config.shadow_min_signal_notional_usdc
             {
-                record_dust_signal_shadow(ctx, &signal, age_seconds).await;
+                record_signal_shadow(ctx, &signal, age_seconds, reason).await;
             }
         }
         return;
+    }
+    if signal.action == SignalAction::OpenBuy {
+        ctx.quality.record_actionable(&signal.source_wallet);
     }
 
     // Market metadata is only required for buy-side signals (exit routing skips
@@ -790,13 +1076,24 @@ async fn handle_signal(ctx: &SignalContext, mut signal: SignalEvent) {
     );
 
     let market_ref = market.as_ref();
-    match ctx
+    let pipeline_result = ctx
         .coordinator
         .process_signal(signal.clone(), market_ref, &book, now)
-        .await
-    {
+        .await;
+    if signal.action == SignalAction::OpenBuy {
+        let market_passed = !matches!(
+            &pipeline_result,
+            Err(error) if error.starts_with("Market validation failed:")
+        );
+        ctx.quality
+            .record_market(&signal.source_wallet, market_passed);
+    }
+    match pipeline_result {
         Ok(Some(prop)) => {
             ctx.runtime.record_proposal();
+            if signal.action == SignalAction::OpenBuy {
+                ctx.quality.record_proposal(&signal.source_wallet);
+            }
             ctx.journal.record(
                 "proposal",
                 serde_json::json!({
@@ -1004,6 +1301,11 @@ async fn handle_signal(ctx: &SignalContext, mut signal: SignalEvent) {
                 "signal_rejected",
                 serde_json::json!({
                     "signalId": signal.signal_id,
+                    "wallet": signal.source_wallet,
+                    "market": signal.market_id,
+                    "token": signal.token_id,
+                    "action": format!("{:?}", signal.action),
+                    "stage": if e.starts_with("Market validation failed:") { "market_validation" } else if e.starts_with("Execution pricing rejected:") { "execution_pricing" } else if e.starts_with("Risk allocation rejected:") || e.starts_with("Risk reservation failed") { "risk" } else { "pipeline" },
                     "reason": e,
                 }),
             );
@@ -1012,7 +1314,12 @@ async fn handle_signal(ctx: &SignalContext, mut signal: SignalEvent) {
     }
 }
 
-async fn record_dust_signal_shadow(ctx: &SignalContext, signal: &SignalEvent, age_seconds: i64) {
+async fn record_signal_shadow(
+    ctx: &SignalContext,
+    signal: &SignalEvent,
+    age_seconds: i64,
+    rejection_stage: &str,
+) {
     if ctx.config.paper_execution_delay_ms > 0 {
         sleep(Duration::from_millis(ctx.config.paper_execution_delay_ms)).await;
     }
@@ -1023,13 +1330,14 @@ async fn record_dust_signal_shadow(ctx: &SignalContext, signal: &SignalEvent, ag
     {
         Ok(book) => book,
         Err(error) => {
+            ctx.quality.record_shadow(&signal.source_wallet, false);
             ctx.journal.record(
                 "signal_shadow",
                 serde_json::json!({
                     "signalId": signal.signal_id,
                     "wallet": signal.source_wallet,
                     "market": signal.market_id,
-                    "stage": "below-minimum-notional",
+                    "stage": rejection_stage,
                     "outcome": "book_error",
                     "ageSeconds": age_seconds,
                     "delayMs": ctx.config.paper_execution_delay_ms,
@@ -1039,23 +1347,50 @@ async fn record_dust_signal_shadow(ctx: &SignalContext, signal: &SignalEvent, ag
             return;
         }
     };
-    let max_by_offset = signal.target_vwap + ctx.config.max_price_offset_usd;
-    let max_by_slippage = signal.target_vwap * (Decimal::ONE + ctx.config.max_slippage_pct);
-    let limit_price = max_by_offset.min(max_by_slippage);
-    let proposal = ExecutionOrderProposal {
-        proposal_id: format!("shadow-{}", signal.signal_id),
+    let nav = ctx.coordinator.risk().read().await.calculate_total_nav();
+    let production_budget = nav * ctx.config.single_trade_allocation_pct;
+    let consensus = polypulse::copy_trading::ConsensusSignal {
+        consensus_id: format!("shadow-consensus-{}", signal.signal_id),
         market_id: signal.market_id.clone(),
         token_id: signal.token_id.clone(),
         outcome: signal.outcome.clone(),
-        side: OrderSide::Buy,
-        limit_price,
-        shares: signal.target_shares,
-        notional_usdc: signal.target_notional_usdc,
-        ttl_seconds: 0,
-        reason: "PAPER dust-signal executability research".to_string(),
+        domain: signal.domain.clone(),
+        contributing_wallets: vec![signal.source_wallet.clone()],
+        consensus_score: Decimal::ONE,
+        target_vwap: signal.target_vwap,
         created_at: Utc::now(),
     };
+    let proposal = match ctx.coordinator.execution().build_buy_proposal(
+        &consensus,
+        &book,
+        production_budget,
+        Utc::now(),
+    ) {
+        Ok(proposal) => proposal,
+        Err(error) => {
+            ctx.quality.record_shadow(&signal.source_wallet, false);
+            ctx.journal.record(
+                "signal_shadow",
+                serde_json::json!({
+                    "signalId": signal.signal_id,
+                    "wallet": signal.source_wallet,
+                    "market": signal.market_id,
+                    "token": signal.token_id,
+                    "stage": rejection_stage,
+                    "outcome": "execution_rejected",
+                    "ageSeconds": age_seconds,
+                    "delayMs": ctx.config.paper_execution_delay_ms,
+                    "sourceNotional": signal.target_notional_usdc.to_string(),
+                    "productionBudget": production_budget.to_string(),
+                    "error": error.to_string(),
+                }),
+            );
+            return;
+        }
+    };
     let fill = simulate_paper_fill(&proposal, &book);
+    ctx.quality
+        .record_shadow(&signal.source_wallet, fill.filled_shares > Decimal::ZERO);
     ctx.journal.record(
         "signal_shadow",
         serde_json::json!({
@@ -1063,14 +1398,18 @@ async fn record_dust_signal_shadow(ctx: &SignalContext, signal: &SignalEvent, ag
             "wallet": signal.source_wallet,
             "market": signal.market_id,
             "token": signal.token_id,
-            "stage": "below-minimum-notional",
-            "outcome": if fill.filled_shares <= Decimal::ZERO { "no_fill" } else if fill.filled_shares < signal.target_shares { "partial" } else { "filled" },
+            "stage": rejection_stage,
+            "outcome": if fill.filled_shares <= Decimal::ZERO { "no_fill" } else if fill.filled_shares < proposal.shares { "partial" } else { "filled" },
             "ageSeconds": age_seconds,
             "delayMs": ctx.config.paper_execution_delay_ms,
             "targetVwap": signal.target_vwap.to_string(),
             "bestAsk": book.best_ask().map(|v| v.to_string()),
-            "limitPrice": limit_price.to_string(),
-            "requested": signal.target_shares.to_string(),
+            "limitPrice": proposal.limit_price.to_string(),
+            "sourceShares": signal.target_shares.to_string(),
+            "sourceNotional": signal.target_notional_usdc.to_string(),
+            "productionBudget": production_budget.to_string(),
+            "requested": proposal.shares.to_string(),
+            "requestedNotional": proposal.notional_usdc.to_string(),
             "filled": fill.filled_shares.to_string(),
             "averagePrice": fill.average_price.to_string(),
             "cost": fill.notional.to_string(),

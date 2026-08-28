@@ -37,9 +37,30 @@ cargo build --release --bin maker_liquidity
 ./target/release/maker_liquidity report results/maker-liquidity/shadow-run-001/events.ndjson
 ```
 
+新一轮修正后的默认结果文件为：
+
+```bash
+./target/release/maker_liquidity report results/maker-liquidity/shadow-run-002/events.ndjson
+```
+
+## Shadow v2 的保守成交口径
+
+- 每个报价只在 `MAKER_QUOTE_INTERVAL_SECS` 指定的生命周期内有效；生成下一报价前视为已经撤销旧报价。
+- 成交代理会先扣除报价生成时同价及更优价位的可见排队量，公开成交必须穿透该队列后才计入模拟成交。
+- `report` 按观察周期列出 queue-aware 成交报价数、成交资金、返佣后 markout 和资金收益率；不同观察周期不能相加。
+- Liquidity Rewards 是全市场奖池，不是本策略收入。v2 会按当前可见盘口、使用同一简化评分公式给出 `visible_reward_estimate`，但它看不到隐藏/瞬时订单、账户资格和官方最终计分，故只用于候选排序，不能直接计入策略 PnL。
+
+市场会按 `MAKER_MARKET_REFRESH_SECS` 周期重新筛选；连续盘口/报价异常达到
+`MAKER_MAX_CONSECUTIVE_MARKET_ERRORS` 后，会按 `MAKER_MARKET_COOLDOWN_SECS`
+暂时排除，并自动寻找替代市场。`MAKER_MIN_TIME_TO_END_SECS` 用于排除临近结束的市场。
+
+建议至少积累 100 个 60 秒周期的 queue-aware 独立成交报价，且保守返佣后的
+60 秒 markout 为正，再考虑下一阶段；在拿到实际 Liquidity Rewards 分配并校准
+可见竞争份额估算前，不应进入真实下单。
+
 ## 结果解释
 
-- `yes/no_fill_proxy_shares` 是乐观代理，不是真实成交确认。同价成交无法知道前方队列；`trade_through=true` 的可信度更高。
+- v2 的 `yes/no_fill_proxy_shares` 会扣除报价时可见的前方队列并限制报价生命周期，明显保守于 v1，但仍不是真实成交确认；`trade_through=true` 的证据更强。
 - `inventory_markout_usdc` 衡量被动成交后的价格选择风险，负值表示成交后价格向不利方向移动。
 - `estimated_rebate_usdc` 只按市场公开费率计算理论 rebate；没有费率的市场为 0。
 - Liquidity Rewards 的最终份额取决于同一计分周期内其他 maker 的分数。本模块记录自身理论分数，但不会把未知奖励分配加入 PnL。

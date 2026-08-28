@@ -8,7 +8,8 @@ use std::path::Path;
 
 use crate::monitor::arbitrage::ArbitrageShadowCandidate;
 use crate::monitor::ArbitrageOpportunity;
-use crate::trading::executor::{ArbitrageRestSnapshot, ExecutionQuote};
+use crate::opportunity_admission::AdmissionRejection;
+use crate::trading::executor::{ArbitrageRestSnapshot, ExecutionQuote, ShadowExecutionAssessment};
 
 #[derive(Serialize)]
 struct ArbitrageRecord {
@@ -71,6 +72,7 @@ struct ArbitrageShadowRecord {
 struct ArbitrageRestShadowRecord {
     action: &'static str,
     source: &'static str,
+    admission_rejection: Option<&'static str>,
     timestamp: String,
     signal_observed_at_ms: i64,
     scheduled_delay_ms: u64,
@@ -85,6 +87,14 @@ struct ArbitrageRestShadowRecord {
     raw_no_ask_price: String,
     yes_limit_price: String,
     no_limit_price: String,
+    signal_gross_edge_per_share: String,
+    signal_yes_fee_per_share: String,
+    signal_no_fee_per_share: String,
+    signal_net_edge_per_share: String,
+    required_gross_edge_per_share: String,
+    required_net_edge_per_share: String,
+    passes_gross_edge: bool,
+    passes_net_edge: bool,
     max_leg_notional_usdc: String,
     requested_size: String,
     yes_filled: String,
@@ -108,6 +118,46 @@ struct ArbitrageRestShadowRecord {
     rest_yes_book_updated_at_ms: Option<i64>,
     rest_no_book_updated_at_ms: Option<i64>,
     error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ArbitrageAdmissionShadowRecord {
+    action: &'static str,
+    timestamp: String,
+    signal_observed_at_ms: i64,
+    admission_rejection: &'static str,
+    market_id: String,
+    market_name: String,
+    yes_token_id: String,
+    no_token_id: String,
+    yes_direction: String,
+    no_direction: String,
+    raw_yes_ask_price: String,
+    raw_no_ask_price: String,
+    raw_total_price: String,
+    raw_profit_percentage: String,
+    yes_ask_size: String,
+    no_ask_size: String,
+    yes_depth_usdc: String,
+    no_depth_usdc: String,
+    yes_limit_price: String,
+    no_limit_price: String,
+    quote_size: String,
+    quote_total_cost: String,
+    signal_gross_edge_per_share: String,
+    signal_yes_fee_per_share: String,
+    signal_no_fee_per_share: String,
+    signal_net_edge_per_share: String,
+    required_gross_edge_per_share: String,
+    required_net_edge_per_share: String,
+    passes_gross_edge: bool,
+    passes_net_edge: bool,
+    fee_rate: String,
+    fee_exponent: u32,
+    minimum_order_size: String,
+    signal_yes_book_age_ms: i64,
+    signal_no_book_age_ms: i64,
+    signal_book_skew_ms: i64,
 }
 
 /// Write only an opportunity that survived the exact slippage/tick/fee quote.
@@ -154,8 +204,9 @@ pub fn log_arbitrage_opportunity(
 #[allow(clippy::too_many_arguments)]
 pub fn log_arbitrage_rest_shadow(
     source: &'static str,
+    admission_rejection: Option<AdmissionRejection>,
     opp: &ArbitrageOpportunity,
-    quote: &ExecutionQuote,
+    assessment: &ShadowExecutionAssessment,
     market_name: &str,
     signal_observed_at_ms: i64,
     scheduled_delay_ms: u64,
@@ -163,6 +214,7 @@ pub fn log_arbitrage_rest_shadow(
     snapshot: &ArbitrageRestSnapshot,
     file_path: &str,
 ) -> Result<()> {
+    let quote = &assessment.quote;
     let paired_size = snapshot.yes_fill.filled.min(snapshot.no_fill.filled);
     let gross_edge_per_share = (paired_size > dec!(0)).then(|| {
         (dec!(1) - snapshot.yes_fill.average_price - snapshot.no_fill.average_price).to_string()
@@ -181,6 +233,7 @@ pub fn log_arbitrage_rest_shadow(
     let record = ArbitrageRestShadowRecord {
         action: "rest_shadow",
         source,
+        admission_rejection: admission_rejection.map(AdmissionRejection::as_str),
         timestamp: Utc::now().to_rfc3339(),
         signal_observed_at_ms,
         scheduled_delay_ms,
@@ -196,6 +249,14 @@ pub fn log_arbitrage_rest_shadow(
         raw_no_ask_price: opp.no_ask_price.to_string(),
         yes_limit_price: quote.yes_price.to_string(),
         no_limit_price: quote.no_price.to_string(),
+        signal_gross_edge_per_share: quote.gross_edge_per_share.to_string(),
+        signal_yes_fee_per_share: quote.yes_fee_per_share.to_string(),
+        signal_no_fee_per_share: quote.no_fee_per_share.to_string(),
+        signal_net_edge_per_share: quote.edge_per_share.to_string(),
+        required_gross_edge_per_share: assessment.required_gross_edge_per_share.to_string(),
+        required_net_edge_per_share: assessment.required_net_edge_per_share.to_string(),
+        passes_gross_edge: assessment.passes_gross_edge,
+        passes_net_edge: assessment.passes_net_edge,
         max_leg_notional_usdc: max_leg_notional_usdc.to_string(),
         requested_size: snapshot.yes_fill.requested.to_string(),
         yes_filled: snapshot.yes_fill.filled.to_string(),
@@ -221,6 +282,59 @@ pub fn log_arbitrage_rest_shadow(
         rest_yes_book_updated_at_ms: snapshot.yes_book_updated_at_ms,
         rest_no_book_updated_at_ms: snapshot.no_book_updated_at_ms,
         error: snapshot.error.clone(),
+    };
+    append_record(file_path, &record)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn log_arbitrage_admission_shadow(
+    rejection: AdmissionRejection,
+    opp: &ArbitrageOpportunity,
+    assessment: &ShadowExecutionAssessment,
+    market_name: &str,
+    yes_direction: &str,
+    no_direction: &str,
+    signal_observed_at_ms: i64,
+    file_path: &str,
+) -> Result<()> {
+    let quote = &assessment.quote;
+    let record = ArbitrageAdmissionShadowRecord {
+        action: "admission_rejected",
+        timestamp: Utc::now().to_rfc3339(),
+        signal_observed_at_ms,
+        admission_rejection: rejection.as_str(),
+        market_id: format!("{:?}", opp.market_id),
+        market_name: market_name.to_string(),
+        yes_token_id: opp.yes_token_id.to_string(),
+        no_token_id: opp.no_token_id.to_string(),
+        yes_direction: yes_direction.to_string(),
+        no_direction: no_direction.to_string(),
+        raw_yes_ask_price: opp.yes_ask_price.to_string(),
+        raw_no_ask_price: opp.no_ask_price.to_string(),
+        raw_total_price: (opp.yes_ask_price + opp.no_ask_price).to_string(),
+        raw_profit_percentage: opp.profit_percentage.to_string(),
+        yes_ask_size: opp.yes_size.to_string(),
+        no_ask_size: opp.no_size.to_string(),
+        yes_depth_usdc: (opp.yes_ask_price * opp.yes_size).to_string(),
+        no_depth_usdc: (opp.no_ask_price * opp.no_size).to_string(),
+        yes_limit_price: quote.yes_price.to_string(),
+        no_limit_price: quote.no_price.to_string(),
+        quote_size: quote.size.to_string(),
+        quote_total_cost: quote.total_cost.to_string(),
+        signal_gross_edge_per_share: quote.gross_edge_per_share.to_string(),
+        signal_yes_fee_per_share: quote.yes_fee_per_share.to_string(),
+        signal_no_fee_per_share: quote.no_fee_per_share.to_string(),
+        signal_net_edge_per_share: quote.edge_per_share.to_string(),
+        required_gross_edge_per_share: assessment.required_gross_edge_per_share.to_string(),
+        required_net_edge_per_share: assessment.required_net_edge_per_share.to_string(),
+        passes_gross_edge: assessment.passes_gross_edge,
+        passes_net_edge: assessment.passes_net_edge,
+        fee_rate: quote.fee_rate.to_string(),
+        fee_exponent: quote.fee_exponent,
+        minimum_order_size: quote.minimum_order_size.to_string(),
+        signal_yes_book_age_ms: signal_observed_at_ms.saturating_sub(opp.yes_book_timestamp_ms),
+        signal_no_book_age_ms: signal_observed_at_ms.saturating_sub(opp.no_book_timestamp_ms),
+        signal_book_skew_ms: (opp.yes_book_timestamp_ms - opp.no_book_timestamp_ms).abs(),
     };
     append_record(file_path, &record)
 }
@@ -367,18 +481,24 @@ mod tests {
             yes_book_timestamp_ms: 9_900,
             no_book_timestamp_ms: 9_850,
         };
-        let quote = ExecutionQuote {
-            yes_price: dec!(0.45),
-            no_price: dec!(0.50),
-            size: dec!(10),
-            total_cost: dec!(9.5),
-            gross_edge_per_share: dec!(0.05),
-            yes_fee_per_share: dec!(0),
-            no_fee_per_share: dec!(0),
-            edge_per_share: dec!(0.05),
-            fee_rate: dec!(0),
-            fee_exponent: 1,
-            minimum_order_size: dec!(1),
+        let assessment = ShadowExecutionAssessment {
+            quote: ExecutionQuote {
+                yes_price: dec!(0.45),
+                no_price: dec!(0.50),
+                size: dec!(10),
+                total_cost: dec!(9.5),
+                gross_edge_per_share: dec!(0.05),
+                yes_fee_per_share: dec!(0),
+                no_fee_per_share: dec!(0),
+                edge_per_share: dec!(0.05),
+                fee_rate: dec!(0),
+                fee_exponent: 1,
+                minimum_order_size: dec!(1),
+            },
+            required_gross_edge_per_share: dec!(0.03),
+            required_net_edge_per_share: dec!(0.003),
+            passes_gross_edge: true,
+            passes_net_edge: true,
         };
         let snapshot = ArbitrageRestSnapshot {
             observed_at_ms: 10_180,
@@ -403,8 +523,9 @@ mod tests {
         };
         log_arbitrage_rest_shadow(
             "full_depth",
+            None,
             &opportunity,
-            &quote,
+            &assessment,
             "btc prediction market",
             10_000,
             100,
@@ -428,6 +549,68 @@ mod tests {
         assert_eq!(record["no_fee"], "0");
         assert_eq!(record["max_leg_notional_usdc"], "5");
         assert_eq!(record["paired_size"], "8");
+        assert_eq!(record["signal_net_edge_per_share"], "0.05");
+        assert_eq!(record["required_gross_edge_per_share"], "0.03");
+        assert_eq!(record["passes_net_edge"], true);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn admission_shadow_records_counterfactual_net_edge() {
+        let path = std::env::temp_dir().join(format!(
+            "polypulse-admission-shadow-{}.ndjson",
+            uuid::Uuid::new_v4()
+        ));
+        let opportunity = ArbitrageOpportunity {
+            market_id: B256::ZERO,
+            yes_token_id: U256::from(1),
+            no_token_id: U256::from(2),
+            yes_ask_price: dec!(0.49),
+            no_ask_price: dec!(0.49),
+            total_cost: dec!(9.8),
+            profit_percentage: dec!(2),
+            yes_size: dec!(10),
+            no_size: dec!(10),
+            yes_book_timestamp_ms: 9_900,
+            no_book_timestamp_ms: 9_850,
+        };
+        let assessment = ShadowExecutionAssessment {
+            quote: ExecutionQuote {
+                yes_price: dec!(0.49),
+                no_price: dec!(0.49),
+                size: dec!(10),
+                total_cost: dec!(10.1),
+                gross_edge_per_share: dec!(0.02),
+                yes_fee_per_share: dec!(0.015),
+                no_fee_per_share: dec!(0.015),
+                edge_per_share: dec!(-0.01),
+                fee_rate: dec!(0.25),
+                fee_exponent: 2,
+                minimum_order_size: dec!(5),
+            },
+            required_gross_edge_per_share: dec!(0.03),
+            required_net_edge_per_share: dec!(0.003),
+            passes_gross_edge: false,
+            passes_net_edge: false,
+        };
+        log_arbitrage_admission_shadow(
+            AdmissionRejection::ExecutionSpread,
+            &opportunity,
+            &assessment,
+            "btc prediction market",
+            "↑",
+            "↓",
+            10_000,
+            path.to_str().unwrap(),
+        )
+        .unwrap();
+        let record: serde_json::Value =
+            serde_json::from_str(std::fs::read_to_string(&path).unwrap().trim()).unwrap();
+        assert_eq!(record["action"], "admission_rejected");
+        assert_eq!(record["admission_rejection"], "execution_spread");
+        assert_eq!(record["signal_net_edge_per_share"], "-0.01");
+        assert_eq!(record["passes_gross_edge"], false);
+        assert_eq!(record["yes_depth_usdc"], "4.90");
         std::fs::remove_file(path).unwrap();
     }
 }

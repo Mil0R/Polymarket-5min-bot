@@ -201,6 +201,9 @@ pub struct WinnerEvaluation {
     pub book_source: String,
     #[serde(default)]
     pub book_age_ms: i64,
+    /// Overlapping research cohorts. They never affect production admission.
+    #[serde(default)]
+    pub research_cohorts: Vec<String>,
     pub directional_margin_bps: f64,
     pub reversal_boundary_bps: f64,
     pub volatility_bps_per_sqrt_second: f64,
@@ -217,10 +220,13 @@ pub struct WinnerShadowExecution {
     pub slug: String,
     pub simulated_at: DateTime<Utc>,
     pub delay_ms: u64,
-    /// `rejected` or `awaiting_confirmation`; older records deserialize as
-    /// `rejected` so historical journals remain readable.
+    /// `rejected_confirmed` for new research records; older `rejected` and
+    /// `awaiting_confirmation` records remain readable.
     #[serde(default = "default_shadow_candidate_stage")]
     pub candidate_stage: String,
+    /// Cohorts copied from the originating evaluation for market-level reports.
+    #[serde(default)]
+    pub research_cohorts: Vec<String>,
     pub outcome: String,
     pub limit_price: Decimal,
     pub requested: Decimal,
@@ -246,6 +252,9 @@ pub struct WinnerConfirmationObservation {
     pub confirmations: u32,
     pub required: u32,
     pub confirmed: bool,
+    /// `production` or `rejected_shadow`; legacy records deserialize empty.
+    #[serde(default)]
+    pub candidate_stage: String,
 }
 
 impl WinnerEvaluation {
@@ -303,6 +312,7 @@ impl WinnerEvaluation {
             seconds_remaining_bucket: seconds_remaining_bucket(seconds_remaining).to_string(),
             book_source,
             book_age_ms,
+            research_cohorts: Vec::new(),
             directional_margin_bps: model.directional_margin_bps,
             reversal_boundary_bps: model.reversal_boundary_bps,
             volatility_bps_per_sqrt_second: model.volatility_bps_per_sqrt_second,
@@ -310,6 +320,49 @@ impl WinnerEvaluation {
             depth_usdc: model.depth_notional,
         }
     }
+}
+
+/// Classify an evaluation into overlapping, read-only research cohorts. The
+/// hybrid cohort treats Chainlink as a directional veto instead of using its
+/// diffusion probability as the absolute source of truth.
+pub fn winner_research_cohorts(
+    evaluation: &WinnerEvaluation,
+    max_spread: Decimal,
+    min_depth_usdc: Decimal,
+) -> Vec<String> {
+    let mut cohorts = vec!["all_candidates".to_string()];
+    let asset = evaluation.asset.trim().to_ascii_lowercase();
+    cohorts.push(format!("asset_{asset}"));
+    cohorts.push(format!(
+        "price_{}",
+        evaluation
+            .ask_price
+            .normalize()
+            .to_string()
+            .replace('.', "_")
+    ));
+    let preferred_price = (dec!(0.96)..=dec!(0.97)).contains(&evaluation.ask_price);
+    if preferred_price {
+        cohorts.push("price_096_097".to_string());
+    }
+    let has_chainlink_model = evaluation.opening_twap.is_some()
+        && evaluation.current_twap.is_some()
+        && evaluation.model_observed_at_ms.is_some();
+    let direction_agrees = has_chainlink_model && evaluation.directional_margin_bps > 0.0;
+    if direction_agrees {
+        cohorts.push("chainlink_direction_agrees".to_string());
+    }
+    if preferred_price
+        && direction_agrees
+        && evaluation.spread <= max_spread
+        && evaluation.depth_usdc >= min_depth_usdc
+    {
+        cohorts.push("hybrid_chainlink_veto".to_string());
+    }
+    if evaluation.rejection.is_none() {
+        cohorts.push("production_model".to_string());
+    }
+    cohorts
 }
 
 fn seconds_remaining_bucket(seconds: i64) -> &'static str {
@@ -1527,12 +1580,32 @@ mod tests {
             seconds_remaining_bucket: "00-20s".into(),
             book_source: "rest".into(),
             book_age_ms: 0,
+            research_cohorts: vec![],
             directional_margin_bps: 100.0,
             reversal_boundary_bps: 10.0,
             volatility_bps_per_sqrt_second: 1.0,
             spread: dec!(0.01),
             depth_usdc: dec!(9.5),
         };
+        let cohorts = winner_research_cohorts(&evaluation, dec!(0.03), dec!(5));
+        assert!(cohorts.iter().any(|cohort| cohort == "all_candidates"));
+        assert!(cohorts
+            .iter()
+            .any(|cohort| cohort == "chainlink_direction_agrees"));
+        assert!(!cohorts.iter().any(|cohort| cohort == "price_096_097"));
+        assert!(!cohorts.iter().any(|cohort| cohort == "production_model"));
+        let mut production_evaluation = evaluation.clone();
+        production_evaluation.ask_price = dec!(0.97);
+        production_evaluation.rejection = None;
+        production_evaluation.failed_checks.clear();
+        let production_cohorts =
+            winner_research_cohorts(&production_evaluation, dec!(0.03), dec!(5));
+        assert!(production_cohorts
+            .iter()
+            .any(|cohort| cohort == "hybrid_chainlink_veto"));
+        assert!(production_cohorts
+            .iter()
+            .any(|cohort| cohort == "production_model"));
         {
             let journal = WinnerEvaluationJournal::open(&path).unwrap();
             journal.record(evaluation).unwrap();
@@ -1545,6 +1618,7 @@ mod tests {
                     confirmations: 1,
                     required: 2,
                     confirmed: false,
+                    candidate_stage: "rejected_shadow".into(),
                 })
                 .unwrap();
             journal
@@ -1554,6 +1628,7 @@ mod tests {
                     simulated_at: now,
                     delay_ms: 250,
                     candidate_stage: "rejected".into(),
+                    research_cohorts: vec!["all_candidates".into()],
                     outcome: "filled".into(),
                     limit_price: dec!(0.95),
                     requested: dec!(20),

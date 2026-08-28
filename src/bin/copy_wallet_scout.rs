@@ -63,7 +63,7 @@ async fn main() -> Result<()> {
     }
 
     let profile = option_value(&args, "--profile")
-        .map(|v| ScoutProfile::parse(v))
+        .map(ScoutProfile::parse)
         .transpose()?
         .unwrap_or(ScoutProfile::Conservative);
     let mut config = match profile {

@@ -4,7 +4,9 @@ use crate::monitor::arbitrage::{
     ArbitrageDetector, ArbitrageOpportunity, ArbitrageScan, ArbitrageShadowCandidate,
 };
 use crate::monitor::orderbook::{best_ask, OrderBookPair};
-use crate::opportunity_admission::{AdmissionContext, OpportunityAdmissionService};
+use crate::opportunity_admission::{
+    AdmissionContext, AdmissionRejection, OpportunityAdmissionService,
+};
 use crate::runtime_metrics::RuntimeMetrics;
 use crate::strategy_gate::{validate_book_timestamps, SignalDeduplicator};
 use dashmap::DashMap;
@@ -31,6 +33,7 @@ pub struct ArbitrageRestShadowCandidate {
     pub source: &'static str,
     pub opportunity: ArbitrageOpportunity,
     pub observed_at_ms: i64,
+    pub admission_rejection: Option<AdmissionRejection>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -144,6 +147,7 @@ impl WindowSessionRunner {
                             source: "full_depth",
                             opportunity: opportunity.clone(),
                             observed_at_ms: now_ms,
+                            admission_rejection: None,
                         });
                     }
                     opportunity
@@ -174,6 +178,7 @@ impl WindowSessionRunner {
                             source: "depth_rejected",
                             opportunity,
                             observed_at_ms: now_ms,
+                            admission_rejection: None,
                         });
                     }
                     shadow_candidate = Some(candidate);
@@ -201,6 +206,10 @@ impl WindowSessionRunner {
             if let Err(reason) = result {
                 self.metrics.record_admission_rejection(reason);
                 self.stable_candidates.remove(&opportunity.market_id);
+                if let Some(candidate) = rest_shadow_candidate.as_mut() {
+                    candidate.source = "admission_rejected";
+                    candidate.admission_rejection = Some(reason);
+                }
                 return None;
             }
             if !self.confirmation_admits(&opportunity, now_ms) {
@@ -382,6 +391,30 @@ mod tests {
         assert_eq!(snapshot.orderbook_pairs, 2);
         assert_eq!(snapshot.opportunities_admitted, 1);
         assert_eq!(snapshot.duplicate_signals, 1);
+    }
+
+    #[test]
+    fn preserves_execution_spread_rejection_for_rest_observation() {
+        let market_id = B256::repeat_byte(12);
+        let metrics = Arc::new(RuntimeMetrics::default());
+        let runner = runner(market_id, metrics.clone());
+        let now_ms = Utc::now().timestamp_millis();
+        let pair = OrderBookPair {
+            yes_book: book(1, market_id, now_ms, dec!(0.495)),
+            no_book: book(2, market_id, now_ms, dec!(0.50)),
+            market_id,
+        };
+        let tick = runner
+            .process_pair(&pair, now_ms, false, true, false)
+            .unwrap();
+        assert!(tick.opportunity.is_none());
+        let candidate = tick.rest_shadow_candidate.expect("shadow candidate");
+        assert_eq!(candidate.source, "admission_rejected");
+        assert_eq!(
+            candidate.admission_rejection,
+            Some(AdmissionRejection::ExecutionSpread)
+        );
+        assert_eq!(metrics.snapshot().rejection_execution_spread, 1);
     }
 
     #[test]

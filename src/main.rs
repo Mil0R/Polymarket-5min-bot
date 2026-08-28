@@ -30,7 +30,7 @@ use polypulse::ui::{decimal_to_f64, spawn_dashboard_thread, symbol_short, Dashbo
 use anyhow::Result;
 use futures::{future::join_all, StreamExt};
 use rust_decimal_macros::dec;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{stdout, IsTerminal};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
@@ -59,9 +59,9 @@ use crate::window_session::WindowSession;
 use crate::window_session_runner::WindowSessionRunner;
 use crate::winner_buy::{
     detect_winner_asks, fee_inclusive_depth_capped_size, received_at_is_fresh, settle_winner_buy,
-    winner_books_need_rest, PendingWinnerBuy, SettlementBackoff, WinnerBuyJournal,
-    WinnerBuyRiskPolicy, WinnerConfirmationObservation, WinnerEvaluation, WinnerEvaluationJournal,
-    WinnerShadowExecution,
+    winner_books_need_rest, winner_research_cohorts, PendingWinnerBuy, SettlementBackoff,
+    WinnerBuyJournal, WinnerBuyRiskPolicy, WinnerConfirmationObservation, WinnerEvaluation,
+    WinnerEvaluationJournal, WinnerShadowExecution,
 };
 use crate::winner_model::{
     attempt_allowed, run_chainlink_twap_feed, ChainlinkTwapStore, WinnerConfirmationTracker,
@@ -675,6 +675,7 @@ async fn main() -> Result<()> {
             }
         };
         let mut market_ws_reconnecting = false;
+        let mut market_ws_disconnect_started_at: Option<Instant> = None;
         let mut market_ws_seen_connected = matches!(
             monitor.connection_state(),
             MarketWsConnectionState::Connected
@@ -686,6 +687,8 @@ async fn main() -> Result<()> {
         let winner_buy_count = Arc::new(AtomicU32::new(0));
         let mut winner_attempts_by_market: HashMap<String, u32> = HashMap::new();
         let mut winner_confirmations = WinnerConfirmationTracker::default();
+        let mut winner_shadow_confirmations = WinnerConfirmationTracker::default();
+        let mut winner_shadow_executed = HashSet::new();
         if winner_buy_available {
             info!(target: "polypulse::strategy::winner_buy",
                 before_end_secs = config.winner_buy_before_end_secs,
@@ -954,8 +957,8 @@ async fn main() -> Result<()> {
                                                 .copied()
                                                 .max()
                                                 .unwrap_or(dec!(1));
-                                            let quote = match shadow_executor
-                                                .shadow_execution_quote(
+                                            let assessment = match shadow_executor
+                                                .shadow_execution_assessment(
                                                     &candidate.opportunity,
                                                     &shadow_yes_dir,
                                                     &shadow_no_dir,
@@ -969,15 +972,52 @@ async fn main() -> Result<()> {
                                                         %error,
                                                         source = candidate.source,
                                                         market = %shadow_market,
-                                                        "REST shadow candidate rejected by executable quote"
+                                                        "REST shadow observation quote unavailable"
                                                     );
                                                     return;
                                                 }
                                             };
+                                            if let Some(rejection) = candidate.admission_rejection {
+                                                shadow_metrics.record_arbitrage_admission_shadow(
+                                                    assessment.passes_gross_edge,
+                                                    assessment.passes_net_edge,
+                                                );
+                                                let logged_candidate = candidate.clone();
+                                                let logged_assessment = assessment.clone();
+                                                let logged_market = shadow_market.clone();
+                                                let logged_path = path.clone();
+                                                let logged_yes_dir = shadow_yes_dir.clone();
+                                                let logged_no_dir = shadow_no_dir.clone();
+                                                if let Err(error) = tokio::task::spawn_blocking(move || {
+                                                    utils::arbitrage_logger::log_arbitrage_admission_shadow(
+                                                        rejection,
+                                                        &logged_candidate.opportunity,
+                                                        &logged_assessment,
+                                                        &logged_market,
+                                                        &logged_yes_dir,
+                                                        &logged_no_dir,
+                                                        logged_candidate.observed_at_ms,
+                                                        &logged_path,
+                                                    )
+                                                })
+                                                .await
+                                                .unwrap_or_else(|error| {
+                                                    Err(anyhow::anyhow!(
+                                                        "admission shadow logger task failed: {error}"
+                                                    ))
+                                                }) {
+                                                    warn!(target: "polypulse::strategy::spread_arbitrage",
+                                                        %error,
+                                                        source = candidate.source,
+                                                        market = %shadow_market,
+                                                        "Failed to persist admission shadow assessment"
+                                                    );
+                                                }
+                                            }
                                             let samples = shadow_delays.into_iter().map(|delay_ms| {
                                                 let sample_executor = shadow_executor.clone();
                                                 let sample_candidate = candidate.clone();
-                                                let sample_quote = quote.clone();
+                                                let sample_assessment = assessment.clone();
                                                 let sample_market = shadow_market.clone();
                                                 let sample_path = path.clone();
                                                 let sample_metrics = shadow_metrics.clone();
@@ -1002,7 +1042,7 @@ async fn main() -> Result<()> {
                                                     let tiers = match sample_executor
                                                         .shadow_arbitrage_ladder(
                                                             &sample_candidate.opportunity,
-                                                            &sample_quote,
+                                                            &sample_assessment.quote,
                                                             &sample_notionals,
                                                         )
                                                         .await
@@ -1026,14 +1066,15 @@ async fn main() -> Result<()> {
                                                             tier.snapshot.error.is_some(),
                                                         );
                                                         let logged_candidate = sample_candidate.clone();
-                                                        let logged_quote = sample_quote.clone();
+                                                        let logged_assessment = sample_assessment.clone();
                                                         let logged_market = sample_market.clone();
                                                         let logged_path = sample_path.clone();
                                                         if let Err(error) = tokio::task::spawn_blocking(move || {
                                                             utils::arbitrage_logger::log_arbitrage_rest_shadow(
                                                                 logged_candidate.source,
+                                                                logged_candidate.admission_rejection,
                                                                 &logged_candidate.opportunity,
-                                                                &logged_quote,
+                                                                &logged_assessment,
                                                                 &logged_market,
                                                                 logged_candidate.observed_at_ms,
                                                                 delay_ms,
@@ -1225,6 +1266,12 @@ async fn main() -> Result<()> {
                     match monitor.connection_state() {
                         MarketWsConnectionState::Connected if market_ws_reconnecting => {
                             runtime_metrics.record_sdk_market_ws_recovery();
+                            if let Some(started_at) = market_ws_disconnect_started_at.take() {
+                                runtime_metrics.record_sdk_market_ws_downtime(
+                                    u64::try_from(started_at.elapsed().as_millis())
+                                        .unwrap_or(u64::MAX),
+                                );
+                            }
                             market_ws_reconnecting = false;
                             market_ws_seen_connected = true;
                             info!("SDK market WebSocket recovered internally");
@@ -1232,6 +1279,8 @@ async fn main() -> Result<()> {
                         MarketWsConnectionState::Reconnecting(attempt) => {
                             if market_ws_seen_connected && !market_ws_reconnecting {
                                 runtime_metrics.record_sdk_market_ws_reconnect();
+                                runtime_metrics.record_sdk_market_ws_reconnecting_transition();
+                                market_ws_disconnect_started_at = Some(Instant::now());
                                 monitor.invalidate_books();
                                 session_runner.invalidate_transient_state();
                                 warn!(attempt, "SDK market WebSocket reconnecting internally");
@@ -1242,6 +1291,8 @@ async fn main() -> Result<()> {
                         | MarketWsConnectionState::Connecting => {
                             if market_ws_seen_connected && !market_ws_reconnecting {
                                 runtime_metrics.record_sdk_market_ws_reconnect();
+                                runtime_metrics.record_sdk_market_ws_disconnected_transition();
+                                market_ws_disconnect_started_at = Some(Instant::now());
                                 monitor.invalidate_books();
                                 session_runner.invalidate_transient_state();
                                 warn!("SDK market WebSocket disconnected; cached books and arbitrage candidates invalidated");
@@ -1374,6 +1425,7 @@ async fn main() -> Result<()> {
 
                     if !strategy_controls.winner_buy_enabled() {
                         winner_confirmations.clear();
+                        winner_shadow_confirmations.clear();
                     }
 
                     // Window-end winner-buy (strategy B): when the window is
@@ -1868,6 +1920,7 @@ async fn main() -> Result<()> {
                                     preliminary_signal.is_some(),
                                 ) {
                                     winner_confirmations.reject(&market.slug);
+                                    winner_shadow_confirmations.reject(&market.slug);
                                     runtime_metrics.record_winner_buy_no_signal();
                                     runtime_metrics.record_winner_buy_asset_no_signal(
                                         &market.crypto_symbol,
@@ -1973,6 +2026,7 @@ async fn main() -> Result<()> {
                             let no_ask = no_top.and_then(|top| top.ask_price);
                             if yes_ask.is_none() && no_ask.is_none() {
                                 winner_confirmations.reject(&market.slug);
+                                winner_shadow_confirmations.reject(&market.slug);
                                 runtime_metrics.record_winner_buy_no_book();
                                 runtime_metrics
                                     .record_winner_buy_asset_no_book(&market.crypto_symbol);
@@ -1986,6 +2040,7 @@ async fn main() -> Result<()> {
                                 detect_winner_asks(yes_ask, no_ask, min_price, max_price)
                             else {
                                 winner_confirmations.reject(&market.slug);
+                                winner_shadow_confirmations.reject(&market.slug);
                                 runtime_metrics.record_winner_buy_no_signal();
                                 runtime_metrics
                                     .record_winner_buy_asset_no_signal(&market.crypto_symbol);
@@ -2009,6 +2064,7 @@ async fn main() -> Result<()> {
                             };
                             let Some(selected_top) = selected_top else {
                                 winner_confirmations.reject(&market.slug);
+                                winner_shadow_confirmations.reject(&market.slug);
                                 continue;
                             };
                             let book_source = if selected_from_rest { "rest" } else { "ws" };
@@ -2021,6 +2077,7 @@ async fn main() -> Result<()> {
                                 selected_top.ask_size,
                             ) else {
                                 winner_confirmations.reject(&market.slug);
+                                winner_shadow_confirmations.reject(&market.slug);
                                 runtime_metrics.record_winner_buy_incomplete_book();
                                 debug!(
                                     market = %market.crypto_symbol,
@@ -2033,6 +2090,8 @@ async fn main() -> Result<()> {
                             };
                             let Some(fee_policy) = winner_fee_policies.get(&market.slug).copied()
                             else {
+                                winner_confirmations.reject(&market.slug);
+                                winner_shadow_confirmations.reject(&market.slug);
                                 continue;
                             };
                             let fee_per_share = fee_policy.fee_per_share(signal.price);
@@ -2054,7 +2113,7 @@ async fn main() -> Result<()> {
                                 ),
                             );
                             let evaluation_id = uuid::Uuid::new_v4().to_string();
-                            let evaluation = WinnerEvaluation::from_model(
+                            let mut evaluation = WinnerEvaluation::from_model(
                                 evaluation_id.clone(),
                                 market.crypto_symbol.clone(),
                                 market.slug.clone(),
@@ -2071,6 +2130,16 @@ async fn main() -> Result<()> {
                                 book_age_ms,
                                 &model,
                             );
+                            evaluation.research_cohorts = winner_research_cohorts(
+                                &evaluation,
+                                rust_decimal::Decimal::try_from(config.winner_buy_max_spread)
+                                    .expect("validated winner-buy max spread"),
+                                rust_decimal::Decimal::try_from(
+                                    config.winner_buy_min_depth_usdc,
+                                )
+                                .expect("validated winner-buy minimum depth"),
+                            );
+                            let research_cohorts = evaluation.research_cohorts.clone();
                             if let Err(error) = winner_evaluation_journal
                                 .as_ref()
                                 .expect("Winner Buy evaluation journal initialized")
@@ -2121,113 +2190,84 @@ async fn main() -> Result<()> {
                                     "Winner-buy rejected by independent Chainlink model"
                                 );
                                 if config.dry_run {
+                                    let Some(observed_at_ms) = model.observed_at_ms else {
+                                        winner_shadow_confirmations.reject(&market.slug);
+                                        continue;
+                                    };
+                                    let confirmation = winner_shadow_confirmations.observe(
+                                        &market.slug,
+                                        signal.buy_yes,
+                                        observed_at_ms,
+                                        config.winner_buy_confirmation_observations,
+                                        config.winner_buy_feed_max_age_ms.saturating_mul(3),
+                                    );
+                                    let confirmation_observation = WinnerConfirmationObservation {
+                                        evaluation_id: evaluation_id.clone(),
+                                        slug: market.slug.clone(),
+                                        recorded_at: Utc::now(),
+                                        model_observed_at_ms: observed_at_ms,
+                                        confirmations: confirmation.confirmations,
+                                        required: confirmation.required,
+                                        confirmed: confirmation.confirmed,
+                                        candidate_stage: "rejected_shadow".to_string(),
+                                    };
+                                    if let Err(error) = winner_evaluation_journal
+                                        .as_ref()
+                                        .expect("Winner Buy evaluation journal initialized")
+                                        .record_confirmation_observation(confirmation_observation)
+                                    {
+                                        error!(target: "polypulse::strategy::winner_buy",
+                                            %error,
+                                            %evaluation_id,
+                                            market = %market.crypto_symbol,
+                                            "Winner Buy rejected-shadow confirmation persistence failed"
+                                        );
+                                        continue;
+                                    }
+                                    if !confirmation.confirmed {
+                                        runtime_metrics
+                                            .record_winner_buy_shadow_awaiting_confirmation();
+                                        continue;
+                                    }
+                                    if winner_shadow_executed.contains(&market.slug) {
+                                        continue;
+                                    }
                                     let shadow_size = fee_inclusive_depth_capped_size(
                                         signal.price,
                                         fee_per_share,
                                         max_order,
                                         ask_size,
                                     );
-                                    let shadow_executor = executor.clone();
-                                    let shadow_journal = winner_evaluation_journal
-                                        .as_ref()
-                                        .expect("Winner Buy evaluation journal initialized")
-                                        .clone();
-                                    let shadow_evaluation_id = evaluation_id.clone();
-                                    let shadow_slug = market.slug.clone();
-                                    let shadow_asset = market.crypto_symbol.clone();
-                                    let shadow_delay_ms = config.paper_winner_buy_delay_ms;
-                                    let shadow_limit = signal.price;
-                                    let shadow_metrics = runtime_metrics.clone();
-                                    runtime_metrics.record_winner_buy_shadow_execution_attempt();
-                                    window_session.spawn_trade(async move {
-                                        let result = shadow_executor
-                                            .shadow_buy_winner(
-                                                token,
-                                                shadow_limit,
-                                                shadow_size,
-                                                fee_per_share,
-                                            )
-                                            .await;
-                                        let (outcome, filled, cost, average_price, estimated_fee, error) =
-                                            match result {
-                                                Ok(execution) if execution.filled > dec!(0) => {
-                                                    shadow_metrics
-                                                        .record_winner_buy_shadow_execution_fill();
-                                                    (
-                                                        "filled",
-                                                        execution.filled,
-                                                        execution.cost,
-                                                        execution.average_price,
-                                                        execution.estimated_fee,
-                                                        None,
-                                                    )
-                                                }
-                                                Ok(_) => {
-                                                    shadow_metrics
-                                                        .record_winner_buy_shadow_execution_no_fill();
-                                                    (
-                                                        "no_fill",
-                                                        dec!(0),
-                                                        dec!(0),
-                                                        dec!(0),
-                                                        dec!(0),
-                                                        None,
-                                                    )
-                                                }
-                                                Err(error) => {
-                                                    shadow_metrics
-                                                        .record_winner_buy_shadow_execution_failure();
-                                                    (
-                                                        "error",
-                                                        dec!(0),
-                                                        dec!(0),
-                                                        dec!(0),
-                                                        dec!(0),
-                                                        Some(error.to_string()),
-                                                    )
-                                                }
-                                            };
-                                        let execution = WinnerShadowExecution {
-                                            evaluation_id: shadow_evaluation_id.clone(),
-                                            slug: shadow_slug.clone(),
-                                            simulated_at: Utc::now(),
-                                            delay_ms: shadow_delay_ms,
-                                            candidate_stage: "rejected".to_string(),
-                                            outcome: outcome.to_string(),
-                                            limit_price: shadow_limit,
-                                            requested: shadow_size,
-                                            filled,
-                                            cost,
-                                            average_price,
-                                            estimated_fee,
-                                            error,
-                                        };
-                                        if let Err(error) =
-                                            shadow_journal.record_shadow_execution(execution)
-                                        {
-                                            warn!(target: "polypulse::strategy::winner_buy",
-                                                %error,
-                                                evaluation_id = %shadow_evaluation_id,
-                                                market = %shadow_asset,
-                                                "Winner Buy shadow execution persistence failed"
-                                            );
-                                            return;
-                                        }
-                                        debug!(target: "polypulse::strategy::winner_buy",
-                                            evaluation_id = %shadow_evaluation_id,
-                                            market = %shadow_asset,
-                                            %outcome,
-                                            %shadow_limit,
-                                            requested = %shadow_size,
-                                            %filled,
-                                            %average_price,
-                                            %cost,
-                                            "Winner Buy rejected-candidate shadow execution recorded"
-                                        );
-                                    });
+                                    if shadow_size > dec!(0) {
+                                        winner_shadow_executed.insert(market.slug.clone());
+                                        runtime_metrics.record_winner_buy_shadow_confirmed();
+                                        runtime_metrics
+                                            .record_winner_buy_shadow_execution_attempt();
+                                        window_session.spawn_trade(record_winner_shadow(
+                                            executor.clone(),
+                                            winner_evaluation_journal
+                                                .as_ref()
+                                                .expect(
+                                                    "Winner Buy evaluation journal initialized",
+                                                )
+                                                .clone(),
+                                            runtime_metrics.clone(),
+                                            token,
+                                            signal.price,
+                                            shadow_size,
+                                            fee_per_share,
+                                            config.paper_winner_buy_delay_ms,
+                                            evaluation_id.clone(),
+                                            market.slug.clone(),
+                                            market.crypto_symbol.clone(),
+                                            "rejected_confirmed".to_string(),
+                                            research_cohorts.clone(),
+                                        ));
+                                    }
                                 }
                                 continue;
                             }
+                            winner_shadow_confirmations.reject(&market.slug);
                             let observed_at_ms = model
                                 .observed_at_ms
                                 .expect("admitted model has observation timestamp");
@@ -2246,6 +2286,7 @@ async fn main() -> Result<()> {
                                 confirmations: confirmation.confirmations,
                                 required: confirmation.required,
                                 confirmed: confirmation.confirmed,
+                                candidate_stage: "production".to_string(),
                             };
                             if let Err(error) = winner_evaluation_journal
                                 .as_ref()
@@ -2271,30 +2312,11 @@ async fn main() -> Result<()> {
                                     "Winner-buy awaiting consecutive Chainlink confirmations"
                                 );
                                 if config.dry_run {
-                                    let shadow_size = fee_inclusive_depth_capped_size(
-                                        signal.price,
-                                        fee_per_share,
-                                        max_order,
-                                        ask_size,
+                                    debug!(target: "polypulse::strategy::winner_buy",
+                                        %evaluation_id,
+                                        market = %market.crypto_symbol,
+                                        "Winner Buy shadow deferred until confirmation to avoid optimistic fill bias"
                                     );
-                                    runtime_metrics
-                                        .record_winner_buy_shadow_execution_attempt();
-                                    window_session.spawn_trade(record_pending_winner_shadow(
-                                        executor.clone(),
-                                        winner_evaluation_journal
-                                            .as_ref()
-                                            .expect("Winner Buy evaluation journal initialized")
-                                            .clone(),
-                                        runtime_metrics.clone(),
-                                        token,
-                                        signal.price,
-                                        shadow_size,
-                                        fee_per_share,
-                                        config.paper_winner_buy_delay_ms,
-                                        evaluation_id.clone(),
-                                        market.slug.clone(),
-                                        market.crypto_symbol.clone(),
-                                    ));
                                 }
                                 continue;
                             }
@@ -2311,6 +2333,7 @@ async fn main() -> Result<()> {
                             }
                             if !strategy_controls.winner_buy_enabled() {
                                 winner_confirmations.clear();
+                                winner_shadow_confirmations.clear();
                                 debug!(target: "polypulse::strategy::winner_buy", market = %market.crypto_symbol, "Winner Buy paused before submission");
                                 continue;
                             }
@@ -2599,7 +2622,7 @@ async fn main() -> Result<()> {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn record_pending_winner_shadow(
+async fn record_winner_shadow(
     executor: Arc<TradingExecutor>,
     journal: Arc<WinnerEvaluationJournal>,
     metrics: Arc<RuntimeMetrics>,
@@ -2611,6 +2634,8 @@ async fn record_pending_winner_shadow(
     evaluation_id: String,
     slug: String,
     asset: String,
+    candidate_stage: String,
+    research_cohorts: Vec<String>,
 ) {
     let result = executor
         .shadow_buy_winner(token, limit_price, size, fee_per_share)
@@ -2648,7 +2673,8 @@ async fn record_pending_winner_shadow(
         slug,
         simulated_at: chrono::Utc::now(),
         delay_ms,
-        candidate_stage: "awaiting_confirmation".to_string(),
+        candidate_stage: candidate_stage.clone(),
+        research_cohorts,
         outcome: outcome.to_string(),
         limit_price,
         requested: size,
@@ -2663,20 +2689,22 @@ async fn record_pending_winner_shadow(
             %error,
             %evaluation_id,
             market = %asset,
-            "Winner Buy awaiting-confirmation shadow persistence failed"
+            stage = %candidate_stage,
+            "Winner Buy shadow persistence failed"
         );
         return;
     }
     debug!(target: "polypulse::strategy::winner_buy",
         %evaluation_id,
         market = %asset,
+        stage = %candidate_stage,
         %outcome,
         %limit_price,
         requested = %size,
         %filled,
         %average_price,
         %cost,
-        "Winner Buy awaiting-confirmation shadow execution recorded"
+        "Winner Buy shadow execution recorded"
     );
 }
 

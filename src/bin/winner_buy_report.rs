@@ -13,10 +13,15 @@ struct EvaluationMeta {
     asset: String,
     ask_bucket: String,
     seconds_bucket: String,
+    research_cohorts: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
 struct ShadowFill {
+    evaluation_id: String,
+    simulated_at: String,
+    candidate_stage: String,
+    research_cohorts: Vec<String>,
     outcome: String,
     filled: Decimal,
     cost: Decimal,
@@ -88,6 +93,28 @@ fn time_bucket(evaluation: &Value) -> String {
     .to_string()
 }
 
+fn string_list(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn legacy_cohorts(asset: &str, ask_bucket: &str) -> Vec<String> {
+    let mut cohorts = vec![
+        "all_candidates".to_string(),
+        format!("asset_{}", asset.trim().to_ascii_lowercase()),
+        format!("price_{}", ask_bucket.replace('.', "_")),
+    ];
+    if matches!(ask_bucket, "0.96" | "0.97") {
+        cohorts.push("price_096_097".to_string());
+    }
+    cohorts
+}
+
 fn wilson_lower_bound(wins: u64, total: u64) -> f64 {
     if total == 0 {
         return 0.0;
@@ -138,6 +165,8 @@ fn main() -> Result<()> {
     );
     let mut evaluations = HashMap::new();
     let mut shadows = HashMap::new();
+    let mut latest_shadow_by_slug = HashMap::<String, ShadowFill>::new();
+    let mut resolved_by_evaluation = HashMap::<String, bool>::new();
     let mut resolutions = Vec::new();
     for (index, line) in reader.lines().enumerate() {
         let line = line.with_context(|| format!("cannot read line {}", index + 1))?;
@@ -150,16 +179,23 @@ fn main() -> Result<()> {
             Some("evaluated") => {
                 let evaluation = &value["evaluation"];
                 if let Some(id) = evaluation.get("evaluation_id").and_then(Value::as_str) {
+                    let asset = evaluation
+                        .get("asset")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let ask_bucket = price_bucket(evaluation);
+                    let mut research_cohorts = string_list(evaluation.get("research_cohorts"));
+                    if research_cohorts.is_empty() {
+                        research_cohorts = legacy_cohorts(&asset, &ask_bucket);
+                    }
                     evaluations.insert(
                         id.to_string(),
                         EvaluationMeta {
-                            asset: evaluation
-                                .get("asset")
-                                .and_then(Value::as_str)
-                                .unwrap_or("unknown")
-                                .to_string(),
-                            ask_bucket: price_bucket(evaluation),
+                            asset,
+                            ask_bucket,
                             seconds_bucket: time_bucket(evaluation),
+                            research_cohorts,
                         },
                     );
                 }
@@ -167,18 +203,54 @@ fn main() -> Result<()> {
             Some("shadow_executed") => {
                 let execution = &value["execution"];
                 if let Some(id) = execution.get("evaluation_id").and_then(Value::as_str) {
-                    shadows.insert(
-                        id.to_string(),
-                        ShadowFill {
-                            outcome: execution
-                                .get("outcome")
-                                .and_then(Value::as_str)
-                                .unwrap_or("missing")
-                                .to_string(),
-                            filled: decimal(execution.get("filled")),
-                            cost: decimal(execution.get("cost")),
-                        },
-                    );
+                    let slug = execution
+                        .get("slug")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let mut research_cohorts = string_list(execution.get("research_cohorts"));
+                    if research_cohorts.is_empty() {
+                        research_cohorts = evaluations
+                            .get(id)
+                            .map(|meta| meta.research_cohorts.clone())
+                            .unwrap_or_default();
+                    }
+                    let shadow = ShadowFill {
+                        evaluation_id: id.to_string(),
+                        simulated_at: execution
+                            .get("simulated_at")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        candidate_stage: execution
+                            .get("candidate_stage")
+                            .and_then(Value::as_str)
+                            .unwrap_or("legacy")
+                            .to_string(),
+                        research_cohorts,
+                        outcome: execution
+                            .get("outcome")
+                            .and_then(Value::as_str)
+                            .unwrap_or("missing")
+                            .to_string(),
+                        filled: decimal(execution.get("filled")),
+                        cost: decimal(execution.get("cost")),
+                    };
+                    shadows.insert(id.to_string(), shadow.clone());
+                    let replace = latest_shadow_by_slug
+                        .get(&slug)
+                        .is_none_or(|existing| shadow.simulated_at >= existing.simulated_at);
+                    if replace {
+                        latest_shadow_by_slug.insert(slug, shadow);
+                    }
+                }
+            }
+            Some("resolved") => {
+                if let (Some(id), Some(won)) = (
+                    value.get("evaluation_id").and_then(Value::as_str),
+                    value.get("won").and_then(Value::as_bool),
+                ) {
+                    resolved_by_evaluation.insert(id.to_string(), won);
                 }
             }
             Some("market_resolved") => resolutions.push(value),
@@ -228,8 +300,31 @@ fn main() -> Result<()> {
     for (label, stats) in &by_time {
         print_group(label, stats);
     }
+    let mut by_cohort = BTreeMap::<String, GroupStats>::new();
+    let mut unresolved_shadows = 0_u64;
+    for shadow in latest_shadow_by_slug.values() {
+        let Some(won) = resolved_by_evaluation.get(&shadow.evaluation_id).copied() else {
+            unresolved_shadows += 1;
+            continue;
+        };
+        let mut cohorts = shadow.research_cohorts.clone();
+        cohorts.push(format!("stage_{}", shadow.candidate_stage));
+        for cohort in cohorts {
+            by_cohort
+                .entry(cohort)
+                .or_default()
+                .record(won, Decimal::ZERO, Some(shadow));
+        }
+    }
+    println!("\nConfirmation-consistent shadow cohorts (latest attempt per market):");
+    for (label, stats) in &by_cohort {
+        print_group(label, stats);
+    }
     if missing_evaluations > 0 {
         eprintln!("warning: {missing_evaluations} market records lack their selected evaluation");
+    }
+    if unresolved_shadows > 0 {
+        eprintln!("warning: {unresolved_shadows} latest shadow attempts are not resolved yet");
     }
     Ok(())
 }

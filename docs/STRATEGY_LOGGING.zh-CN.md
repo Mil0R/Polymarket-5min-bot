@@ -10,7 +10,8 @@
 logs/
 ├── system.log                 # 系统事件；已配置分策略日志时不重复策略事件
 ├── spread-arbitrage.log       # Spread Arbitrage 专属文本日志
-└── winner-buy.log             # Winner Buy 专属文本日志
+├── winner-buy.log             # Winner Buy 专属文本日志
+└── copy-trader.log            # Copy Trading 专属文本日志
 
 results/
 ├── spread-arbitrage/
@@ -37,11 +38,12 @@ results/
 - `system.log`：连接、认证、市场发现、WebSocket 和健康检查；配置分策略日志后，对应策略事件不会在此重复写入。
 - `spread-arbitrage.log`：套利盘口判断、最终报价拒绝、风控拒绝、下单及恢复执行。
 - `winner-buy.log`：TWAP、模型评估、拒绝原因、确认、下单、成交和结算。
+- `copy-trader.log`：钱包画像、数据源、信号漏斗、运行质量审计、候选轮换、下单和结算。
 - Spread Arbitrage `orders.ndjson`：可恢复的订单对状态，是实盘安全状态，不应只作为普通统计文件处理。
 - Spread Arbitrage `opportunities.ndjson`：达到机会初筛门槛的数据，不代表最终可成交或已经下单。
-- Spread Arbitrage `shadow-candidates.ndjson`：通过价格初筛但被生产深度阈值拒绝的研究数据，包含两腿价格/深度、盘口年龄、阈值网格和连续存在时间；它不会改变准入或触发订单。
+- Spread Arbitrage `shadow-candidates.ndjson`：只在 `DRY_RUN=true` 下写入研究数据，不会改变准入或触发订单。`action=depth_rejected` 记录浅深度候选；`action=admission_rejected` 记录准入拒绝原因及滑点、tick、动态手续费后的反事实净边际；`action=rest_shadow` 记录不同延迟和名义金额下的 REST 双腿可成交情况。可通过 `admission_rejection`、`passes_gross_edge`、`passes_net_edge` 区分固定门槛和真实费用影响。
 - Winner Buy `orders.ndjson`：订单和结算事实，也是风险熔断与重启恢复的数据源。
-- Winner Buy `evaluations.ndjson`：包括拒绝和未成交候选，用于阈值校准，避免只分析成交样本造成幸存者偏差。
+- Winner Buy `evaluations.ndjson`：包括拒绝和未成交候选、生产/拒绝-shadow 的连续确认进度、只读研究 cohort 与延迟撮合结果，用于阈值校准并避免幸存者偏差。拒绝候选只有完成与生产一致的连续确认后才进行 shadow 撮合。
 
 ## 配置规则
 

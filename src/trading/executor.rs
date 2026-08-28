@@ -79,6 +79,15 @@ pub struct ExecutionQuote {
     pub minimum_order_size: Decimal,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShadowExecutionAssessment {
+    pub quote: ExecutionQuote,
+    pub required_gross_edge_per_share: Decimal,
+    pub required_net_edge_per_share: Decimal,
+    pub passes_gross_edge: bool,
+    pub passes_net_edge: bool,
+}
+
 impl ExecutionQuote {
     pub fn fee_per_share(&self, price: Decimal) -> Decimal {
         fee_per_share(self.fee_rate, self.fee_exponent, price)
@@ -174,6 +183,13 @@ fn fee_per_share(rate: Decimal, exponent: u32, price: Decimal) -> Decimal {
 }
 
 fn calculate_execution_quote(request: QuoteRequest<'_>) -> Result<ExecutionQuote> {
+    calculate_execution_quote_with_policy(request, true)
+}
+
+fn calculate_execution_quote_with_policy(
+    request: QuoteRequest<'_>,
+    enforce_profitability: bool,
+) -> Result<ExecutionQuote> {
     let yes_price = round_buy_price_to_tick(
         request.opportunity.yes_ask_price + request.yes_slippage,
         request.yes_tick,
@@ -183,7 +199,7 @@ fn calculate_execution_quote(request: QuoteRequest<'_>) -> Result<ExecutionQuote
         request.no_tick,
     )?;
     let gross_edge_per_share = dec!(1) - yes_price - no_price;
-    if gross_edge_per_share < request.execution_spread {
+    if enforce_profitability && gross_edge_per_share < request.execution_spread {
         anyhow::bail!(
             "final quote gross edge is too small: YES {} + NO {} leaves {}, required {}",
             yes_price,
@@ -204,7 +220,7 @@ fn calculate_execution_quote(request: QuoteRequest<'_>) -> Result<ExecutionQuote
     );
     let edge_per_share = gross_edge_per_share - yes_fee_per_share - no_fee_per_share;
     let required_net_edge = request.min_profit_threshold + request.fee_buffer;
-    if edge_per_share < required_net_edge {
+    if enforce_profitability && edge_per_share < required_net_edge {
         anyhow::bail!(
             "final quote net edge is insufficient after dynamic fees: gross {}, fees {}, net {}, required {}",
             gross_edge_per_share,
@@ -234,7 +250,7 @@ fn calculate_execution_quote(request: QuoteRequest<'_>) -> Result<ExecutionQuote
     }
     let yes_cost = yes_price * size;
     let no_cost = no_price * size;
-    if yes_cost <= dec!(1) || no_cost <= dec!(1) {
+    if request.enforce_min_order_size && (yes_cost <= dec!(1) || no_cost <= dec!(1)) {
         anyhow::bail!(
             "order size below minimum: YES {:.2}, NO {:.2}; both must be > $1",
             yes_cost,
@@ -747,13 +763,16 @@ impl TradingExecutor {
         })
     }
 
-    pub async fn shadow_execution_quote(
+    /// Build the exact tick/slippage/fee quote for research without applying
+    /// production profitability gates. The returned flags show whether the
+    /// same quote would pass those gates; no order is submitted.
+    pub async fn shadow_execution_assessment(
         &self,
         opp: &ArbitrageOpportunity,
         yes_dir: &str,
         no_dir: &str,
         max_order_notional: Decimal,
-    ) -> Result<ExecutionQuote> {
+    ) -> Result<ShadowExecutionAssessment> {
         let yes_token = U256::from_str(&opp.yes_token_id.to_string())?;
         let no_token = U256::from_str(&opp.no_token_id.to_string())?;
         let (yes_tick, no_tick, market_rules) = tokio::join!(
@@ -761,18 +780,29 @@ impl TradingExecutor {
             self.cached_tick_size(no_token),
             self.arbitrage_market_rules(opp.market_id),
         );
-        calculate_execution_quote(QuoteRequest {
-            opportunity: opp,
-            yes_slippage: self.slippage_for_direction(yes_dir),
-            no_slippage: self.slippage_for_direction(no_dir),
-            max_order_notional,
-            min_profit_threshold: self.min_profit_threshold,
-            execution_spread: self.execution_spread,
-            fee_buffer: self.fee_buffer,
-            yes_tick: yes_tick?,
-            no_tick: no_tick?,
-            market_rules: market_rules?,
-            enforce_min_order_size: false,
+        let quote = calculate_execution_quote_with_policy(
+            QuoteRequest {
+                opportunity: opp,
+                yes_slippage: self.slippage_for_direction(yes_dir),
+                no_slippage: self.slippage_for_direction(no_dir),
+                max_order_notional,
+                min_profit_threshold: self.min_profit_threshold,
+                execution_spread: self.execution_spread,
+                fee_buffer: self.fee_buffer,
+                yes_tick: yes_tick?,
+                no_tick: no_tick?,
+                market_rules: market_rules?,
+                enforce_min_order_size: false,
+            },
+            false,
+        )?;
+        let required_net_edge_per_share = self.min_profit_threshold + self.fee_buffer;
+        Ok(ShadowExecutionAssessment {
+            passes_gross_edge: quote.gross_edge_per_share >= self.execution_spread,
+            passes_net_edge: quote.edge_per_share >= required_net_edge_per_share,
+            quote,
+            required_gross_edge_per_share: self.execution_spread,
+            required_net_edge_per_share,
         })
     }
 
@@ -1633,6 +1663,33 @@ mod tests {
             enforce_min_order_size: true,
         });
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn shadow_quote_preserves_unprofitable_candidate_for_observation() {
+        let mut opportunity = opportunity();
+        opportunity.yes_ask_price = dec!(0.49);
+        opportunity.no_ask_price = dec!(0.49);
+        let request = QuoteRequest {
+            opportunity: &opportunity,
+            yes_slippage: dec!(0),
+            no_slippage: dec!(0),
+            max_order_notional: dec!(5),
+            min_profit_threshold: dec!(0.001),
+            execution_spread: dec!(0.03),
+            fee_buffer: dec!(0.002),
+            yes_tick: dec!(0.01),
+            no_tick: dec!(0.01),
+            market_rules: ArbitrageMarketRules {
+                fee_rate: dec!(0.25),
+                fee_exponent: 2,
+                minimum_order_size: dec!(5),
+            },
+            enforce_min_order_size: false,
+        };
+        let quote = calculate_execution_quote_with_policy(request, false).unwrap();
+        assert_eq!(quote.gross_edge_per_share, dec!(0.02));
+        assert!(quote.edge_per_share < dec!(0));
     }
 
     #[test]

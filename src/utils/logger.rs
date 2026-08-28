@@ -28,12 +28,14 @@ pub fn init_logger(quiet_stdout: bool) -> Result<()> {
 
     let split_arbitrage = log_path_configured("ARBITRAGE_STRATEGY_LOG_FILE");
     let split_winner_buy = log_path_configured("WINNER_BUY_STRATEGY_LOG_FILE");
+    let split_copy_trading = log_path_configured("COPY_TRADING_LOG_FILE");
     let mut log_layers: Vec<LogLayer> = vec![tracing_subscriber::fmt::layer()
         .with_writer(system_writer)
         .with_ansi(false)
         .with_filter(filter_fn(move |metadata| {
             !(split_arbitrage && is_arbitrage_metadata(metadata)
-                || split_winner_buy && is_winner_buy_metadata(metadata))
+                || split_winner_buy && is_winner_buy_metadata(metadata)
+                || split_copy_trading && is_copy_trading_metadata(metadata))
         }))
         .boxed()];
     if let Some(layer) = strategy_log_layer("ARBITRAGE_STRATEGY_LOG_FILE", is_arbitrage_metadata)? {
@@ -41,6 +43,9 @@ pub fn init_logger(quiet_stdout: bool) -> Result<()> {
     }
     if let Some(layer) = strategy_log_layer("WINNER_BUY_STRATEGY_LOG_FILE", is_winner_buy_metadata)?
     {
+        log_layers.push(layer);
+    }
+    if let Some(layer) = strategy_log_layer("COPY_TRADING_LOG_FILE", is_copy_trading_metadata)? {
         log_layers.push(layer);
     }
 
@@ -91,6 +96,11 @@ fn is_winner_buy_metadata(metadata: &Metadata<'_>) -> bool {
     target == WINNER_BUY_LOG_TARGET
         || target.ends_with("::winner_buy")
         || target.ends_with("::winner_model")
+}
+
+fn is_copy_trading_metadata(metadata: &Metadata<'_>) -> bool {
+    let target = metadata.target();
+    target.ends_with("::copy_trader_embedded") || target.contains("::copy_trading")
 }
 
 struct SizeRotatingWriter {

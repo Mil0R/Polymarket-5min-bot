@@ -99,12 +99,24 @@ pub struct ShadowQuote {
     pub yes_bid: Decimal,
     pub no_bid: Decimal,
     pub size_shares: Decimal,
+    /// Resting bid size ahead of the shadow quote at better or equal prices.
+    #[serde(default)]
+    pub yes_queue_ahead_shares: Decimal,
+    #[serde(default)]
+    pub no_queue_ahead_shares: Decimal,
     pub yes_distance: Decimal,
     pub no_distance: Decimal,
     pub reward_max_distance: Decimal,
     pub yes_reward_score: Decimal,
     pub no_reward_score: Decimal,
     pub two_sided_reward_score: Decimal,
+    /// Approximation based only on currently visible competing bid depth.
+    #[serde(default)]
+    pub visible_competition_reward_score: Decimal,
+    #[serde(default)]
+    pub estimated_visible_reward_share: Decimal,
+    #[serde(default)]
+    pub estimated_daily_liquidity_reward_usdc: Decimal,
     pub quoted_capital_usdc: Decimal,
     pub complete_set_discount_per_share: Decimal,
     pub yes_rebate_if_filled: Decimal,
@@ -119,6 +131,9 @@ pub struct ShadowMarkout {
     pub condition_id: String,
     pub observed_at: DateTime<Utc>,
     pub target_horizon_secs: u64,
+    /// Time at which this quote was replaced/cancelled. Later trades are ignored.
+    #[serde(default)]
+    pub active_until: Option<DateTime<Utc>>,
     pub actual_age_ms: i64,
     #[serde(default)]
     pub trade_data_available: bool,
@@ -232,6 +247,12 @@ pub fn rank_candidates(
                     .contains(filter)
             })
         })
+        .filter(|market| {
+            market.end_date.is_none_or(|end| {
+                end.signed_duration_since(Utc::now()).num_seconds()
+                    >= i64::try_from(config.min_time_to_end_secs).unwrap_or(i64::MAX)
+            })
+        })
         .map(|market| {
             let required_shares = market.rewards_min_size.max(config.quote_size_shares);
             let reward_per_required_share = market.daily_reward_usdc / required_shares;
@@ -259,7 +280,7 @@ pub fn rank_candidates(
             }
         })
         .collect::<Vec<_>>();
-    selected.sort_by(|left, right| right.selection_score.cmp(&left.selection_score));
+    selected.sort_by_key(|selection| std::cmp::Reverse(selection.selection_score));
     selected.truncate(config.max_markets);
     selected
 }
@@ -301,6 +322,8 @@ pub fn generate_shadow_quote(
         no_book.best_ask(),
         tick,
     )?;
+    let yes_queue_ahead_shares = queue_ahead(yes_book, yes_bid);
+    let no_queue_ahead_shares = queue_ahead(no_book, no_bid);
     let size_shares = config
         .quote_size_shares
         .max(selection.market.rewards_min_size);
@@ -312,6 +335,13 @@ pub fn generate_shadow_quote(
     if two_sided_reward_score <= Decimal::ZERO {
         bail!("the proposed two-sided quote is outside the reward scoring band");
     }
+    let visible_yes_competition = visible_reward_score(yes_book, fair_yes, reward_max_distance);
+    let visible_no_competition = visible_reward_score(no_book, fair_no, reward_max_distance);
+    let visible_competition_reward_score = visible_yes_competition.min(visible_no_competition);
+    let estimated_visible_reward_share = two_sided_reward_score
+        / (two_sided_reward_score + visible_competition_reward_score).max(two_sided_reward_score);
+    let estimated_daily_liquidity_reward_usdc =
+        selection.market.daily_reward_usdc * estimated_visible_reward_share;
     let yes_rebate_if_filled = fee_per_share(
         selection.market.fee_rate,
         selection.market.fee_exponent,
@@ -335,12 +365,17 @@ pub fn generate_shadow_quote(
         yes_bid,
         no_bid,
         size_shares,
+        yes_queue_ahead_shares,
+        no_queue_ahead_shares,
         yes_distance,
         no_distance,
         reward_max_distance,
         yes_reward_score,
         no_reward_score,
         two_sided_reward_score,
+        visible_competition_reward_score,
+        estimated_visible_reward_share,
+        estimated_daily_liquidity_reward_usdc,
         quoted_capital_usdc: (yes_bid + no_bid) * size_shares,
         complete_set_discount_per_share: dec!(1) - yes_bid - no_bid,
         yes_rebate_if_filled,
@@ -350,12 +385,14 @@ pub fn generate_shadow_quote(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn markout_observation(
     quote: &ShadowQuote,
     yes_book: &BookSnapshot,
     no_book: &BookSnapshot,
     trades: &[MarketTrade],
     trade_data_available: bool,
+    active_until: Option<DateTime<Utc>>,
     target_horizon_secs: u64,
     now: DateTime<Utc>,
 ) -> Result<ShadowMarkout> {
@@ -373,6 +410,7 @@ pub fn markout_observation(
         // Data API timestamps have one-second precision. Strictly later avoids
         // attributing a print from just before quote creation to the quote.
         .filter(|trade| trade.timestamp > quote_timestamp)
+        .filter(|trade| active_until.is_none_or(|until| trade.timestamp <= until.timestamp()))
         .filter(|trade| trade.side.eq_ignore_ascii_case("SELL"));
     let mut yes_volume = Decimal::ZERO;
     let mut no_volume = Decimal::ZERO;
@@ -387,10 +425,14 @@ pub fn markout_observation(
             no_trade_through |= trade.price < quote.no_bid;
         }
     }
-    // At-price prints do not reveal queue position. This is deliberately an
-    // optimistic fill proxy; trade-through flags are the stronger evidence.
-    let yes_fill_proxy_shares = yes_volume.min(quote.size_shares);
-    let no_fill_proxy_shares = no_volume.min(quote.size_shares);
+    // A new bid sits behind displayed size at equal/better prices. Subtracting
+    // it and enforcing the active window avoids optimistic duplicate fills.
+    let yes_fill_proxy_shares = (yes_volume - quote.yes_queue_ahead_shares)
+        .max(Decimal::ZERO)
+        .min(quote.size_shares);
+    let no_fill_proxy_shares = (no_volume - quote.no_queue_ahead_shares)
+        .max(Decimal::ZERO)
+        .min(quote.size_shares);
     let yes_touched = yes_book_crossed || yes_fill_proxy_shares > Decimal::ZERO;
     let no_touched = no_book_crossed || no_fill_proxy_shares > Decimal::ZERO;
     let yes_markout = (yes_fill_proxy_shares > Decimal::ZERO).then_some(yes_mid - quote.yes_bid);
@@ -414,6 +456,7 @@ pub fn markout_observation(
         condition_id: quote.condition_id.clone(),
         observed_at: now,
         target_horizon_secs,
+        active_until,
         actual_age_ms: now
             .signed_duration_since(quote.created_at)
             .num_milliseconds(),
@@ -441,6 +484,14 @@ pub fn markout_observation(
                     * yes_fill_proxy_shares.min(no_fill_proxy_shares),
             ),
     })
+}
+
+fn queue_ahead(book: &BookSnapshot, quote_bid: Decimal) -> Decimal {
+    book.bids
+        .iter()
+        .filter(|level| level.size > Decimal::ZERO && level.price >= quote_bid)
+        .map(|level| level.size)
+        .sum()
 }
 
 fn maker_bid(
@@ -473,6 +524,14 @@ fn reward_score(max_distance: Decimal, distance: Decimal, size: Decimal) -> Deci
     }
     let ratio = (max_distance - distance) / max_distance;
     ratio * ratio * size
+}
+
+fn visible_reward_score(book: &BookSnapshot, fair: Decimal, max_distance: Decimal) -> Decimal {
+    book.bids
+        .iter()
+        .filter(|level| level.size > Decimal::ZERO)
+        .map(|level| reward_score(max_distance, (fair - level.price).abs(), level.size))
+        .sum()
 }
 
 fn fee_per_share(rate: Decimal, exponent: u32, price: Decimal) -> Decimal {
@@ -556,6 +615,10 @@ mod tests {
             reward_band_fraction: dec!(0.8),
             book_poll_secs: 5,
             quote_interval_secs: 30,
+            market_refresh_secs: 300,
+            market_cooldown_secs: 1800,
+            max_consecutive_market_errors: 6,
+            min_time_to_end_secs: 1800,
             markout_horizons_secs: vec![1, 5, 30, 60],
             duration_secs: 0,
         }
@@ -603,6 +666,7 @@ mod tests {
             &book("2", dec!(0.48), dec!(0.52)),
             &trades,
             true,
+            None,
             5,
             created + chrono::Duration::seconds(5),
         )
@@ -612,6 +676,73 @@ mod tests {
         assert_eq!(markout.yes_fill_proxy_shares, dec!(7));
         assert!(markout.yes_markout_per_share.unwrap() < Decimal::ZERO);
         assert!(markout.estimated_rebate_usdc > Decimal::ZERO);
+    }
+
+    #[test]
+    fn queue_aware_fill_requires_volume_beyond_resting_depth() {
+        let created = Utc::now();
+        let quote = generate_shadow_quote(
+            &selection(),
+            &book("1", dec!(0.49), dec!(0.51)),
+            &book("2", dec!(0.49), dec!(0.51)),
+            &config(),
+            created,
+        )
+        .unwrap();
+        assert_eq!(quote.yes_queue_ahead_shares, dec!(100));
+        let trades = vec![MarketTrade {
+            asset: quote.yes_token_id.clone(),
+            side: "SELL".into(),
+            price: quote.yes_bid,
+            size: dec!(107),
+            timestamp: created.timestamp() + 1,
+            transaction_hash: "0xtx".into(),
+        }];
+        let markout = markout_observation(
+            &quote,
+            &book("1", dec!(0.46), dec!(0.49)),
+            &book("2", dec!(0.48), dec!(0.52)),
+            &trades,
+            true,
+            None,
+            5,
+            created + chrono::Duration::seconds(5),
+        )
+        .unwrap();
+        assert_eq!(markout.yes_fill_proxy_shares, dec!(7));
+    }
+
+    #[test]
+    fn trades_after_quote_cancellation_are_not_attributed() {
+        let created = Utc::now();
+        let quote = generate_shadow_quote(
+            &selection(),
+            &book("1", dec!(0.48), dec!(0.52)),
+            &book("2", dec!(0.48), dec!(0.52)),
+            &config(),
+            created,
+        )
+        .unwrap();
+        let trades = vec![MarketTrade {
+            asset: quote.yes_token_id.clone(),
+            side: "SELL".into(),
+            price: quote.yes_bid,
+            size: dec!(20),
+            timestamp: created.timestamp() + 31,
+            transaction_hash: "0xlate".into(),
+        }];
+        let markout = markout_observation(
+            &quote,
+            &book("1", dec!(0.46), dec!(0.49)),
+            &book("2", dec!(0.48), dec!(0.52)),
+            &trades,
+            true,
+            Some(created + chrono::Duration::seconds(30)),
+            60,
+            created + chrono::Duration::seconds(60),
+        )
+        .unwrap();
+        assert_eq!(markout.yes_fill_proxy_shares, Decimal::ZERO);
     }
 
     #[test]

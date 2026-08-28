@@ -18,6 +18,7 @@ pub use proxy_relay::{
     PROXY_MERGE_PUSD_GAS, PUSD_POLYGON, RPC_URL_DEFAULT, USDC_POLYGON,
 };
 
+pub mod bayesian_arb;
 pub mod copy_trading;
 pub mod maker_liquidity;
 pub mod merge;

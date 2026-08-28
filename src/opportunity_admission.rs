@@ -15,6 +15,20 @@ pub enum AdmissionRejection {
     NearMarketEnd,
 }
 
+impl AdmissionRejection {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ExecutionSpread => "execution_spread",
+            Self::TradingPaused => "trading_paused",
+            Self::ConnectionUnhealthy => "connection_unhealthy",
+            Self::UnresolvedState => "unresolved_state",
+            Self::YesPriceTooLow => "yes_price_too_low",
+            Self::NoPriceTooLow => "no_price_too_low",
+            Self::NearMarketEnd => "near_market_end",
+        }
+    }
+}
+
 pub struct AdmissionContext {
     pub total_price: Decimal,
     pub trading_paused: bool,

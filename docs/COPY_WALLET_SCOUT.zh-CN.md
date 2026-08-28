@@ -88,3 +88,30 @@ target/release/copy_wallet_scout
 `research` 放宽到最近7天活跃、30天5笔交易、3个活跃日和30个独立已结算市场。研究档输出只能进入 shadow/PAPER 观察，不应直接用于实盘。
 
 不要同时放宽多个硬条件。如果没有钱包通过，应先查看 `rejections.ndjson` 中出现频率最高的拒绝原因，再单独调整一个参数并保留运行快照。
+
+## 运行期间动态替换
+
+Polypulse 可以在 PAPER 运行期间读取 scout 的 `report.json` 作为候选池。运行质量审计达到最小样本后，会检查每个钱包的信号新鲜率、可执行信号率、市场通过率和生产金额 shadow 可执行率；不合格钱包先转为 `Probation`，不会再贡献新入场信号，但已有持仓仍由退出和结算模块管理。
+
+建议让 scout 写入固定目录：
+
+```bash
+./target/release/copy_wallet_scout \
+  --profile research \
+  --category CRYPTO,POLITICS \
+  --period WEEK,MONTH \
+  --order PNL,VOL \
+  --max-candidates 80 \
+  --top 10 \
+  --output results/copy-candidates/rotation-current
+```
+
+对应配置：
+
+```dotenv
+COPY_AUTO_ROTATION_ENABLED=true
+COPY_WALLET_QUALITY_AUDIT_MINUTES=360
+COPY_ROTATION_CANDIDATE_REPORT=results/copy-candidates/rotation-current/report.json
+```
+
+候选必须同时满足 scout `accepted=true`、`runtime_compatible=true`，重新拉取历史后仍通过运行时漏斗，并覆盖被替换钱包的领域。自动替换只在 PAPER 模式生效；LIVE 模式不会自动更换资金信号源。scout 使用原子方式写报告，因此可以在 Polypulse 运行期间定时重新扫描。

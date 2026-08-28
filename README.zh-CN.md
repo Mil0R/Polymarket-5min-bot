@@ -136,6 +136,8 @@ cargo run --release --bin winner_buy_report -- \
 
 不传文件名时，命令优先读取 `WINNER_BUY_EVALUATION_JOURNAL_FILE`。
 
+报告同时输出独立市场结果和经过连续确认、延迟撮合后的 shadow cohort；后者按 shadow 自身的 evaluation 方向结算，可用于比较 `price_096_097`、`chainlink_direction_agrees` 与 `hybrid_chainlink_veto`，不会改变生产准入。
+
 启动时会用 CLOB 累计成交和 Data API 持仓自动对账，并重建可管理的恢复任务。状态日志新记录带版本号和 SHA-256 校验和；若崩溃只损坏最后一行，启动时会将其隔离为 `.corrupt-*` 文件并保留此前有效记录。中间记录损坏仍会阻止启动。缺少上下文的旧日志默认阻止实盘启动；`ALLOW_UNRESOLVED_STATE=true` 只允许进程进入核对/恢复流程，未解决状态仍禁止新实盘开仓。
 
 首次极小额验证建议使用 `DRY_RUN=false`、`CANARY_MODE=true`、`ARBITRAGE_ORDER_TYPE=FAK`。`/readyz` 只有在初始化、行情/用户流连接、journal 可写、磁盘空间充足、无未解决订单且实盘安全闸门未熔断时才返回 200。任何无法确认结果的 CLOB 写请求都会跨窗口暂停新开仓，必须重启并完成账户/订单核对，不能在进程内手工解除。
@@ -145,6 +147,8 @@ cargo run --release --bin winner_buy_report -- \
 ## 跟单候选钱包发现
 
 独立的只读 `copy_wallet_scout` 可按市场一级/二级分类、近期活跃度、已结算样本、收益质量、风险和当前盘口适配度筛选跟单候选地址。它不读取密钥、不下单，也不直接修改 `.env`。编译、参数和输出说明见 [跟单候选钱包发现器](docs/COPY_WALLET_SCOUT.zh-CN.md)。
+
+PAPER 模式还支持运行质量审计和候选池热替换：不合格钱包先进入 `Probation`，再从 scout 原子更新的 `report.json` 中选择同领域、运行时漏斗复核通过的替代钱包；LIVE 模式不会自动轮换。
 
 ## 免责声明
 

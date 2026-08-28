@@ -8,6 +8,7 @@ pub mod ladder_exit;
 pub mod live_executor;
 pub mod market_filter;
 pub mod onchain_feed;
+pub mod quality;
 pub mod risk;
 pub mod runtime;
 pub mod scout;
@@ -28,6 +29,7 @@ pub use ladder_exit::{ladder_size, ladder_target_price, LadderExitConfig, Ladder
 pub use live_executor::{CopyTradeExecutor, OrderExecutionOutcome};
 pub use market_filter::MarketFilterEngine;
 pub use onchain_feed::OnChainTradeFeed;
+pub use quality::{WalletQualityPolicy, WalletQualitySnapshot, WalletQualityTracker};
 pub use risk::RiskController;
 pub use runtime::{CopyTradingRuntime, CopyTradingRuntimeSnapshot};
 pub use scout::{CandidateScout, ScoutConfig, ScoutProfile, ScoutReport};

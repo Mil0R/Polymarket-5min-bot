@@ -39,6 +39,10 @@ pub struct MetricsSnapshot {
     pub stream_recoveries: u64,
     pub sdk_market_ws_reconnects: u64,
     pub sdk_market_ws_recoveries: u64,
+    pub sdk_market_ws_reconnecting_transitions: u64,
+    pub sdk_market_ws_disconnected_transitions: u64,
+    pub sdk_market_ws_downtime_ms_total: u64,
+    pub sdk_market_ws_downtime_ms_max: u64,
     pub sdk_market_ws_last_book_at_ms: i64,
     pub sdk_user_ws_reconnects: u64,
     pub sdk_user_ws_recoveries: u64,
@@ -56,6 +60,9 @@ pub struct MetricsSnapshot {
     pub arbitrage_rest_shadow_one_sided: u64,
     pub arbitrage_rest_shadow_neither_fillable: u64,
     pub arbitrage_rest_shadow_errors: u64,
+    pub arbitrage_admission_shadow_samples: u64,
+    pub arbitrage_admission_shadow_gross_passes: u64,
+    pub arbitrage_admission_shadow_net_passes: u64,
     pub winner_buy_attempts: u64,
     pub winner_buy_scans: u64,
     pub winner_buy_signals: u64,
@@ -89,6 +96,8 @@ pub struct MetricsSnapshot {
     pub winner_buy_shadow_execution_fills: u64,
     pub winner_buy_shadow_execution_no_fills: u64,
     pub winner_buy_shadow_execution_failures: u64,
+    pub winner_buy_shadow_awaiting_confirmation: u64,
+    pub winner_buy_shadow_confirmed: u64,
     pub winner_buy_awaiting_confirmation: u64,
     pub winner_buy_fills: u64,
     pub winner_buy_pending: u64,
@@ -128,6 +137,10 @@ pub struct RuntimeMetrics {
     stream_recoveries: AtomicU64,
     sdk_market_ws_reconnects: AtomicU64,
     sdk_market_ws_recoveries: AtomicU64,
+    sdk_market_ws_reconnecting_transitions: AtomicU64,
+    sdk_market_ws_disconnected_transitions: AtomicU64,
+    sdk_market_ws_downtime_ms_total: AtomicU64,
+    sdk_market_ws_downtime_ms_max: AtomicU64,
     sdk_market_ws_last_book_at_ms: AtomicI64,
     sdk_user_ws_reconnects: AtomicU64,
     sdk_user_ws_recoveries: AtomicU64,
@@ -145,6 +158,9 @@ pub struct RuntimeMetrics {
     arbitrage_rest_shadow_one_sided: AtomicU64,
     arbitrage_rest_shadow_neither_fillable: AtomicU64,
     arbitrage_rest_shadow_errors: AtomicU64,
+    arbitrage_admission_shadow_samples: AtomicU64,
+    arbitrage_admission_shadow_gross_passes: AtomicU64,
+    arbitrage_admission_shadow_net_passes: AtomicU64,
     winner_buy_attempts: AtomicU64,
     winner_buy_scans: AtomicU64,
     winner_buy_signals: AtomicU64,
@@ -178,6 +194,8 @@ pub struct RuntimeMetrics {
     winner_buy_shadow_execution_fills: AtomicU64,
     winner_buy_shadow_execution_no_fills: AtomicU64,
     winner_buy_shadow_execution_failures: AtomicU64,
+    winner_buy_shadow_awaiting_confirmation: AtomicU64,
+    winner_buy_shadow_confirmed: AtomicU64,
     winner_buy_awaiting_confirmation: AtomicU64,
     winner_buy_fills: AtomicU64,
     winner_buy_pending: AtomicU64,
@@ -238,6 +256,19 @@ impl RuntimeMetrics {
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
+
+    pub fn record_arbitrage_admission_shadow(&self, gross_passes: bool, net_passes: bool) {
+        self.arbitrage_admission_shadow_samples
+            .fetch_add(1, Ordering::Relaxed);
+        if gross_passes {
+            self.arbitrage_admission_shadow_gross_passes
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if net_passes {
+            self.arbitrage_admission_shadow_net_passes
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
     incrementer!(record_trade_started, trades_started);
     incrementer!(record_trade_succeeded, trades_succeeded);
     incrementer!(record_trade_failed, trades_failed);
@@ -246,8 +277,23 @@ impl RuntimeMetrics {
     incrementer!(record_stream_recovery, stream_recoveries);
     incrementer!(record_sdk_market_ws_reconnect, sdk_market_ws_reconnects);
     incrementer!(record_sdk_market_ws_recovery, sdk_market_ws_recoveries);
+    incrementer!(
+        record_sdk_market_ws_reconnecting_transition,
+        sdk_market_ws_reconnecting_transitions
+    );
+    incrementer!(
+        record_sdk_market_ws_disconnected_transition,
+        sdk_market_ws_disconnected_transitions
+    );
     incrementer!(record_sdk_user_ws_reconnect, sdk_user_ws_reconnects);
     incrementer!(record_sdk_user_ws_recovery, sdk_user_ws_recoveries);
+
+    pub fn record_sdk_market_ws_downtime(&self, downtime_ms: u64) {
+        self.sdk_market_ws_downtime_ms_total
+            .fetch_add(downtime_ms, Ordering::Relaxed);
+        self.sdk_market_ws_downtime_ms_max
+            .fetch_max(downtime_ms, Ordering::Relaxed);
+    }
     incrementer!(record_winner_buy_attempt, winner_buy_attempts);
     incrementer!(record_winner_buy_scan, winner_buy_scans);
     incrementer!(record_winner_buy_signal, winner_buy_signals);
@@ -322,6 +368,14 @@ impl RuntimeMetrics {
     incrementer!(
         record_winner_buy_shadow_execution_failure,
         winner_buy_shadow_execution_failures
+    );
+    incrementer!(
+        record_winner_buy_shadow_awaiting_confirmation,
+        winner_buy_shadow_awaiting_confirmation
+    );
+    incrementer!(
+        record_winner_buy_shadow_confirmed,
+        winner_buy_shadow_confirmed
     );
     incrementer!(record_winner_buy_fill, winner_buy_fills);
     incrementer!(record_winner_buy_resolved, winner_buy_resolved);
@@ -537,6 +591,14 @@ impl RuntimeMetrics {
             stream_recoveries: load(&self.stream_recoveries),
             sdk_market_ws_reconnects: load(&self.sdk_market_ws_reconnects),
             sdk_market_ws_recoveries: load(&self.sdk_market_ws_recoveries),
+            sdk_market_ws_reconnecting_transitions: load(
+                &self.sdk_market_ws_reconnecting_transitions,
+            ),
+            sdk_market_ws_disconnected_transitions: load(
+                &self.sdk_market_ws_disconnected_transitions,
+            ),
+            sdk_market_ws_downtime_ms_total: load(&self.sdk_market_ws_downtime_ms_total),
+            sdk_market_ws_downtime_ms_max: load(&self.sdk_market_ws_downtime_ms_max),
             sdk_market_ws_last_book_at_ms: self
                 .sdk_market_ws_last_book_at_ms
                 .load(Ordering::Relaxed),
@@ -558,6 +620,13 @@ impl RuntimeMetrics {
                 &self.arbitrage_rest_shadow_neither_fillable,
             ),
             arbitrage_rest_shadow_errors: load(&self.arbitrage_rest_shadow_errors),
+            arbitrage_admission_shadow_samples: load(&self.arbitrage_admission_shadow_samples),
+            arbitrage_admission_shadow_gross_passes: load(
+                &self.arbitrage_admission_shadow_gross_passes,
+            ),
+            arbitrage_admission_shadow_net_passes: load(
+                &self.arbitrage_admission_shadow_net_passes,
+            ),
             winner_buy_attempts: load(&self.winner_buy_attempts),
             winner_buy_scans: load(&self.winner_buy_scans),
             winner_buy_signals: load(&self.winner_buy_signals),
@@ -597,6 +666,10 @@ impl RuntimeMetrics {
             winner_buy_shadow_execution_fills: load(&self.winner_buy_shadow_execution_fills),
             winner_buy_shadow_execution_no_fills: load(&self.winner_buy_shadow_execution_no_fills),
             winner_buy_shadow_execution_failures: load(&self.winner_buy_shadow_execution_failures),
+            winner_buy_shadow_awaiting_confirmation: load(
+                &self.winner_buy_shadow_awaiting_confirmation,
+            ),
+            winner_buy_shadow_confirmed: load(&self.winner_buy_shadow_confirmed),
             winner_buy_awaiting_confirmation: load(&self.winner_buy_awaiting_confirmation),
             winner_buy_fills: load(&self.winner_buy_fills),
             winner_buy_pending: load(&self.winner_buy_pending),
@@ -658,6 +731,18 @@ impl RuntimeMetrics {
                 snapshot.sdk_market_ws_recoveries,
             ),
             (
+                "sdk_market_ws_reconnecting_transitions_total",
+                snapshot.sdk_market_ws_reconnecting_transitions,
+            ),
+            (
+                "sdk_market_ws_disconnected_transitions_total",
+                snapshot.sdk_market_ws_disconnected_transitions,
+            ),
+            (
+                "sdk_market_ws_downtime_ms_total",
+                snapshot.sdk_market_ws_downtime_ms_total,
+            ),
+            (
                 "sdk_user_ws_reconnects_total",
                 snapshot.sdk_user_ws_reconnects,
             ),
@@ -710,6 +795,18 @@ impl RuntimeMetrics {
             (
                 "arbitrage_rest_shadow_errors_total",
                 snapshot.arbitrage_rest_shadow_errors,
+            ),
+            (
+                "arbitrage_admission_shadow_samples_total",
+                snapshot.arbitrage_admission_shadow_samples,
+            ),
+            (
+                "arbitrage_admission_shadow_gross_passes_total",
+                snapshot.arbitrage_admission_shadow_gross_passes,
+            ),
+            (
+                "arbitrage_admission_shadow_net_passes_total",
+                snapshot.arbitrage_admission_shadow_net_passes,
             ),
             ("winner_buy_attempts_total", snapshot.winner_buy_attempts),
             ("winner_buy_scans_total", snapshot.winner_buy_scans),
@@ -825,6 +922,14 @@ impl RuntimeMetrics {
                 snapshot.winner_buy_shadow_execution_failures,
             ),
             (
+                "winner_buy_shadow_awaiting_confirmation_total",
+                snapshot.winner_buy_shadow_awaiting_confirmation,
+            ),
+            (
+                "winner_buy_shadow_confirmed_total",
+                snapshot.winner_buy_shadow_confirmed,
+            ),
+            (
                 "winner_buy_awaiting_confirmation_total",
                 snapshot.winner_buy_awaiting_confirmation,
             ),
@@ -921,6 +1026,9 @@ impl RuntimeMetrics {
         output.push_str("# TYPE polypulse_sdk_market_ws_last_book_at_ms gauge\npolypulse_sdk_market_ws_last_book_at_ms ");
         output.push_str(&snapshot.sdk_market_ws_last_book_at_ms.to_string());
         output.push('\n');
+        output.push_str("# TYPE polypulse_sdk_market_ws_downtime_ms_max gauge\npolypulse_sdk_market_ws_downtime_ms_max ");
+        output.push_str(&snapshot.sdk_market_ws_downtime_ms_max.to_string());
+        output.push('\n');
         output
     }
 }
@@ -939,6 +1047,8 @@ mod tests {
         metrics.record_arbitrage_rest_shadow(dec!(2), dec!(2), false);
         metrics.record_arbitrage_rest_shadow(dec!(2), dec!(0), true);
         metrics.record_arbitrage_rest_shadow(dec!(0), dec!(0), false);
+        metrics.record_arbitrage_admission_shadow(false, false);
+        metrics.record_arbitrage_admission_shadow(true, true);
         metrics.record_admission_rejection(AdmissionRejection::ConnectionUnhealthy);
         metrics.record_admission_rejection(AdmissionRejection::YesPriceTooLow);
         metrics.record_trade_started();
@@ -946,6 +1056,10 @@ mod tests {
         metrics.record_stream_connect_failure();
         metrics.record_stream_reconnect();
         metrics.record_stream_recovery();
+        metrics.record_sdk_market_ws_reconnect();
+        metrics.record_sdk_market_ws_reconnecting_transition();
+        metrics.record_sdk_market_ws_recovery();
+        metrics.record_sdk_market_ws_downtime(125);
         metrics.record_winner_buy_scan();
         metrics.record_winner_buy_asset_scan("BTC");
         metrics.record_winner_buy_signal();
@@ -959,6 +1073,8 @@ mod tests {
         metrics.record_winner_buy_shadow_execution_fill();
         metrics.record_winner_buy_shadow_execution_no_fill();
         metrics.record_winner_buy_shadow_execution_failure();
+        metrics.record_winner_buy_shadow_awaiting_confirmation();
+        metrics.record_winner_buy_shadow_confirmed();
         metrics.record_winner_buy_awaiting_confirmation();
         metrics.set_winner_buy_pending(2);
         metrics.record_paper_result(dec!(3), dec!(2), dec!(0.4), dec!(0.5));
@@ -970,6 +1086,9 @@ mod tests {
         assert_eq!(snapshot.arbitrage_rest_shadow_one_sided, 1);
         assert_eq!(snapshot.arbitrage_rest_shadow_neither_fillable, 1);
         assert_eq!(snapshot.arbitrage_rest_shadow_errors, 1);
+        assert_eq!(snapshot.arbitrage_admission_shadow_samples, 2);
+        assert_eq!(snapshot.arbitrage_admission_shadow_gross_passes, 1);
+        assert_eq!(snapshot.arbitrage_admission_shadow_net_passes, 1);
         assert_eq!(snapshot.depth_rejections, 1);
         assert_eq!(snapshot.opportunities_rejected, 2);
         assert_eq!(snapshot.rejection_connection_unhealthy, 1);
@@ -978,6 +1097,9 @@ mod tests {
         assert_eq!(snapshot.stream_connect_failures, 1);
         assert_eq!(snapshot.stream_reconnects, 1);
         assert_eq!(snapshot.stream_recoveries, 1);
+        assert_eq!(snapshot.sdk_market_ws_reconnecting_transitions, 1);
+        assert_eq!(snapshot.sdk_market_ws_downtime_ms_total, 125);
+        assert_eq!(snapshot.sdk_market_ws_downtime_ms_max, 125);
         assert_eq!(snapshot.winner_buy_scans, 1);
         assert_eq!(snapshot.winner_buy_signals, 1);
         assert_eq!(snapshot.winner_buy_ws_missing_books, 1);
@@ -995,6 +1117,8 @@ mod tests {
         assert_eq!(snapshot.winner_buy_shadow_execution_fills, 1);
         assert_eq!(snapshot.winner_buy_shadow_execution_no_fills, 1);
         assert_eq!(snapshot.winner_buy_shadow_execution_failures, 1);
+        assert_eq!(snapshot.winner_buy_shadow_awaiting_confirmation, 1);
+        assert_eq!(snapshot.winner_buy_shadow_confirmed, 1);
         assert_eq!(snapshot.winner_buy_awaiting_confirmation, 1);
         assert_eq!(snapshot.winner_buy_pending, 2);
         assert_eq!(snapshot.paper_pairs, 1);
@@ -1003,9 +1127,12 @@ mod tests {
         let exposition = metrics.prometheus();
         assert!(exposition.contains("polypulse_trades_failed_total 1"));
         assert!(exposition.contains("polypulse_arbitrage_rest_shadow_samples_total 3"));
+        assert!(exposition.contains("polypulse_arbitrage_admission_shadow_samples_total 2"));
+        assert!(exposition.contains("polypulse_sdk_market_ws_downtime_ms_max 125"));
         assert!(exposition.contains("polypulse_paper_net_pnl_usd -0.2"));
         assert!(exposition.contains("polypulse_winner_buy_pending 2"));
         assert!(exposition.contains("polypulse_winner_buy_shadow_execution_fills_total 1"));
+        assert!(exposition.contains("polypulse_winner_buy_shadow_confirmed_total 1"));
         assert!(exposition.contains("polypulse_winner_buy_rest_latency_ms_max 40"));
         assert!(exposition.contains("polypulse_winner_buy_asset_scans_total{asset=\"btc\"} 1"));
     }

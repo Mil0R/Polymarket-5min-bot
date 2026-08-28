@@ -174,6 +174,13 @@ impl MakerResearchClient {
     }
 
     pub async fn discover(&self) -> Result<Vec<MarketSelection>> {
+        self.discover_excluding(&HashSet::new()).await
+    }
+
+    pub async fn discover_excluding(
+        &self,
+        excluded_condition_ids: &HashSet<String>,
+    ) -> Result<Vec<MarketSelection>> {
         let mut rewards = self.fetch_reward_markets().await?;
         rewards.retain(|market| {
             market.daily_rate() >= self.config.min_daily_reward_usdc
@@ -204,7 +211,13 @@ impl MakerResearchClient {
         })
         .collect::<Vec<_>>()
         .await;
-        Ok(rank_candidates(candidates, &self.config))
+        Ok(rank_candidates(
+            candidates
+                .into_iter()
+                .filter(|candidate| !excluded_condition_ids.contains(&candidate.condition_id))
+                .collect(),
+            &self.config,
+        ))
     }
 
     pub async fn fetch_book(&self, token_id: &str) -> Result<BookSnapshot> {
