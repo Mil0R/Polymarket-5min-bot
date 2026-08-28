@@ -142,6 +142,37 @@ For the first tiny live validation, use `DRY_RUN=false`, `CANARY_MODE=true`, and
 
 With `DRY_RUN=true`, paper execution walks the real multi-level CLOB book for the harder leg, waits `PAPER_SECOND_LEG_DELAY_MS`, fetches a fresh live book for the opposite leg, and applies FOK/FAK/immediate-fill semantics to the confirmed virtual first-leg amount. It never restores real recovery tasks, syncs real positions, places/cancels orders, merges, or sells. Prometheus exposes paper pair/one-sided/PnL metrics, CLOB connect-failure/reconnect/recovery counters, and the Winner Buy scan → signal → model rejection/confirmation → attempt → fill → pending → resolved → redeemed funnel. The TUI keeps estimated winner payout separate from realized settlement PnL.
 
+### Strategy development stages
+
+Strategies now follow a strict local backtest → live-data dry-run → interactive
+TUI live-promotion workflow. Spread Arbitrage and Winner Buy support both
+`backtest` and forced-safe standalone `dry-run` commands. Copy Trading starts at
+live-data PAPER because wallet history is absent from PolyBacktest; Maker and
+Bayesian research likewise start with read-only `shadow` mode. Standalone
+executables cannot enter real execution, and live/canary `polypulse` requires an
+interactive TUI terminal.
+
+See [the Chinese stage guide](docs/STRATEGY_DEVELOPMENT_STAGES.zh-CN.md) for the
+strategy/data compatibility matrix, commands, result paths, and promotion gates.
+
+### PolyBacktest historical downloader
+
+The independent downloader persists resolved crypto Up/Down markets for offline
+Spread Arbitrage and Winner Buy replay. It stores an auditable Zstandard copy of
+each API page plus a WAL-enabled SQLite catalog with scalar signals, top of book,
+and compressed full books. Completed pages are transactional and idempotent, so
+rerunning after Ctrl-C or a crash resumes at the first missing offset.
+
+```bash
+cargo run --release --bin polybacktest_downloader -- sync
+cargo run --release --bin polybacktest_downloader -- watch
+cargo run --release --bin polybacktest_downloader -- status
+```
+
+Free Plan defaults enforce at least 1100ms between request starts. See
+[`docs/POLYBACKTEST_DOWNLOADER.zh-CN.md`](docs/POLYBACKTEST_DOWNLOADER.zh-CN.md)
+for storage schema, recovery behavior, and operational guidance.
+
 ## Disclaimer
 
 This software is for learning and research only — not investment advice. Crypto and prediction markets carry significant risk, including loss of funds. Assess your own risk and comply with Polymarket’s terms and applicable laws.

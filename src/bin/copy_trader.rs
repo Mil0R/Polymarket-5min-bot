@@ -43,6 +43,15 @@ async fn main() -> Result<()> {
     dotenv().ok();
     init_copy_trader_logging("logs/copy-trader.log")?;
 
+    let configured_dry_run = env::var("COPY_DRY_RUN")
+        .map(|value| value.trim() == "1" || value.trim().eq_ignore_ascii_case("true"))
+        .unwrap_or(true);
+    if !configured_dry_run {
+        anyhow::bail!(
+            "standalone copy_trader is restricted to stage-2 PAPER mode; set COPY_DRY_RUN=true. Real execution is only allowed through the interactive polypulse TUI"
+        );
+    }
+
     let enabled = env::var("COPY_TRADING_ENABLED")
         .map(|v| v.trim().to_lowercase() != "false" && v.trim() != "0")
         .unwrap_or(true);
