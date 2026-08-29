@@ -4,7 +4,9 @@
 
 **Official Website**: [polypulse.wiki](https://polypulse.wiki/)
 
-> Rust arbitrage bot for [Polymarket](https://polymarket.com) crypto “Up or Down” 5-minute prediction markets.
+> Rust quantitative trading research and execution system for [Polymarket](https://polymarket.com),
+> including binary complement arbitrage, late-resolution trading, wallet following,
+> market making, and cross-market probability research.
 
 ![account](image/account.png)
 
@@ -105,7 +107,7 @@ Get these from Polymarket → Settings → Builder.
 | `CANARY_MAX_PAIR_NOTIONAL_USDC` / `CANARY_MAX_TOTAL_NOTIONAL_USDC` | `3.0` / `3.0` | Per-pair and process-total planned notional limits |
 | `CANARY_MAX_LOSS_USDC` | `2.0` | Conservative downside budget; permanently pauses entries for the process when reached |
 | `CANARY_MAX_PAIRS_PER_WINDOW` / `CANARY_MAX_PAIRS_TOTAL` | `1` / `1` | Hard pair-count limits per window and process |
-| `WINNER_BUY_MAX_STRATEGY_LOSS_USDC` / `WINNER_BUY_MAX_ASSET_LOSS_USDC` | `20.0` / `10.0` | Persisted Winner Buy realized-loss circuit breakers, globally and per asset |
+| `WINNER_BUY_MAX_STRATEGY_LOSS_USDC` / `WINNER_BUY_MAX_ASSET_LOSS_USDC` | `20.0` / `10.0` | Persisted Late-Resolution Winner Trading realized-loss circuit breakers, globally and per asset |
 | `WINNER_BUY_MAX_CONSECUTIVE_LOSSES` | `3` | Persisted consecutive-loss circuit breaker; `0` disables it |
 | `WINNER_BUY_AUTO_REDEEM` | `false` | Automatically redeem confirmed winning tokens in live mode; requires proxy/builder credentials |
 | `WINNER_BUY_RTDS_URL` / `WINNER_BUY_FEED_MAX_AGE_MS` | official RTDS / `5000` | Chainlink 60-second TWAP source and fail-closed freshness limit |
@@ -118,12 +120,12 @@ Get these from Polymarket → Settings → Builder.
 | `PAPER_INITIAL_BALANCE_USDC` | `50.0` | Independent virtual cash budget for Dry-run |
 | `PAPER_LIQUIDITY_HAIRCUT` | `0.75` | Fraction of displayed depth treated as executable in paper fills |
 | `PAPER_SECOND_LEG_DELAY_MS` | `250` | Delay before fetching a fresh live book for the opposite leg |
-| `PAPER_WINNER_BUY_DELAY_MS` | `250` | Dry-run latency before Winner Buy re-reads the live book and simulates the fill |
+| `PAPER_WINNER_BUY_DELAY_MS` | `250` | Dry-run latency before Late-Resolution Winner Trading re-reads the live book and simulates the fill |
 | `MAX_BOOK_AGE_MS` / `MAX_BOOK_SKEW_MS` | `2000` / `1000` | Reject stale or mutually skewed leg snapshots |
 | `SIGNAL_COOLDOWN_MS` | `3000` | Cooldown for identical market/price signals |
-| `ARBITRAGE_STATE_JOURNAL_FILE` | `results/spread-arbitrage/{paper|live}/orders.ndjson` | Arbitrage order-pair/recovery journal; legacy `STATE_JOURNAL_FILE` remains supported |
-| `WINNER_BUY_STATE_JOURNAL_FILE` | `results/winner-buy/{paper|live}/orders.ndjson` | Winner Buy order, fill, and settlement journal |
-| `WINNER_BUY_EVALUATION_JOURNAL_FILE` | `results/winner-buy/{paper|live}/evaluations.ndjson` | Winner Buy candidate and counterfactual evaluations |
+| `ARBITRAGE_STATE_JOURNAL_FILE` | `results/binary-complement-arbitrage/{paper|live}/orders.ndjson` | Arbitrage order-pair/recovery journal; legacy `STATE_JOURNAL_FILE` remains supported |
+| `WINNER_BUY_STATE_JOURNAL_FILE` | `results/late-resolution-winner-trading/{paper|live}/orders.ndjson` | Late-Resolution Winner Trading order, fill, and settlement journal |
+| `WINNER_BUY_EVALUATION_JOURNAL_FILE` | `results/late-resolution-winner-trading/{paper|live}/evaluations.ndjson` | Late-Resolution Winner Trading candidate and counterfactual evaluations |
 | `ARBITRAGE_SHADOW_LOG_FILE` | unset | Optional NDJSON research log for price-positive candidates rejected by depth; never changes admission |
 | `LOG_FILE` | `logs/system.log` in TUI mode | System log; strategy events move to their configured strategy file without duplication |
 | `ARBITRAGE_STRATEGY_LOG_FILE` / `WINNER_BUY_STRATEGY_LOG_FILE` | unset | Optional mutually exclusive per-strategy text logs |
@@ -140,25 +142,28 @@ Startup reconciles cumulative CLOB fills and Data API positions, then restores m
 
 For the first tiny live validation, use `DRY_RUN=false`, `CANARY_MODE=true`, and `ARBITRAGE_ORDER_TYPE=FAK`. `/readyz` returns 200 only when initialization, market/user-stream connectivity, journal writability, disk capacity, unresolved-order state, and the process-wide live safety gate are all healthy. Any ambiguous CLOB write pauses new entries across windows and requires a restart plus account/order reconciliation; it cannot be cleared in-process.
 
-With `DRY_RUN=true`, paper execution walks the real multi-level CLOB book for the harder leg, waits `PAPER_SECOND_LEG_DELAY_MS`, fetches a fresh live book for the opposite leg, and applies FOK/FAK/immediate-fill semantics to the confirmed virtual first-leg amount. It never restores real recovery tasks, syncs real positions, places/cancels orders, merges, or sells. Prometheus exposes paper pair/one-sided/PnL metrics, CLOB connect-failure/reconnect/recovery counters, and the Winner Buy scan → signal → model rejection/confirmation → attempt → fill → pending → resolved → redeemed funnel. The TUI keeps estimated winner payout separate from realized settlement PnL.
+With `DRY_RUN=true`, paper execution walks the real multi-level CLOB book for the harder leg, waits `PAPER_SECOND_LEG_DELAY_MS`, fetches a fresh live book for the opposite leg, and applies FOK/FAK/immediate-fill semantics to the confirmed virtual first-leg amount. It never restores real recovery tasks, syncs real positions, places/cancels orders, merges, or sells. Prometheus exposes paper pair/one-sided/PnL metrics, CLOB connect-failure/reconnect/recovery counters, and the Late-Resolution Winner Trading scan → signal → model rejection/confirmation → attempt → fill → pending → resolved → redeemed funnel. The TUI keeps estimated winner payout separate from realized settlement PnL.
 
 ### Strategy development stages
 
 Strategies now follow a strict local backtest → live-data dry-run → interactive
-TUI live-promotion workflow. Spread Arbitrage and Winner Buy support both
-`backtest` and forced-safe standalone `dry-run` commands. Copy Trading starts at
-live-data PAPER because wallet history is absent from PolyBacktest; Maker and
-Bayesian research likewise start with read-only `shadow` mode. Standalone
+TUI live-promotion workflow. Binary Complement Arbitrage and Late-Resolution Winner Trading support both
+`backtest` and forced-safe standalone `dry-run` commands. Wallet-Copy Trading starts at
+live-data PAPER because wallet history is absent from PolyBacktest; Market Making and
+Cross-Market Probability Arbitrage research likewise start with read-only `shadow` mode. Standalone
 executables cannot enter real execution, and live/canary `polypulse` requires an
 interactive TUI terminal.
 
 See [the Chinese stage guide](docs/STRATEGY_DEVELOPMENT_STAGES.zh-CN.md) for the
 strategy/data compatibility matrix, commands, result paths, and promotion gates.
+The canonical strategy names, legacy aliases, Rust modules, executables, and
+result directories are recorded in
+[the strategy naming guide](docs/STRATEGY_NAMING.zh-CN.md).
 
 ### PolyBacktest historical downloader
 
 The independent downloader persists resolved crypto Up/Down markets for offline
-Spread Arbitrage and Winner Buy replay. It stores an auditable Zstandard copy of
+Binary Complement Arbitrage and Late-Resolution Winner Trading replay. It stores an auditable Zstandard copy of
 each API page plus a WAL-enabled SQLite catalog with scalar signals, top of book,
 and compressed full books. Completed pages are transactional and idempotent, so
 rerunning after Ctrl-C or a crash resumes at the first missing offset.

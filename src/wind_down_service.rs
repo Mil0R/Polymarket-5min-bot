@@ -195,7 +195,7 @@ impl WindDownService {
         if protected_count > 0 {
             info!(
                 protected = protected_count,
-                "Winner-buy hold-to-settlement tokens excluded from wind-down"
+                "Late-Resolution Winner Trading hold-to-settlement tokens excluded from wind-down"
             );
         }
         let wind_down_tokens = unprotected_tokens(&allowed_tokens, &protected_tokens);

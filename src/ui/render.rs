@@ -345,8 +345,8 @@ fn draw_desktop_strategies(frame: &mut Frame, area: Rect, app: &DashboardState) 
         ])
         .split(area);
     draw_arbitrage(frame, panels[0], app);
-    draw_winner_buy(frame, panels[1], app);
-    draw_copy_trading(frame, panels[2], app);
+    draw_late_resolution_winner_trading(frame, panels[1], app);
+    draw_wallet_copy_trading(frame, panels[2], app);
 }
 
 fn draw_medium_strategies(frame: &mut Frame, area: Rect, app: &DashboardState) {
@@ -359,17 +359,17 @@ fn draw_medium_strategies(frame: &mut Frame, area: Rect, app: &DashboardState) {
         ])
         .split(area);
     draw_arbitrage_compact(frame, panels[0], app);
-    draw_winner_buy_compact(frame, panels[1], app);
-    draw_copy_trading_compact(frame, panels[2], app);
+    draw_late_resolution_winner_trading_compact(frame, panels[1], app);
+    draw_wallet_copy_trading_compact(frame, panels[2], app);
 }
 
 fn draw_selected_strategy(frame: &mut Frame, area: Rect, app: &DashboardState) {
     if app.selected_strategy == 0 {
         draw_arbitrage_compact(frame, area, app);
     } else if app.selected_strategy == 1 {
-        draw_winner_buy_compact(frame, area, app);
+        draw_late_resolution_winner_trading_compact(frame, area, app);
     } else {
-        draw_copy_trading_compact(frame, area, app);
+        draw_wallet_copy_trading_compact(frame, area, app);
     }
 }
 
@@ -464,8 +464,8 @@ fn draw_arbitrage(frame: &mut Frame, area: Rect, app: &DashboardState) {
         Paragraph::new(lines)
             .block(strategy_block(
                 "1",
-                "SPREAD ARBITRAGE",
-                app.arbitrage_state,
+                "BINARY COMPLEMENT ARBITRAGE",
+                app.binary_complement_arbitrage_state,
                 app.selected_strategy == 0,
             ))
             .wrap(Wrap { trim: true }),
@@ -501,8 +501,8 @@ fn draw_arbitrage_compact(frame: &mut Frame, area: Rect, app: &DashboardState) {
         Paragraph::new(lines)
             .block(strategy_block(
                 "1",
-                "SPREAD ARBITRAGE",
-                app.arbitrage_state,
+                "BINARY COMPLEMENT ARBITRAGE",
+                app.binary_complement_arbitrage_state,
                 app.selected_strategy == 0,
             ))
             .wrap(Wrap { trim: true }),
@@ -510,25 +510,25 @@ fn draw_arbitrage_compact(frame: &mut Frame, area: Rect, app: &DashboardState) {
     );
 }
 
-fn draw_winner_buy(frame: &mut Frame, area: Rect, app: &DashboardState) {
-    let total = app.winner_buy_wins + app.winner_buy_losses;
+fn draw_late_resolution_winner_trading(frame: &mut Frame, area: Rect, app: &DashboardState) {
+    let total = app.late_resolution_winner_trading_wins + app.late_resolution_winner_trading_losses;
     let win_rate = if total > 0 {
-        app.winner_buy_wins as f64 / total as f64 * 100.0
+        app.late_resolution_winner_trading_wins as f64 / total as f64 * 100.0
     } else {
         0.0
     };
     let lines = vec![
         metric_line(
             "Scans",
-            app.winner_buy_scans,
+            app.late_resolution_winner_trading_scans,
             "Candidates",
-            app.winner_buy_signals,
+            app.late_resolution_winner_trading_signals,
         ),
         metric_line(
             "Attempts",
-            app.winner_buy_attempts,
+            app.late_resolution_winner_trading_attempts,
             "Fills",
-            app.winner_buy_fills,
+            app.late_resolution_winner_trading_fills,
         ),
         metric_line(
             "Data reject",
@@ -546,30 +546,31 @@ fn draw_winner_buy(frame: &mut Frame, area: Rect, app: &DashboardState) {
             "Shadow EV",
             app.winner_shadow_ev_failures,
             "Confirming",
-            app.winner_buy_awaiting_confirmation,
+            app.late_resolution_winner_trading_awaiting_confirmation,
         ),
         metric_line(
             "Pending",
-            app.winner_buy_pending,
+            app.late_resolution_winner_trading_pending,
             "Resolved",
-            app.winner_buy_resolved,
+            app.late_resolution_winner_trading_resolved,
         ),
         Line::from(vec![
             Span::styled(format!("{:<13}", "Result"), muted()),
             Span::raw(format!(
                 "{}-{} ({win_rate:.1}%)  ",
-                app.winner_buy_wins, app.winner_buy_losses
+                app.late_resolution_winner_trading_wins, app.late_resolution_winner_trading_losses
             )),
             Span::styled(
-                format!("${:.2}", app.winner_buy_realized_pnl),
-                pnl_style(app.winner_buy_realized_pnl),
+                format!("${:.2}", app.late_resolution_winner_trading_realized_pnl),
+                pnl_style(app.late_resolution_winner_trading_realized_pnl),
             ),
         ]),
         Line::from(vec![
             Span::styled(format!("{:<13}", "Budget"), muted()),
             Span::raw(format!(
                 "${:.2} / ${:.2}",
-                app.winner_buy_exposure, app.winner_buy_budget
+                app.late_resolution_winner_trading_exposure,
+                app.late_resolution_winner_trading_budget
             )),
         ]),
     ];
@@ -577,8 +578,8 @@ fn draw_winner_buy(frame: &mut Frame, area: Rect, app: &DashboardState) {
         Paragraph::new(lines)
             .block(strategy_block(
                 "2",
-                "WINNER BUY",
-                app.winner_buy_state,
+                "LATE-RESOLUTION WINNER TRADING",
+                app.late_resolution_winner_trading_state,
                 app.selected_strategy == 1,
             ))
             .wrap(Wrap { trim: true }),
@@ -586,25 +587,29 @@ fn draw_winner_buy(frame: &mut Frame, area: Rect, app: &DashboardState) {
     );
 }
 
-fn draw_winner_buy_compact(frame: &mut Frame, area: Rect, app: &DashboardState) {
-    let total = app.winner_buy_wins + app.winner_buy_losses;
+fn draw_late_resolution_winner_trading_compact(
+    frame: &mut Frame,
+    area: Rect,
+    app: &DashboardState,
+) {
+    let total = app.late_resolution_winner_trading_wins + app.late_resolution_winner_trading_losses;
     let win_rate = if total > 0 {
-        app.winner_buy_wins as f64 / total as f64 * 100.0
+        app.late_resolution_winner_trading_wins as f64 / total as f64 * 100.0
     } else {
         0.0
     };
     let lines = vec![
         compact_metric(
             "Scans",
-            app.winner_buy_scans,
+            app.late_resolution_winner_trading_scans,
             "Cand",
-            app.winner_buy_signals,
+            app.late_resolution_winner_trading_signals,
         ),
         compact_metric(
             "Attempts",
-            app.winner_buy_attempts,
+            app.late_resolution_winner_trading_attempts,
             "Fills",
-            app.winner_buy_fills,
+            app.late_resolution_winner_trading_fills,
         ),
         compact_metric(
             "Data rej",
@@ -620,31 +625,31 @@ fn draw_winner_buy_compact(frame: &mut Frame, area: Rect, app: &DashboardState) 
         ),
         compact_metric(
             "Pending",
-            app.winner_buy_pending,
+            app.late_resolution_winner_trading_pending,
             "Resolved",
-            app.winner_buy_resolved,
+            app.late_resolution_winner_trading_resolved,
         ),
         Line::from(vec![
             Span::raw(format!(
                 "W-L {}-{} {win_rate:.0}%  ",
-                app.winner_buy_wins, app.winner_buy_losses
+                app.late_resolution_winner_trading_wins, app.late_resolution_winner_trading_losses
             )),
             Span::styled(
-                format!("${:.2}", app.winner_buy_realized_pnl),
-                pnl_style(app.winner_buy_realized_pnl),
+                format!("${:.2}", app.late_resolution_winner_trading_realized_pnl),
+                pnl_style(app.late_resolution_winner_trading_realized_pnl),
             ),
         ]),
         Line::from(format!(
             "Exposure ${:.2} / ${:.2}",
-            app.winner_buy_exposure, app.winner_buy_budget
+            app.late_resolution_winner_trading_exposure, app.late_resolution_winner_trading_budget
         )),
     ];
     frame.render_widget(
         Paragraph::new(lines)
             .block(strategy_block(
                 "2",
-                "WINNER BUY",
-                app.winner_buy_state,
+                "LATE-RESOLUTION WINNER TRADING",
+                app.late_resolution_winner_trading_state,
                 app.selected_strategy == 1,
             ))
             .wrap(Wrap { trim: true }),
@@ -652,7 +657,7 @@ fn draw_winner_buy_compact(frame: &mut Frame, area: Rect, app: &DashboardState) 
     );
 }
 
-fn draw_copy_trading(frame: &mut Frame, area: Rect, app: &DashboardState) {
+fn draw_wallet_copy_trading(frame: &mut Frame, area: Rect, app: &DashboardState) {
     let lines = vec![
         metric_line(
             "Wallets",
@@ -674,7 +679,7 @@ fn draw_copy_trading(frame: &mut Frame, area: Rect, app: &DashboardState) {
         ),
         Line::from(vec![
             Span::styled(format!("{:<13}", "Budget"), muted()),
-            Span::raw(format!("${:.2}", app.copy_trading_budget)),
+            Span::raw(format!("${:.2}", app.wallet_copy_trading_budget)),
         ]),
         Line::from(vec![
             Span::styled(format!("{:<13}", "NAV / Cash"), muted()),
@@ -689,8 +694,8 @@ fn draw_copy_trading(frame: &mut Frame, area: Rect, app: &DashboardState) {
         Paragraph::new(lines)
             .block(strategy_block(
                 "3",
-                "COPY TRADING",
-                app.copy_trading_state,
+                "WALLET-COPY TRADING",
+                app.wallet_copy_trading_state,
                 app.selected_strategy == 2,
             ))
             .wrap(Wrap { trim: true }),
@@ -698,7 +703,7 @@ fn draw_copy_trading(frame: &mut Frame, area: Rect, app: &DashboardState) {
     );
 }
 
-fn draw_copy_trading_compact(frame: &mut Frame, area: Rect, app: &DashboardState) {
+fn draw_wallet_copy_trading_compact(frame: &mut Frame, area: Rect, app: &DashboardState) {
     let lines = vec![
         compact_metric(
             "Wallets",
@@ -715,7 +720,7 @@ fn draw_copy_trading_compact(frame: &mut Frame, area: Rect, app: &DashboardState
         compact_metric("Fills", app.copy_fills, "Open", app.copy_open_positions),
         Line::from(format!(
             "Budget ${:.2}  NAV ${:.2}  Cash ${:.2}",
-            app.copy_trading_budget, app.copy_nav, app.copy_cash
+            app.wallet_copy_trading_budget, app.copy_nav, app.copy_cash
         )),
         Line::from(format!("Last poll {}", age_label(app.copy_last_poll_at_ms))),
     ];
@@ -723,8 +728,8 @@ fn draw_copy_trading_compact(frame: &mut Frame, area: Rect, app: &DashboardState
         Paragraph::new(lines)
             .block(strategy_block(
                 "3",
-                "COPY TRADING",
-                app.copy_trading_state,
+                "WALLET-COPY TRADING",
+                app.wallet_copy_trading_state,
                 app.selected_strategy == 2,
             ))
             .wrap(Wrap { trim: true }),
@@ -787,9 +792,9 @@ fn draw_events(frame: &mut Frame, area: Rect, app: &DashboardState) {
 }
 
 fn draw_footer(frame: &mut Frame, area: Rect, app: &DashboardState, mobile: bool) {
-    let warning = if app.arbitrage_state == StrategyDisplayState::Blocked
-        || app.winner_buy_state == StrategyDisplayState::Blocked
-        || app.copy_trading_state == StrategyDisplayState::Blocked
+    let warning = if app.binary_complement_arbitrage_state == StrategyDisplayState::Blocked
+        || app.late_resolution_winner_trading_state == StrategyDisplayState::Blocked
+        || app.wallet_copy_trading_state == StrategyDisplayState::Blocked
     {
         format!("  Blocked: {}", app.strategy_message)
     } else {
@@ -873,8 +878,8 @@ mod tests {
         for (width, height) in [(120, 40), (80, 32)] {
             let text = rendered_state(width, height, &state);
             assert!(text.contains("MARKET SNAPSHOT"));
-            assert!(text.contains("SPREAD ARBITRAGE"));
-            assert!(text.contains("WINNER BUY"));
+            assert!(text.contains("BINARY COMPLEMENT ARBITRAGE"));
+            assert!(text.contains("LATE-RESOLUTION WINNER TRADING"));
             assert!(text.contains("HEALTH"));
             assert!(!text.contains("PNL FLOW"));
             assert!(!text.contains("EDGE CURVES"));
@@ -899,39 +904,39 @@ mod tests {
         let mut state = DashboardState::new_live("FAK", 1_000.0);
         let arbitrage = rendered_state(40, 22, &state);
         assert!(arbitrage.contains("MARKETS"));
-        assert!(arbitrage.contains("SPREAD ARBITRAGE"));
-        assert!(!arbitrage.contains("WINNER BUY"));
+        assert!(arbitrage.contains("BINARY COMPLEMENT ARBITRAGE"));
+        assert!(!arbitrage.contains("LATE-RESOLUTION WINNER TRADING"));
         assert!(arbitrage.contains("1/2/3"));
         assert!(arbitrage.contains("Space"));
 
         state.selected_strategy = 1;
         let winner = rendered_state(40, 22, &state);
-        assert!(winner.contains("WINNER BUY"));
-        assert!(!winner.contains("SPREAD ARBITRAGE"));
+        assert!(winner.contains("LATE-RESOLUTION WINNER TRADING"));
+        assert!(!winner.contains("BINARY COMPLEMENT ARBITRAGE"));
         assert!(winner.contains("Pending"));
 
         state.selected_strategy = 2;
         let copy = rendered_state(40, 22, &state);
-        assert!(copy.contains("COPY TRADING"));
-        assert!(!copy.contains("SPREAD ARBITRAGE"));
+        assert!(copy.contains("WALLET-COPY TRADING"));
+        assert!(!copy.contains("BINARY COMPLEMENT ARBITRAGE"));
     }
 
     #[test]
     fn responsive_breakpoints_switch_without_hiding_controls() {
         let state = DashboardState::new_live("FAK", 1_000.0);
         let narrow = rendered_state(69, 32, &state);
-        assert!(narrow.contains("SPREAD ARBITRAGE"));
-        assert!(!narrow.contains("WINNER BUY"));
+        assert!(narrow.contains("BINARY COMPLEMENT ARBITRAGE"));
+        assert!(!narrow.contains("LATE-RESOLUTION WINNER TRADING"));
         assert!(narrow.contains("Space"));
 
         let medium = rendered_state(70, 32, &state);
-        assert!(medium.contains("SPREAD ARBITRAGE"));
-        assert!(medium.contains("WINNER BUY"));
-        assert!(medium.contains("COPY TRADING"));
+        assert!(medium.contains("BINARY COMPLEMENT ARBITRAGE"));
+        assert!(medium.contains("LATE-RESOLUTION WINNER TRADING"));
+        assert!(medium.contains("WALLET-COPY TRADING"));
 
         let short_wide = rendered_state(120, 31, &state);
-        assert!(short_wide.contains("SPREAD ARBITRAGE"));
-        assert!(!short_wide.contains("WINNER BUY"));
+        assert!(short_wide.contains("BINARY COMPLEMENT ARBITRAGE"));
+        assert!(!short_wide.contains("LATE-RESOLUTION WINNER TRADING"));
     }
 
     #[test]

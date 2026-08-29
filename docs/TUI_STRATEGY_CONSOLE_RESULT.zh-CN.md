@@ -10,7 +10,7 @@ TUI 已由“利润大屏 + 多个趋势图”调整为面向运行和验证的�
 
 1. 全局状态：DRY RUN/CANARY/LIVE、运行时长、窗口倒计时、UTC，以及 Market WS、User WS、RTDS、Safety 健康状态。
 2. 共享市场快照：资产、YES/NO ask、总价、套利 edge、订单簿本地接收年龄。
-3. 三策略面板：Spread Arbitrage、Winner Buy 和 Copy Trading 各自展示运行状态、额度、漏斗、拒绝原因、成交和收益。
+3. 三策略面板：Binary Complement Arbitrage、Late-Resolution Winner Trading 和 Wallet-Copy Trading 各自展示运行状态、额度、漏斗、拒绝原因、成交和收益。
 4. 最近事件：只保留紧凑的运行、成交、结算、重连和人工控制事件。
 5. 快捷键提示。
 
@@ -43,7 +43,7 @@ TUI 已由“利润大屏 + 多个趋势图”调整为面向运行和验证的�
 | 按键 | 操作 |
 |---|---|
 | `↑/↓/←/→`、`j/k` | 选择策略 |
-| `1/2/3` | 直接选择 Spread Arbitrage / Winner Buy / Copy Trading |
+| `1/2/3` | 直接选择 Binary Complement Arbitrage / Late-Resolution Winner Trading / Wallet-Copy Trading |
 | `Space` | 启动或暂停选中策略的新准入 |
 | `P` | 暂停所有策略的新准入 |
 | `Y` | 确认 LIVE/CANARY 策略恢复，确认有效期 5 秒 |
@@ -55,11 +55,11 @@ TUI 已由“利润大屏 + 多个趋势图”调整为面向运行和验证的�
 
 - Market/User/RTDS 数据连接；
 - 已提交订单和单腿风险恢复；
-- Winner Buy 已有仓位结算与赎回；
-- Copy Trading 已有仓位减仓、阶梯退出、盯市和结算；
+- Late-Resolution Winner Trading 已有仓位结算与赎回；
+- Wallet-Copy Trading 已有仓位减仓、阶梯退出、盯市和结算；
 - journal 持久化和健康检查。
 
-暂停只阻止新订单进入提交流程。Winner Buy 暂停时还会清除尚未完成的连续确认状态。
+暂停只阻止新订单进入提交流程。Late-Resolution Winner Trading 暂停时还会清除尚未完成的连续确认状态。
 
 策略恢复前检查：
 
@@ -84,9 +84,9 @@ COPY_TRADING_BUDGET_USDC=10000
 
 配置决定进程启动时的初始策略状态。TUI 修改只影响当前进程，重启后恢复 `.env`。
 
-DRY RUN TUI 会预初始化 Winner Buy 的只读数据和 paper journal 依赖，因此可以从初始关闭状态热启动。LIVE 模式下，如果 `WINNER_BUY_ENABLED=false`，Winner Buy 显示为不可用并要求修改配置后重启，以保证凭据和策略兼容校验不会被绕过。
+DRY RUN TUI 会预初始化 Late-Resolution Winner Trading 的只读数据和 paper journal 依赖，因此可以从初始关闭状态热启动。LIVE 模式下，如果 `WINNER_BUY_ENABLED=false`，Late-Resolution Winner Trading 显示为不可用并要求修改配置后重启，以保证凭据和策略兼容校验不会被绕过。
 
-Copy Trading 当前以 PAPER-first 方式嵌入 polypulse：`DRY_RUN=true` 时与另外两个策略一同运行并接受 TUI 控制；`DRY_RUN=false` 时显示 `UNAVAILABLE`，继续阻止三策略共享账户实盘，直到统一账户资金预留和跨策略持仓归属完成。三个策略的 PAPER 现金/风险额度彼此独立，修改额度不会自动修改单笔订单上限。
+Wallet-Copy Trading 当前以 PAPER-first 方式嵌入 polypulse：`DRY_RUN=true` 时与另外两个策略一同运行并接受 TUI 控制；`DRY_RUN=false` 时显示 `UNAVAILABLE`，继续阻止三策略共享账户实盘，直到统一账户资金预留和跨策略持仓归属完成。三个策略的 PAPER 现金/风险额度彼此独立，修改额度不会自动修改单笔订单上限。
 
 ## 已移除的界面内容
 

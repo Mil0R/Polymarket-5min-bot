@@ -8,7 +8,7 @@
 - [一、系统主事件循环与生命周期](#一系统主事件循环与生命周期)
 - [二、核心双腿套利检测与执行流](#二核心双腿套利检测与执行流)
 - [三、风控、持仓平衡与止盈止损（Hedge Monitor）](#三风控持仓平衡与止盈止损hedge-monitor)
-- [四、尾盘策略：Winner-Buy 与 Wind-Down](#四尾盘策略winner-buy-与-wind-down)
+- [四、尾盘策略：Late-Resolution Winner Trading 与 Wind-Down](#四尾盘策略late-resolution-winner-trading-与-wind-down)
 - [五、关键代码模块映射表](#五关键代码模块映射表)
 
 ---
@@ -40,10 +40,10 @@ flowchart TD
 
     %% 分支 4: 1秒周期任务
     WindowLoop -->|"每秒轮询 (1s Tick)"| S1Check["更新 UI 倒计时与监控健康度"]
-    S1Check --> S1_1{"是否满足尾盘吃单条件? (WinnerBuy)"}
-    S1_1 -- "是" --> WinnerBuyExec["Winner-Buy: 买入确定胜方份额 (见流程图四)"]
+    S1Check --> S1_1{"是否满足尾盘吃单条件? (LateResolutionWinnerTrading)"}
+    S1_1 -- "是" --> LateResolutionWinnerTradingExec["Late-Resolution Winner Trading: 买入确定胜方份额 (见流程图四)"]
     S1_1 -- "否" --> S1_2{"是否到达 WindDown 触发点?"}
-    WinnerBuyExec --> S1_2
+    LateResolutionWinnerTradingExec --> S1_2
     
     S1_2 -- "是" --> WindDownExec["WindDownService: 撤单 -> 链上 Merge -> 兜底平仓"]
     S1_2 -- "否" --> S1_3{"窗口是否已到期 Rollover?"}
@@ -143,25 +143,25 @@ flowchart TD
 
 ---
 
-## 四、尾盘策略：Winner-Buy 与 Wind-Down
+## 四、尾盘策略：Late-Resolution Winner Trading 与 Wind-Down
 
-展示窗口临近到期时，**尾盘胜者吃单**（[`winner_buy.rs`](file:///home/lin/Workspace/Polymarket-5min-bot/src/winner_buy.rs)）与**尾盘平仓风控**（[`wind_down_service.rs`](file:///home/lin/Workspace/Polymarket-5min-bot/src/wind_down_service.rs)）的执行路径。
+展示窗口临近到期时，**尾盘胜者吃单**（[`late_resolution_winner_trading.rs`](file:///home/lin/Workspace/Polymarket-5min-bot/src/late_resolution_winner_trading.rs)）与**尾盘平仓风控**（[`wind_down_service.rs`](file:///home/lin/Workspace/Polymarket-5min-bot/src/wind_down_service.rs)）的执行路径。
 
 ```mermaid
 flowchart TD
-    WindowTimeCheck["1秒心跳检查剩余时间: seconds_until_end"] --> CheckWinnerBuy{"WINNER_BUY_ENABLED && seconds_until_end <= 30s?"}
+    WindowTimeCheck["1秒心跳检查剩余时间: seconds_until_end"] --> CheckLateResolutionWinnerTrading{"WINNER_BUY_ENABLED && seconds_until_end <= 30s?"}
 
-    %% Winner Buy 分支
-    CheckWinnerBuy -- "是" --> FetchRestAsks["REST API 查询 YES 和 NO 的真实买卖深度"]
+    %% Late-Resolution Winner Trading 分支
+    CheckLateResolutionWinnerTrading -- "是" --> FetchRestAsks["REST API 查询 YES 和 NO 的真实买卖深度"]
     FetchRestAsks --> WinnerSignalDetect{"判断胜负信号 (detect_winner_asks)"}
-    WinnerSignalDetect -- "胜方最佳卖价在 0.95~0.99 且负方价格 <= 0.1" --> BuildWinnerBuy["生成胜方单边买单 (限价 0.95~0.99)"]
-    WinnerSignalDetect -- "胜负未定/两边皆高/无深度" --> SkipWinnerBuy["跳过吃单"]
-    BuildWinnerBuy --> PostWinnerBuy["向 CLOB 提交胜方买单"]
-    PostWinnerBuy --> HoldToSettle["成交后加入 PendingWinnerBuy 列表，持有至到期结算 ($1.00)"]
-    CheckWinnerBuy -- "否" --> CheckWindDown
+    WinnerSignalDetect -- "胜方最佳卖价在 0.95~0.99 且负方价格 <= 0.1" --> BuildLateResolutionWinnerTrading["生成胜方单边买单 (限价 0.95~0.99)"]
+    WinnerSignalDetect -- "胜负未定/两边皆高/无深度" --> SkipLateResolutionWinnerTrading["跳过吃单"]
+    BuildLateResolutionWinnerTrading --> PostLateResolutionWinnerTrading["向 CLOB 提交胜方买单"]
+    PostLateResolutionWinnerTrading --> HoldToSettle["成交后加入 PendingLateResolutionWinnerTrading 列表，持有至到期结算 ($1.00)"]
+    CheckLateResolutionWinnerTrading -- "否" --> CheckWindDown
 
     %% Wind Down 分支
-    SkipWinnerBuy --> CheckWindDown{"WIND_DOWN_BEFORE_WINDOW_END_MINUTES > 0 && 达到设定时间?"}
+    SkipLateResolutionWinnerTrading --> CheckWindDown{"WIND_DOWN_BEFORE_WINDOW_END_MINUTES > 0 && 达到设定时间?"}
     HoldToSettle --> CheckWindDown
 
     CheckWindDown -- "是 (如最后 60s)" --> WindDownStart["启动 WindDown 流程，暂停当前窗口套利开仓"]
@@ -186,5 +186,5 @@ flowchart TD
 | **持仓追踪与风险状态机** | [`src/risk/manager.rs`](file:///home/lin/Workspace/Polymarket-5min-bot/src/risk/manager.rs)<br>[`src/risk/positions.rs`](file:///home/lin/Workspace/Polymarket-5min-bot/src/risk/positions.rs) | 管理总持仓敞口（Exposure）、订单对状态及日志持久化 |
 | **不平衡平衡器** | [`src/risk/position_balancer.rs`](file:///home/lin/Workspace/Polymarket-5min-bot/src/risk/position_balancer.rs) | 定期比对各市场多空挂单与持仓，撤除不平衡买单 |
 | **动态止盈止损监控** | [`src/risk/hedge_monitor.rs`](file:///home/lin/Workspace/Polymarket-5min-bot/src/risk/hedge_monitor.rs) | 实时监听行情买一价，对单边持仓执行 TP/SL 限价卖出 |
-| **尾盘胜方单边吃单** | [`src/winner_buy.rs`](file:///home/lin/Workspace/Polymarket-5min-bot/src/winner_buy.rs) | 窗口尾声（最后 30s）检测胜负并买入胜方持有至结算 |
+| **尾盘胜方单边吃单** | [`src/late_resolution_winner_trading.rs`](file:///home/lin/Workspace/Polymarket-5min-bot/src/late_resolution_winner_trading.rs) | 窗口尾声（最后 30s）检测胜负并买入胜方持有至结算 |
 | **尾盘风控与清仓** | [`src/wind_down_service.rs`](file:///home/lin/Workspace/Polymarket-5min-bot/src/wind_down_service.rs)<br>[`src/merge.rs`](file:///home/lin/Workspace/Polymarket-5min-bot/src/merge.rs) | 窗口结束前撤单、链上对冲 Merge 及兜底平仓 |

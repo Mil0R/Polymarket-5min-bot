@@ -1,7 +1,7 @@
 # PolyBacktest 历史数据下载器
 
 `polybacktest_downloader` 是独立只读工具，用于持续保存 BTC/ETH/SOL
-Up/Down 历史市场，供 Spread Arbitrage 和 Winner Buy 离线回放。它不会读取
+Up/Down 历史市场，供 Binary Complement Arbitrage 和 Late-Resolution Winner Trading 离线回放。它不会读取
 Polymarket 私钥，也不会提交订单。
 
 ## 运行
@@ -71,7 +71,8 @@ POLYBACKTEST_MAX_MARKETS_PER_SYNC=0
 - `POLYBACKTEST_MAX_MARKETS_PER_SYNC=0` 表示处理全部待下载市场。设置为正数可用于小批量验证。
 - 31 天、三种资产的首次全量补齐耗时取决于盘口快照数量；在 Pro 的 250ms 间隔下，
   通常需要数小时。可先设置 `POLYBACKTEST_MAX_MARKETS_PER_SYNC=1` 验证，再恢复为 `0`。
-- Spread/Winner 正式回放应保持 `POLYBACKTEST_INCLUDE_ORDERBOOK=true`。
+- Binary Complement Arbitrage 与 Late-Resolution Winner Trading 正式回放应保持
+  `POLYBACKTEST_INCLUDE_ORDERBOOK=true`。
 - API key 只用于请求头，启动日志不会打印其值。
 
 ## 本地布局
@@ -142,7 +143,7 @@ data/polybacktest/
 
 ## 回测质量门槛
 
-Winner Buy 严格模型只应使用：
+Late-Resolution Winner Trading 严格模型只应使用：
 
 ```text
 coin_twap IS NOT NULL
@@ -150,7 +151,7 @@ coin_twap_source = 'chainlink_twap'
 不同 coin_twap_observed_at 才计为独立确认
 ```
 
-Spread Arbitrage 应从信号快照之后选择首个满足
+Binary Complement Arbitrage 应从信号快照之后选择首个满足
 `time >= signal_time + configured_delay` 的快照成交，逐档读取压缩完整盘口，
 并在返回深度不足时判定不成交。不要使用 `snapshot-at` 的最近两秒近似接口。
 

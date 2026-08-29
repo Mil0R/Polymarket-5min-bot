@@ -106,7 +106,7 @@ impl ExecutionQuote {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct WinnerBuyExecution {
+pub struct LateResolutionWinnerTradingExecution {
     pub requested: Decimal,
     pub filled: Decimal,
     pub cost: Decimal,
@@ -324,7 +324,7 @@ pub struct TradingExecutor {
     gtd_expiration_secs: u64,
     arbitrage_order_type: OrderType,
     dry_run: bool,
-    paper_winner_buy_delay_ms: u64,
+    paper_late_resolution_winner_trading_delay_ms: u64,
     arbitrage_paper: PaperTradingEngine,
     winner_paper: PaperTradingEngine,
     /// token_id -> minimum tick size, cached to avoid an HTTP round-trip per quote.
@@ -344,11 +344,11 @@ pub struct ExecutionPolicy {
     pub order_type: OrderType,
     pub dry_run: bool,
     pub arbitrage_budget_usdc: f64,
-    pub winner_buy_budget_usdc: f64,
+    pub late_resolution_winner_trading_budget_usdc: f64,
     pub paper_liquidity_haircut: f64,
     pub arbitrage_paper_liquidity_haircut: f64,
     pub paper_second_leg_delay_ms: u64,
-    pub paper_winner_buy_delay_ms: u64,
+    pub paper_late_resolution_winner_trading_delay_ms: u64,
 }
 
 struct SendErrorContext<'a> {
@@ -437,7 +437,8 @@ impl TradingExecutor {
             gtd_expiration_secs: policy.gtd_expiration_secs,
             arbitrage_order_type: policy.order_type,
             dry_run: policy.dry_run,
-            paper_winner_buy_delay_ms: policy.paper_winner_buy_delay_ms,
+            paper_late_resolution_winner_trading_delay_ms: policy
+                .paper_late_resolution_winner_trading_delay_ms,
             arbitrage_paper: PaperTradingEngine::new(PaperSettings {
                 initial_balance: Decimal::try_from(policy.arbitrage_budget_usdc)
                     .unwrap_or(dec!(50)),
@@ -446,8 +447,10 @@ impl TradingExecutor {
                 second_leg_delay_ms: policy.paper_second_leg_delay_ms,
             }),
             winner_paper: PaperTradingEngine::new(PaperSettings {
-                initial_balance: Decimal::try_from(policy.winner_buy_budget_usdc)
-                    .unwrap_or(dec!(50)),
+                initial_balance: Decimal::try_from(
+                    policy.late_resolution_winner_trading_budget_usdc,
+                )
+                .unwrap_or(dec!(50)),
                 liquidity_haircut: Decimal::try_from(policy.paper_liquidity_haircut)
                     .unwrap_or(dec!(0.75)),
                 second_leg_delay_ms: policy.paper_second_leg_delay_ms,
@@ -525,7 +528,7 @@ impl TradingExecutor {
         })
     }
 
-    /// Conservative cash/risk reservation for a Winner Buy. Live fills use
+    /// Conservative cash/risk reservation for a Late-Resolution Winner Trading. Live fills use
     /// exchange-reported amounts; paper fills use the configured fee buffer.
     pub fn winner_planned_cost(
         &self,
@@ -545,7 +548,7 @@ impl TradingExecutor {
         limit_price: Decimal,
         size: Decimal,
         fee_per_share: Decimal,
-    ) -> Result<WinnerBuyExecution> {
+    ) -> Result<LateResolutionWinnerTradingExecution> {
         if self.dry_run {
             let reservation = self.winner_paper.reserve(self.winner_planned_cost(
                 limit_price,
@@ -563,13 +566,13 @@ impl TradingExecutor {
                 average_price: execution.average_price,
             };
             let paper = reservation.commit_winner(fill);
-            info!(target: "polypulse::strategy::winner_buy",
+            info!(target: "polypulse::strategy::late_resolution_winner_trading",
                 filled = %fill.filled,
                 average_price = %fill.average_price,
                 cost = %fill.cost,
                 cash_remaining = %paper.cash_remaining,
                 winner_positions_open = paper.winner_positions_open,
-                "PAPER winner-buy cash committed"
+                "PAPER late-resolution-winner-trading cash committed"
             );
             return Ok(execution);
         }
@@ -592,7 +595,7 @@ impl TradingExecutor {
         } else {
             dec!(0)
         };
-        Ok(WinnerBuyExecution {
+        Ok(LateResolutionWinnerTradingExecution {
             requested: size,
             filled,
             cost: if cost > dec!(0) {
@@ -606,7 +609,7 @@ impl TradingExecutor {
     }
 
     /// Re-read the live book after the configured paper delay and simulate a
-    /// Winner Buy without reserving cash or mutating the paper ledger. This is
+    /// Late-Resolution Winner Trading without reserving cash or mutating the paper ledger. This is
     /// intentionally unavailable in live mode and is used only to measure the
     /// executability of rejected candidates.
     pub async fn shadow_buy_winner(
@@ -615,7 +618,7 @@ impl TradingExecutor {
         limit_price: Decimal,
         size: Decimal,
         fee_per_share: Decimal,
-    ) -> Result<WinnerBuyExecution> {
+    ) -> Result<LateResolutionWinnerTradingExecution> {
         if !self.dry_run {
             anyhow::bail!("winner shadow execution is available only in dry-run mode");
         }
@@ -629,10 +632,10 @@ impl TradingExecutor {
         limit_price: Decimal,
         size: Decimal,
         fee_per_share: Decimal,
-    ) -> Result<WinnerBuyExecution> {
-        if self.paper_winner_buy_delay_ms > 0 {
+    ) -> Result<LateResolutionWinnerTradingExecution> {
+        if self.paper_late_resolution_winner_trading_delay_ms > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(
-                self.paper_winner_buy_delay_ms,
+                self.paper_late_resolution_winner_trading_delay_ms,
             ))
             .await;
         }
@@ -648,7 +651,7 @@ impl TradingExecutor {
             fill.cost += estimated_fee;
             fill.average_price = fill.cost / fill.filled;
         }
-        Ok(WinnerBuyExecution {
+        Ok(LateResolutionWinnerTradingExecution {
             requested: size,
             filled: fill.filled,
             cost: fill.cost,

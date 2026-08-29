@@ -1,8 +1,10 @@
 //! Deterministic stage-1 replay against the SQLite database produced by
 //! `polybacktest_downloader`. No network client or signer is reachable here.
 
-use crate::winner_buy::detect_winner_asks;
-use crate::winner_model::{ChainlinkTwapStore, TwapSample, WinnerModelInput, WinnerModelPolicy};
+use crate::late_resolution_winner_model::{
+    ChainlinkTwapStore, TwapSample, WinnerModelInput, WinnerModelPolicy,
+};
+use crate::late_resolution_winner_trading::detect_winner_asks;
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use rusqlite::{Connection, Row};
@@ -163,7 +165,7 @@ struct Totals {
     fees: Decimal,
 }
 
-pub fn run_spread_replay() -> Result<PathBuf> {
+pub fn run_binary_complement_replay() -> Result<PathBuf> {
     let config = ReplayConfig::from_env()?;
     config.validate()?;
     let connection = open_database(&config)?;
@@ -173,11 +175,16 @@ pub fn run_spread_replay() -> Result<PathBuf> {
         let snapshots = load_snapshots(&connection, &market.id)?;
         totals.snapshots += snapshots.len();
         replay_spread_market(&config, &snapshots, &mut totals)?;
-        print_progress("spread-arbitrage", index + 1, markets.len(), &totals);
+        print_progress(
+            "binary-complement-arbitrage",
+            index + 1,
+            markets.len(),
+            &totals,
+        );
     }
     write_report(
         &config,
-        "spread-arbitrage",
+        "binary-complement-arbitrage",
         markets.len(),
         totals,
         vec![
@@ -187,7 +194,7 @@ pub fn run_spread_replay() -> Result<PathBuf> {
     )
 }
 
-pub fn run_winner_replay() -> Result<PathBuf> {
+pub fn run_late_resolution_winner_replay() -> Result<PathBuf> {
     let config = ReplayConfig::from_env()?;
     config.validate()?;
     let connection = open_database(&config)?;
@@ -197,11 +204,16 @@ pub fn run_winner_replay() -> Result<PathBuf> {
         let snapshots = load_snapshots(&connection, &market.id)?;
         totals.snapshots += snapshots.len();
         replay_winner_market(&config, market, &snapshots, &mut totals)?;
-        print_progress("winner-buy", index + 1, markets.len(), &totals);
+        print_progress(
+            "late-resolution-winner-trading",
+            index + 1,
+            markets.len(),
+            &totals,
+        );
     }
     write_report(
         &config,
-        "winner-buy",
+        "late-resolution-winner-trading",
         markets.len(),
         totals,
         vec![

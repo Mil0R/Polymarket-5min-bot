@@ -4,7 +4,11 @@
 
 **官方网站**：[polypulse.wiki](https://polypulse.wiki/)
 
-> 面向 [Polymarket](https://polymarket.com) 加密货币「Up or Down」5 分钟预测市场的 Rust 套利机器人。
+> 面向 [Polymarket](https://polymarket.com) 的 Rust 量化交易研究与执行系统，覆盖二元互补套利、
+> 临近结算交易、链上钱包跟随、做市和跨市场概率研究。
+
+五个策略的正式英文名称、旧名称、代码模块、独立可执行文件和结果目录统一记录在
+[策略正式名称与兼容约定](docs/STRATEGY_NAMING.zh-CN.md)。
 
 ![account](image/account.png)
 
@@ -106,15 +110,15 @@ cargo run              # 运行程序
 | `CANARY_MAX_LOSS_USDC` | `2.0` | 单腿残余成本等保守损失预算，触发后永久暂停本进程开仓 |
 | `CANARY_MAX_PAIRS_PER_WINDOW` / `CANARY_MAX_PAIRS_TOTAL` | `1` / `1` | 每窗口及单进程订单对硬上限 |
 | `ARBITRAGE_BUDGET_USDC` / `WINNER_BUY_BUDGET_USDC` / `COPY_TRADING_BUDGET_USDC` | `1000` / `50` / `10000` | 三策略独立可用额度；TUI 分别显示并在下单前硬限制 |
-| `PAPER_INITIAL_BALANCE_USDC` | `50.0` | 旧版 PAPER 默认额度；未配置 Winner Buy 独立额度时作为兼容回退 |
+| `PAPER_INITIAL_BALANCE_USDC` | `50.0` | 旧版 PAPER 默认额度；未配置 Late-Resolution Winner Trading 独立额度时作为兼容回退 |
 | `PAPER_LIQUIDITY_HAIRCUT` | `0.75` | 模拟时只认为盘口显示深度的该比例可以成交 |
 | `PAPER_SECOND_LEG_DELAY_MS` | `250` | 第一腿模拟后等待多久重新读取第二腿真实盘口 |
 | `MAX_BOOK_AGE_MS` / `MAX_BOOK_SKEW_MS` | `2000` / `1000` | 拒绝过期或两腿时间差过大的行情快照 |
 | `SIGNAL_COOLDOWN_MS` | `3000` | 相同市场和价格信号的去重冷却时间 |
-| `ARBITRAGE_STATE_JOURNAL_FILE` | `results/spread-arbitrage/{paper|live}/orders.ndjson` | 套利订单对与恢复状态；旧 `STATE_JOURNAL_FILE` 仍兼容 |
-| `WINNER_BUY_STATE_JOURNAL_FILE` | `results/winner-buy/{paper|live}/orders.ndjson` | Winner Buy 下单、成交与结算状态 |
-| `WINNER_BUY_EVALUATION_JOURNAL_FILE` | `results/winner-buy/{paper|live}/evaluations.ndjson` | Winner Buy 候选与反事实评估数据 |
-| `WINNER_BUY_MAX_BOOK_AGE_MS` | `1000` | Winner Buy 独立 WS 行情年龄；疑似候选或缺书时才进行严格 REST 确认 |
+| `ARBITRAGE_STATE_JOURNAL_FILE` | `results/binary-complement-arbitrage/{paper|live}/orders.ndjson` | 套利订单对与恢复状态；旧 `STATE_JOURNAL_FILE` 仍兼容 |
+| `WINNER_BUY_STATE_JOURNAL_FILE` | `results/late-resolution-winner-trading/{paper|live}/orders.ndjson` | Late-Resolution Winner Trading 下单、成交与结算状态 |
+| `WINNER_BUY_EVALUATION_JOURNAL_FILE` | `results/late-resolution-winner-trading/{paper|live}/evaluations.ndjson` | Late-Resolution Winner Trading 候选与反事实评估数据 |
+| `WINNER_BUY_MAX_BOOK_AGE_MS` | `1000` | Late-Resolution Winner Trading 独立 WS 行情年龄；疑似候选或缺书时才进行严格 REST 确认 |
 | `ARBITRAGE_SHADOW_LOG_FILE` | 未设置 | 可选的深度拒绝候选 NDJSON 研究日志，不改变准入阈值 |
 | `LOG_FILE` | TUI 下为 `logs/system.log` | 系统日志；配置分策略日志后不再重复对应策略事件 |
 | `ARBITRAGE_STRATEGY_LOG_FILE` / `WINNER_BUY_STRATEGY_LOG_FILE` | 未设置 | 可选、互斥的分策略文本日志 |
@@ -127,11 +131,11 @@ cargo run              # 运行程序
 
 其余参数（CLOB 地址、签名类型、滑点、订单类型、持仓同步等）均有合理默认值，一般无需修改。完整列表与注释见 `.env.example`。
 
-Winner Buy 应按 `market_resolved` 独立市场统计，避免重复评估放大样本。可直接生成手续费后、Shadow 成交后以及 Wilson 95% 胜率下界报告：
+Late-Resolution Winner Trading 应按 `market_resolved` 独立市场统计，避免重复评估放大样本。可直接生成手续费后、Shadow 成交后以及 Wilson 95% 胜率下界报告：
 
 ```bash
-cargo run --release --bin winner_buy_report -- \
-  results/winner-buy/server-paper-run-001/evaluations.ndjson
+cargo run --release --bin late_resolution_winner_report -- \
+  results/late-resolution-winner-trading/server-paper-run-001/evaluations.ndjson
 ```
 
 不传文件名时，命令优先读取 `WINNER_BUY_EVALUATION_JOURNAL_FILE`。
@@ -146,7 +150,7 @@ cargo run --release --bin winner_buy_report -- \
 
 ## 跟单候选钱包发现
 
-独立的只读 `copy_wallet_scout` 可按市场一级/二级分类、近期活跃度、已结算样本、收益质量、风险和当前盘口适配度筛选跟单候选地址。它不读取密钥、不下单，也不直接修改 `.env`。编译、参数和输出说明见 [跟单候选钱包发现器](docs/COPY_WALLET_SCOUT.zh-CN.md)。
+独立的只读 `wallet_copy_scout` 可按市场一级/二级分类、近期活跃度、已结算样本、收益质量、风险和当前盘口适配度筛选跟单候选地址。它不读取密钥、不下单，也不直接修改 `.env`。编译、参数和输出说明见 [跟单候选钱包发现器](docs/WALLET_COPY_SCOUT.zh-CN.md)。
 
 PAPER 模式还支持运行质量审计和候选池热替换：不合格钱包先进入 `Probation`，再从 scout 原子更新的 `report.json` 中选择同领域、运行时漏斗复核通过的替代钱包；LIVE 模式不会自动轮换。
 

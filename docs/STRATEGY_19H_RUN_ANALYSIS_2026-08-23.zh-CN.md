@@ -8,11 +8,11 @@
 
 1. 本次存在一次约 7 分钟的前置运行，随后于 `2026-08-22 06:34:21 UTC` 重启。以下运行指标以第二次连续运行至 `2026-08-23 01:55 UTC` 的快照为主，覆盖约 19 小时 21 分钟；对应北京时间约 8 月 22 日 14:34 至 8 月 23 日 09:55。
 2. 两种策略均处于 `DRY_RUN=true` 的 paper 模式，均未产生模拟订单；两个 `orders.ndjson` 都是空文件。
-3. Spread Arbitrage 在主运行中处理了 889,261 个通过时间安全检查的盘口对，发现 4,154 个满足初始价差条件、但双腿深度不足的候选；没有候选进入准入和模拟下单阶段。
-4. Winner Buy 共扫描 12,960 次，产生 52 次候选评估，涉及 29 个独立市场；52 次候选全部被模型或市场质量条件拒绝，没有下单尝试。
-5. Winner Buy 的 29 个独立市场反事实结果为 27 胜 2 负，表面胜率 93.10%；但成交成本的平均盈亏平衡胜率约为 97.36%，每市场买 1 份累计亏损 1.235566 USDC，投入回报率约为 **-4.38%**。
-6. Spread Arbitrage 是理论上的双腿套利，但这批数据没有证明存在可执行套利；Winner Buy 是尾盘方向交易，不是无风险套利，本批数据反而显示当前价格区间下为负收益。
-7. Winner Buy 存在一个明确的 REST 盘口新鲜度判断缺陷，使 20,946 次 REST 回退结果全部被判过期。应先修复数据路径，再继续评估候选覆盖率。
+3. Binary Complement Arbitrage 在主运行中处理了 889,261 个通过时间安全检查的盘口对，发现 4,154 个满足初始价差条件、但双腿深度不足的候选；没有候选进入准入和模拟下单阶段。
+4. Late-Resolution Winner Trading 共扫描 12,960 次，产生 52 次候选评估，涉及 29 个独立市场；52 次候选全部被模型或市场质量条件拒绝，没有下单尝试。
+5. Late-Resolution Winner Trading 的 29 个独立市场反事实结果为 27 胜 2 负，表面胜率 93.10%；但成交成本的平均盈亏平衡胜率约为 97.36%，每市场买 1 份累计亏损 1.235566 USDC，投入回报率约为 **-4.38%**。
+6. Binary Complement Arbitrage 是理论上的双腿套利，但这批数据没有证明存在可执行套利；Late-Resolution Winner Trading 是尾盘方向交易，不是无风险套利，本批数据反而显示当前价格区间下为负收益。
+7. Late-Resolution Winner Trading 存在一个明确的 REST 盘口新鲜度判断缺陷，使 20,946 次 REST 回退结果全部被判过期。应先修复数据路径，再继续评估候选覆盖率。
 8. 当前不应进入真实资金测试。值得继续完善的重点是数据质量、影子候选记录、模型校准和日志治理，而不是直接放宽风控阈值。
 
 ## 2. 数据范围与完整性
@@ -22,13 +22,13 @@
 | 文件 | 大小/记录数 | 用途 |
 | --- | ---: | --- |
 | `logs/system.log` | 717,492,413 字节 | 全局运行、连接和指标快照 |
-| `logs/spread-arbitrage.log` | 324,591,264 字节 | 双腿价差策略日志 |
-| `logs/winner-buy.log` | 2,237,721 字节 | Winner Buy 策略日志 |
-| `results/spread-arbitrage/paper/orders.ndjson` | 0 行 | 双腿策略模拟订单，当前为空 |
-| `results/winner-buy/paper/orders.ndjson` | 0 行 | Winner Buy 模拟订单，当前为空 |
-| `results/winner-buy/paper/evaluations.ndjson` | 133 行 | 52 次评估、52 次逐评估结算、29 次按市场汇总 |
+| `logs/binary-complement-arbitrage.log` | 324,591,264 字节 | 双腿价差策略日志 |
+| `logs/late-resolution-winner-trading.log` | 2,237,721 字节 | Late-Resolution Winner Trading 策略日志 |
+| `results/binary-complement-arbitrage/paper/orders.ndjson` | 0 行 | 双腿策略模拟订单，当前为空 |
+| `results/late-resolution-winner-trading/paper/orders.ndjson` | 0 行 | Late-Resolution Winner Trading 模拟订单，当前为空 |
+| `results/late-resolution-winner-trading/paper/evaluations.ndjson` | 133 行 | 52 次评估、52 次逐评估结算、29 次按市场汇总 |
 
-配置的 `results/spread-arbitrage/paper/opportunities.ndjson` 没有生成，说明没有机会进入持久化环节。Winner Buy 评估 NDJSON 可被完整解析，52 次评估均已有结算事件，没有残留未结算评估。
+配置的 `results/binary-complement-arbitrage/paper/opportunities.ndjson` 没有生成，说明没有机会进入持久化环节。Late-Resolution Winner Trading 评估 NDJSON 可被完整解析，52 次评估均已有结算事件，没有残留未结算评估。
 
 ### 2.2 两次启动
 
@@ -36,9 +36,9 @@
 - 第二次启动：`2026-08-22 06:34:21 UTC`；
 - 日志最后事件：约 `2026-08-23 01:56:47 UTC`。
 
-第二次启动时运行计数器清零，因此不能把两个运行末值直接相加。Winner Buy 的第一条评估发生在第二次启动以后，故其 52 条评估属于主运行。日志没有记录明确的优雅退出事件，但结果文件尾部结构完整。
+第二次启动时运行计数器清零，因此不能把两个运行末值直接相加。Late-Resolution Winner Trading 的第一条评估发生在第二次启动以后，故其 52 条评估属于主运行。日志没有记录明确的优雅退出事件，但结果文件尾部结构完整。
 
-## 3. Spread Arbitrage 执行情况
+## 3. Binary Complement Arbitrage 执行情况
 
 ### 3.1 主运行指标
 
@@ -84,14 +84,14 @@
 
 ### 3.4 是否值得完善
 
-值得完善，但现阶段重点应是可观测性和影子验证，优先级低于 Winner Buy 的数据缺陷修复。建议：
+值得完善，但现阶段重点应是可观测性和影子验证，优先级低于 Late-Resolution Winner Trading 的数据缺陷修复。建议：
 
 1. 只对潜在边际样本持久化结构化记录：时间、市场、YES/NO 最优价、各腿深度、原始边际、盘口年龄、双腿时间差和拒绝原因。
 2. 同时运行不下单的参数网格，例如边际 0.1%/0.5%/1%/2%/3%，深度 1/2/3/5 USDC；不要改变真实准入阈值。
 3. 记录候选持续时间和 250 ms 后的盘口，估算第二腿滑移、消失率和单腿暴露，而不是只统计瞬时快照。
 4. 至少积累 7～14 天跨时段数据后，再决定是否值得优化执行器或扩展市场范围。
 
-## 4. Winner Buy 执行情况
+## 4. Late-Resolution Winner Trading 执行情况
 
 ### 4.1 扫描与候选漏斗
 
@@ -162,7 +162,7 @@
 
 ### 4.4 是否存在套利可能
 
-结论是：**Winner Buy 不是套利，当前样本没有正期望证据。**
+结论是：**Late-Resolution Winner Trading 不是套利，当前样本没有正期望证据。**
 
 它只买入 YES 或 NO 的一边，若尾盘反转会损失接近全部本金。0.95～0.98 的高价格已经包含极高隐含胜率，策略必须证明自身真实胜率在手续费后仍高于约 95%～98% 才能盈利。本批样本虽然胜率看起来很高，但实际反事实收益为负，且独立 Chainlink 模型对所有有效候选均给出负净 EV。
 
@@ -170,10 +170,10 @@
 
 主运行指标同时显示：
 
-- `winner_buy_rest_fallbacks = 20,946`；
-- `winner_buy_stale_rest_books = 20,946`；
-- `winner_buy_stale_ws_books = 20,946`；
-- `winner_buy_stale_books = 41,892`。
+- `late_resolution_winner_trading_rest_fallbacks = 20,946`；
+- `late_resolution_winner_trading_stale_rest_books = 20,946`；
+- `late_resolution_winner_trading_stale_ws_books = 20,946`；
+- `late_resolution_winner_trading_stale_books = 41,892`。
 
 即每一个过期 WS 盘口都触发 REST 回退，而每一次 REST 回退又全部被判过期。结合代码可确定原因：
 
@@ -193,7 +193,7 @@
 
 - SDK 市场 WebSocket 重连/恢复：12/12，没有未恢复事件；
 - Chainlink RTDS 连接/断开：22/21，连接失败 0，收到 521,565 条消息；
-- Winner Buy 模型价格过期拒绝仅 2 次。
+- Late-Resolution Winner Trading 模型价格过期拒绝仅 2 次。
 
 系统日志包含 298 条 SDK WebSocket ERROR，其中 225 条 `ConnectionClosed`、73 条未发送关闭握手的 reset。大量事件接近 5 分钟市场流切换时间，属于窗口流销毁/远端关闭与少量异常断线的混合；最终恢复计数完整，未造成持续停机。不过预期的窗口流关闭被 SDK 记录为 ERROR，会干扰真正故障识别，后续应区分“正常 rollover 关闭”和“活跃流异常断线”。
 
@@ -201,38 +201,38 @@ Chainlink 出现 21 次 stale/closed 重连，但全部重新连接且没有连�
 
 ### 5.2 结算轮询
 
-Winner Buy 反事实评估出现 475 次“闭市查询返回空结果”，结算查询失败为 0，最终 52 条评估全部成功结算。当前代码每约 10 秒重复查询已到期但尚未被 Gamma 闭市接口收录的市场，平均会造成较多空轮询。
+Late-Resolution Winner Trading 反事实评估出现 475 次“闭市查询返回空结果”，结算查询失败为 0，最终 52 条评估全部成功结算。当前代码每约 10 秒重复查询已到期但尚未被 Gamma 闭市接口收录的市场，平均会造成较多空轮询。
 
 建议给每个 slug 保存下一次查询时间并做 10/20/40/60 秒退避，或在市场结束后延迟首次闭市查询。它不会改变收益，但能降低 API 压力和日志噪声。
 
 ### 5.3 日志体积与轮转
 
-约 19.5 小时产生约 996 MiB 日志，其中系统日志约 685 MiB、Spread 日志约 310 MiB。`RUST_LOG=debug` 使近 89 万条盘口详情同时进入全局日志和策略日志，而当前 `LOG_ROTATE_MAX_BYTES` 只在进程启动时检查轮转，不会限制单次长运行中的文件增长。
+约 19.5 小时产生约 996 MiB 日志，其中系统日志约 685 MiB、Binary Complement Arbitrage 日志约 310 MiB。`RUST_LOG=debug` 使近 89 万条盘口详情同时进入全局日志和策略日志，而当前 `LOG_ROTATE_MAX_BYTES` 只在进程启动时检查轮转，不会限制单次长运行中的文件增长。
 
 建议：
 
 1. 将高频盘口调试改为结构化聚合指标或采样，不逐更新写入；
 2. 系统日志与策略日志使用互斥过滤，避免相同 debug 事件重复保存；
-3. Winner Buy 可保留候选级 debug，Spread 日常 soak 应降为 info，并依赖候选结构化结果；
+3. Late-Resolution Winner Trading 可保留候选级 debug，Binary Complement Arbitrage 日常 soak 应降为 info，并依赖候选结构化结果；
 4. 实现运行期间按大小或时间持续轮转，而不是仅启动时轮转。
 
 ## 6. 是否值得继续完善
 
 | 策略 | 当前可行性 | 是否值得完善 | 真实资金状态 |
 | --- | --- | --- | --- |
-| Spread Arbitrage | 理论上是套利；本次无深度充足机会，执行链未得到样本验证 | 值得做影子候选与持续时间统计；若 7～14 天仍无可执行机会，再降低投入优先级 | 不可启用 |
-| Winner Buy | 当前是负期望方向策略，不是套利；候选数据还受 REST 新鲜度缺陷影响 | 值得修复数据路径并积累校准样本；不值得直接放宽 EV/反转/深度风控 | 不可启用 |
+| Binary Complement Arbitrage | 理论上是套利；本次无深度充足机会，执行链未得到样本验证 | 值得做影子候选与持续时间统计；若 7～14 天仍无可执行机会，再降低投入优先级 | 不可启用 |
+| Late-Resolution Winner Trading | 当前是负期望方向策略，不是套利；候选数据还受 REST 新鲜度缺陷影响 | 值得修复数据路径并积累校准样本；不值得直接放宽 EV/反转/深度风控 | 不可启用 |
 
 ## 7. 推荐实施顺序与验收条件
 
-### P0：修复 Winner Buy REST 新鲜度判断
+### P0：修复 Late-Resolution Winner Trading REST 新鲜度判断
 
 - 使用检查发生时的当前时间或单调时钟计算 age；
 - 增加异步请求完成时间晚于循环快照的回归测试；
 - 分离统计 WS 缺失、WS 过期、REST 成功、REST 空盘口、REST 过期和 REST 延迟；
 - 验收：正常 REST 回退不再 100% 被判过期，`stale_rest/fallback` 比例显著下降，且没有接受真正老旧盘口。
 
-### P1：补全 Spread 影子机会数据
+### P1：补全 Binary Complement Arbitrage 影子机会数据
 
 - 持久化或聚合所有价格有边际但被深度拒绝的样本；
 - 并行计算多组边际/深度阈值，不改变实际下单阈值；
@@ -249,25 +249,25 @@ Winner Buy 反事实评估出现 475 次“闭市查询返回空结果”，结�
 ### P3：重新进行 dry-run 验证
 
 1. 修复后先运行 24 小时，验证数据路径和结果文件完整性；
-2. Spread 至少运行 7～14 天，覆盖不同时段；
-3. Winner Buy 初步分析至少积累 500 个独立已结算市场，按资产、YES/NO、买价、剩余秒数、深度、spread 和模型边际分层；
+2. Binary Complement Arbitrage 至少运行 7～14 天，覆盖不同时段；
+3. Late-Resolution Winner Trading 初步分析至少积累 500 个独立已结算市场，按资产、YES/NO、买价、剩余秒数、深度、spread 和模型边际分层；
 4. 是否进入真实资金决策建议累计 1,000～2,000 个独立市场，并进行训练期/验证期分离，检查胜率置信区间、净收益、最大回撤、尾部失败聚集和参数稳定性；
 5. 在新数据证明正期望前，不降低 `WINNER_BUY_MIN_NET_EV`、反转边界或深度保护，也不根据本次 13/13 的 NO 小样本调整方向开关。
 
 ## 8. 最终判断
 
-- **Spread Arbitrage：** 没有发现可执行套利，但存在值得进一步记录的浅薄价差。策略逻辑可以保留，下一步应证明机会是否真实、持续且能双腿成交。
-- **Winner Buy：** 29 个市场的高胜率仍产生 -4.38% 反事实回报，当前没有套利或正期望证据。独立模型的拒绝与最终亏损方向一致，不应放宽。
-- **工程状态：** 连接能够自动恢复，反事实结算完整；但 Winner Buy REST 回退实际失效、Spread 缺少被拒候选明细、日志增长失控。这三项应先于任何真实资金测试处理。
+- **Binary Complement Arbitrage：** 没有发现可执行套利，但存在值得进一步记录的浅薄价差。策略逻辑可以保留，下一步应证明机会是否真实、持续且能双腿成交。
+- **Late-Resolution Winner Trading：** 29 个市场的高胜率仍产生 -4.38% 反事实回报，当前没有套利或正期望证据。独立模型的拒绝与最终亏损方向一致，不应放宽。
+- **工程状态：** 连接能够自动恢复，反事实结算完整；但 Late-Resolution Winner Trading REST 回退实际失效、Binary Complement Arbitrage 缺少被拒候选明细、日志增长失控。这三项应先于任何真实资金测试处理。
 
 ## 9. 实施状态（2026-08-23）
 
 本报告提出的 P0～P2 工程改进已经实施：
 
-- Winner Buy REST 返回后改用检查时刻重新计算接收年龄，并新增 WS 缺失、REST 成功/空结果和 REST 延迟指标；
+- Late-Resolution Winner Trading REST 返回后改用检查时刻重新计算接收年龄，并新增 WS 缺失、REST 成功/空结果和 REST 延迟指标；
 - Spread 深度拒绝候选写入独立 `shadow-candidates.ndjson`，记录阈值网格与连续存在 250 ms 状态，生产准入阈值未放宽；
-- Winner Buy 实盘持仓和反事实评估的结算查询均增加 10/20/40/60 秒退避；
+- Late-Resolution Winner Trading 实盘持仓和反事实评估的结算查询均增加 10/20/40/60 秒退避；
 - 文本日志改为运行期间按大小轮转，系统与已配置的分策略日志不再重复写入策略事件；
-- 当前 dry-run 的日志级别调整为系统 info、Winner Buy 候选与模型 debug，Spread 高频逐盘口详情降为 trace。
+- 当前 dry-run 的日志级别调整为系统 info、Late-Resolution Winner Trading 候选与模型 debug，Binary Complement Arbitrage 高频逐盘口详情降为 trace。
 
 长期 24 小时、7～14 天以及 500～2,000 个独立市场的验证仍属于下一阶段运行验收，不能由单元测试替代。

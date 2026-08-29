@@ -123,7 +123,7 @@ pub struct Config {
     /// crypto up/down slugs (btc-updown-5m / btc-updown-15m).
     pub market_period_minutes: u64,
     pub risk_max_exposure_usdc: f64,
-    /// Maximum capital/exposure assigned to Spread Arbitrage.
+    /// Maximum capital/exposure assigned to Binary Complement Arbitrage.
     pub arbitrage_budget_usdc: f64,
     pub risk_imbalance_threshold: f64,
     pub hedge_take_profit_pct: f64, // Hedge take-profit % (e.g. 0.05 = 5%)
@@ -140,58 +140,58 @@ pub struct Config {
     /// Order type for arbitrage: GTC (good till cancel), GTD (with gtd_expiration_secs), FOK (fill or kill), FAK (fill and kill remainder)
     pub arbitrage_order_type: OrderType,
     pub stop_arbitrage_before_end_minutes: u64, // Stop arbitrage N minutes before market end, default 0 (no stop)
-    /// Initial runtime state for the YES+NO spread arbitrage strategy.
+    /// Initial runtime state for the YES+NO binary complement arbitrage strategy.
     pub arbitrage_enabled: bool,
     /// Window-end "buy the determined winner" strategy (single-leg directional buy).
-    pub winner_buy_enabled: bool,
-    pub copy_trading_enabled: bool,
-    /// Maximum simultaneous capital assigned to Winner Buy.
-    pub winner_buy_budget_usdc: f64,
-    /// PAPER NAV assigned to Copy Trading when embedded in polypulse.
-    pub copy_trading_budget_usdc: f64,
+    pub late_resolution_winner_trading_enabled: bool,
+    pub wallet_copy_trading_enabled: bool,
+    /// Maximum simultaneous capital assigned to Late-Resolution Winner Trading.
+    pub late_resolution_winner_trading_budget_usdc: f64,
+    /// PAPER NAV assigned to Wallet-Copy Trading when embedded in polypulse.
+    pub wallet_copy_trading_budget_usdc: f64,
     /// Trigger when the window has this many seconds left.
-    pub winner_buy_before_end_secs: u32,
+    pub late_resolution_winner_trading_before_end_secs: u32,
     /// Only buy a side whose best ask is >= this price (direction considered decided).
-    pub winner_buy_min_price: f64,
+    pub late_resolution_winner_trading_min_price: f64,
     /// Do not buy above this price (edge < 1 - max_price becomes too thin).
-    pub winner_buy_max_price: f64,
+    pub late_resolution_winner_trading_max_price: f64,
     /// PAPER-only research path: allow the evidence-backed Chainlink-direction
     /// veto cohort through the normal simulated order lifecycle.
-    pub winner_buy_hybrid_paper_enabled: bool,
-    /// Max notional (USDC) per winner buy.
-    pub winner_buy_max_order_usdc: f64,
-    /// Max winner buys per window (0 = unlimited).
-    pub winner_buy_max_per_window: u32,
-    /// Stop Winner Buy after cumulative realized losses reach this amount.
-    pub winner_buy_max_strategy_loss_usdc: f64,
-    /// Stop Winner Buy for one asset after its realized losses reach this amount.
-    pub winner_buy_max_asset_loss_usdc: f64,
-    /// Stop Winner Buy after this many consecutive losing settlements (0 = disabled).
-    pub winner_buy_max_consecutive_losses: u32,
+    pub late_resolution_winner_trading_hybrid_paper_enabled: bool,
+    /// Max notional (USDC) per late-resolution winner trading.
+    pub late_resolution_winner_trading_max_order_usdc: f64,
+    /// Max late-resolution winner tradings per window (0 = unlimited).
+    pub late_resolution_winner_trading_max_per_window: u32,
+    /// Stop Late-Resolution Winner Trading after cumulative realized losses reach this amount.
+    pub late_resolution_winner_trading_max_strategy_loss_usdc: f64,
+    /// Stop Late-Resolution Winner Trading for one asset after its realized losses reach this amount.
+    pub late_resolution_winner_trading_max_asset_loss_usdc: f64,
+    /// Stop Late-Resolution Winner Trading after this many consecutive losing settlements (0 = disabled).
+    pub late_resolution_winner_trading_max_consecutive_losses: u32,
     /// Automatically redeem confirmed winning tokens in live mode.
-    pub winner_buy_auto_redeem: bool,
+    pub late_resolution_winner_trading_auto_redeem: bool,
     /// Polymarket RTDS endpoint for the official Chainlink 60-second TWAP.
-    pub winner_buy_rtds_url: String,
-    /// Winner Buy WS snapshot age limit. Kept separate from the much stricter
+    pub late_resolution_winner_trading_rtds_url: String,
+    /// Late-Resolution Winner Trading WS snapshot age limit. Kept separate from the much stricter
     /// two-leg arbitrage synchronization threshold.
-    pub winner_buy_max_book_age_ms: i64,
-    pub winner_buy_feed_max_age_ms: i64,
-    pub winner_buy_opening_max_skew_ms: i64,
-    pub winner_buy_volatility_lookback_secs: u64,
-    pub winner_buy_min_observations: usize,
-    pub winner_buy_confirmation_observations: u32,
-    pub winner_buy_max_attempts_per_market: u32,
-    pub winner_buy_min_margin_bps: f64,
-    pub winner_buy_reversal_sigma: f64,
-    pub winner_buy_max_spread: f64,
-    pub winner_buy_min_depth_usdc: f64,
-    pub winner_buy_min_net_ev: f64,
-    pub winner_buy_btc_min_volatility_bps: f64,
-    pub winner_buy_eth_min_volatility_bps: f64,
-    pub winner_buy_other_min_volatility_bps: f64,
-    pub winner_buy_btc_model_risk_buffer: f64,
-    pub winner_buy_eth_model_risk_buffer: f64,
-    pub winner_buy_other_model_risk_buffer: f64,
+    pub late_resolution_winner_trading_max_book_age_ms: i64,
+    pub late_resolution_winner_trading_feed_max_age_ms: i64,
+    pub late_resolution_winner_trading_opening_max_skew_ms: i64,
+    pub late_resolution_winner_trading_volatility_lookback_secs: u64,
+    pub late_resolution_winner_trading_min_observations: usize,
+    pub late_resolution_winner_trading_confirmation_observations: u32,
+    pub late_resolution_winner_trading_max_attempts_per_market: u32,
+    pub late_resolution_winner_trading_min_margin_bps: f64,
+    pub late_resolution_winner_trading_reversal_sigma: f64,
+    pub late_resolution_winner_trading_max_spread: f64,
+    pub late_resolution_winner_trading_min_depth_usdc: f64,
+    pub late_resolution_winner_trading_min_net_ev: f64,
+    pub late_resolution_winner_trading_btc_min_volatility_bps: f64,
+    pub late_resolution_winner_trading_eth_min_volatility_bps: f64,
+    pub late_resolution_winner_trading_other_min_volatility_bps: f64,
+    pub late_resolution_winner_trading_btc_model_risk_buffer: f64,
+    pub late_resolution_winner_trading_eth_model_risk_buffer: f64,
+    pub late_resolution_winner_trading_other_model_risk_buffer: f64,
     /// Scheduled Merge interval (minutes); 0 = disabled. CONDITION_ID from current window markets like orderbook.
     pub merge_interval_minutes: u64,
     /// YES price threshold: only execute arbitrage when YES >= this, default 0.0 (no limit)
@@ -215,10 +215,10 @@ pub struct Config {
     /// Optional append-only shadow log for price-positive candidates rejected
     /// by the production depth floor. It never changes execution admission.
     pub arbitrage_shadow_log_file: Option<String>,
-    /// Winner Buy order/fill/settlement lifecycle journal.
-    pub winner_buy_state_journal_file: String,
-    /// Winner Buy candidate and counterfactual evaluation journal.
-    pub winner_buy_evaluation_journal_file: String,
+    /// Late-Resolution Winner Trading order/fill/settlement lifecycle journal.
+    pub late_resolution_winner_trading_state_journal_file: String,
+    /// Late-Resolution Winner Trading candidate and counterfactual evaluation journal.
+    pub late_resolution_winner_trading_evaluation_journal_file: String,
     /// Observe and simulate fills without submitting, cancelling, merging or selling.
     pub dry_run: bool,
     /// Explicit, fail-closed mode for the first real-money validation run.
@@ -234,8 +234,8 @@ pub struct Config {
     pub paper_liquidity_haircut: f64,
     pub arbitrage_paper_liquidity_haircut: f64,
     pub paper_second_leg_delay_ms: u64,
-    /// Dry-run latency before re-reading the live book for Winner Buy fills.
-    pub paper_winner_buy_delay_ms: u64,
+    /// Dry-run latency before re-reading the live book for Late-Resolution Winner Trading fills.
+    pub paper_late_resolution_winner_trading_delay_ms: u64,
     /// Reject orderbook snapshots older than this many milliseconds.
     pub max_book_age_ms: i64,
     /// Reject YES/NO snapshots farther apart than this many milliseconds.
@@ -271,11 +271,17 @@ impl Config {
         let mode = if dry_run { "paper" } else { "live" };
         let state_journal_file = env::var("ARBITRAGE_STATE_JOURNAL_FILE")
             .or_else(|_| env::var("STATE_JOURNAL_FILE"))
-            .unwrap_or_else(|_| format!("results/spread-arbitrage/{mode}/orders.ndjson"));
-        let winner_buy_state_journal_file = env::var("WINNER_BUY_STATE_JOURNAL_FILE")
-            .unwrap_or_else(|_| format!("results/winner-buy/{mode}/orders.ndjson"));
-        let winner_buy_evaluation_journal_file = env::var("WINNER_BUY_EVALUATION_JOURNAL_FILE")
-            .unwrap_or_else(|_| format!("results/winner-buy/{mode}/evaluations.ndjson"));
+            .unwrap_or_else(|_| {
+                format!("results/binary-complement-arbitrage/{mode}/orders.ndjson")
+            });
+        let late_resolution_winner_trading_state_journal_file =
+            env::var("WINNER_BUY_STATE_JOURNAL_FILE").unwrap_or_else(|_| {
+                format!("results/late-resolution-winner-trading/{mode}/orders.ndjson")
+            });
+        let late_resolution_winner_trading_evaluation_journal_file =
+            env::var("WINNER_BUY_EVALUATION_JOURNAL_FILE").unwrap_or_else(|_| {
+                format!("results/late-resolution-winner-trading/{mode}/evaluations.ndjson")
+            });
         let risk_max_exposure_usdc = env_parse("RISK_MAX_EXPOSURE_USDC", "1000.0")?;
         let paper_initial_balance_usdc = env_parse("PAPER_INITIAL_BALANCE_USDC", "50.0")?;
         let arbitrage_budget_usdc = env::var("ARBITRAGE_BUDGET_USDC")
@@ -284,13 +290,13 @@ impl Config {
             .transpose()
             .context("ARBITRAGE_BUDGET_USDC has an invalid value")?
             .unwrap_or(risk_max_exposure_usdc);
-        let winner_buy_budget_usdc = env::var("WINNER_BUY_BUDGET_USDC")
+        let late_resolution_winner_trading_budget_usdc = env::var("WINNER_BUY_BUDGET_USDC")
             .ok()
             .map(|value| value.trim().parse::<f64>())
             .transpose()
             .context("WINNER_BUY_BUDGET_USDC has an invalid value")?
             .unwrap_or(paper_initial_balance_usdc);
-        let copy_trading_budget_usdc = env::var("COPY_TRADING_BUDGET_USDC")
+        let wallet_copy_trading_budget_usdc = env::var("COPY_TRADING_BUDGET_USDC")
             .or_else(|_| env::var("COPY_INITIAL_NAV_USDC"))
             .unwrap_or_else(|_| "10000.0".into())
             .trim()
@@ -333,67 +339,106 @@ impl Config {
             )?,
             stop_arbitrage_before_end_minutes: env_parse("STOP_ARBITRAGE_BEFORE_END_MINUTES", "0")?,
             arbitrage_enabled: env_bool("ARBITRAGE_ENABLED", true)?,
-            winner_buy_enabled: env_bool("WINNER_BUY_ENABLED", false)?,
-            copy_trading_enabled: env_bool("COPY_TRADING_ENABLED", false)?,
-            winner_buy_budget_usdc,
-            copy_trading_budget_usdc,
-            winner_buy_before_end_secs: env_parse("WINNER_BUY_BEFORE_END_SECS", "30")?,
-            winner_buy_min_price: env_parse("WINNER_BUY_MIN_PRICE", "0.95")?,
-            winner_buy_max_price: env_parse("WINNER_BUY_MAX_PRICE", "0.99")?,
-            winner_buy_hybrid_paper_enabled: env_bool("WINNER_BUY_HYBRID_PAPER_ENABLED", false)?,
-            winner_buy_max_order_usdc: env_parse("WINNER_BUY_MAX_ORDER_USDC", "50.0")?,
-            winner_buy_max_per_window: env_parse("WINNER_BUY_MAX_PER_WINDOW", "1")?,
-            winner_buy_max_strategy_loss_usdc: env_parse(
+            late_resolution_winner_trading_enabled: env_bool("WINNER_BUY_ENABLED", false)?,
+            wallet_copy_trading_enabled: env_bool("COPY_TRADING_ENABLED", false)?,
+            late_resolution_winner_trading_budget_usdc,
+            wallet_copy_trading_budget_usdc,
+            late_resolution_winner_trading_before_end_secs: env_parse(
+                "WINNER_BUY_BEFORE_END_SECS",
+                "30",
+            )?,
+            late_resolution_winner_trading_min_price: env_parse("WINNER_BUY_MIN_PRICE", "0.95")?,
+            late_resolution_winner_trading_max_price: env_parse("WINNER_BUY_MAX_PRICE", "0.99")?,
+            late_resolution_winner_trading_hybrid_paper_enabled: env_bool(
+                "WINNER_BUY_HYBRID_PAPER_ENABLED",
+                false,
+            )?,
+            late_resolution_winner_trading_max_order_usdc: env_parse(
+                "WINNER_BUY_MAX_ORDER_USDC",
+                "50.0",
+            )?,
+            late_resolution_winner_trading_max_per_window: env_parse(
+                "WINNER_BUY_MAX_PER_WINDOW",
+                "1",
+            )?,
+            late_resolution_winner_trading_max_strategy_loss_usdc: env_parse(
                 "WINNER_BUY_MAX_STRATEGY_LOSS_USDC",
                 "20.0",
             )?,
-            winner_buy_max_asset_loss_usdc: env_parse("WINNER_BUY_MAX_ASSET_LOSS_USDC", "10.0")?,
-            winner_buy_max_consecutive_losses: env_parse("WINNER_BUY_MAX_CONSECUTIVE_LOSSES", "3")?,
-            winner_buy_auto_redeem: env_bool("WINNER_BUY_AUTO_REDEEM", false)?,
-            winner_buy_rtds_url: env::var("WINNER_BUY_RTDS_URL")
+            late_resolution_winner_trading_max_asset_loss_usdc: env_parse(
+                "WINNER_BUY_MAX_ASSET_LOSS_USDC",
+                "10.0",
+            )?,
+            late_resolution_winner_trading_max_consecutive_losses: env_parse(
+                "WINNER_BUY_MAX_CONSECUTIVE_LOSSES",
+                "3",
+            )?,
+            late_resolution_winner_trading_auto_redeem: env_bool("WINNER_BUY_AUTO_REDEEM", false)?,
+            late_resolution_winner_trading_rtds_url: env::var("WINNER_BUY_RTDS_URL")
                 .unwrap_or_else(|_| "wss://ws-live-data.polymarket.com".to_string()),
-            winner_buy_max_book_age_ms: env_parse("WINNER_BUY_MAX_BOOK_AGE_MS", "1000")?,
-            winner_buy_feed_max_age_ms: env_parse("WINNER_BUY_FEED_MAX_AGE_MS", "5000")?,
-            winner_buy_opening_max_skew_ms: env_parse("WINNER_BUY_OPENING_MAX_SKEW_MS", "5000")?,
-            winner_buy_volatility_lookback_secs: env_parse(
+            late_resolution_winner_trading_max_book_age_ms: env_parse(
+                "WINNER_BUY_MAX_BOOK_AGE_MS",
+                "1000",
+            )?,
+            late_resolution_winner_trading_feed_max_age_ms: env_parse(
+                "WINNER_BUY_FEED_MAX_AGE_MS",
+                "5000",
+            )?,
+            late_resolution_winner_trading_opening_max_skew_ms: env_parse(
+                "WINNER_BUY_OPENING_MAX_SKEW_MS",
+                "5000",
+            )?,
+            late_resolution_winner_trading_volatility_lookback_secs: env_parse(
                 "WINNER_BUY_VOLATILITY_LOOKBACK_SECS",
                 "120",
             )?,
-            winner_buy_min_observations: env_parse("WINNER_BUY_MIN_OBSERVATIONS", "10")?,
-            winner_buy_confirmation_observations: env_parse(
+            late_resolution_winner_trading_min_observations: env_parse(
+                "WINNER_BUY_MIN_OBSERVATIONS",
+                "10",
+            )?,
+            late_resolution_winner_trading_confirmation_observations: env_parse(
                 "WINNER_BUY_CONFIRMATION_OBSERVATIONS",
                 "3",
             )?,
-            winner_buy_max_attempts_per_market: env_parse(
+            late_resolution_winner_trading_max_attempts_per_market: env_parse(
                 "WINNER_BUY_MAX_ATTEMPTS_PER_MARKET",
                 "1",
             )?,
-            winner_buy_min_margin_bps: env_parse("WINNER_BUY_MIN_MARGIN_BPS", "3.0")?,
-            winner_buy_reversal_sigma: env_parse("WINNER_BUY_REVERSAL_SIGMA", "2.0")?,
-            winner_buy_max_spread: env_parse("WINNER_BUY_MAX_SPREAD", "0.03")?,
-            winner_buy_min_depth_usdc: env_parse("WINNER_BUY_MIN_DEPTH_USDC", "10.0")?,
-            winner_buy_min_net_ev: env_parse("WINNER_BUY_MIN_NET_EV", "0.002")?,
-            winner_buy_btc_min_volatility_bps: env_parse(
+            late_resolution_winner_trading_min_margin_bps: env_parse(
+                "WINNER_BUY_MIN_MARGIN_BPS",
+                "3.0",
+            )?,
+            late_resolution_winner_trading_reversal_sigma: env_parse(
+                "WINNER_BUY_REVERSAL_SIGMA",
+                "2.0",
+            )?,
+            late_resolution_winner_trading_max_spread: env_parse("WINNER_BUY_MAX_SPREAD", "0.03")?,
+            late_resolution_winner_trading_min_depth_usdc: env_parse(
+                "WINNER_BUY_MIN_DEPTH_USDC",
+                "10.0",
+            )?,
+            late_resolution_winner_trading_min_net_ev: env_parse("WINNER_BUY_MIN_NET_EV", "0.002")?,
+            late_resolution_winner_trading_btc_min_volatility_bps: env_parse(
                 "WINNER_BUY_BTC_MIN_VOLATILITY_BPS",
                 "0.8",
             )?,
-            winner_buy_eth_min_volatility_bps: env_parse(
+            late_resolution_winner_trading_eth_min_volatility_bps: env_parse(
                 "WINNER_BUY_ETH_MIN_VOLATILITY_BPS",
                 "1.2",
             )?,
-            winner_buy_other_min_volatility_bps: env_parse(
+            late_resolution_winner_trading_other_min_volatility_bps: env_parse(
                 "WINNER_BUY_OTHER_MIN_VOLATILITY_BPS",
                 "1.5",
             )?,
-            winner_buy_btc_model_risk_buffer: env_parse(
+            late_resolution_winner_trading_btc_model_risk_buffer: env_parse(
                 "WINNER_BUY_BTC_MODEL_RISK_BUFFER",
                 "0.01",
             )?,
-            winner_buy_eth_model_risk_buffer: env_parse(
+            late_resolution_winner_trading_eth_model_risk_buffer: env_parse(
                 "WINNER_BUY_ETH_MODEL_RISK_BUFFER",
                 "0.015",
             )?,
-            winner_buy_other_model_risk_buffer: env_parse(
+            late_resolution_winner_trading_other_model_risk_buffer: env_parse(
                 "WINNER_BUY_OTHER_MODEL_RISK_BUFFER",
                 "0.02",
             )?,
@@ -415,8 +460,8 @@ impl Config {
             arbitrage_shadow_log_file: env::var("ARBITRAGE_SHADOW_LOG_FILE")
                 .ok()
                 .filter(|value| !value.trim().is_empty()),
-            winner_buy_state_journal_file,
-            winner_buy_evaluation_journal_file,
+            late_resolution_winner_trading_state_journal_file,
+            late_resolution_winner_trading_evaluation_journal_file,
             dry_run,
             canary_mode: env_bool("CANARY_MODE", false)?,
             canary_max_pair_notional_usdc: env_parse("CANARY_MAX_PAIR_NOTIONAL_USDC", "3.0")?,
@@ -432,7 +477,10 @@ impl Config {
                 "0.75",
             )?,
             paper_second_leg_delay_ms: env_parse("PAPER_SECOND_LEG_DELAY_MS", "250")?,
-            paper_winner_buy_delay_ms: env_parse("PAPER_WINNER_BUY_DELAY_MS", "250")?,
+            paper_late_resolution_winner_trading_delay_ms: env_parse(
+                "PAPER_WINNER_BUY_DELAY_MS",
+                "250",
+            )?,
             max_book_age_ms: env_parse("MAX_BOOK_AGE_MS", "2000")?,
             max_book_skew_ms: env_parse("MAX_BOOK_SKEW_MS", "1000")?,
             signal_cooldown_ms: env_parse("SIGNAL_COOLDOWN_MS", "3000")?,
@@ -511,8 +559,14 @@ impl Config {
             ("MIN_ASK_DEPTH_USDC", self.min_ask_depth_usdc),
             ("RISK_MAX_EXPOSURE_USDC", self.risk_max_exposure_usdc),
             ("ARBITRAGE_BUDGET_USDC", self.arbitrage_budget_usdc),
-            ("WINNER_BUY_BUDGET_USDC", self.winner_buy_budget_usdc),
-            ("COPY_TRADING_BUDGET_USDC", self.copy_trading_budget_usdc),
+            (
+                "WINNER_BUY_BUDGET_USDC",
+                self.late_resolution_winner_trading_budget_usdc,
+            ),
+            (
+                "COPY_TRADING_BUDGET_USDC",
+                self.wallet_copy_trading_budget_usdc,
+            ),
             (
                 "POSITION_BALANCE_THRESHOLD",
                 self.position_balance_threshold,
@@ -536,11 +590,11 @@ impl Config {
             ),
             (
                 "WINNER_BUY_MAX_STRATEGY_LOSS_USDC",
-                self.winner_buy_max_strategy_loss_usdc,
+                self.late_resolution_winner_trading_max_strategy_loss_usdc,
             ),
             (
                 "WINNER_BUY_MAX_ASSET_LOSS_USDC",
-                self.winner_buy_max_asset_loss_usdc,
+                self.late_resolution_winner_trading_max_asset_loss_usdc,
             ),
         ] {
             if !value.is_finite() || value <= 0.0 {
@@ -559,7 +613,9 @@ impl Config {
         {
             bail!("ARBITRAGE_PAPER_LIQUIDITY_HAIRCUT must be in (0, 1]");
         }
-        if self.paper_second_leg_delay_ms > 30_000 || self.paper_winner_buy_delay_ms > 30_000 {
+        if self.paper_second_leg_delay_ms > 30_000
+            || self.paper_late_resolution_winner_trading_delay_ms > 30_000
+        {
             bail!("paper execution delays cannot exceed 30000ms");
         }
         if self.canary_max_pair_notional_usdc > ABSOLUTE_CANARY_PAIR_LIMIT_USDC
@@ -573,7 +629,9 @@ impl Config {
         if self.canary_max_pair_notional_usdc > self.canary_max_total_notional_usdc {
             bail!("CANARY_MAX_PAIR_NOTIONAL_USDC cannot exceed CANARY_MAX_TOTAL_NOTIONAL_USDC");
         }
-        if self.winner_buy_max_asset_loss_usdc > self.winner_buy_max_strategy_loss_usdc {
+        if self.late_resolution_winner_trading_max_asset_loss_usdc
+            > self.late_resolution_winner_trading_max_strategy_loss_usdc
+        {
             bail!("WINNER_BUY_MAX_ASSET_LOSS_USDC cannot exceed WINNER_BUY_MAX_STRATEGY_LOSS_USDC");
         }
         if self.max_order_size_usdc > self.arbitrage_budget_usdc {
@@ -582,18 +640,21 @@ impl Config {
         if self.arbitrage_dynamic_fee_gate_paper && !self.dry_run {
             bail!("ARBITRAGE_DYNAMIC_FEE_GATE_PAPER can only be enabled with DRY_RUN=true");
         }
-        if self.winner_buy_max_order_usdc > self.winner_buy_budget_usdc {
+        if self.late_resolution_winner_trading_max_order_usdc
+            > self.late_resolution_winner_trading_budget_usdc
+        {
             bail!("WINNER_BUY_MAX_ORDER_USDC cannot exceed WINNER_BUY_BUDGET_USDC");
         }
-        if !self.winner_buy_min_price.is_finite()
-            || !self.winner_buy_max_price.is_finite()
-            || self.winner_buy_min_price <= 0.0
-            || self.winner_buy_min_price > self.winner_buy_max_price
-            || self.winner_buy_max_price >= 1.0
+        if !self.late_resolution_winner_trading_min_price.is_finite()
+            || !self.late_resolution_winner_trading_max_price.is_finite()
+            || self.late_resolution_winner_trading_min_price <= 0.0
+            || self.late_resolution_winner_trading_min_price
+                > self.late_resolution_winner_trading_max_price
+            || self.late_resolution_winner_trading_max_price >= 1.0
         {
-            bail!("Winner Buy prices require 0 < WINNER_BUY_MIN_PRICE <= WINNER_BUY_MAX_PRICE < 1");
+            bail!("Late-Resolution Winner Trading prices require 0 < WINNER_BUY_MIN_PRICE <= WINNER_BUY_MAX_PRICE < 1");
         }
-        if self.winner_buy_hybrid_paper_enabled && !self.dry_run {
+        if self.late_resolution_winner_trading_hybrid_paper_enabled && !self.dry_run {
             bail!("WINNER_BUY_HYBRID_PAPER_ENABLED can only be enabled with DRY_RUN=true");
         }
         if self.canary_max_pairs_per_window == 0
@@ -653,61 +714,87 @@ impl Config {
         if self.state_journal_file.trim().is_empty() {
             bail!("ARBITRAGE_STATE_JOURNAL_FILE cannot be empty");
         }
-        if self.winner_buy_state_journal_file.trim().is_empty() {
+        if self
+            .late_resolution_winner_trading_state_journal_file
+            .trim()
+            .is_empty()
+        {
             bail!("WINNER_BUY_STATE_JOURNAL_FILE cannot be empty");
         }
-        if self.winner_buy_evaluation_journal_file.trim().is_empty() {
+        if self
+            .late_resolution_winner_trading_evaluation_journal_file
+            .trim()
+            .is_empty()
+        {
             bail!("WINNER_BUY_EVALUATION_JOURNAL_FILE cannot be empty");
         }
-        if !self.winner_buy_rtds_url.starts_with("wss://") {
+        if !self
+            .late_resolution_winner_trading_rtds_url
+            .starts_with("wss://")
+        {
             bail!("WINNER_BUY_RTDS_URL must use wss://");
         }
-        if self.winner_buy_max_book_age_ms <= 0
-            || self.winner_buy_max_book_age_ms > 30_000
-            || self.winner_buy_feed_max_age_ms <= 0
-            || self.winner_buy_opening_max_skew_ms < 0
-            || self.winner_buy_volatility_lookback_secs == 0
-            || self.winner_buy_min_observations < 2
-            || self.winner_buy_confirmation_observations == 0
-            || self.winner_buy_max_attempts_per_market == 0
+        if self.late_resolution_winner_trading_max_book_age_ms <= 0
+            || self.late_resolution_winner_trading_max_book_age_ms > 30_000
+            || self.late_resolution_winner_trading_feed_max_age_ms <= 0
+            || self.late_resolution_winner_trading_opening_max_skew_ms < 0
+            || self.late_resolution_winner_trading_volatility_lookback_secs == 0
+            || self.late_resolution_winner_trading_min_observations < 2
+            || self.late_resolution_winner_trading_confirmation_observations == 0
+            || self.late_resolution_winner_trading_max_attempts_per_market == 0
         {
-            bail!("Winner Buy book/model timing, observation and attempt limits are invalid");
+            bail!("Late-Resolution Winner Trading book/model timing, observation and attempt limits are invalid");
         }
         for (name, value) in [
-            ("WINNER_BUY_MIN_MARGIN_BPS", self.winner_buy_min_margin_bps),
-            ("WINNER_BUY_REVERSAL_SIGMA", self.winner_buy_reversal_sigma),
+            (
+                "WINNER_BUY_MIN_MARGIN_BPS",
+                self.late_resolution_winner_trading_min_margin_bps,
+            ),
+            (
+                "WINNER_BUY_REVERSAL_SIGMA",
+                self.late_resolution_winner_trading_reversal_sigma,
+            ),
             (
                 "WINNER_BUY_BTC_MIN_VOLATILITY_BPS",
-                self.winner_buy_btc_min_volatility_bps,
+                self.late_resolution_winner_trading_btc_min_volatility_bps,
             ),
             (
                 "WINNER_BUY_ETH_MIN_VOLATILITY_BPS",
-                self.winner_buy_eth_min_volatility_bps,
+                self.late_resolution_winner_trading_eth_min_volatility_bps,
             ),
             (
                 "WINNER_BUY_OTHER_MIN_VOLATILITY_BPS",
-                self.winner_buy_other_min_volatility_bps,
+                self.late_resolution_winner_trading_other_min_volatility_bps,
             ),
-            ("WINNER_BUY_MIN_DEPTH_USDC", self.winner_buy_min_depth_usdc),
+            (
+                "WINNER_BUY_MIN_DEPTH_USDC",
+                self.late_resolution_winner_trading_min_depth_usdc,
+            ),
         ] {
             if !value.is_finite() || value <= 0.0 {
                 bail!("{name} must be finite and greater than 0");
             }
         }
         for (name, value) in [
-            ("WINNER_BUY_MAX_SPREAD", self.winner_buy_max_spread),
-            ("WINNER_BUY_MIN_NET_EV", self.winner_buy_min_net_ev),
+            (
+                "WINNER_BUY_MAX_SPREAD",
+                self.late_resolution_winner_trading_max_spread,
+            ),
+            (
+                "WINNER_BUY_MIN_NET_EV",
+                self.late_resolution_winner_trading_min_net_ev,
+            ),
             (
                 "WINNER_BUY_BTC_MODEL_RISK_BUFFER",
-                self.winner_buy_btc_model_risk_buffer,
+                self.late_resolution_winner_trading_btc_model_risk_buffer,
             ),
             (
                 "WINNER_BUY_ETH_MODEL_RISK_BUFFER",
-                self.winner_buy_eth_model_risk_buffer,
+                self.late_resolution_winner_trading_eth_model_risk_buffer,
             ),
             (
                 "WINNER_BUY_OTHER_MODEL_RISK_BUFFER",
-                self.winner_buy_other_model_risk_buffer,
+                self.late_resolution_winner_trading_other_model_risk_buffer,
             ),
         ] {
             if !value.is_finite() || !(0.0..1.0).contains(&value) {
@@ -721,7 +808,7 @@ impl Config {
         }
         validate_strategy_compatibility(
             self.dry_run,
-            self.winner_buy_enabled,
+            self.late_resolution_winner_trading_enabled,
             self.wind_down_before_window_end_minutes,
         )?;
         if self.proxy_address.is_none()
@@ -744,7 +831,10 @@ impl Config {
         {
             bail!("scheduled Merge or wind-down requires all POLY_BUILDER_* credentials");
         }
-        if !self.dry_run && self.winner_buy_enabled && self.winner_buy_auto_redeem {
+        if !self.dry_run
+            && self.late_resolution_winner_trading_enabled
+            && self.late_resolution_winner_trading_auto_redeem
+        {
             if self.proxy_address.is_none() {
                 bail!("live WINNER_BUY_AUTO_REDEEM requires POLYMARKET_PROXY_ADDRESS");
             }
@@ -765,10 +855,11 @@ impl Config {
 
 fn validate_strategy_compatibility(
     dry_run: bool,
-    winner_buy_enabled: bool,
+    late_resolution_winner_trading_enabled: bool,
     wind_down_before_window_end_minutes: u64,
 ) -> Result<()> {
-    if !dry_run && winner_buy_enabled && wind_down_before_window_end_minutes > 0 {
+    if !dry_run && late_resolution_winner_trading_enabled && wind_down_before_window_end_minutes > 0
+    {
         bail!("live WINNER_BUY_ENABLED and WIND_DOWN_BEFORE_WINDOW_END_MINUTES cannot be enabled together");
     }
     Ok(())
@@ -848,7 +939,7 @@ mod tests {
     }
 
     #[test]
-    fn live_winner_buy_and_wind_down_are_mutually_exclusive() {
+    fn live_late_resolution_winner_trading_and_wind_down_are_mutually_exclusive() {
         assert!(validate_strategy_compatibility(false, true, 1).is_err());
         assert!(validate_strategy_compatibility(true, true, 1).is_ok());
         assert!(validate_strategy_compatibility(false, true, 0).is_ok());

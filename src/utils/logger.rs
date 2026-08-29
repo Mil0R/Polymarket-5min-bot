@@ -8,8 +8,10 @@ use tracing_subscriber::filter::filter_fn;
 use tracing_subscriber::fmt::writer::BoxMakeWriter;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
-pub const ARBITRAGE_LOG_TARGET: &str = "polypulse::strategy::spread_arbitrage";
-pub const WINNER_BUY_LOG_TARGET: &str = "polypulse::strategy::winner_buy";
+pub const BINARY_COMPLEMENT_ARBITRAGE_LOG_TARGET: &str =
+    "polypulse::strategy::binary_complement_arbitrage";
+pub const LATE_RESOLUTION_WINNER_TRADING_LOG_TARGET: &str =
+    "polypulse::strategy::late_resolution_winner_trading";
 type LogLayer = Box<dyn Layer<tracing_subscriber::Registry> + Send + Sync>;
 
 pub fn init_logger(quiet_stdout: bool) -> Result<()> {
@@ -26,26 +28,35 @@ pub fn init_logger(quiet_stdout: bool) -> Result<()> {
         BoxMakeWriter::new(std::io::stdout)
     };
 
-    let split_arbitrage = log_path_configured("ARBITRAGE_STRATEGY_LOG_FILE");
-    let split_winner_buy = log_path_configured("WINNER_BUY_STRATEGY_LOG_FILE");
-    let split_copy_trading = log_path_configured("COPY_TRADING_LOG_FILE");
+    let split_binary_complement_arbitrage = log_path_configured("ARBITRAGE_STRATEGY_LOG_FILE");
+    let split_late_resolution_winner_trading = log_path_configured("WINNER_BUY_STRATEGY_LOG_FILE");
+    let split_wallet_copy_trading = log_path_configured("COPY_TRADING_LOG_FILE");
     let mut log_layers: Vec<LogLayer> = vec![tracing_subscriber::fmt::layer()
         .with_writer(system_writer)
         .with_ansi(false)
         .with_filter(filter_fn(move |metadata| {
-            !(split_arbitrage && is_arbitrage_metadata(metadata)
-                || split_winner_buy && is_winner_buy_metadata(metadata)
-                || split_copy_trading && is_copy_trading_metadata(metadata))
+            !(split_binary_complement_arbitrage
+                && is_binary_complement_arbitrage_metadata(metadata)
+                || split_late_resolution_winner_trading
+                    && is_late_resolution_winner_trading_metadata(metadata)
+                || split_wallet_copy_trading && is_wallet_copy_trading_metadata(metadata))
         }))
         .boxed()];
-    if let Some(layer) = strategy_log_layer("ARBITRAGE_STRATEGY_LOG_FILE", is_arbitrage_metadata)? {
+    if let Some(layer) = strategy_log_layer(
+        "ARBITRAGE_STRATEGY_LOG_FILE",
+        is_binary_complement_arbitrage_metadata,
+    )? {
         log_layers.push(layer);
     }
-    if let Some(layer) = strategy_log_layer("WINNER_BUY_STRATEGY_LOG_FILE", is_winner_buy_metadata)?
+    if let Some(layer) = strategy_log_layer(
+        "WINNER_BUY_STRATEGY_LOG_FILE",
+        is_late_resolution_winner_trading_metadata,
+    )? {
+        log_layers.push(layer);
+    }
+    if let Some(layer) =
+        strategy_log_layer("COPY_TRADING_LOG_FILE", is_wallet_copy_trading_metadata)?
     {
-        log_layers.push(layer);
-    }
-    if let Some(layer) = strategy_log_layer("COPY_TRADING_LOG_FILE", is_copy_trading_metadata)? {
         log_layers.push(layer);
     }
 
@@ -83,24 +94,24 @@ fn log_path_configured(variable: &str) -> bool {
         .is_some_and(|value| !value.trim().is_empty())
 }
 
-fn is_arbitrage_metadata(metadata: &Metadata<'_>) -> bool {
+fn is_binary_complement_arbitrage_metadata(metadata: &Metadata<'_>) -> bool {
     let target = metadata.target();
-    target == ARBITRAGE_LOG_TARGET
+    target == BINARY_COMPLEMENT_ARBITRAGE_LOG_TARGET
         || target.ends_with("::strategy_service")
         || target.ends_with("::monitor::arbitrage")
         || target.ends_with("::trading::executor")
 }
 
-fn is_winner_buy_metadata(metadata: &Metadata<'_>) -> bool {
+fn is_late_resolution_winner_trading_metadata(metadata: &Metadata<'_>) -> bool {
     let target = metadata.target();
-    target == WINNER_BUY_LOG_TARGET
-        || target.ends_with("::winner_buy")
-        || target.ends_with("::winner_model")
+    target == LATE_RESOLUTION_WINNER_TRADING_LOG_TARGET
+        || target.ends_with("::late_resolution_winner_trading")
+        || target.ends_with("::late_resolution_winner_model")
 }
 
-fn is_copy_trading_metadata(metadata: &Metadata<'_>) -> bool {
+fn is_wallet_copy_trading_metadata(metadata: &Metadata<'_>) -> bool {
     let target = metadata.target();
-    target.ends_with("::copy_trader_embedded") || target.contains("::copy_trading")
+    target.ends_with("::wallet_copy_trading_embedded") || target.contains("::wallet_copy_trading")
 }
 
 struct SizeRotatingWriter {

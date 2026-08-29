@@ -30,7 +30,7 @@ impl MarketScheduler {
         self.discoverer.calculate_next_window_timestamp(now)
     }
 
-    /// Raw markets by slug — used for settlement checks of winner-buy positions.
+    /// Raw markets by slug — used for settlement checks of late-resolution-winner-trading positions.
     #[allow(dead_code)]
     pub async fn fetch_markets_by_slug(
         &self,

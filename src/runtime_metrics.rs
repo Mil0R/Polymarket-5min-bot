@@ -1,12 +1,12 @@
+use crate::late_resolution_winner_model::ModelRejection;
 use crate::opportunity_admission::AdmissionRejection;
-use crate::winner_model::ModelRejection;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 #[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
-pub struct WinnerBuyAssetMetrics {
+pub struct LateResolutionWinnerTradingAssetMetrics {
     pub asset: String,
     pub scans: u64,
     pub signals: u64,
@@ -18,7 +18,8 @@ pub struct WinnerBuyAssetMetrics {
     pub resolved: u64,
 }
 
-type WinnerBuyAssetMetricAccessor = fn(&WinnerBuyAssetMetrics) -> u64;
+type LateResolutionWinnerTradingAssetMetricAccessor =
+    fn(&LateResolutionWinnerTradingAssetMetrics) -> u64;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct MetricsSnapshot {
@@ -63,59 +64,59 @@ pub struct MetricsSnapshot {
     pub arbitrage_admission_shadow_samples: u64,
     pub arbitrage_admission_shadow_gross_passes: u64,
     pub arbitrage_admission_shadow_net_passes: u64,
-    pub winner_buy_attempts: u64,
-    pub winner_buy_scans: u64,
-    pub winner_buy_signals: u64,
-    pub winner_buy_no_book: u64,
-    pub winner_buy_no_signal: u64,
-    pub winner_buy_book_read_errors: u64,
-    pub winner_buy_incomplete_books: u64,
-    pub winner_buy_stale_books: u64,
-    pub winner_buy_stale_ws_books: u64,
-    pub winner_buy_stale_rest_books: u64,
-    pub winner_buy_ws_missing_books: u64,
-    pub winner_buy_rest_fallbacks: u64,
-    pub winner_buy_rest_successes: u64,
-    pub winner_buy_rest_empty_books: u64,
-    pub winner_buy_rest_latency_ms_total: u64,
-    pub winner_buy_rest_latency_ms_max: u64,
-    pub winner_buy_fee_read_errors: u64,
-    pub winner_buy_evaluations: u64,
-    pub winner_buy_evaluations_resolved: u64,
-    pub winner_buy_model_data_rejections: u64,
-    pub winner_buy_rejection_no_price_history: u64,
-    pub winner_buy_rejection_stale_price: u64,
-    pub winner_buy_rejection_no_opening_reference: u64,
-    pub winner_buy_rejection_invalid_price: u64,
-    pub winner_buy_rejection_insufficient_observations: u64,
-    pub winner_buy_model_market_rejections: u64,
-    pub winner_buy_model_boundary_rejections: u64,
-    pub winner_buy_model_ev_rejections: u64,
-    pub winner_buy_shadow_ev_failures: u64,
-    pub winner_buy_shadow_execution_attempts: u64,
-    pub winner_buy_shadow_execution_fills: u64,
-    pub winner_buy_shadow_execution_no_fills: u64,
-    pub winner_buy_shadow_execution_failures: u64,
-    pub winner_buy_shadow_awaiting_confirmation: u64,
-    pub winner_buy_shadow_confirmed: u64,
-    pub winner_buy_awaiting_confirmation: u64,
-    pub winner_buy_fills: u64,
-    pub winner_buy_pending: u64,
-    pub winner_buy_resolved: u64,
-    pub winner_buy_redeemed: u64,
-    pub winner_buy_settlement_query_failures: u64,
-    pub winner_buy_settlement_empty_results: u64,
-    pub winner_buy_settlement_not_terminal: u64,
-    pub winner_buy_est_pnl_microusd: i64,
-    pub winner_buy_wins: u64,
-    pub winner_buy_losses: u64,
-    pub winner_buy_realized_pnl_microusd: i64,
-    pub winner_buy_rtds_connections: u64,
-    pub winner_buy_rtds_disconnects: u64,
-    pub winner_buy_rtds_connect_failures: u64,
-    pub winner_buy_rtds_messages: u64,
-    pub winner_buy_rtds_last_observed_at_ms: i64,
-    pub winner_buy_by_asset: Vec<WinnerBuyAssetMetrics>,
+    pub late_resolution_winner_trading_attempts: u64,
+    pub late_resolution_winner_trading_scans: u64,
+    pub late_resolution_winner_trading_signals: u64,
+    pub late_resolution_winner_trading_no_book: u64,
+    pub late_resolution_winner_trading_no_signal: u64,
+    pub late_resolution_winner_trading_book_read_errors: u64,
+    pub late_resolution_winner_trading_incomplete_books: u64,
+    pub late_resolution_winner_trading_stale_books: u64,
+    pub late_resolution_winner_trading_stale_ws_books: u64,
+    pub late_resolution_winner_trading_stale_rest_books: u64,
+    pub late_resolution_winner_trading_ws_missing_books: u64,
+    pub late_resolution_winner_trading_rest_fallbacks: u64,
+    pub late_resolution_winner_trading_rest_successes: u64,
+    pub late_resolution_winner_trading_rest_empty_books: u64,
+    pub late_resolution_winner_trading_rest_latency_ms_total: u64,
+    pub late_resolution_winner_trading_rest_latency_ms_max: u64,
+    pub late_resolution_winner_trading_fee_read_errors: u64,
+    pub late_resolution_winner_trading_evaluations: u64,
+    pub late_resolution_winner_trading_evaluations_resolved: u64,
+    pub late_resolution_winner_trading_model_data_rejections: u64,
+    pub late_resolution_winner_trading_rejection_no_price_history: u64,
+    pub late_resolution_winner_trading_rejection_stale_price: u64,
+    pub late_resolution_winner_trading_rejection_no_opening_reference: u64,
+    pub late_resolution_winner_trading_rejection_invalid_price: u64,
+    pub late_resolution_winner_trading_rejection_insufficient_observations: u64,
+    pub late_resolution_winner_trading_model_market_rejections: u64,
+    pub late_resolution_winner_trading_model_boundary_rejections: u64,
+    pub late_resolution_winner_trading_model_ev_rejections: u64,
+    pub late_resolution_winner_trading_shadow_ev_failures: u64,
+    pub late_resolution_winner_trading_shadow_execution_attempts: u64,
+    pub late_resolution_winner_trading_shadow_execution_fills: u64,
+    pub late_resolution_winner_trading_shadow_execution_no_fills: u64,
+    pub late_resolution_winner_trading_shadow_execution_failures: u64,
+    pub late_resolution_winner_trading_shadow_awaiting_confirmation: u64,
+    pub late_resolution_winner_trading_shadow_confirmed: u64,
+    pub late_resolution_winner_trading_awaiting_confirmation: u64,
+    pub late_resolution_winner_trading_fills: u64,
+    pub late_resolution_winner_trading_pending: u64,
+    pub late_resolution_winner_trading_resolved: u64,
+    pub late_resolution_winner_trading_redeemed: u64,
+    pub late_resolution_winner_trading_settlement_query_failures: u64,
+    pub late_resolution_winner_trading_settlement_empty_results: u64,
+    pub late_resolution_winner_trading_settlement_not_terminal: u64,
+    pub late_resolution_winner_trading_est_pnl_microusd: i64,
+    pub late_resolution_winner_trading_wins: u64,
+    pub late_resolution_winner_trading_losses: u64,
+    pub late_resolution_winner_trading_realized_pnl_microusd: i64,
+    pub late_resolution_winner_trading_rtds_connections: u64,
+    pub late_resolution_winner_trading_rtds_disconnects: u64,
+    pub late_resolution_winner_trading_rtds_connect_failures: u64,
+    pub late_resolution_winner_trading_rtds_messages: u64,
+    pub late_resolution_winner_trading_rtds_last_observed_at_ms: i64,
+    pub late_resolution_winner_trading_by_asset: Vec<LateResolutionWinnerTradingAssetMetrics>,
 }
 
 #[derive(Default)]
@@ -161,59 +162,60 @@ pub struct RuntimeMetrics {
     arbitrage_admission_shadow_samples: AtomicU64,
     arbitrage_admission_shadow_gross_passes: AtomicU64,
     arbitrage_admission_shadow_net_passes: AtomicU64,
-    winner_buy_attempts: AtomicU64,
-    winner_buy_scans: AtomicU64,
-    winner_buy_signals: AtomicU64,
-    winner_buy_no_book: AtomicU64,
-    winner_buy_no_signal: AtomicU64,
-    winner_buy_book_read_errors: AtomicU64,
-    winner_buy_incomplete_books: AtomicU64,
-    winner_buy_stale_books: AtomicU64,
-    winner_buy_stale_ws_books: AtomicU64,
-    winner_buy_stale_rest_books: AtomicU64,
-    winner_buy_ws_missing_books: AtomicU64,
-    winner_buy_rest_fallbacks: AtomicU64,
-    winner_buy_rest_successes: AtomicU64,
-    winner_buy_rest_empty_books: AtomicU64,
-    winner_buy_rest_latency_ms_total: AtomicU64,
-    winner_buy_rest_latency_ms_max: AtomicU64,
-    winner_buy_fee_read_errors: AtomicU64,
-    winner_buy_evaluations: AtomicU64,
-    winner_buy_evaluations_resolved: AtomicU64,
-    winner_buy_model_data_rejections: AtomicU64,
-    winner_buy_rejection_no_price_history: AtomicU64,
-    winner_buy_rejection_stale_price: AtomicU64,
-    winner_buy_rejection_no_opening_reference: AtomicU64,
-    winner_buy_rejection_invalid_price: AtomicU64,
-    winner_buy_rejection_insufficient_observations: AtomicU64,
-    winner_buy_model_market_rejections: AtomicU64,
-    winner_buy_model_boundary_rejections: AtomicU64,
-    winner_buy_model_ev_rejections: AtomicU64,
-    winner_buy_shadow_ev_failures: AtomicU64,
-    winner_buy_shadow_execution_attempts: AtomicU64,
-    winner_buy_shadow_execution_fills: AtomicU64,
-    winner_buy_shadow_execution_no_fills: AtomicU64,
-    winner_buy_shadow_execution_failures: AtomicU64,
-    winner_buy_shadow_awaiting_confirmation: AtomicU64,
-    winner_buy_shadow_confirmed: AtomicU64,
-    winner_buy_awaiting_confirmation: AtomicU64,
-    winner_buy_fills: AtomicU64,
-    winner_buy_pending: AtomicU64,
-    winner_buy_resolved: AtomicU64,
-    winner_buy_redeemed: AtomicU64,
-    winner_buy_settlement_query_failures: AtomicU64,
-    winner_buy_settlement_empty_results: AtomicU64,
-    winner_buy_settlement_not_terminal: AtomicU64,
-    winner_buy_est_pnl_microusd: AtomicI64,
-    winner_buy_wins: AtomicU64,
-    winner_buy_losses: AtomicU64,
-    winner_buy_realized_pnl_microusd: AtomicI64,
-    winner_buy_rtds_connections: AtomicU64,
-    winner_buy_rtds_disconnects: AtomicU64,
-    winner_buy_rtds_connect_failures: AtomicU64,
-    winner_buy_rtds_messages: AtomicU64,
-    winner_buy_rtds_last_observed_at_ms: AtomicI64,
-    winner_buy_by_asset: Mutex<HashMap<String, WinnerBuyAssetMetrics>>,
+    late_resolution_winner_trading_attempts: AtomicU64,
+    late_resolution_winner_trading_scans: AtomicU64,
+    late_resolution_winner_trading_signals: AtomicU64,
+    late_resolution_winner_trading_no_book: AtomicU64,
+    late_resolution_winner_trading_no_signal: AtomicU64,
+    late_resolution_winner_trading_book_read_errors: AtomicU64,
+    late_resolution_winner_trading_incomplete_books: AtomicU64,
+    late_resolution_winner_trading_stale_books: AtomicU64,
+    late_resolution_winner_trading_stale_ws_books: AtomicU64,
+    late_resolution_winner_trading_stale_rest_books: AtomicU64,
+    late_resolution_winner_trading_ws_missing_books: AtomicU64,
+    late_resolution_winner_trading_rest_fallbacks: AtomicU64,
+    late_resolution_winner_trading_rest_successes: AtomicU64,
+    late_resolution_winner_trading_rest_empty_books: AtomicU64,
+    late_resolution_winner_trading_rest_latency_ms_total: AtomicU64,
+    late_resolution_winner_trading_rest_latency_ms_max: AtomicU64,
+    late_resolution_winner_trading_fee_read_errors: AtomicU64,
+    late_resolution_winner_trading_evaluations: AtomicU64,
+    late_resolution_winner_trading_evaluations_resolved: AtomicU64,
+    late_resolution_winner_trading_model_data_rejections: AtomicU64,
+    late_resolution_winner_trading_rejection_no_price_history: AtomicU64,
+    late_resolution_winner_trading_rejection_stale_price: AtomicU64,
+    late_resolution_winner_trading_rejection_no_opening_reference: AtomicU64,
+    late_resolution_winner_trading_rejection_invalid_price: AtomicU64,
+    late_resolution_winner_trading_rejection_insufficient_observations: AtomicU64,
+    late_resolution_winner_trading_model_market_rejections: AtomicU64,
+    late_resolution_winner_trading_model_boundary_rejections: AtomicU64,
+    late_resolution_winner_trading_model_ev_rejections: AtomicU64,
+    late_resolution_winner_trading_shadow_ev_failures: AtomicU64,
+    late_resolution_winner_trading_shadow_execution_attempts: AtomicU64,
+    late_resolution_winner_trading_shadow_execution_fills: AtomicU64,
+    late_resolution_winner_trading_shadow_execution_no_fills: AtomicU64,
+    late_resolution_winner_trading_shadow_execution_failures: AtomicU64,
+    late_resolution_winner_trading_shadow_awaiting_confirmation: AtomicU64,
+    late_resolution_winner_trading_shadow_confirmed: AtomicU64,
+    late_resolution_winner_trading_awaiting_confirmation: AtomicU64,
+    late_resolution_winner_trading_fills: AtomicU64,
+    late_resolution_winner_trading_pending: AtomicU64,
+    late_resolution_winner_trading_resolved: AtomicU64,
+    late_resolution_winner_trading_redeemed: AtomicU64,
+    late_resolution_winner_trading_settlement_query_failures: AtomicU64,
+    late_resolution_winner_trading_settlement_empty_results: AtomicU64,
+    late_resolution_winner_trading_settlement_not_terminal: AtomicU64,
+    late_resolution_winner_trading_est_pnl_microusd: AtomicI64,
+    late_resolution_winner_trading_wins: AtomicU64,
+    late_resolution_winner_trading_losses: AtomicU64,
+    late_resolution_winner_trading_realized_pnl_microusd: AtomicI64,
+    late_resolution_winner_trading_rtds_connections: AtomicU64,
+    late_resolution_winner_trading_rtds_disconnects: AtomicU64,
+    late_resolution_winner_trading_rtds_connect_failures: AtomicU64,
+    late_resolution_winner_trading_rtds_messages: AtomicU64,
+    late_resolution_winner_trading_rtds_last_observed_at_ms: AtomicI64,
+    late_resolution_winner_trading_by_asset:
+        Mutex<HashMap<String, LateResolutionWinnerTradingAssetMetrics>>,
 }
 
 macro_rules! incrementer {
@@ -294,111 +296,154 @@ impl RuntimeMetrics {
         self.sdk_market_ws_downtime_ms_max
             .fetch_max(downtime_ms, Ordering::Relaxed);
     }
-    incrementer!(record_winner_buy_attempt, winner_buy_attempts);
-    incrementer!(record_winner_buy_scan, winner_buy_scans);
-    incrementer!(record_winner_buy_signal, winner_buy_signals);
-    incrementer!(record_winner_buy_no_book, winner_buy_no_book);
-    incrementer!(record_winner_buy_no_signal, winner_buy_no_signal);
     incrementer!(
-        record_winner_buy_book_read_error,
-        winner_buy_book_read_errors
+        record_late_resolution_winner_trading_attempt,
+        late_resolution_winner_trading_attempts
     );
     incrementer!(
-        record_winner_buy_incomplete_book,
-        winner_buy_incomplete_books
+        record_late_resolution_winner_trading_scan,
+        late_resolution_winner_trading_scans
     );
-    incrementer!(record_winner_buy_stale_book, winner_buy_stale_books);
-    incrementer!(record_winner_buy_stale_ws_book, winner_buy_stale_ws_books);
     incrementer!(
-        record_winner_buy_stale_rest_book,
-        winner_buy_stale_rest_books
+        record_late_resolution_winner_trading_signal,
+        late_resolution_winner_trading_signals
     );
-    incrementer!(record_winner_buy_rest_fallback, winner_buy_rest_fallbacks);
     incrementer!(
-        record_winner_buy_ws_missing_book,
-        winner_buy_ws_missing_books
+        record_late_resolution_winner_trading_no_book,
+        late_resolution_winner_trading_no_book
     );
-    incrementer!(record_winner_buy_fee_read_error, winner_buy_fee_read_errors);
+    incrementer!(
+        record_late_resolution_winner_trading_no_signal,
+        late_resolution_winner_trading_no_signal
+    );
+    incrementer!(
+        record_late_resolution_winner_trading_book_read_error,
+        late_resolution_winner_trading_book_read_errors
+    );
+    incrementer!(
+        record_late_resolution_winner_trading_incomplete_book,
+        late_resolution_winner_trading_incomplete_books
+    );
+    incrementer!(
+        record_late_resolution_winner_trading_stale_book,
+        late_resolution_winner_trading_stale_books
+    );
+    incrementer!(
+        record_late_resolution_winner_trading_stale_ws_book,
+        late_resolution_winner_trading_stale_ws_books
+    );
+    incrementer!(
+        record_late_resolution_winner_trading_stale_rest_book,
+        late_resolution_winner_trading_stale_rest_books
+    );
+    incrementer!(
+        record_late_resolution_winner_trading_rest_fallback,
+        late_resolution_winner_trading_rest_fallbacks
+    );
+    incrementer!(
+        record_late_resolution_winner_trading_ws_missing_book,
+        late_resolution_winner_trading_ws_missing_books
+    );
+    incrementer!(
+        record_late_resolution_winner_trading_fee_read_error,
+        late_resolution_winner_trading_fee_read_errors
+    );
 
-    pub fn record_winner_buy_rest_result(&self, latency_ms: u64, found: bool) {
+    pub fn record_late_resolution_winner_trading_rest_result(&self, latency_ms: u64, found: bool) {
         let counter = if found {
-            &self.winner_buy_rest_successes
+            &self.late_resolution_winner_trading_rest_successes
         } else {
-            &self.winner_buy_rest_empty_books
+            &self.late_resolution_winner_trading_rest_empty_books
         };
         counter.fetch_add(1, Ordering::Relaxed);
-        self.winner_buy_rest_latency_ms_total
+        self.late_resolution_winner_trading_rest_latency_ms_total
             .fetch_add(latency_ms, Ordering::Relaxed);
-        self.winner_buy_rest_latency_ms_max
+        self.late_resolution_winner_trading_rest_latency_ms_max
             .fetch_max(latency_ms, Ordering::Relaxed);
     }
-    incrementer!(record_winner_buy_evaluation, winner_buy_evaluations);
     incrementer!(
-        record_winner_buy_rtds_connection,
-        winner_buy_rtds_connections
+        record_late_resolution_winner_trading_evaluation,
+        late_resolution_winner_trading_evaluations
     );
     incrementer!(
-        record_winner_buy_rtds_disconnect,
-        winner_buy_rtds_disconnects
+        record_late_resolution_winner_trading_rtds_connection,
+        late_resolution_winner_trading_rtds_connections
     );
     incrementer!(
-        record_winner_buy_rtds_connect_failure,
-        winner_buy_rtds_connect_failures
+        record_late_resolution_winner_trading_rtds_disconnect,
+        late_resolution_winner_trading_rtds_disconnects
     );
     incrementer!(
-        record_winner_buy_awaiting_confirmation,
-        winner_buy_awaiting_confirmation
+        record_late_resolution_winner_trading_rtds_connect_failure,
+        late_resolution_winner_trading_rtds_connect_failures
     );
     incrementer!(
-        record_winner_buy_shadow_ev_failure,
-        winner_buy_shadow_ev_failures
+        record_late_resolution_winner_trading_awaiting_confirmation,
+        late_resolution_winner_trading_awaiting_confirmation
     );
     incrementer!(
-        record_winner_buy_shadow_execution_attempt,
-        winner_buy_shadow_execution_attempts
+        record_late_resolution_winner_trading_shadow_ev_failure,
+        late_resolution_winner_trading_shadow_ev_failures
     );
     incrementer!(
-        record_winner_buy_shadow_execution_fill,
-        winner_buy_shadow_execution_fills
+        record_late_resolution_winner_trading_shadow_execution_attempt,
+        late_resolution_winner_trading_shadow_execution_attempts
     );
     incrementer!(
-        record_winner_buy_shadow_execution_no_fill,
-        winner_buy_shadow_execution_no_fills
+        record_late_resolution_winner_trading_shadow_execution_fill,
+        late_resolution_winner_trading_shadow_execution_fills
     );
     incrementer!(
-        record_winner_buy_shadow_execution_failure,
-        winner_buy_shadow_execution_failures
+        record_late_resolution_winner_trading_shadow_execution_no_fill,
+        late_resolution_winner_trading_shadow_execution_no_fills
     );
     incrementer!(
-        record_winner_buy_shadow_awaiting_confirmation,
-        winner_buy_shadow_awaiting_confirmation
+        record_late_resolution_winner_trading_shadow_execution_failure,
+        late_resolution_winner_trading_shadow_execution_failures
     );
     incrementer!(
-        record_winner_buy_shadow_confirmed,
-        winner_buy_shadow_confirmed
-    );
-    incrementer!(record_winner_buy_fill, winner_buy_fills);
-    incrementer!(record_winner_buy_resolved, winner_buy_resolved);
-    incrementer!(record_winner_buy_redeemed, winner_buy_redeemed);
-    incrementer!(
-        record_winner_buy_settlement_query_failure,
-        winner_buy_settlement_query_failures
+        record_late_resolution_winner_trading_shadow_awaiting_confirmation,
+        late_resolution_winner_trading_shadow_awaiting_confirmation
     );
     incrementer!(
-        record_winner_buy_settlement_empty_result,
-        winner_buy_settlement_empty_results
+        record_late_resolution_winner_trading_shadow_confirmed,
+        late_resolution_winner_trading_shadow_confirmed
     );
     incrementer!(
-        record_winner_buy_settlement_not_terminal,
-        winner_buy_settlement_not_terminal
+        record_late_resolution_winner_trading_fill,
+        late_resolution_winner_trading_fills
+    );
+    incrementer!(
+        record_late_resolution_winner_trading_resolved,
+        late_resolution_winner_trading_resolved
+    );
+    incrementer!(
+        record_late_resolution_winner_trading_redeemed,
+        late_resolution_winner_trading_redeemed
+    );
+    incrementer!(
+        record_late_resolution_winner_trading_settlement_query_failure,
+        late_resolution_winner_trading_settlement_query_failures
+    );
+    incrementer!(
+        record_late_resolution_winner_trading_settlement_empty_result,
+        late_resolution_winner_trading_settlement_empty_results
+    );
+    incrementer!(
+        record_late_resolution_winner_trading_settlement_not_terminal,
+        late_resolution_winner_trading_settlement_not_terminal
     );
 
-    pub fn set_winner_buy_pending(&self, count: usize) {
-        self.winner_buy_pending
+    pub fn set_late_resolution_winner_trading_pending(&self, count: usize) {
+        self.late_resolution_winner_trading_pending
             .store(count.try_into().unwrap_or(u64::MAX), Ordering::Relaxed);
     }
 
-    fn record_winner_asset(&self, asset: &str, update: impl FnOnce(&mut WinnerBuyAssetMetrics)) {
+    fn record_winner_asset(
+        &self,
+        asset: &str,
+        update: impl FnOnce(&mut LateResolutionWinnerTradingAssetMetrics),
+    ) {
         let key = asset.trim().to_ascii_lowercase();
         let key = if key.is_empty() {
             "unknown".into()
@@ -406,60 +451,67 @@ impl RuntimeMetrics {
             key
         };
         let mut metrics = self
-            .winner_buy_by_asset
+            .late_resolution_winner_trading_by_asset
             .lock()
-            .expect("Winner Buy asset metrics lock poisoned");
-        let entry = metrics
-            .entry(key.clone())
-            .or_insert_with(|| WinnerBuyAssetMetrics {
-                asset: key,
-                ..WinnerBuyAssetMetrics::default()
-            });
+            .expect("Late-Resolution Winner Trading asset metrics lock poisoned");
+        let entry =
+            metrics
+                .entry(key.clone())
+                .or_insert_with(|| LateResolutionWinnerTradingAssetMetrics {
+                    asset: key,
+                    ..LateResolutionWinnerTradingAssetMetrics::default()
+                });
         update(entry);
     }
 
-    pub fn record_winner_buy_asset_scan(&self, asset: &str) {
+    pub fn record_late_resolution_winner_trading_asset_scan(&self, asset: &str) {
         self.record_winner_asset(asset, |metrics| metrics.scans += 1);
     }
 
-    pub fn record_winner_buy_asset_signal(&self, asset: &str) {
+    pub fn record_late_resolution_winner_trading_asset_signal(&self, asset: &str) {
         self.record_winner_asset(asset, |metrics| metrics.signals += 1);
     }
 
-    pub fn record_winner_buy_asset_no_book(&self, asset: &str) {
+    pub fn record_late_resolution_winner_trading_asset_no_book(&self, asset: &str) {
         self.record_winner_asset(asset, |metrics| metrics.no_book += 1);
     }
 
-    pub fn record_winner_buy_asset_no_signal(&self, asset: &str) {
+    pub fn record_late_resolution_winner_trading_asset_no_signal(&self, asset: &str) {
         self.record_winner_asset(asset, |metrics| metrics.no_signal += 1);
     }
 
-    pub fn record_winner_buy_asset_evaluation(&self, asset: &str) {
+    pub fn record_late_resolution_winner_trading_asset_evaluation(&self, asset: &str) {
         self.record_winner_asset(asset, |metrics| metrics.evaluations += 1);
     }
 
-    pub fn record_winner_buy_asset_attempt(&self, asset: &str) {
+    pub fn record_late_resolution_winner_trading_asset_attempt(&self, asset: &str) {
         self.record_winner_asset(asset, |metrics| metrics.attempts += 1);
     }
 
-    pub fn record_winner_buy_asset_fill(&self, asset: &str) {
+    pub fn record_late_resolution_winner_trading_asset_fill(&self, asset: &str) {
         self.record_winner_asset(asset, |metrics| metrics.fills += 1);
     }
 
-    pub fn record_winner_buy_asset_resolved(&self, asset: &str) {
+    pub fn record_late_resolution_winner_trading_asset_resolved(&self, asset: &str) {
         self.record_winner_asset(asset, |metrics| metrics.resolved += 1);
     }
 
-    pub fn record_winner_model_rejection(&self, rejection: ModelRejection) {
+    pub fn record_late_resolution_winner_model_rejection(&self, rejection: ModelRejection) {
         let detail = match rejection {
-            ModelRejection::NoPriceHistory => Some(&self.winner_buy_rejection_no_price_history),
-            ModelRejection::StalePrice => Some(&self.winner_buy_rejection_stale_price),
-            ModelRejection::NoOpeningReference => {
-                Some(&self.winner_buy_rejection_no_opening_reference)
+            ModelRejection::NoPriceHistory => {
+                Some(&self.late_resolution_winner_trading_rejection_no_price_history)
             }
-            ModelRejection::InvalidPrice => Some(&self.winner_buy_rejection_invalid_price),
+            ModelRejection::StalePrice => {
+                Some(&self.late_resolution_winner_trading_rejection_stale_price)
+            }
+            ModelRejection::NoOpeningReference => {
+                Some(&self.late_resolution_winner_trading_rejection_no_opening_reference)
+            }
+            ModelRejection::InvalidPrice => {
+                Some(&self.late_resolution_winner_trading_rejection_invalid_price)
+            }
             ModelRejection::InsufficientObservations => {
-                Some(&self.winner_buy_rejection_insufficient_observations)
+                Some(&self.late_resolution_winner_trading_rejection_insufficient_observations)
             }
             _ => None,
         };
@@ -471,20 +523,24 @@ impl RuntimeMetrics {
             | ModelRejection::StalePrice
             | ModelRejection::NoOpeningReference
             | ModelRejection::InvalidPrice
-            | ModelRejection::InsufficientObservations => &self.winner_buy_model_data_rejections,
-            ModelRejection::SpreadTooWide | ModelRejection::InsufficientDepth => {
-                &self.winner_buy_model_market_rejections
+            | ModelRejection::InsufficientObservations => {
+                &self.late_resolution_winner_trading_model_data_rejections
             }
-            ModelRejection::ReversalBoundary => &self.winner_buy_model_boundary_rejections,
-            ModelRejection::NetEvTooLow => &self.winner_buy_model_ev_rejections,
+            ModelRejection::SpreadTooWide | ModelRejection::InsufficientDepth => {
+                &self.late_resolution_winner_trading_model_market_rejections
+            }
+            ModelRejection::ReversalBoundary => {
+                &self.late_resolution_winner_trading_model_boundary_rejections
+            }
+            ModelRejection::NetEvTooLow => &self.late_resolution_winner_trading_model_ev_rejections,
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn record_winner_buy_rtds_observation(&self, observed_at_ms: i64) {
-        self.winner_buy_rtds_messages
+    pub fn record_late_resolution_winner_trading_rtds_observation(&self, observed_at_ms: i64) {
+        self.late_resolution_winner_trading_rtds_messages
             .fetch_add(1, Ordering::Relaxed);
-        self.winner_buy_rtds_last_observed_at_ms
+        self.late_resolution_winner_trading_rtds_last_observed_at_ms
             .fetch_max(observed_at_ms, Ordering::Relaxed);
     }
 
@@ -493,13 +549,13 @@ impl RuntimeMetrics {
             .fetch_max(observed_at_ms, Ordering::Relaxed);
     }
 
-    pub fn record_winner_buy_evaluations_resolved(&self, count: usize) {
-        self.winner_buy_evaluations_resolved
+    pub fn record_late_resolution_winner_trading_evaluations_resolved(&self, count: usize) {
+        self.late_resolution_winner_trading_evaluations_resolved
             .fetch_add(count.try_into().unwrap_or(u64::MAX), Ordering::Relaxed);
     }
 
-    /// Estimate winner-buy profit: filled shares held to settlement (pays 1.00).
-    pub fn record_winner_buy_pnl(
+    /// Estimate late-resolution-winner-trading profit: filled shares held to settlement (pays 1.00).
+    pub fn record_late_resolution_winner_trading_pnl(
         &self,
         filled: rust_decimal::Decimal,
         price: rust_decimal::Decimal,
@@ -508,21 +564,23 @@ impl RuntimeMetrics {
         use rust_decimal_macros::dec;
         let pnl = filled * (dec!(1) - price);
         let microusd = (pnl * dec!(1000000)).round().to_i64().unwrap_or(0);
-        self.winner_buy_est_pnl_microusd
+        self.late_resolution_winner_trading_est_pnl_microusd
             .fetch_add(microusd, Ordering::Relaxed);
     }
 
-    /// Record the REALIZED settlement result of a winner-buy paper position.
-    pub fn record_winner_buy_settlement(&self, pnl: rust_decimal::Decimal) {
+    /// Record the REALIZED settlement result of a late-resolution-winner-trading paper position.
+    pub fn record_late_resolution_winner_trading_settlement(&self, pnl: rust_decimal::Decimal) {
         use rust_decimal::prelude::ToPrimitive;
         use rust_decimal_macros::dec;
         if pnl > dec!(0) {
-            self.winner_buy_wins.fetch_add(1, Ordering::Relaxed);
+            self.late_resolution_winner_trading_wins
+                .fetch_add(1, Ordering::Relaxed);
         } else {
-            self.winner_buy_losses.fetch_add(1, Ordering::Relaxed);
+            self.late_resolution_winner_trading_losses
+                .fetch_add(1, Ordering::Relaxed);
         }
         let microusd = (pnl * dec!(1000000)).round().to_i64().unwrap_or(0);
-        self.winner_buy_realized_pnl_microusd
+        self.late_resolution_winner_trading_realized_pnl_microusd
             .fetch_add(microusd, Ordering::Relaxed);
     }
 
@@ -565,14 +623,14 @@ impl RuntimeMetrics {
 
     pub fn snapshot(&self) -> MetricsSnapshot {
         let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
-        let mut winner_buy_by_asset: Vec<_> = self
-            .winner_buy_by_asset
+        let mut late_resolution_winner_trading_by_asset: Vec<_> = self
+            .late_resolution_winner_trading_by_asset
             .lock()
-            .expect("Winner Buy asset metrics lock poisoned")
+            .expect("Late-Resolution Winner Trading asset metrics lock poisoned")
             .values()
             .cloned()
             .collect();
-        winner_buy_by_asset.sort_by(|left, right| left.asset.cmp(&right.asset));
+        late_resolution_winner_trading_by_asset.sort_by(|left, right| left.asset.cmp(&right.asset));
         MetricsSnapshot {
             orderbook_pairs: load(&self.orderbook_pairs),
             opportunities_admitted: load(&self.opportunities_admitted),
@@ -627,71 +685,157 @@ impl RuntimeMetrics {
             arbitrage_admission_shadow_net_passes: load(
                 &self.arbitrage_admission_shadow_net_passes,
             ),
-            winner_buy_attempts: load(&self.winner_buy_attempts),
-            winner_buy_scans: load(&self.winner_buy_scans),
-            winner_buy_signals: load(&self.winner_buy_signals),
-            winner_buy_no_book: load(&self.winner_buy_no_book),
-            winner_buy_no_signal: load(&self.winner_buy_no_signal),
-            winner_buy_book_read_errors: load(&self.winner_buy_book_read_errors),
-            winner_buy_incomplete_books: load(&self.winner_buy_incomplete_books),
-            winner_buy_stale_books: load(&self.winner_buy_stale_books),
-            winner_buy_stale_ws_books: load(&self.winner_buy_stale_ws_books),
-            winner_buy_stale_rest_books: load(&self.winner_buy_stale_rest_books),
-            winner_buy_ws_missing_books: load(&self.winner_buy_ws_missing_books),
-            winner_buy_rest_fallbacks: load(&self.winner_buy_rest_fallbacks),
-            winner_buy_rest_successes: load(&self.winner_buy_rest_successes),
-            winner_buy_rest_empty_books: load(&self.winner_buy_rest_empty_books),
-            winner_buy_rest_latency_ms_total: load(&self.winner_buy_rest_latency_ms_total),
-            winner_buy_rest_latency_ms_max: load(&self.winner_buy_rest_latency_ms_max),
-            winner_buy_fee_read_errors: load(&self.winner_buy_fee_read_errors),
-            winner_buy_evaluations: load(&self.winner_buy_evaluations),
-            winner_buy_evaluations_resolved: load(&self.winner_buy_evaluations_resolved),
-            winner_buy_model_data_rejections: load(&self.winner_buy_model_data_rejections),
-            winner_buy_rejection_no_price_history: load(
-                &self.winner_buy_rejection_no_price_history,
+            late_resolution_winner_trading_attempts: load(
+                &self.late_resolution_winner_trading_attempts,
             ),
-            winner_buy_rejection_stale_price: load(&self.winner_buy_rejection_stale_price),
-            winner_buy_rejection_no_opening_reference: load(
-                &self.winner_buy_rejection_no_opening_reference,
+            late_resolution_winner_trading_scans: load(&self.late_resolution_winner_trading_scans),
+            late_resolution_winner_trading_signals: load(
+                &self.late_resolution_winner_trading_signals,
             ),
-            winner_buy_rejection_invalid_price: load(&self.winner_buy_rejection_invalid_price),
-            winner_buy_rejection_insufficient_observations: load(
-                &self.winner_buy_rejection_insufficient_observations,
+            late_resolution_winner_trading_no_book: load(
+                &self.late_resolution_winner_trading_no_book,
             ),
-            winner_buy_model_market_rejections: load(&self.winner_buy_model_market_rejections),
-            winner_buy_model_boundary_rejections: load(&self.winner_buy_model_boundary_rejections),
-            winner_buy_model_ev_rejections: load(&self.winner_buy_model_ev_rejections),
-            winner_buy_shadow_ev_failures: load(&self.winner_buy_shadow_ev_failures),
-            winner_buy_shadow_execution_attempts: load(&self.winner_buy_shadow_execution_attempts),
-            winner_buy_shadow_execution_fills: load(&self.winner_buy_shadow_execution_fills),
-            winner_buy_shadow_execution_no_fills: load(&self.winner_buy_shadow_execution_no_fills),
-            winner_buy_shadow_execution_failures: load(&self.winner_buy_shadow_execution_failures),
-            winner_buy_shadow_awaiting_confirmation: load(
-                &self.winner_buy_shadow_awaiting_confirmation,
+            late_resolution_winner_trading_no_signal: load(
+                &self.late_resolution_winner_trading_no_signal,
             ),
-            winner_buy_shadow_confirmed: load(&self.winner_buy_shadow_confirmed),
-            winner_buy_awaiting_confirmation: load(&self.winner_buy_awaiting_confirmation),
-            winner_buy_fills: load(&self.winner_buy_fills),
-            winner_buy_pending: load(&self.winner_buy_pending),
-            winner_buy_resolved: load(&self.winner_buy_resolved),
-            winner_buy_redeemed: load(&self.winner_buy_redeemed),
-            winner_buy_settlement_query_failures: load(&self.winner_buy_settlement_query_failures),
-            winner_buy_settlement_empty_results: load(&self.winner_buy_settlement_empty_results),
-            winner_buy_settlement_not_terminal: load(&self.winner_buy_settlement_not_terminal),
-            winner_buy_est_pnl_microusd: self.winner_buy_est_pnl_microusd.load(Ordering::Relaxed),
-            winner_buy_wins: load(&self.winner_buy_wins),
-            winner_buy_losses: load(&self.winner_buy_losses),
-            winner_buy_realized_pnl_microusd: self
-                .winner_buy_realized_pnl_microusd
+            late_resolution_winner_trading_book_read_errors: load(
+                &self.late_resolution_winner_trading_book_read_errors,
+            ),
+            late_resolution_winner_trading_incomplete_books: load(
+                &self.late_resolution_winner_trading_incomplete_books,
+            ),
+            late_resolution_winner_trading_stale_books: load(
+                &self.late_resolution_winner_trading_stale_books,
+            ),
+            late_resolution_winner_trading_stale_ws_books: load(
+                &self.late_resolution_winner_trading_stale_ws_books,
+            ),
+            late_resolution_winner_trading_stale_rest_books: load(
+                &self.late_resolution_winner_trading_stale_rest_books,
+            ),
+            late_resolution_winner_trading_ws_missing_books: load(
+                &self.late_resolution_winner_trading_ws_missing_books,
+            ),
+            late_resolution_winner_trading_rest_fallbacks: load(
+                &self.late_resolution_winner_trading_rest_fallbacks,
+            ),
+            late_resolution_winner_trading_rest_successes: load(
+                &self.late_resolution_winner_trading_rest_successes,
+            ),
+            late_resolution_winner_trading_rest_empty_books: load(
+                &self.late_resolution_winner_trading_rest_empty_books,
+            ),
+            late_resolution_winner_trading_rest_latency_ms_total: load(
+                &self.late_resolution_winner_trading_rest_latency_ms_total,
+            ),
+            late_resolution_winner_trading_rest_latency_ms_max: load(
+                &self.late_resolution_winner_trading_rest_latency_ms_max,
+            ),
+            late_resolution_winner_trading_fee_read_errors: load(
+                &self.late_resolution_winner_trading_fee_read_errors,
+            ),
+            late_resolution_winner_trading_evaluations: load(
+                &self.late_resolution_winner_trading_evaluations,
+            ),
+            late_resolution_winner_trading_evaluations_resolved: load(
+                &self.late_resolution_winner_trading_evaluations_resolved,
+            ),
+            late_resolution_winner_trading_model_data_rejections: load(
+                &self.late_resolution_winner_trading_model_data_rejections,
+            ),
+            late_resolution_winner_trading_rejection_no_price_history: load(
+                &self.late_resolution_winner_trading_rejection_no_price_history,
+            ),
+            late_resolution_winner_trading_rejection_stale_price: load(
+                &self.late_resolution_winner_trading_rejection_stale_price,
+            ),
+            late_resolution_winner_trading_rejection_no_opening_reference: load(
+                &self.late_resolution_winner_trading_rejection_no_opening_reference,
+            ),
+            late_resolution_winner_trading_rejection_invalid_price: load(
+                &self.late_resolution_winner_trading_rejection_invalid_price,
+            ),
+            late_resolution_winner_trading_rejection_insufficient_observations: load(
+                &self.late_resolution_winner_trading_rejection_insufficient_observations,
+            ),
+            late_resolution_winner_trading_model_market_rejections: load(
+                &self.late_resolution_winner_trading_model_market_rejections,
+            ),
+            late_resolution_winner_trading_model_boundary_rejections: load(
+                &self.late_resolution_winner_trading_model_boundary_rejections,
+            ),
+            late_resolution_winner_trading_model_ev_rejections: load(
+                &self.late_resolution_winner_trading_model_ev_rejections,
+            ),
+            late_resolution_winner_trading_shadow_ev_failures: load(
+                &self.late_resolution_winner_trading_shadow_ev_failures,
+            ),
+            late_resolution_winner_trading_shadow_execution_attempts: load(
+                &self.late_resolution_winner_trading_shadow_execution_attempts,
+            ),
+            late_resolution_winner_trading_shadow_execution_fills: load(
+                &self.late_resolution_winner_trading_shadow_execution_fills,
+            ),
+            late_resolution_winner_trading_shadow_execution_no_fills: load(
+                &self.late_resolution_winner_trading_shadow_execution_no_fills,
+            ),
+            late_resolution_winner_trading_shadow_execution_failures: load(
+                &self.late_resolution_winner_trading_shadow_execution_failures,
+            ),
+            late_resolution_winner_trading_shadow_awaiting_confirmation: load(
+                &self.late_resolution_winner_trading_shadow_awaiting_confirmation,
+            ),
+            late_resolution_winner_trading_shadow_confirmed: load(
+                &self.late_resolution_winner_trading_shadow_confirmed,
+            ),
+            late_resolution_winner_trading_awaiting_confirmation: load(
+                &self.late_resolution_winner_trading_awaiting_confirmation,
+            ),
+            late_resolution_winner_trading_fills: load(&self.late_resolution_winner_trading_fills),
+            late_resolution_winner_trading_pending: load(
+                &self.late_resolution_winner_trading_pending,
+            ),
+            late_resolution_winner_trading_resolved: load(
+                &self.late_resolution_winner_trading_resolved,
+            ),
+            late_resolution_winner_trading_redeemed: load(
+                &self.late_resolution_winner_trading_redeemed,
+            ),
+            late_resolution_winner_trading_settlement_query_failures: load(
+                &self.late_resolution_winner_trading_settlement_query_failures,
+            ),
+            late_resolution_winner_trading_settlement_empty_results: load(
+                &self.late_resolution_winner_trading_settlement_empty_results,
+            ),
+            late_resolution_winner_trading_settlement_not_terminal: load(
+                &self.late_resolution_winner_trading_settlement_not_terminal,
+            ),
+            late_resolution_winner_trading_est_pnl_microusd: self
+                .late_resolution_winner_trading_est_pnl_microusd
                 .load(Ordering::Relaxed),
-            winner_buy_rtds_connections: load(&self.winner_buy_rtds_connections),
-            winner_buy_rtds_disconnects: load(&self.winner_buy_rtds_disconnects),
-            winner_buy_rtds_connect_failures: load(&self.winner_buy_rtds_connect_failures),
-            winner_buy_rtds_messages: load(&self.winner_buy_rtds_messages),
-            winner_buy_rtds_last_observed_at_ms: self
-                .winner_buy_rtds_last_observed_at_ms
+            late_resolution_winner_trading_wins: load(&self.late_resolution_winner_trading_wins),
+            late_resolution_winner_trading_losses: load(
+                &self.late_resolution_winner_trading_losses,
+            ),
+            late_resolution_winner_trading_realized_pnl_microusd: self
+                .late_resolution_winner_trading_realized_pnl_microusd
                 .load(Ordering::Relaxed),
-            winner_buy_by_asset,
+            late_resolution_winner_trading_rtds_connections: load(
+                &self.late_resolution_winner_trading_rtds_connections,
+            ),
+            late_resolution_winner_trading_rtds_disconnects: load(
+                &self.late_resolution_winner_trading_rtds_disconnects,
+            ),
+            late_resolution_winner_trading_rtds_connect_failures: load(
+                &self.late_resolution_winner_trading_rtds_connect_failures,
+            ),
+            late_resolution_winner_trading_rtds_messages: load(
+                &self.late_resolution_winner_trading_rtds_messages,
+            ),
+            late_resolution_winner_trading_rtds_last_observed_at_ms: self
+                .late_resolution_winner_trading_rtds_last_observed_at_ms
+                .load(Ordering::Relaxed),
+            late_resolution_winner_trading_by_asset,
         }
     }
 
@@ -808,163 +952,193 @@ impl RuntimeMetrics {
                 "arbitrage_admission_shadow_net_passes_total",
                 snapshot.arbitrage_admission_shadow_net_passes,
             ),
-            ("winner_buy_attempts_total", snapshot.winner_buy_attempts),
-            ("winner_buy_scans_total", snapshot.winner_buy_scans),
-            ("winner_buy_signals_total", snapshot.winner_buy_signals),
-            ("winner_buy_no_book_total", snapshot.winner_buy_no_book),
-            ("winner_buy_no_signal_total", snapshot.winner_buy_no_signal),
             (
-                "winner_buy_book_read_errors_total",
-                snapshot.winner_buy_book_read_errors,
+                "late_resolution_winner_trading_attempts_total",
+                snapshot.late_resolution_winner_trading_attempts,
             ),
             (
-                "winner_buy_incomplete_books_total",
-                snapshot.winner_buy_incomplete_books,
+                "late_resolution_winner_trading_scans_total",
+                snapshot.late_resolution_winner_trading_scans,
             ),
             (
-                "winner_buy_stale_books_total",
-                snapshot.winner_buy_stale_books,
+                "late_resolution_winner_trading_signals_total",
+                snapshot.late_resolution_winner_trading_signals,
             ),
             (
-                "winner_buy_stale_ws_books_total",
-                snapshot.winner_buy_stale_ws_books,
+                "late_resolution_winner_trading_no_book_total",
+                snapshot.late_resolution_winner_trading_no_book,
             ),
             (
-                "winner_buy_stale_rest_books_total",
-                snapshot.winner_buy_stale_rest_books,
+                "late_resolution_winner_trading_no_signal_total",
+                snapshot.late_resolution_winner_trading_no_signal,
             ),
             (
-                "winner_buy_ws_missing_books_total",
-                snapshot.winner_buy_ws_missing_books,
+                "late_resolution_winner_trading_book_read_errors_total",
+                snapshot.late_resolution_winner_trading_book_read_errors,
             ),
             (
-                "winner_buy_rest_fallbacks_total",
-                snapshot.winner_buy_rest_fallbacks,
+                "late_resolution_winner_trading_incomplete_books_total",
+                snapshot.late_resolution_winner_trading_incomplete_books,
             ),
             (
-                "winner_buy_rest_successes_total",
-                snapshot.winner_buy_rest_successes,
+                "late_resolution_winner_trading_stale_books_total",
+                snapshot.late_resolution_winner_trading_stale_books,
             ),
             (
-                "winner_buy_rest_empty_books_total",
-                snapshot.winner_buy_rest_empty_books,
+                "late_resolution_winner_trading_stale_ws_books_total",
+                snapshot.late_resolution_winner_trading_stale_ws_books,
             ),
             (
-                "winner_buy_rest_latency_ms_total",
-                snapshot.winner_buy_rest_latency_ms_total,
+                "late_resolution_winner_trading_stale_rest_books_total",
+                snapshot.late_resolution_winner_trading_stale_rest_books,
             ),
             (
-                "winner_buy_fee_read_errors_total",
-                snapshot.winner_buy_fee_read_errors,
+                "late_resolution_winner_trading_ws_missing_books_total",
+                snapshot.late_resolution_winner_trading_ws_missing_books,
             ),
             (
-                "winner_buy_evaluations_total",
-                snapshot.winner_buy_evaluations,
+                "late_resolution_winner_trading_rest_fallbacks_total",
+                snapshot.late_resolution_winner_trading_rest_fallbacks,
             ),
             (
-                "winner_buy_evaluations_resolved_total",
-                snapshot.winner_buy_evaluations_resolved,
+                "late_resolution_winner_trading_rest_successes_total",
+                snapshot.late_resolution_winner_trading_rest_successes,
             ),
             (
-                "winner_buy_model_data_rejections_total",
-                snapshot.winner_buy_model_data_rejections,
+                "late_resolution_winner_trading_rest_empty_books_total",
+                snapshot.late_resolution_winner_trading_rest_empty_books,
             ),
             (
-                "winner_buy_rejection_no_price_history_total",
-                snapshot.winner_buy_rejection_no_price_history,
+                "late_resolution_winner_trading_rest_latency_ms_total",
+                snapshot.late_resolution_winner_trading_rest_latency_ms_total,
             ),
             (
-                "winner_buy_rejection_stale_price_total",
-                snapshot.winner_buy_rejection_stale_price,
+                "late_resolution_winner_trading_fee_read_errors_total",
+                snapshot.late_resolution_winner_trading_fee_read_errors,
             ),
             (
-                "winner_buy_rejection_no_opening_reference_total",
-                snapshot.winner_buy_rejection_no_opening_reference,
+                "late_resolution_winner_trading_evaluations_total",
+                snapshot.late_resolution_winner_trading_evaluations,
             ),
             (
-                "winner_buy_rejection_invalid_price_total",
-                snapshot.winner_buy_rejection_invalid_price,
+                "late_resolution_winner_trading_evaluations_resolved_total",
+                snapshot.late_resolution_winner_trading_evaluations_resolved,
             ),
             (
-                "winner_buy_rejection_insufficient_observations_total",
-                snapshot.winner_buy_rejection_insufficient_observations,
+                "late_resolution_winner_trading_model_data_rejections_total",
+                snapshot.late_resolution_winner_trading_model_data_rejections,
             ),
             (
-                "winner_buy_model_market_rejections_total",
-                snapshot.winner_buy_model_market_rejections,
+                "late_resolution_winner_trading_rejection_no_price_history_total",
+                snapshot.late_resolution_winner_trading_rejection_no_price_history,
             ),
             (
-                "winner_buy_model_boundary_rejections_total",
-                snapshot.winner_buy_model_boundary_rejections,
+                "late_resolution_winner_trading_rejection_stale_price_total",
+                snapshot.late_resolution_winner_trading_rejection_stale_price,
             ),
             (
-                "winner_buy_model_ev_rejections_total",
-                snapshot.winner_buy_model_ev_rejections,
+                "late_resolution_winner_trading_rejection_no_opening_reference_total",
+                snapshot.late_resolution_winner_trading_rejection_no_opening_reference,
             ),
             (
-                "winner_buy_shadow_ev_failures_total",
-                snapshot.winner_buy_shadow_ev_failures,
+                "late_resolution_winner_trading_rejection_invalid_price_total",
+                snapshot.late_resolution_winner_trading_rejection_invalid_price,
             ),
             (
-                "winner_buy_shadow_execution_attempts_total",
-                snapshot.winner_buy_shadow_execution_attempts,
+                "late_resolution_winner_trading_rejection_insufficient_observations_total",
+                snapshot.late_resolution_winner_trading_rejection_insufficient_observations,
             ),
             (
-                "winner_buy_shadow_execution_fills_total",
-                snapshot.winner_buy_shadow_execution_fills,
+                "late_resolution_winner_trading_model_market_rejections_total",
+                snapshot.late_resolution_winner_trading_model_market_rejections,
             ),
             (
-                "winner_buy_shadow_execution_no_fills_total",
-                snapshot.winner_buy_shadow_execution_no_fills,
+                "late_resolution_winner_trading_model_boundary_rejections_total",
+                snapshot.late_resolution_winner_trading_model_boundary_rejections,
             ),
             (
-                "winner_buy_shadow_execution_failures_total",
-                snapshot.winner_buy_shadow_execution_failures,
+                "late_resolution_winner_trading_model_ev_rejections_total",
+                snapshot.late_resolution_winner_trading_model_ev_rejections,
             ),
             (
-                "winner_buy_shadow_awaiting_confirmation_total",
-                snapshot.winner_buy_shadow_awaiting_confirmation,
+                "late_resolution_winner_trading_shadow_ev_failures_total",
+                snapshot.late_resolution_winner_trading_shadow_ev_failures,
             ),
             (
-                "winner_buy_shadow_confirmed_total",
-                snapshot.winner_buy_shadow_confirmed,
+                "late_resolution_winner_trading_shadow_execution_attempts_total",
+                snapshot.late_resolution_winner_trading_shadow_execution_attempts,
             ),
             (
-                "winner_buy_awaiting_confirmation_total",
-                snapshot.winner_buy_awaiting_confirmation,
-            ),
-            ("winner_buy_fills_total", snapshot.winner_buy_fills),
-            ("winner_buy_resolved_total", snapshot.winner_buy_resolved),
-            ("winner_buy_redeemed_total", snapshot.winner_buy_redeemed),
-            (
-                "winner_buy_settlement_query_failures_total",
-                snapshot.winner_buy_settlement_query_failures,
+                "late_resolution_winner_trading_shadow_execution_fills_total",
+                snapshot.late_resolution_winner_trading_shadow_execution_fills,
             ),
             (
-                "winner_buy_settlement_empty_results_total",
-                snapshot.winner_buy_settlement_empty_results,
+                "late_resolution_winner_trading_shadow_execution_no_fills_total",
+                snapshot.late_resolution_winner_trading_shadow_execution_no_fills,
             ),
             (
-                "winner_buy_settlement_not_terminal_total",
-                snapshot.winner_buy_settlement_not_terminal,
-            ),
-            ("winner_buy_wins_total", snapshot.winner_buy_wins),
-            ("winner_buy_losses_total", snapshot.winner_buy_losses),
-            (
-                "winner_buy_rtds_connections_total",
-                snapshot.winner_buy_rtds_connections,
+                "late_resolution_winner_trading_shadow_execution_failures_total",
+                snapshot.late_resolution_winner_trading_shadow_execution_failures,
             ),
             (
-                "winner_buy_rtds_disconnects_total",
-                snapshot.winner_buy_rtds_disconnects,
+                "late_resolution_winner_trading_shadow_awaiting_confirmation_total",
+                snapshot.late_resolution_winner_trading_shadow_awaiting_confirmation,
             ),
             (
-                "winner_buy_rtds_connect_failures_total",
-                snapshot.winner_buy_rtds_connect_failures,
+                "late_resolution_winner_trading_shadow_confirmed_total",
+                snapshot.late_resolution_winner_trading_shadow_confirmed,
             ),
             (
-                "winner_buy_rtds_messages_total",
-                snapshot.winner_buy_rtds_messages,
+                "late_resolution_winner_trading_awaiting_confirmation_total",
+                snapshot.late_resolution_winner_trading_awaiting_confirmation,
+            ),
+            (
+                "late_resolution_winner_trading_fills_total",
+                snapshot.late_resolution_winner_trading_fills,
+            ),
+            (
+                "late_resolution_winner_trading_resolved_total",
+                snapshot.late_resolution_winner_trading_resolved,
+            ),
+            (
+                "late_resolution_winner_trading_redeemed_total",
+                snapshot.late_resolution_winner_trading_redeemed,
+            ),
+            (
+                "late_resolution_winner_trading_settlement_query_failures_total",
+                snapshot.late_resolution_winner_trading_settlement_query_failures,
+            ),
+            (
+                "late_resolution_winner_trading_settlement_empty_results_total",
+                snapshot.late_resolution_winner_trading_settlement_empty_results,
+            ),
+            (
+                "late_resolution_winner_trading_settlement_not_terminal_total",
+                snapshot.late_resolution_winner_trading_settlement_not_terminal,
+            ),
+            (
+                "late_resolution_winner_trading_wins_total",
+                snapshot.late_resolution_winner_trading_wins,
+            ),
+            (
+                "late_resolution_winner_trading_losses_total",
+                snapshot.late_resolution_winner_trading_losses,
+            ),
+            (
+                "late_resolution_winner_trading_rtds_connections_total",
+                snapshot.late_resolution_winner_trading_rtds_connections,
+            ),
+            (
+                "late_resolution_winner_trading_rtds_disconnects_total",
+                snapshot.late_resolution_winner_trading_rtds_disconnects,
+            ),
+            (
+                "late_resolution_winner_trading_rtds_connect_failures_total",
+                snapshot.late_resolution_winner_trading_rtds_connect_failures,
+            ),
+            (
+                "late_resolution_winner_trading_rtds_messages_total",
+                snapshot.late_resolution_winner_trading_rtds_messages,
             ),
         ];
         let mut output = String::new();
@@ -977,7 +1151,7 @@ impl RuntimeMetrics {
             output.push_str(&value.to_string());
             output.push('\n');
         }
-        let asset_fields: [(&str, WinnerBuyAssetMetricAccessor); 8] = [
+        let asset_fields: [(&str, LateResolutionWinnerTradingAssetMetricAccessor); 8] = [
             ("scans", |metrics| metrics.scans),
             ("signals", |metrics| metrics.signals),
             ("no_book", |metrics| metrics.no_book),
@@ -988,11 +1162,11 @@ impl RuntimeMetrics {
             ("resolved", |metrics| metrics.resolved),
         ];
         for (name, value) in asset_fields {
-            output.push_str("# TYPE polypulse_winner_buy_asset_");
+            output.push_str("# TYPE polypulse_late_resolution_winner_trading_asset_");
             output.push_str(name);
             output.push_str("_total counter\n");
-            for asset in &snapshot.winner_buy_by_asset {
-                output.push_str("polypulse_winner_buy_asset_");
+            for asset in &snapshot.late_resolution_winner_trading_by_asset {
+                output.push_str("polypulse_late_resolution_winner_trading_asset_");
                 output.push_str(name);
                 output.push_str("_total{asset=\"");
                 output.push_str(&asset.asset.replace('\\', "\\\\").replace('"', "\\\""));
@@ -1004,24 +1178,36 @@ impl RuntimeMetrics {
         output.push_str("# TYPE polypulse_paper_net_pnl_usd gauge\npolypulse_paper_net_pnl_usd ");
         output.push_str(&(snapshot.paper_net_pnl_microusd as f64 / 1_000_000.0).to_string());
         output.push('\n');
-        output.push_str("# TYPE polypulse_winner_buy_pending gauge\npolypulse_winner_buy_pending ");
-        output.push_str(&snapshot.winner_buy_pending.to_string());
+        output.push_str("# TYPE polypulse_late_resolution_winner_trading_pending gauge\npolypulse_late_resolution_winner_trading_pending ");
+        output.push_str(&snapshot.late_resolution_winner_trading_pending.to_string());
         output.push('\n');
-        output.push_str("# TYPE polypulse_winner_buy_rest_latency_ms_max gauge\npolypulse_winner_buy_rest_latency_ms_max ");
-        output.push_str(&snapshot.winner_buy_rest_latency_ms_max.to_string());
-        output.push('\n');
+        output.push_str("# TYPE polypulse_late_resolution_winner_trading_rest_latency_ms_max gauge\npolypulse_late_resolution_winner_trading_rest_latency_ms_max ");
         output.push_str(
-            "# TYPE polypulse_winner_buy_est_pnl_usd gauge\npolypulse_winner_buy_est_pnl_usd ",
-        );
-        output.push_str(&(snapshot.winner_buy_est_pnl_microusd as f64 / 1_000_000.0).to_string());
-        output.push('\n');
-        output.push_str("# TYPE polypulse_winner_buy_realized_pnl_usd gauge\npolypulse_winner_buy_realized_pnl_usd ");
-        output.push_str(
-            &(snapshot.winner_buy_realized_pnl_microusd as f64 / 1_000_000.0).to_string(),
+            &snapshot
+                .late_resolution_winner_trading_rest_latency_ms_max
+                .to_string(),
         );
         output.push('\n');
-        output.push_str("# TYPE polypulse_winner_buy_rtds_last_observed_at_ms gauge\npolypulse_winner_buy_rtds_last_observed_at_ms ");
-        output.push_str(&snapshot.winner_buy_rtds_last_observed_at_ms.to_string());
+        output.push_str(
+            "# TYPE polypulse_late_resolution_winner_trading_est_pnl_usd gauge\npolypulse_late_resolution_winner_trading_est_pnl_usd ",
+        );
+        output.push_str(
+            &(snapshot.late_resolution_winner_trading_est_pnl_microusd as f64 / 1_000_000.0)
+                .to_string(),
+        );
+        output.push('\n');
+        output.push_str("# TYPE polypulse_late_resolution_winner_trading_realized_pnl_usd gauge\npolypulse_late_resolution_winner_trading_realized_pnl_usd ");
+        output.push_str(
+            &(snapshot.late_resolution_winner_trading_realized_pnl_microusd as f64 / 1_000_000.0)
+                .to_string(),
+        );
+        output.push('\n');
+        output.push_str("# TYPE polypulse_late_resolution_winner_trading_rtds_last_observed_at_ms gauge\npolypulse_late_resolution_winner_trading_rtds_last_observed_at_ms ");
+        output.push_str(
+            &snapshot
+                .late_resolution_winner_trading_rtds_last_observed_at_ms
+                .to_string(),
+        );
         output.push('\n');
         output.push_str("# TYPE polypulse_sdk_market_ws_last_book_at_ms gauge\npolypulse_sdk_market_ws_last_book_at_ms ");
         output.push_str(&snapshot.sdk_market_ws_last_book_at_ms.to_string());
@@ -1060,23 +1246,23 @@ mod tests {
         metrics.record_sdk_market_ws_reconnecting_transition();
         metrics.record_sdk_market_ws_recovery();
         metrics.record_sdk_market_ws_downtime(125);
-        metrics.record_winner_buy_scan();
-        metrics.record_winner_buy_asset_scan("BTC");
-        metrics.record_winner_buy_signal();
-        metrics.record_winner_buy_asset_signal("btc");
-        metrics.record_winner_buy_ws_missing_book();
-        metrics.record_winner_buy_rest_fallback();
-        metrics.record_winner_buy_rest_result(25, true);
-        metrics.record_winner_buy_rest_result(40, false);
-        metrics.record_winner_model_rejection(ModelRejection::StalePrice);
-        metrics.record_winner_buy_shadow_execution_attempt();
-        metrics.record_winner_buy_shadow_execution_fill();
-        metrics.record_winner_buy_shadow_execution_no_fill();
-        metrics.record_winner_buy_shadow_execution_failure();
-        metrics.record_winner_buy_shadow_awaiting_confirmation();
-        metrics.record_winner_buy_shadow_confirmed();
-        metrics.record_winner_buy_awaiting_confirmation();
-        metrics.set_winner_buy_pending(2);
+        metrics.record_late_resolution_winner_trading_scan();
+        metrics.record_late_resolution_winner_trading_asset_scan("BTC");
+        metrics.record_late_resolution_winner_trading_signal();
+        metrics.record_late_resolution_winner_trading_asset_signal("btc");
+        metrics.record_late_resolution_winner_trading_ws_missing_book();
+        metrics.record_late_resolution_winner_trading_rest_fallback();
+        metrics.record_late_resolution_winner_trading_rest_result(25, true);
+        metrics.record_late_resolution_winner_trading_rest_result(40, false);
+        metrics.record_late_resolution_winner_model_rejection(ModelRejection::StalePrice);
+        metrics.record_late_resolution_winner_trading_shadow_execution_attempt();
+        metrics.record_late_resolution_winner_trading_shadow_execution_fill();
+        metrics.record_late_resolution_winner_trading_shadow_execution_no_fill();
+        metrics.record_late_resolution_winner_trading_shadow_execution_failure();
+        metrics.record_late_resolution_winner_trading_shadow_awaiting_confirmation();
+        metrics.record_late_resolution_winner_trading_shadow_confirmed();
+        metrics.record_late_resolution_winner_trading_awaiting_confirmation();
+        metrics.set_late_resolution_winner_trading_pending(2);
         metrics.record_paper_result(dec!(3), dec!(2), dec!(0.4), dec!(0.5));
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot.orderbook_pairs, 1);
@@ -1100,27 +1286,60 @@ mod tests {
         assert_eq!(snapshot.sdk_market_ws_reconnecting_transitions, 1);
         assert_eq!(snapshot.sdk_market_ws_downtime_ms_total, 125);
         assert_eq!(snapshot.sdk_market_ws_downtime_ms_max, 125);
-        assert_eq!(snapshot.winner_buy_scans, 1);
-        assert_eq!(snapshot.winner_buy_signals, 1);
-        assert_eq!(snapshot.winner_buy_ws_missing_books, 1);
-        assert_eq!(snapshot.winner_buy_rest_fallbacks, 1);
-        assert_eq!(snapshot.winner_buy_rest_successes, 1);
-        assert_eq!(snapshot.winner_buy_rest_empty_books, 1);
-        assert_eq!(snapshot.winner_buy_rest_latency_ms_total, 65);
-        assert_eq!(snapshot.winner_buy_rest_latency_ms_max, 40);
-        assert_eq!(snapshot.winner_buy_by_asset.len(), 1);
-        assert_eq!(snapshot.winner_buy_by_asset[0].asset, "btc");
-        assert_eq!(snapshot.winner_buy_by_asset[0].scans, 1);
-        assert_eq!(snapshot.winner_buy_by_asset[0].signals, 1);
-        assert_eq!(snapshot.winner_buy_model_data_rejections, 1);
-        assert_eq!(snapshot.winner_buy_shadow_execution_attempts, 1);
-        assert_eq!(snapshot.winner_buy_shadow_execution_fills, 1);
-        assert_eq!(snapshot.winner_buy_shadow_execution_no_fills, 1);
-        assert_eq!(snapshot.winner_buy_shadow_execution_failures, 1);
-        assert_eq!(snapshot.winner_buy_shadow_awaiting_confirmation, 1);
-        assert_eq!(snapshot.winner_buy_shadow_confirmed, 1);
-        assert_eq!(snapshot.winner_buy_awaiting_confirmation, 1);
-        assert_eq!(snapshot.winner_buy_pending, 2);
+        assert_eq!(snapshot.late_resolution_winner_trading_scans, 1);
+        assert_eq!(snapshot.late_resolution_winner_trading_signals, 1);
+        assert_eq!(snapshot.late_resolution_winner_trading_ws_missing_books, 1);
+        assert_eq!(snapshot.late_resolution_winner_trading_rest_fallbacks, 1);
+        assert_eq!(snapshot.late_resolution_winner_trading_rest_successes, 1);
+        assert_eq!(snapshot.late_resolution_winner_trading_rest_empty_books, 1);
+        assert_eq!(
+            snapshot.late_resolution_winner_trading_rest_latency_ms_total,
+            65
+        );
+        assert_eq!(
+            snapshot.late_resolution_winner_trading_rest_latency_ms_max,
+            40
+        );
+        assert_eq!(snapshot.late_resolution_winner_trading_by_asset.len(), 1);
+        assert_eq!(
+            snapshot.late_resolution_winner_trading_by_asset[0].asset,
+            "btc"
+        );
+        assert_eq!(snapshot.late_resolution_winner_trading_by_asset[0].scans, 1);
+        assert_eq!(
+            snapshot.late_resolution_winner_trading_by_asset[0].signals,
+            1
+        );
+        assert_eq!(
+            snapshot.late_resolution_winner_trading_model_data_rejections,
+            1
+        );
+        assert_eq!(
+            snapshot.late_resolution_winner_trading_shadow_execution_attempts,
+            1
+        );
+        assert_eq!(
+            snapshot.late_resolution_winner_trading_shadow_execution_fills,
+            1
+        );
+        assert_eq!(
+            snapshot.late_resolution_winner_trading_shadow_execution_no_fills,
+            1
+        );
+        assert_eq!(
+            snapshot.late_resolution_winner_trading_shadow_execution_failures,
+            1
+        );
+        assert_eq!(
+            snapshot.late_resolution_winner_trading_shadow_awaiting_confirmation,
+            1
+        );
+        assert_eq!(snapshot.late_resolution_winner_trading_shadow_confirmed, 1);
+        assert_eq!(
+            snapshot.late_resolution_winner_trading_awaiting_confirmation,
+            1
+        );
+        assert_eq!(snapshot.late_resolution_winner_trading_pending, 2);
         assert_eq!(snapshot.paper_pairs, 1);
         assert_eq!(snapshot.paper_one_sided, 1);
         assert_eq!(snapshot.paper_net_pnl_microusd, -200_000);
@@ -1130,10 +1349,16 @@ mod tests {
         assert!(exposition.contains("polypulse_arbitrage_admission_shadow_samples_total 2"));
         assert!(exposition.contains("polypulse_sdk_market_ws_downtime_ms_max 125"));
         assert!(exposition.contains("polypulse_paper_net_pnl_usd -0.2"));
-        assert!(exposition.contains("polypulse_winner_buy_pending 2"));
-        assert!(exposition.contains("polypulse_winner_buy_shadow_execution_fills_total 1"));
-        assert!(exposition.contains("polypulse_winner_buy_shadow_confirmed_total 1"));
-        assert!(exposition.contains("polypulse_winner_buy_rest_latency_ms_max 40"));
-        assert!(exposition.contains("polypulse_winner_buy_asset_scans_total{asset=\"btc\"} 1"));
+        assert!(exposition.contains("polypulse_late_resolution_winner_trading_pending 2"));
+        assert!(exposition
+            .contains("polypulse_late_resolution_winner_trading_shadow_execution_fills_total 1"));
+        assert!(exposition
+            .contains("polypulse_late_resolution_winner_trading_shadow_confirmed_total 1"));
+        assert!(
+            exposition.contains("polypulse_late_resolution_winner_trading_rest_latency_ms_max 40")
+        );
+        assert!(exposition.contains(
+            "polypulse_late_resolution_winner_trading_asset_scans_total{asset=\"btc\"} 1"
+        ));
     }
 }

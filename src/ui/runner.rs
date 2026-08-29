@@ -71,13 +71,13 @@ fn run_dashboard(
                     }
                     let result = match action {
                         DashboardAction::ToggleStrategy(0) => {
-                            Some(controls.toggle(StrategyKind::Arbitrage))
+                            Some(controls.toggle(StrategyKind::BinaryComplementArbitrage))
                         }
                         DashboardAction::ToggleStrategy(1) => {
-                            Some(controls.toggle(StrategyKind::WinnerBuy))
+                            Some(controls.toggle(StrategyKind::LateResolutionWinnerTrading))
                         }
                         DashboardAction::ToggleStrategy(2) => {
-                            Some(controls.toggle(StrategyKind::CopyTrading))
+                            Some(controls.toggle(StrategyKind::WalletCopyTrading))
                         }
                         DashboardAction::PauseAll => {
                             controls.pause_all();
@@ -117,9 +117,9 @@ fn run_dashboard(
                     }
                     let mut app = state.lock().expect("dashboard lock");
                     app.set_strategy_states(
-                        controls.state(StrategyKind::Arbitrage),
-                        controls.state(StrategyKind::WinnerBuy),
-                        controls.state(StrategyKind::CopyTrading),
+                        controls.state(StrategyKind::BinaryComplementArbitrage),
+                        controls.state(StrategyKind::LateResolutionWinnerTrading),
+                        controls.state(StrategyKind::WalletCopyTrading),
                         controls.blocked_reason(),
                     );
                 }
@@ -143,8 +143,8 @@ fn run_dashboard(
 
 fn strategy_name(strategy: StrategyKind) -> &'static str {
     match strategy {
-        StrategyKind::Arbitrage => "Spread Arbitrage",
-        StrategyKind::WinnerBuy => "Winner Buy",
-        StrategyKind::CopyTrading => "Copy Trading",
+        StrategyKind::BinaryComplementArbitrage => "Binary Complement Arbitrage",
+        StrategyKind::LateResolutionWinnerTrading => "Late-Resolution Winner Trading",
+        StrategyKind::WalletCopyTrading => "Wallet-Copy Trading",
     }
 }

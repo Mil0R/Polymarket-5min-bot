@@ -159,20 +159,20 @@ pub struct DashboardState {
     pub total_trades: u32,
     pub successful_trades: u32,
     pub best_trade: f64,
-    /// Window-end winner-buy (strategy B) stats.
-    pub winner_buy_fills: u64,
-    pub winner_buy_scans: u64,
-    pub winner_buy_signals: u64,
-    pub winner_buy_attempts: u64,
-    pub winner_buy_model_rejections: u64,
-    pub winner_buy_awaiting_confirmation: u64,
-    pub winner_buy_pending: u64,
-    pub winner_buy_resolved: u64,
-    pub winner_buy_redeemed: u64,
-    pub winner_buy_wins: u64,
-    pub winner_buy_losses: u64,
-    pub winner_buy_est_pnl: f64,
-    pub winner_buy_realized_pnl: f64,
+    /// Window-end late-resolution-winner-trading (strategy B) stats.
+    pub late_resolution_winner_trading_fills: u64,
+    pub late_resolution_winner_trading_scans: u64,
+    pub late_resolution_winner_trading_signals: u64,
+    pub late_resolution_winner_trading_attempts: u64,
+    pub late_resolution_winner_trading_model_rejections: u64,
+    pub late_resolution_winner_trading_awaiting_confirmation: u64,
+    pub late_resolution_winner_trading_pending: u64,
+    pub late_resolution_winner_trading_resolved: u64,
+    pub late_resolution_winner_trading_redeemed: u64,
+    pub late_resolution_winner_trading_wins: u64,
+    pub late_resolution_winner_trading_losses: u64,
+    pub late_resolution_winner_trading_est_pnl: f64,
+    pub late_resolution_winner_trading_realized_pnl: f64,
     pub pnl_sparkline: Vec<u64>,
     pub window_pnl_sparkline: Vec<u64>,
     pub exposure_sparkline: Vec<u64>,
@@ -184,14 +184,14 @@ pub struct DashboardState {
     pub connected: bool,
     pub execution_mode: String,
     pub selected_strategy: usize,
-    pub arbitrage_state: StrategyDisplayState,
-    pub winner_buy_state: StrategyDisplayState,
-    pub copy_trading_state: StrategyDisplayState,
+    pub binary_complement_arbitrage_state: StrategyDisplayState,
+    pub late_resolution_winner_trading_state: StrategyDisplayState,
+    pub wallet_copy_trading_state: StrategyDisplayState,
     pub strategy_message: String,
-    pub arbitrage_budget: f64,
-    pub winner_buy_budget: f64,
-    pub winner_buy_exposure: f64,
-    pub copy_trading_budget: f64,
+    pub binary_complement_arbitrage_budget: f64,
+    pub late_resolution_winner_trading_budget: f64,
+    pub late_resolution_winner_trading_exposure: f64,
+    pub wallet_copy_trading_budget: f64,
     pub copy_whitelist_wallets: u64,
     pub copy_signals_seen: u64,
     pub copy_signals_rejected: u64,
@@ -270,19 +270,19 @@ impl DashboardState {
             total_trades: 0,
             successful_trades: 0,
             best_trade: 0.0,
-            winner_buy_fills: 0,
-            winner_buy_scans: 0,
-            winner_buy_signals: 0,
-            winner_buy_attempts: 0,
-            winner_buy_model_rejections: 0,
-            winner_buy_awaiting_confirmation: 0,
-            winner_buy_pending: 0,
-            winner_buy_resolved: 0,
-            winner_buy_redeemed: 0,
-            winner_buy_wins: 0,
-            winner_buy_losses: 0,
-            winner_buy_est_pnl: 0.0,
-            winner_buy_realized_pnl: 0.0,
+            late_resolution_winner_trading_fills: 0,
+            late_resolution_winner_trading_scans: 0,
+            late_resolution_winner_trading_signals: 0,
+            late_resolution_winner_trading_attempts: 0,
+            late_resolution_winner_trading_model_rejections: 0,
+            late_resolution_winner_trading_awaiting_confirmation: 0,
+            late_resolution_winner_trading_pending: 0,
+            late_resolution_winner_trading_resolved: 0,
+            late_resolution_winner_trading_redeemed: 0,
+            late_resolution_winner_trading_wins: 0,
+            late_resolution_winner_trading_losses: 0,
+            late_resolution_winner_trading_est_pnl: 0.0,
+            late_resolution_winner_trading_realized_pnl: 0.0,
             pnl_sparkline: vec![2, 3, 3, 4, 5, 6, 5, 7, 8, 9, 10, 11],
             window_pnl_sparkline: vec![1, 2, 2, 3, 4, 5, 4, 6, 7, 8],
             exposure_sparkline: vec![3, 4, 5, 4, 6, 5, 7, 6, 8, 7],
@@ -293,14 +293,14 @@ impl DashboardState {
             connected: false,
             execution_mode: "LIVE".into(),
             selected_strategy: 0,
-            arbitrage_state: StrategyDisplayState::Blocked,
-            winner_buy_state: StrategyDisplayState::Unavailable,
-            copy_trading_state: StrategyDisplayState::Unavailable,
+            binary_complement_arbitrage_state: StrategyDisplayState::Blocked,
+            late_resolution_winner_trading_state: StrategyDisplayState::Unavailable,
+            wallet_copy_trading_state: StrategyDisplayState::Unavailable,
             strategy_message: "initializing".into(),
-            arbitrage_budget: exposure_limit,
-            winner_buy_budget: 0.0,
-            winner_buy_exposure: 0.0,
-            copy_trading_budget: 0.0,
+            binary_complement_arbitrage_budget: exposure_limit,
+            late_resolution_winner_trading_budget: 0.0,
+            late_resolution_winner_trading_exposure: 0.0,
+            wallet_copy_trading_budget: 0.0,
             copy_whitelist_wallets: 0,
             copy_signals_seen: 0,
             copy_signals_rejected: 0,
@@ -644,27 +644,34 @@ impl DashboardState {
         self.push_event(format!("❌ {symbol} failed: {err}"));
     }
 
-    /// Strategy B: a winner-buy paper fill was recorded.
-    pub fn record_winner_buy_fill(&mut self, est_pnl: f64) {
-        self.winner_buy_fills = self.winner_buy_fills.saturating_add(1);
-        self.winner_buy_est_pnl += est_pnl;
-        self.push_event(format!("🎯 Winner-buy filled | est +${est_pnl:.2}"));
+    /// Strategy B: a late-resolution-winner-trading paper fill was recorded.
+    pub fn record_late_resolution_winner_trading_fill(&mut self, est_pnl: f64) {
+        self.late_resolution_winner_trading_fills =
+            self.late_resolution_winner_trading_fills.saturating_add(1);
+        self.late_resolution_winner_trading_est_pnl += est_pnl;
+        self.push_event(format!(
+            "🎯 Late-Resolution Winner Trading filled | est +${est_pnl:.2}"
+        ));
     }
 
-    /// Strategy B: a paper winner-buy position settled against the real market.
-    pub fn record_winner_buy_settlement(&mut self, pnl: f64, won: bool) {
+    /// Strategy B: a paper late-resolution-winner-trading position settled against the real market.
+    pub fn record_late_resolution_winner_trading_settlement(&mut self, pnl: f64, won: bool) {
         if won {
-            self.winner_buy_wins = self.winner_buy_wins.saturating_add(1);
+            self.late_resolution_winner_trading_wins =
+                self.late_resolution_winner_trading_wins.saturating_add(1);
         } else {
-            self.winner_buy_losses = self.winner_buy_losses.saturating_add(1);
+            self.late_resolution_winner_trading_losses =
+                self.late_resolution_winner_trading_losses.saturating_add(1);
         }
-        self.winner_buy_realized_pnl += pnl;
+        self.late_resolution_winner_trading_realized_pnl += pnl;
         let icon = if won { "✅" } else { "❌" };
-        self.push_event(format!("🏁 Winner-buy settled {icon} ${pnl:.2}"));
+        self.push_event(format!(
+            "🏁 Late-Resolution Winner Trading settled {icon} ${pnl:.2}"
+        ));
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn set_winner_buy_funnel(
+    pub fn set_late_resolution_winner_trading_funnel(
         &mut self,
         scans: u64,
         signals: u64,
@@ -675,14 +682,14 @@ impl DashboardState {
         resolved: u64,
         redeemed: u64,
     ) {
-        self.winner_buy_scans = scans;
-        self.winner_buy_signals = signals;
-        self.winner_buy_attempts = attempts;
-        self.winner_buy_model_rejections = model_rejections;
-        self.winner_buy_awaiting_confirmation = awaiting_confirmation;
-        self.winner_buy_pending = pending;
-        self.winner_buy_resolved = resolved;
-        self.winner_buy_redeemed = redeemed;
+        self.late_resolution_winner_trading_scans = scans;
+        self.late_resolution_winner_trading_signals = signals;
+        self.late_resolution_winner_trading_attempts = attempts;
+        self.late_resolution_winner_trading_model_rejections = model_rejections;
+        self.late_resolution_winner_trading_awaiting_confirmation = awaiting_confirmation;
+        self.late_resolution_winner_trading_pending = pending;
+        self.late_resolution_winner_trading_resolved = resolved;
+        self.late_resolution_winner_trading_redeemed = redeemed;
     }
 
     pub fn set_execution_mode(&mut self, mode: impl Into<String>) {
@@ -692,28 +699,33 @@ impl DashboardState {
     pub fn set_strategy_states(
         &mut self,
         arbitrage: StrategyDisplayState,
-        winner_buy: StrategyDisplayState,
-        copy_trading: StrategyDisplayState,
+        late_resolution_winner_trading: StrategyDisplayState,
+        wallet_copy_trading: StrategyDisplayState,
         message: impl Into<String>,
     ) {
-        self.arbitrage_state = arbitrage;
-        self.winner_buy_state = winner_buy;
-        self.copy_trading_state = copy_trading;
+        self.binary_complement_arbitrage_state = arbitrage;
+        self.late_resolution_winner_trading_state = late_resolution_winner_trading;
+        self.wallet_copy_trading_state = wallet_copy_trading;
         self.strategy_message = message.into();
     }
 
-    pub fn set_strategy_budgets(&mut self, arbitrage: f64, winner_buy: f64, copy: f64) {
-        self.arbitrage_budget = arbitrage;
-        self.winner_buy_budget = winner_buy;
-        self.copy_trading_budget = copy;
+    pub fn set_strategy_budgets(
+        &mut self,
+        arbitrage: f64,
+        late_resolution_winner_trading: f64,
+        copy: f64,
+    ) {
+        self.binary_complement_arbitrage_budget = arbitrage;
+        self.late_resolution_winner_trading_budget = late_resolution_winner_trading;
+        self.wallet_copy_trading_budget = copy;
     }
 
-    pub fn set_winner_buy_exposure(&mut self, exposure: f64) {
-        self.winner_buy_exposure = exposure;
+    pub fn set_late_resolution_winner_trading_exposure(&mut self, exposure: f64) {
+        self.late_resolution_winner_trading_exposure = exposure;
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn set_copy_trading_metrics(
+    pub fn set_wallet_copy_trading_metrics(
         &mut self,
         whitelist_wallets: u64,
         signals_seen: u64,

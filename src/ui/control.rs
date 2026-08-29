@@ -2,13 +2,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use crate::copy_trading::CopyTradingRuntime;
+use crate::wallet_copy_trading::WalletCopyTradingRuntime;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StrategyKind {
-    Arbitrage,
-    WinnerBuy,
-    CopyTrading,
+    BinaryComplementArbitrage,
+    LateResolutionWinnerTrading,
+    WalletCopyTrading,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,11 +37,11 @@ struct PendingConfirmation {
 }
 
 pub struct StrategyControls {
-    arbitrage_enabled: AtomicBool,
-    winner_buy_enabled: AtomicBool,
-    winner_buy_available: bool,
-    copy_trading_available: bool,
-    copy_runtime: Option<CopyTradingRuntime>,
+    binary_complement_arbitrage_enabled: AtomicBool,
+    late_resolution_winner_trading_enabled: AtomicBool,
+    late_resolution_winner_trading_available: bool,
+    wallet_copy_trading_available: bool,
+    copy_runtime: Option<WalletCopyTradingRuntime>,
     live_mode: bool,
     resume_allowed: AtomicBool,
     blocked_reason: Mutex<String>,
@@ -50,18 +50,22 @@ pub struct StrategyControls {
 
 impl StrategyControls {
     pub fn new(
-        arbitrage_enabled: bool,
-        winner_buy_enabled: bool,
-        winner_buy_available: bool,
-        copy_trading_available: bool,
-        copy_runtime: Option<CopyTradingRuntime>,
+        binary_complement_arbitrage_enabled: bool,
+        late_resolution_winner_trading_enabled: bool,
+        late_resolution_winner_trading_available: bool,
+        wallet_copy_trading_available: bool,
+        copy_runtime: Option<WalletCopyTradingRuntime>,
         live_mode: bool,
     ) -> Self {
         Self {
-            arbitrage_enabled: AtomicBool::new(arbitrage_enabled),
-            winner_buy_enabled: AtomicBool::new(winner_buy_enabled && winner_buy_available),
-            winner_buy_available,
-            copy_trading_available,
+            binary_complement_arbitrage_enabled: AtomicBool::new(
+                binary_complement_arbitrage_enabled,
+            ),
+            late_resolution_winner_trading_enabled: AtomicBool::new(
+                late_resolution_winner_trading_enabled && late_resolution_winner_trading_available,
+            ),
+            late_resolution_winner_trading_available,
+            wallet_copy_trading_available,
             copy_runtime,
             live_mode,
             resume_allowed: AtomicBool::new(false),
@@ -70,18 +74,20 @@ impl StrategyControls {
         }
     }
 
-    pub fn arbitrage_enabled(&self) -> bool {
-        self.arbitrage_enabled.load(Ordering::Relaxed)
+    pub fn binary_complement_arbitrage_enabled(&self) -> bool {
+        self.binary_complement_arbitrage_enabled
+            .load(Ordering::Relaxed)
     }
 
-    pub fn winner_buy_enabled(&self) -> bool {
-        self.winner_buy_enabled.load(Ordering::Relaxed)
+    pub fn late_resolution_winner_trading_enabled(&self) -> bool {
+        self.late_resolution_winner_trading_enabled
+            .load(Ordering::Relaxed)
     }
 
-    pub fn copy_trading_enabled(&self) -> bool {
+    pub fn wallet_copy_trading_enabled(&self) -> bool {
         self.copy_runtime
             .as_ref()
-            .is_some_and(CopyTradingRuntime::entry_enabled)
+            .is_some_and(WalletCopyTradingRuntime::entry_enabled)
     }
 
     pub fn set_resume_allowed(&self, allowed: bool, reason: impl Into<String>) {
@@ -97,13 +103,17 @@ impl StrategyControls {
     }
 
     pub fn state(&self, strategy: StrategyKind) -> StrategyDisplayState {
-        if matches!(strategy, StrategyKind::WinnerBuy) && !self.winner_buy_available {
+        if matches!(strategy, StrategyKind::LateResolutionWinnerTrading)
+            && !self.late_resolution_winner_trading_available
+        {
             return StrategyDisplayState::Unavailable;
         }
-        if matches!(strategy, StrategyKind::CopyTrading) && !self.copy_trading_available {
+        if matches!(strategy, StrategyKind::WalletCopyTrading)
+            && !self.wallet_copy_trading_available
+        {
             return StrategyDisplayState::Unavailable;
         }
-        if matches!(strategy, StrategyKind::CopyTrading) {
+        if matches!(strategy, StrategyKind::WalletCopyTrading) {
             let Some(runtime) = &self.copy_runtime else {
                 return StrategyDisplayState::Unavailable;
             };
@@ -117,9 +127,11 @@ impl StrategyControls {
             };
         }
         let enabled = match strategy {
-            StrategyKind::Arbitrage => self.arbitrage_enabled(),
-            StrategyKind::WinnerBuy => self.winner_buy_enabled(),
-            StrategyKind::CopyTrading => self.copy_trading_enabled(),
+            StrategyKind::BinaryComplementArbitrage => self.binary_complement_arbitrage_enabled(),
+            StrategyKind::LateResolutionWinnerTrading => {
+                self.late_resolution_winner_trading_enabled()
+            }
+            StrategyKind::WalletCopyTrading => self.wallet_copy_trading_enabled(),
         };
         if !enabled {
             StrategyDisplayState::Paused
@@ -131,18 +143,27 @@ impl StrategyControls {
     }
 
     pub fn toggle(&self, strategy: StrategyKind) -> ControlResult {
-        if matches!(strategy, StrategyKind::WinnerBuy) && !self.winner_buy_available {
-            return ControlResult::Rejected("Winner Buy dependencies are unavailable".into());
-        }
-        if matches!(strategy, StrategyKind::CopyTrading) && !self.copy_trading_available {
+        if matches!(strategy, StrategyKind::LateResolutionWinnerTrading)
+            && !self.late_resolution_winner_trading_available
+        {
             return ControlResult::Rejected(
-                "Copy Trading is available only when its PAPER service is initialized".into(),
+                "Late-Resolution Winner Trading dependencies are unavailable".into(),
+            );
+        }
+        if matches!(strategy, StrategyKind::WalletCopyTrading)
+            && !self.wallet_copy_trading_available
+        {
+            return ControlResult::Rejected(
+                "Wallet-Copy Trading is available only when its PAPER service is initialized"
+                    .into(),
             );
         }
         let enabled = match strategy {
-            StrategyKind::Arbitrage => self.arbitrage_enabled(),
-            StrategyKind::WinnerBuy => self.winner_buy_enabled(),
-            StrategyKind::CopyTrading => self.copy_trading_enabled(),
+            StrategyKind::BinaryComplementArbitrage => self.binary_complement_arbitrage_enabled(),
+            StrategyKind::LateResolutionWinnerTrading => {
+                self.late_resolution_winner_trading_enabled()
+            }
+            StrategyKind::WalletCopyTrading => self.wallet_copy_trading_enabled(),
         };
         if enabled {
             self.set_enabled(strategy, false);
@@ -151,13 +172,15 @@ impl StrategyControls {
                 enabled: false,
             };
         }
-        if matches!(strategy, StrategyKind::CopyTrading) {
+        if matches!(strategy, StrategyKind::WalletCopyTrading) {
             let ready = self.copy_runtime.as_ref().is_some_and(|runtime| {
                 let snapshot = runtime.snapshot();
                 snapshot.initialized && snapshot.healthy
             });
             if !ready {
-                return ControlResult::Rejected("Copy Trading service is not healthy".into());
+                return ControlResult::Rejected(
+                    "Wallet-Copy Trading service is not healthy".into(),
+                );
             }
             self.set_enabled(strategy, true);
             return ControlResult::Changed {
@@ -208,8 +231,10 @@ impl StrategyControls {
     }
 
     pub fn pause_all(&self) {
-        self.arbitrage_enabled.store(false, Ordering::Relaxed);
-        self.winner_buy_enabled.store(false, Ordering::Relaxed);
+        self.binary_complement_arbitrage_enabled
+            .store(false, Ordering::Relaxed);
+        self.late_resolution_winner_trading_enabled
+            .store(false, Ordering::Relaxed);
         if let Some(runtime) = &self.copy_runtime {
             runtime.set_entry_enabled(false);
         }
@@ -221,9 +246,13 @@ impl StrategyControls {
 
     fn set_enabled(&self, strategy: StrategyKind, enabled: bool) {
         match strategy {
-            StrategyKind::Arbitrage => self.arbitrage_enabled.store(enabled, Ordering::Relaxed),
-            StrategyKind::WinnerBuy => self.winner_buy_enabled.store(enabled, Ordering::Relaxed),
-            StrategyKind::CopyTrading => {
+            StrategyKind::BinaryComplementArbitrage => self
+                .binary_complement_arbitrage_enabled
+                .store(enabled, Ordering::Relaxed),
+            StrategyKind::LateResolutionWinnerTrading => self
+                .late_resolution_winner_trading_enabled
+                .store(enabled, Ordering::Relaxed),
+            StrategyKind::WalletCopyTrading => {
                 if let Some(runtime) = &self.copy_runtime {
                     runtime.set_entry_enabled(enabled);
                 }
@@ -238,33 +267,34 @@ mod tests {
 
     #[test]
     fn dry_run_toggles_immediately_and_pause_all_is_fail_closed() {
-        let runtime = CopyTradingRuntime::new(std::sync::Arc::new(AtomicBool::new(false)), true);
+        let runtime =
+            WalletCopyTradingRuntime::new(std::sync::Arc::new(AtomicBool::new(false)), true);
         let controls = StrategyControls::new(true, true, true, true, Some(runtime), false);
         controls.set_resume_allowed(true, "ready");
         assert!(matches!(
-            controls.toggle(StrategyKind::WinnerBuy),
+            controls.toggle(StrategyKind::LateResolutionWinnerTrading),
             ControlResult::Changed { enabled: false, .. }
         ));
         assert!(matches!(
-            controls.toggle(StrategyKind::WinnerBuy),
+            controls.toggle(StrategyKind::LateResolutionWinnerTrading),
             ControlResult::Changed { enabled: true, .. }
         ));
         controls.pause_all();
-        assert!(!controls.arbitrage_enabled());
-        assert!(!controls.winner_buy_enabled());
-        assert!(!controls.copy_trading_enabled());
+        assert!(!controls.binary_complement_arbitrage_enabled());
+        assert!(!controls.late_resolution_winner_trading_enabled());
+        assert!(!controls.wallet_copy_trading_enabled());
     }
 
     #[test]
     fn live_resume_requires_confirmation_and_health() {
         let controls = StrategyControls::new(false, false, true, false, None, true);
         assert!(matches!(
-            controls.toggle(StrategyKind::Arbitrage),
+            controls.toggle(StrategyKind::BinaryComplementArbitrage),
             ControlResult::Rejected(_)
         ));
         controls.set_resume_allowed(true, "ready");
         assert!(matches!(
-            controls.toggle(StrategyKind::Arbitrage),
+            controls.toggle(StrategyKind::BinaryComplementArbitrage),
             ControlResult::ConfirmationRequired { .. }
         ));
         assert!(matches!(

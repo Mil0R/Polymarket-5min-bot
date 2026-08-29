@@ -7,11 +7,11 @@
 
 | 策略 | 独立可执行文件 | 第一阶段 PolyBacktest | 第二阶段真实数据 dry-run | 第三阶段 TUI 实盘 |
 |---|---|---:|---:|---:|
-| Spread Arbitrage | `spread_arbitrage` | 支持 | 支持 | `polypulse`，通过准入后 |
-| Winner Buy | `winner_buy` | 支持，但受 TWAP/费用字段限制 | 支持 | `polypulse`，通过准入后 |
-| Copy Trading | `copy_trader` | 不支持：数据没有钱包逐笔交易、持仓与跟随时延 | 支持 | 当前仍禁用，等待账户级共享资金/订单归属账本 |
-| Maker Liquidity | `maker_liquidity` | 不支持：数据没有历史奖励参数、队列位置及可靠逐笔成交 | `scan` / `shadow` | 当前为只读研究策略，没有真实下单器 |
-| Bayesian Arbitrage | `bayesian_arb` | 不支持：BTC 5m 数据没有父子市场关系图和同步跨市场盘口 | `scan` / `shadow` | 当前为只读研究策略，没有真实下单器 |
+| Binary Complement Arbitrage | `binary_complement_arbitrage` | 支持 | 支持 | `polypulse`，通过准入后 |
+| Late-Resolution Winner Trading | `late_resolution_winner_trading` | 支持，但受 TWAP/费用字段限制 | 支持 | `polypulse`，通过准入后 |
+| Wallet-Copy Trading | `wallet_copy_trading` | 不支持：数据没有钱包逐笔交易、持仓与跟随时延 | 支持 | 当前仍禁用，等待账户级共享资金/订单归属账本 |
+| Market Making | `market_making` | 不支持：数据没有历史奖励参数、队列位置及可靠逐笔成交 | `scan` / `shadow` | 当前为只读研究策略，没有真实下单器 |
+| Cross-Market Probability Arbitrage | `cross_market_probability_arbitrage` | 不支持：BTC 5m 数据没有父子市场关系图和同步跨市场盘口 | `scan` / `shadow` | 当前为只读研究策略，没有真实下单器 |
 
 “不支持第一阶段”不代表策略无效，只表示用当前 PolyBacktest 数据回放会产生错误的
 精确感。这些策略直接从第二阶段开始，以真实公开行情做无账户写入的 shadow/PAPER 验证。
@@ -21,11 +21,11 @@
 每个策略均可单独编译，不需要编译其他策略 binary：
 
 ```bash
-cargo build --release --bin spread_arbitrage
-cargo build --release --bin winner_buy
-cargo build --release --bin copy_trader
-cargo build --release --bin maker_liquidity
-cargo build --release --bin bayesian_arb
+cargo build --release --bin binary_complement_arbitrage
+cargo build --release --bin late_resolution_winner_trading
+cargo build --release --bin wallet_copy_trading
+cargo build --release --bin market_making
+cargo build --release --bin cross_market_probability_arbitrage
 
 # 数据工具和最终 TUI 分开编译
 cargo build --release --bin polybacktest_downloader
@@ -38,25 +38,25 @@ cargo build --release --bin polypulse
 
 ```bash
 ./target/release/polybacktest_downloader sync
-./target/release/spread_arbitrage backtest
-./target/release/winner_buy backtest
+./target/release/binary_complement_arbitrage backtest
+./target/release/late_resolution_winner_trading backtest
 ```
 
 回放只以只读方式打开 SQLite，不初始化网络客户端、签名器或账户。报告使用时间戳文件名：
 
 ```text
-results/backtests/spread-arbitrage/run-YYYYMMDDTHHMMSSZ-<uuid>.json
-results/backtests/winner-buy/run-YYYYMMDDTHHMMSSZ-<uuid>.json
+results/backtests/binary-complement-arbitrage/run-YYYYMMDDTHHMMSSZ-<uuid>.json
+results/backtests/late-resolution-winner-trading/run-YYYYMMDDTHHMMSSZ-<uuid>.json
 ```
 
 报告同时包含候选、模型准入、模拟成交、胜负、毛收益、费用、净收益以及按原因聚合的
 `rejections` 漏斗，便于不同参数轮次做回归对比。
 
-Spread 回放规则：在发现价差后等待 `BACKTEST_EXECUTION_DELAY_MS`，使用第一条达到延迟
+Binary Complement Arbitrage 回放规则：在发现价差后等待 `BACKTEST_EXECUTION_DELAY_MS`，使用第一条达到延迟
 的快照，按完整 ask 深度、流动性折扣、两腿费用和最小净利润撮合；同一五分钟市场最多
 建立一个非重叠仓位。
 
-Winner 回放规则：只接纳 `coin_twap_source=chainlink_twap`，复用生产模型的开盘参考、
+Late-Resolution Winner Trading 回放规则：只接纳 `coin_twap_source=chainlink_twap`，复用生产模型的开盘参考、
 数据新鲜度、波动率、反转边界、spread、深度和净 EV 检查；必须由不同的 TWAP
 observation 连续确认，再在延迟后的完整盘口撮合，并用市场真实 winner 结算。
 
@@ -75,14 +75,14 @@ observation 连续确认，再在延迟后的完整盘口撮合，并用市场�
 ## 第二阶段：服务器真实行情 dry-run
 
 ```bash
-./target/release/spread_arbitrage dry-run
-./target/release/winner_buy dry-run
-./target/release/copy_trader
-./target/release/maker_liquidity shadow
-./target/release/bayesian_arb shadow
+./target/release/binary_complement_arbitrage dry-run
+./target/release/late_resolution_winner_trading dry-run
+./target/release/wallet_copy_trading
+./target/release/market_making shadow
+./target/release/cross_market_probability_arbitrage shadow
 ```
 
-`spread_arbitrage` 和 `winner_buy` 的独立入口会在进程内强制：
+`binary_complement_arbitrage` 和 `late_resolution_winner_trading` 的独立入口会在进程内强制：
 
 ```text
 DRY_RUN=true
@@ -91,8 +91,9 @@ TUI_ENABLED=false
 关闭其他策略、Merge 和 Wind-down
 ```
 
-即使服务器 `.env` 写成 live，独立入口也不能下真实订单。`copy_trader` 若发现
-`COPY_DRY_RUN=false` 会拒绝启动。Maker 和 Bayesian binary 本身不包含签名和订单写入。
+即使服务器 `.env` 写成 live，独立入口也不能下真实订单。`wallet_copy_trading` 若发现
+`COPY_DRY_RUN=false` 会拒绝启动。Market Making 和 Cross-Market Probability Arbitrage
+binary 本身不包含签名和订单写入。
 
 每轮调整应使用新的日志/结果边界，至少覆盖正常窗口、重连、API 限速、异常退出恢复、
 跨日和终局结算。建议先运行 24 小时定位漏斗，再运行 7–14 天验证参数稳定性。每轮只把

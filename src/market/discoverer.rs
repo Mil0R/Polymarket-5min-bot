@@ -35,7 +35,7 @@ pub struct MarketInfo {
     pub crypto_symbol: String,
     pub neg_risk: bool,
     /// Reference (last-trade) prices for (YES, NO) from gamma, captured at
-    /// subscription time. Kept for diagnostics; direction for winner-buy comes
+    /// subscription time. Kept for diagnostics; direction for late-resolution-winner-trading comes
     /// from the live price feed instead (gamma prices stop updating on
     /// low-volume windows).
     #[allow(dead_code)]
@@ -131,7 +131,7 @@ impl MarketDiscoverer {
     /// Fetch closed markets by slug for terminal settlement checks.
     /// Gamma excludes closed markets from the unfiltered slug query, which can
     /// otherwise turn a successful empty response into a permanently unresolved
-    /// Winner Buy position/evaluation.
+    /// Late-Resolution Winner Trading position/evaluation.
     pub async fn fetch_closed_markets_by_slug(&self, slugs: Vec<String>) -> Result<Vec<Market>> {
         retry_read(ReadRetryPolicy::default(), || {
             self.gamma_transport.markets(slugs.clone(), Some(true))

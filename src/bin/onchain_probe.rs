@@ -2,7 +2,7 @@
 //! Not intended for production — run once, then delete.
 use anyhow::Result;
 use chrono::Utc;
-use polypulse::copy_trading::OnChainTradeFeed;
+use polypulse::wallet_copy_trading::OnChainTradeFeed;
 
 #[tokio::main]
 async fn main() -> Result<()> {

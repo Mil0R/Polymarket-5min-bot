@@ -110,7 +110,7 @@ impl PaperTradingEngine {
         )
     }
 
-    /// Apply persisted Winner Buy history before new paper orders are admitted.
+    /// Apply persisted Late-Resolution Winner Trading history before new paper orders are admitted.
     pub fn restore_winner_history(
         &self,
         pending_cost: Decimal,
@@ -127,7 +127,7 @@ impl PaperTradingEngine {
         snapshot(&self.settings, &ledger)
     }
 
-    /// Resolve one open Winner Buy position and release its locked paper cash.
+    /// Resolve one open Late-Resolution Winner Trading position and release its locked paper cash.
     pub fn settle_winner(&self, cost: Decimal, payout: Decimal) -> PaperSnapshot {
         let mut ledger = self.ledger.lock().expect("paper ledger lock poisoned");
         let cost = cost.max(dec!(0));

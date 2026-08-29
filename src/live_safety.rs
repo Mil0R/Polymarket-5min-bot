@@ -66,9 +66,9 @@ impl LiveSafetyGuard {
     }
 
     /// Apply the same canary notional and frequency limits to a single-leg
-    /// Winner Buy before it can write to the account.
+    /// Late-Resolution Winner Trading before it can write to the account.
     pub fn try_start_winner(&self, window: i64, planned_cost: Decimal) -> Result<(), String> {
-        self.try_start_notional(window, planned_cost, "winner-buy")
+        self.try_start_notional(window, planned_cost, "late-resolution-winner-trading")
     }
 
     fn try_start_notional(
@@ -156,7 +156,7 @@ impl LiveSafetyGuard {
         state.loss_budget_used += cost.max(dec!(0));
         if self.policy.enabled && state.loss_budget_used >= self.policy.max_loss_budget {
             let reason = format!(
-                "canary loss budget {} reached limit {} after winner-buy settlement",
+                "canary loss budget {} reached limit {} after late-resolution-winner-trading settlement",
                 state.loss_budget_used, self.policy.max_loss_budget
             );
             trip_locked(&mut state, &reason);
@@ -309,7 +309,7 @@ mod tests {
     }
 
     #[test]
-    fn winner_buy_uses_canary_notional_and_loss_budget() {
+    fn late_resolution_winner_trading_uses_canary_notional_and_loss_budget() {
         let guard = LiveSafetyGuard::new(policy());
         assert!(guard.try_start_winner(1, dec!(2)).is_ok());
         assert!(guard.try_start_winner(1, dec!(1)).is_err());
