@@ -1,18 +1,71 @@
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use fs2::FileExt;
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use reqwest::{StatusCode, Url};
 use rusqlite::{params, Connection, Transaction};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const SCHEMA_VERSION: i64 = 1;
 const HISTORY_WINDOW_SAFETY_MS: i64 = 5 * 60 * 1000;
+static ACTIVE_PROGRESS: OnceLock<Mutex<Option<ProgressBar>>> = OnceLock::new();
+
+struct ConsoleProgress {
+    bar: ProgressBar,
+    interactive: bool,
+}
+
+impl ConsoleProgress {
+    fn new(len: u64) -> Result<Self> {
+        let interactive = std::io::stdout().is_terminal();
+        let bar = if interactive {
+            ProgressBar::with_draw_target(Some(len), ProgressDrawTarget::stdout_with_hz(10))
+        } else {
+            ProgressBar::hidden()
+        };
+        bar.set_style(
+            ProgressStyle::with_template(
+                "{spinner:.green} [{elapsed_precise}] [{bar:36.cyan/blue}] {pos}/{len} {msg}",
+            )?
+            .progress_chars("=>-"),
+        );
+        if interactive {
+            let mut active = ACTIVE_PROGRESS
+                .get_or_init(|| Mutex::new(None))
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *active = Some(bar.clone());
+        }
+        Ok(Self { bar, interactive })
+    }
+}
+
+impl std::ops::Deref for ConsoleProgress {
+    type Target = ProgressBar;
+
+    fn deref(&self) -> &Self::Target {
+        &self.bar
+    }
+}
+
+impl Drop for ConsoleProgress {
+    fn drop(&mut self) {
+        if self.interactive {
+            let mut active = ACTIVE_PROGRESS
+                .get_or_init(|| Mutex::new(None))
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            active.take();
+        }
+        self.bar.finish_and_clear();
+    }
+}
 
 #[derive(Debug, Clone)]
 struct Config {
@@ -826,13 +879,7 @@ impl Downloader {
                 self.config.database_file.display()
             ),
         );
-        let progress = ProgressBar::new(pending.len() as u64);
-        progress.set_style(
-            ProgressStyle::with_template(
-                "{spinner:.green} [{elapsed_precise}] [{bar:36.cyan/blue}] {pos}/{len} {msg}",
-            )?
-            .progress_chars("=>-"),
-        );
+        let progress = ConsoleProgress::new(pending.len() as u64)?;
         let mut summary = SyncSummary {
             discovered: discovered.len(),
             ..SyncSummary::default()
@@ -887,7 +934,7 @@ impl Downloader {
                 ),
             );
         }
-        progress.finish_and_clear();
+        drop(progress);
         Ok(summary)
     }
 
@@ -1065,7 +1112,17 @@ fn timestamp() -> String {
 }
 
 fn log_line(level: &str, message: impl std::fmt::Display) {
-    println!("{} {level:<5} {message}", timestamp());
+    let rendered = format!("{} {level:<5} {message}", timestamp());
+    let progress = ACTIVE_PROGRESS
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    if let Some(progress) = progress {
+        progress.println(rendered);
+    } else {
+        println!("{rendered}");
+    }
 }
 
 fn human_bytes(bytes: u64) -> String {
