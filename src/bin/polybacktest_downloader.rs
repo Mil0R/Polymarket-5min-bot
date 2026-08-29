@@ -12,13 +12,19 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const SCHEMA_VERSION: i64 = 1;
+const HISTORY_WINDOW_SAFETY_MS: i64 = 5 * 60 * 1000;
 
 #[derive(Debug, Clone)]
 struct Config {
     api_key: String,
     api_url: String,
     coin: String,
+    coins: Vec<String>,
     market_type: String,
+    plan: String,
+    history_days: u64,
+    history_start_ms: Option<i64>,
+    history_end_ms: Option<i64>,
     data_dir: PathBuf,
     database_file: PathBuf,
     page_limit: usize,
@@ -50,12 +56,16 @@ impl Config {
         if !(1..=1000).contains(&page_limit) {
             bail!("POLYBACKTEST_PAGE_LIMIT must be in 1..=1000");
         }
-        let coin = std::env::var("POLYBACKTEST_COIN")
-            .unwrap_or_else(|_| "btc".to_string())
+        let coins = parse_coins(&std::env::var("POLYBACKTEST_COINS").unwrap_or_else(|_| {
+            std::env::var("POLYBACKTEST_COIN").unwrap_or_else(|_| "btc".to_string())
+        }))?;
+        let coin = coins[0].clone();
+        let plan = std::env::var("POLYBACKTEST_PLAN")
+            .unwrap_or_else(|_| "free".to_string())
             .trim()
             .to_ascii_lowercase();
-        if !matches!(coin.as_str(), "btc" | "eth" | "sol") {
-            bail!("POLYBACKTEST_COIN must be btc, eth, or sol");
+        if !matches!(plan.as_str(), "free" | "pro" | "enterprise") {
+            bail!("POLYBACKTEST_PLAN must be free, pro, or enterprise");
         }
         let market_type = std::env::var("POLYBACKTEST_MARKET_TYPE")
             .unwrap_or_else(|_| "5m".to_string())
@@ -64,9 +74,16 @@ impl Config {
         if !matches!(market_type.as_str(), "5m" | "15m" | "1h" | "4h" | "24h") {
             bail!("POLYBACKTEST_MARKET_TYPE must be 5m, 15m, 1h, 4h, or 24h");
         }
-        let request_interval_ms = env_parse("POLYBACKTEST_REQUEST_INTERVAL_MS", 1100u64)?;
-        if request_interval_ms < 1000 {
+        let default_request_interval_ms = if plan == "free" { 1100 } else { 250 };
+        let request_interval_ms = env_parse(
+            "POLYBACKTEST_REQUEST_INTERVAL_MS",
+            default_request_interval_ms,
+        )?;
+        if plan == "free" && request_interval_ms < 1000 {
             bail!("POLYBACKTEST_REQUEST_INTERVAL_MS must be at least 1000 for Free Plan");
+        }
+        if plan != "free" && request_interval_ms < 100 {
+            bail!("POLYBACKTEST_REQUEST_INTERVAL_MS must be at least 100 for Pro/Enterprise");
         }
         let poll_seconds = env_parse("POLYBACKTEST_POLL_SECONDS", 300u64)?;
         if poll_seconds < 60 {
@@ -76,6 +93,14 @@ impl Config {
         if max_retries == 0 {
             bail!("POLYBACKTEST_MAX_RETRIES must be greater than zero");
         }
+        let history_days = env_parse("POLYBACKTEST_HISTORY_DAYS", 31u64)?;
+        let history_start_ms = env_optional_parse("POLYBACKTEST_HISTORY_START_MS")?;
+        let history_end_ms = env_optional_parse("POLYBACKTEST_HISTORY_END_MS")?;
+        if let (Some(start), Some(end)) = (history_start_ms, history_end_ms) {
+            if start >= end {
+                bail!("POLYBACKTEST_HISTORY_START_MS must be less than HISTORY_END_MS");
+            }
+        }
         Ok(Self {
             api_key,
             api_url: std::env::var("POLYBACKTEST_API_URL")
@@ -83,7 +108,12 @@ impl Config {
                 .trim_end_matches('/')
                 .to_string(),
             coin,
+            coins,
             market_type,
+            plan,
+            history_days,
+            history_start_ms,
+            history_end_ms,
             data_dir,
             database_file,
             page_limit,
@@ -99,6 +129,38 @@ impl Config {
             max_markets_per_sync: env_parse("POLYBACKTEST_MAX_MARKETS_PER_SYNC", 0usize)?,
         })
     }
+
+    fn for_coin(&self, coin: &str) -> Self {
+        let mut scoped = self.clone();
+        scoped.coin = coin.to_string();
+        scoped
+    }
+
+    fn history_bounds(&self) -> (i64, i64) {
+        let end = self.history_end_ms.unwrap_or_else(now_ms);
+        let start = self.history_start_ms.unwrap_or_else(|| {
+            end.saturating_sub(self.history_days as i64 * 86_400_000)
+                .saturating_add(HISTORY_WINDOW_SAFETY_MS)
+        });
+        (start, end)
+    }
+}
+
+fn parse_coins(raw: &str) -> Result<Vec<String>> {
+    let mut coins = raw
+        .split(',')
+        .map(|coin| coin.trim().to_ascii_lowercase())
+        .filter(|coin| !coin.is_empty())
+        .collect::<Vec<_>>();
+    if coins.is_empty()
+        || coins
+            .iter()
+            .any(|coin| !matches!(coin.as_str(), "btc" | "eth" | "sol"))
+    {
+        bail!("POLYBACKTEST_COINS must contain one or more of btc, eth, sol");
+    }
+    coins.dedup();
+    Ok(coins)
 }
 
 fn env_parse<T>(name: &str, default: T) -> Result<T>
@@ -110,6 +172,21 @@ where
         .unwrap_or_else(|_| default.to_string())
         .parse()
         .with_context(|| format!("{name} has an invalid value"))
+}
+
+fn env_optional_parse<T>(name: &str) -> Result<Option<T>>
+where
+    T: std::str::FromStr,
+    T::Err: std::error::Error + Send + Sync + 'static,
+{
+    match std::env::var(name) {
+        Ok(value) if !value.trim().is_empty() => value
+            .parse()
+            .map(Some)
+            .with_context(|| format!("{name} has an invalid value")),
+        Ok(_) | Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn env_bool(name: &str, default: bool) -> Result<bool> {
@@ -665,6 +742,7 @@ impl Downloader {
     async fn discover_markets(&mut self) -> Result<Vec<MarketRecord>> {
         let mut offset = 0usize;
         let mut markets = Vec::new();
+        let (history_start_ms, history_end_ms) = self.config.history_bounds();
         loop {
             let raw = self
                 .api
@@ -674,6 +752,8 @@ impl Downloader {
                         ("coin", self.config.coin.clone()),
                         ("market_type", self.config.market_type.clone()),
                         ("resolved", "true".to_string()),
+                        ("start_time", history_start_ms.to_string()),
+                        ("end_time", history_end_ms.to_string()),
                         ("limit", "100".to_string()),
                         ("offset", offset.to_string()),
                         ("include_total", "true".to_string()),
@@ -714,9 +794,12 @@ impl Downloader {
         log_line(
             "INFO",
             format!(
-                "discovering resolved {} {} markets",
+                "discovering resolved {} {} markets in {}..{} (plan={})",
                 self.config.coin.to_ascii_uppercase(),
-                self.config.market_type
+                self.config.market_type,
+                self.config.history_bounds().0,
+                self.config.history_bounds().1,
+                self.config.plan
             ),
         );
         let discovered = self.discover_markets().await?;
@@ -1035,12 +1118,42 @@ async fn run_sync(downloader: &mut Downloader) -> Result<()> {
     Ok(())
 }
 
-async fn run_watch(mut downloader: Downloader) -> Result<()> {
+async fn run_sync_all(config: &Config) -> Result<()> {
+    let mut failures = 0usize;
+    for coin in &config.coins {
+        let scoped_config = config.for_coin(coin);
+        log_line(
+            "INFO",
+            format!("starting sync scope={}", coin.to_ascii_uppercase()),
+        );
+        match Downloader::new(scoped_config) {
+            Ok(mut downloader) => {
+                if let Err(error) = run_sync(&mut downloader).await {
+                    failures += 1;
+                    log_line("ERROR", format!("sync scope={} failed: {error:#}", coin));
+                }
+            }
+            Err(error) => {
+                failures += 1;
+                log_line(
+                    "ERROR",
+                    format!("initializing scope={} failed: {error:#}", coin),
+                );
+            }
+        }
+    }
+    if failures > 0 {
+        bail!("{} asset sync scope(s) failed; rerun to resume", failures);
+    }
+    Ok(())
+}
+
+async fn run_watch_all(config: Config) -> Result<()> {
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
     loop {
         tokio::select! {
-            result = run_sync(&mut downloader) => {
+            result = run_sync_all(&config) => {
                 if let Err(error) = result {
                     log_line("ERROR", format!("sync cycle failed: {error:#}"));
                 }
@@ -1054,12 +1167,13 @@ async fn run_watch(mut downloader: Downloader) -> Result<()> {
         log_line(
             "INFO",
             format!(
-                "next update in {} seconds",
-                downloader.config.poll_interval.as_secs()
+                "next update in {} seconds for {}",
+                config.poll_interval.as_secs(),
+                config.coins.join(",")
             ),
         );
         tokio::select! {
-            _ = tokio::time::sleep(downloader.config.poll_interval) => {}
+            _ = tokio::time::sleep(config.poll_interval) => {}
             result = &mut shutdown => {
                 result?;
                 log_line("INFO", "shutdown requested");
@@ -1073,7 +1187,7 @@ fn print_usage() {
     println!(
         "Usage: polybacktest_downloader [sync|watch|status]\n\
          \n\
-         sync    Download missing resolved markets once (default)\n\
+         sync    Download missing resolved markets for all configured coins once (default)\n\
          watch   Keep polling and downloading new resolved markets\n\
          status  Show local database counts without making API requests"
     );
@@ -1095,10 +1209,17 @@ async fn main() -> Result<()> {
     log_line(
         "INFO",
         format!(
-            "PolyBacktest downloader mode={} scope={} {} page_limit={} orderbook={} request_interval_ms={} (API key hidden)",
+            "PolyBacktest downloader mode={} scopes={} market_type={} history_days={} plan={} page_limit={} orderbook={} request_interval_ms={} (API key hidden)",
             command,
-            config.coin.to_ascii_uppercase(),
+            config
+                .coins
+                .iter()
+                .map(|coin| coin.to_ascii_uppercase())
+                .collect::<Vec<_>>()
+                .join(","),
             config.market_type,
+            config.history_days,
+            config.plan,
             config.page_limit,
             config.include_orderbook,
             config.request_interval.as_millis()
@@ -1106,11 +1227,10 @@ async fn main() -> Result<()> {
     );
     match command.as_str() {
         "sync" => {
-            let mut downloader = Downloader::new(config)?;
             let shutdown = tokio::signal::ctrl_c();
             tokio::pin!(shutdown);
             tokio::select! {
-                result = run_sync(&mut downloader) => result,
+                result = run_sync_all(&config) => result,
                 result = &mut shutdown => {
                     result?;
                     log_line("INFO", "shutdown requested; rerun sync to resume");
@@ -1118,10 +1238,13 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        "watch" => run_watch(Downloader::new(config)?).await,
+        "watch" => run_watch_all(config).await,
         "status" => {
-            let store = Store::open(&config)?;
-            print_status(&store.status(&config.coin, &config.market_type)?, &config);
+            for coin in &config.coins {
+                let scoped_config = config.for_coin(coin);
+                let store = Store::open(&scoped_config)?;
+                print_status(&store.status(coin, &config.market_type)?, &scoped_config);
+            }
             Ok(())
         }
         _ => {
@@ -1141,7 +1264,12 @@ mod tests {
             api_key: "hidden".to_string(),
             api_url: "https://example.invalid".to_string(),
             coin: "btc".to_string(),
+            coins: vec!["btc".to_string()],
             market_type: "5m".to_string(),
+            plan: "free".to_string(),
+            history_days: 31,
+            history_start_ms: None,
+            history_end_ms: None,
             data_dir: root.to_path_buf(),
             database_file: root.join("catalog.sqlite3"),
             page_limit: 1000,

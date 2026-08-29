@@ -7,7 +7,7 @@ Polymarket 私钥，也不会提交订单。
 ## 运行
 
 ```bash
-# 下载当前 API 权限范围内所有缺失的已结算市场，然后退出
+# 下载当前 API 权限范围内、所有配置资产的缺失已结算市场，然后退出
 ./target/release/polybacktest_downloader sync
 
 # 每 5 分钟检查新市场，Ctrl-C 正常停止
@@ -23,20 +23,33 @@ Polymarket 私钥，也不会提交订单。
 cargo run --release --bin polybacktest_downloader -- sync
 ```
 
-首次使用 Free Plan 下载约 100 个 BTC 5m 市场，完整订单簿通常需要约
-20–30 分钟。之后每个新市场约需 3 页和 10–15 秒。
+Pro 31-day 配置会按 `POLYBACKTEST_COINS` 依次发现并下载 BTC/ETH/SOL 5m
+市场。Free Plan 只能访问其套餐允许的最近市场；Pro 才适合做全量 31 天回溯。
+下载器遇到已完成市场会跳过，只为待下载市场请求快照，因此可以中断后继续。
+
+如果机器上仍有旧版单币种 `watch` 进程，先在该进程终端按 `Ctrl-C` 正常停止（或
+向确认过的 PID 发送 `SIGINT`），再启动新版本；不要让两个下载器同时使用同一个
+数据目录。随后先运行 `status` 检查三个资产，再运行 `sync` 补齐历史数据，最后按需
+运行 `watch`。已有 BTC 数据会复用，ETH/SOL 会在同一数据库中新增，不需要删除
+`data/polybacktest`。
 
 ## 配置
 
 ```dotenv
 POLYBACKTEST_API_KEY=
 POLYBACKTEST_API_URL=https://api.polybacktest.com
+POLYBACKTEST_COINS=btc,eth,sol
 POLYBACKTEST_COIN=btc
 POLYBACKTEST_MARKET_TYPE=5m
+POLYBACKTEST_PLAN=pro
+POLYBACKTEST_HISTORY_DAYS=31
+# 可选：指定固定 Unix 毫秒边界；设置后覆盖 HISTORY_DAYS
+# POLYBACKTEST_HISTORY_START_MS=
+# POLYBACKTEST_HISTORY_END_MS=
 POLYBACKTEST_DATA_DIR=data/polybacktest
 POLYBACKTEST_DATABASE_FILE=data/polybacktest/polybacktest.sqlite3
 POLYBACKTEST_PAGE_LIMIT=1000
-POLYBACKTEST_REQUEST_INTERVAL_MS=1100
+POLYBACKTEST_REQUEST_INTERVAL_MS=250
 POLYBACKTEST_POLL_SECONDS=300
 POLYBACKTEST_MAX_RETRIES=5
 POLYBACKTEST_RETRY_INITIAL_MS=1500
@@ -45,8 +58,19 @@ POLYBACKTEST_INCLUDE_ORDERBOOK=true
 POLYBACKTEST_MAX_MARKETS_PER_SYNC=0
 ```
 
-- Free Plan 必须保持 `POLYBACKTEST_REQUEST_INTERVAL_MS>=1000`；默认 1100ms。
+- Free Plan 必须保持 `POLYBACKTEST_REQUEST_INTERVAL_MS>=1000`；Pro/Enterprise 最低
+  100ms。Pro 使用 250ms 时低于 300 requests/minute 的持续限制。
+- `POLYBACKTEST_PLAN` 只用于本地限速校验，必须与 API Key 实际套餐一致；程序不会把
+  Free Key 伪装成 Pro Key。需要核对时应查询 v4 plan-limits。
+- `POLYBACKTEST_COINS=btc,eth,sol` 会在一次 `sync`/`watch` 中依次处理三个资产；
+  `POLYBACKTEST_COIN` 继续作为兼容旧配置的单资产回退值。
+- `POLYBACKTEST_HISTORY_DAYS=31` 会自动生成“当前时间往前约 31 天”的市场发现边界，
+  内置 5 分钟安全余量以适应服务端滚动窗口；固定回补任务可使用显式
+  `POLYBACKTEST_HISTORY_START_MS/END_MS`。
+  固定回补任务可使用显式 `POLYBACKTEST_HISTORY_START_MS/END_MS`。
 - `POLYBACKTEST_MAX_MARKETS_PER_SYNC=0` 表示处理全部待下载市场。设置为正数可用于小批量验证。
+- 31 天、三种资产的首次全量补齐耗时取决于盘口快照数量；在 Pro 的 250ms 间隔下，
+  通常需要数小时。可先设置 `POLYBACKTEST_MAX_MARKETS_PER_SYNC=1` 验证，再恢复为 `0`。
 - Spread/Winner 正式回放应保持 `POLYBACKTEST_INCLUDE_ORDERBOOK=true`。
 - API key 只用于请求头，启动日志不会打印其值。
 
@@ -59,7 +83,9 @@ data/polybacktest/
 ├── polybacktest.sqlite3-wal
 ├── polybacktest.sqlite3-shm
 └── raw/
-    └── btc/5m/<market_id>/
+    ├── btc/5m/<market_id>/
+    ├── eth/5m/<market_id>/
+    └── sol/5m/<market_id>/
         ├── market.json.zst
         ├── snapshots-000000000.json.zst
         ├── snapshots-000001000.json.zst

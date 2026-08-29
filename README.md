@@ -169,7 +169,9 @@ cargo run --release --bin polybacktest_downloader -- watch
 cargo run --release --bin polybacktest_downloader -- status
 ```
 
-Free Plan defaults enforce at least 1100ms between request starts. See
+The downloader supports multi-asset 31-day Pro backfills; Free Plan defaults
+remain at least 1100ms between request starts, while Pro uses a conservative
+250ms interval. See
 [`docs/POLYBACKTEST_DOWNLOADER.zh-CN.md`](docs/POLYBACKTEST_DOWNLOADER.zh-CN.md)
 for storage schema, recovery behavior, and operational guidance.
 
