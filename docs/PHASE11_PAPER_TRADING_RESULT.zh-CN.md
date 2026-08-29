@@ -11,9 +11,9 @@
   → 选择最佳卖盘更薄的困难腿
   → REST 重新获取困难腿完整实时订单簿
   → 仅撮合价格不高于最终限价的多档 asks
-  → 对显示深度应用 PAPER_LIQUIDITY_HAIRCUT
+  → 对显示深度应用 LATE_RESOLUTION_WINNER_TRADING_PAPER_LIQUIDITY_HAIRCUT
   → 应用 FOK 或 FAK/即时部分成交语义
-  → 等待 PAPER_SECOND_LEG_DELAY_MS
+  → 等待 BINARY_COMPLEMENT_ARBITRAGE_PAPER_SECOND_LEG_DELAY_MS
   → REST 重新获取第二腿实时订单簿
   → 第二腿最多按第一腿虚拟成交量撮合
   → 记录 VWAP、配对量、单腿成本、虚拟现金与理论 PnL
@@ -23,7 +23,7 @@ GTC/GTD 在模拟器中只计算立即可成交部分并视为随后撤销余量
 
 ## 3. 虚拟资金
 
-`PAPER_INITIAL_BALANCE_USDC` 默认 50 USDC。每个并发模拟任务会先原子预留计划成本，避免多个任务共同穿透余额；REST 读取失败或任务取消时由 RAII 自动释放预留。撮合完成后先扣除实际虚拟成交成本，再把完整 YES+NO 配对按每 share 1 USDC 立即计回虚拟现金；未配对腿继续按成本占用资金。
+`LATE_RESOLUTION_WINNER_TRADING_PAPER_INITIAL_BALANCE_USDC` 默认 50 USDC。每个并发模拟任务会先原子预留计划成本，避免多个任务共同穿透余额；REST 读取失败或任务取消时由 RAII 自动释放预留。撮合完成后先扣除实际虚拟成交成本，再把完整 YES+NO 配对按每 share 1 USDC 立即计回虚拟现金；未配对腿继续按成本占用资金。
 
 账本累计记录：
 
@@ -63,13 +63,13 @@ GTC/GTD 在模拟器中只计算立即可成交部分并视为随后撤销余量
 ```env
 DRY_RUN=true
 CANARY_MODE=false
-PAPER_INITIAL_BALANCE_USDC=50.0
-PAPER_LIQUIDITY_HAIRCUT=0.75
-PAPER_SECOND_LEG_DELAY_MS=250
-ARBITRAGE_STATE_JOURNAL_FILE=results/binary-complement-arbitrage/paper/orders.ndjson
-WINNER_BUY_STATE_JOURNAL_FILE=results/late-resolution-winner-trading/paper/orders.ndjson
-WINNER_BUY_EVALUATION_JOURNAL_FILE=results/late-resolution-winner-trading/paper/evaluations.ndjson
-ARBITRAGE_LOG_FILE=results/binary-complement-arbitrage/paper/opportunities.ndjson
+LATE_RESOLUTION_WINNER_TRADING_PAPER_INITIAL_BALANCE_USDC=50.0
+LATE_RESOLUTION_WINNER_TRADING_PAPER_LIQUIDITY_HAIRCUT=0.75
+BINARY_COMPLEMENT_ARBITRAGE_PAPER_SECOND_LEG_DELAY_MS=250
+BINARY_COMPLEMENT_ARBITRAGE_STATE_JOURNAL_FILE=results/binary-complement-arbitrage/paper/orders.ndjson
+LATE_RESOLUTION_WINNER_TRADING_STATE_JOURNAL_FILE=results/late-resolution-winner-trading/paper/orders.ndjson
+LATE_RESOLUTION_WINNER_TRADING_EVALUATION_JOURNAL_FILE=results/late-resolution-winner-trading/paper/evaluations.ndjson
+BINARY_COMPLEMENT_ARBITRAGE_LOG_FILE=results/binary-complement-arbitrage/paper/opportunities.ndjson
 POSITION_SYNC_INTERVAL_SECS=0
 POSITION_BALANCE_INTERVAL_SECS=0
 MERGE_INTERVAL_MINUTES=0

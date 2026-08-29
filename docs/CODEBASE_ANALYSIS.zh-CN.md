@@ -162,7 +162,7 @@ flowchart TD
 4. 计算 `total = yes_ask + no_ask`；`total < 1` 仅用于展示，真正执行条件是：
 
    ```text
-   total <= 1 - ARBITRAGE_EXECUTION_SPREAD
+   total <= 1 - BINARY_COMPLEMENT_ARBITRAGE_EXECUTION_SPREAD
    ```
 
 5. `ArbitrageDetector` 把价格四舍五入到 2 位，取两腿最优档可用量的较小值，并向下截断到 2 位；两腿名义金额都必须至少约 1 美元。
@@ -182,7 +182,7 @@ flowchart TD
 - `POLYMARKET_PROXY_ADDRESS` 解析失败会变成 `None`，不会立即报告地址格式错误。
 - `SIGNATURE_TYPE` 默认 `Poly1271`；非 EOA 签名类型必须有 funder 地址。
 - `.env.example` 的示例值与代码默认值并不完全相同，例如示例只监控 `btc,eth` 且套利 spread 为 `0.03`，代码默认监控四种币且 spread 为 `0.01`。
-- `MAX_ORDER_SIZE_USDC` 在实际执行中被当作 **share 数量上限**，不是严格的美元成本上限。
+- `BINARY_COMPLEMENT_ARBITRAGE_MAX_ORDER_SIZE_USDC` 在实际执行中被当作 **share 数量上限**，不是严格的美元成本上限。
 
 ### 6.2 `market/`：市场发现与窗口调度
 
@@ -202,7 +202,7 @@ flowchart TD
 
 `ArbitrageDetector` 当前只检查最优一档，虽然结构中有 `max_depth = 10`，但没有实际跨档聚合。它计算共同数量、组合成本和理论利润率，并要求两腿各自名义金额达到最小值。
 
-重要现状：构造器接收的 `MIN_PROFIT_THRESHOLD` 被保存，但检测函数没有使用该字段；实际触发利润门槛完全由 `ARBITRAGE_EXECUTION_SPREAD` 控制。
+重要现状：构造器接收的 `BINARY_COMPLEMENT_ARBITRAGE_MIN_PROFIT_THRESHOLD` 被保存，但检测函数没有使用该字段；实际触发利润门槛完全由 `BINARY_COMPLEMENT_ARBITRAGE_EXECUTION_SPREAD` 控制。
 
 ### 6.4 `trading/` 与 `clob_v2.rs`：认证和订单执行
 
@@ -282,7 +282,7 @@ TUI 默认在交互式终端开启，可通过键盘退出并设置共享 `shutd
 | Wind-down 任务 | 每个窗口最多启动一次 | 全撤单、链上 Merge、剩余持仓卖单 |
 | TUI 线程 | TUI 开启时 | 读取/更新 `DashboardState`，设置 shutdown |
 
-关键共享对象通过 `Arc`、`DashMap`、`AtomicBool` 和 `Mutex` 协调。`wind_down_in_progress` 只用于阻止定时 Merge 与收尾 Merge 重叠，不会阻止主循环继续产生套利订单；停止临近结束交易依赖另一个配置 `STOP_ARBITRAGE_BEFORE_END_MINUTES`。
+关键共享对象通过 `Arc`、`DashMap`、`AtomicBool` 和 `Mutex` 协调。`wind_down_in_progress` 只用于阻止定时 Merge 与收尾 Merge 重叠，不会阻止主循环继续产生套利订单；停止临近结束交易依赖另一个配置 `BINARY_COMPLEMENT_ARBITRAGE_STOP_BEFORE_END_MINUTES`。
 
 ## 8. 配置分组与作用
 
@@ -291,10 +291,10 @@ TUI 默认在交互式终端开启，可通过键盘退出并设置共享 `shutd
 | 账户 | `POLYMARKET_PRIVATE_KEY`、`POLYMARKET_PROXY_ADDRESS`、`SIGNATURE_TYPE` | CLOB 签名、funder、Data API 与链上钱包 |
 | Builder/链上 | `POLY_BUILDER_*`、`RELAYER_URL`、`MERGE_OUTPUT_TOKEN`、`MERGE_WRAP_TO_PUSD` | Relayer 鉴权及 Merge/Redeem 输出 |
 | 市场 | `CRYPTO_SYMBOLS`、`MARKET_REFRESH_ADVANCE_SECS` | slug 生成与窗口提前查询 |
-| 套利 | `ARBITRAGE_EXECUTION_SPREAD`、`MIN_*_PRICE_THRESHOLD`、`SLIPPAGE` | 机会门槛和实际限价调整 |
-| 订单 | `MAX_ORDER_SIZE_USDC`、`ARBITRAGE_ORDER_TYPE`、`GTD_EXPIRATION_SECS` | share 上限、订单生命周期 |
-| 风控 | `RISK_MAX_EXPOSURE_USDC`、`POSITION_BALANCE_*` | 本轮预记成本限制与失衡挂单撤销 |
-| 收尾 | `STOP_ARBITRAGE_BEFORE_END_MINUTES`、`WIND_DOWN_*`、`MERGE_INTERVAL_MINUTES` | 停止开仓、全撤单、Merge 和低价卖出 |
+| 套利 | `BINARY_COMPLEMENT_ARBITRAGE_EXECUTION_SPREAD`、`MIN_*_PRICE_THRESHOLD`、`BINARY_COMPLEMENT_ARBITRAGE_SLIPPAGE` | 机会门槛和实际限价调整 |
+| 订单 | `BINARY_COMPLEMENT_ARBITRAGE_MAX_ORDER_SIZE_USDC`、`BINARY_COMPLEMENT_ARBITRAGE_ORDER_TYPE`、`BINARY_COMPLEMENT_ARBITRAGE_GTD_EXPIRATION_SECS` | share 上限、订单生命周期 |
+| 风控 | `BINARY_COMPLEMENT_ARBITRAGE_MAX_EXPOSURE_USDC`、`POSITION_BALANCE_*` | 本轮预记成本限制与失衡挂单撤销 |
+| 收尾 | `BINARY_COMPLEMENT_ARBITRAGE_STOP_BEFORE_END_MINUTES`、`WIND_DOWN_*`、`MERGE_INTERVAL_MINUTES` | 停止开仓、全撤单、Merge 和低价卖出 |
 | 观测 | `RUST_LOG`、`LOG_FILE`、`TUI_ENABLED`、`PLAIN_LOGS` | 日志级别、目标和 UI 模式 |
 
 完整默认值和注释以 `.env.example` 与 `Config::from_env()` 为准；两者不一致时，未设置环境变量的实际行为以代码默认值为准。
@@ -313,8 +313,8 @@ TUI 默认在交互式终端开启，可通过键盘退出并设置共享 `shutd
 
 ### 中优先级
 
-1. **`MIN_PROFIT_THRESHOLD` 当前无效。** 字段存入 detector 但从未参与判断；有效门槛是 `ARBITRAGE_EXECUTION_SPREAD`。
-2. **`MAX_ORDER_SIZE_USDC` 命名与实现不符。** 它直接限制 share 数量；不同 token 价格下实际美元成本不同。
+1. **`BINARY_COMPLEMENT_ARBITRAGE_MIN_PROFIT_THRESHOLD` 当前无效。** 字段存入 detector 但从未参与判断；有效门槛是 `BINARY_COMPLEMENT_ARBITRAGE_EXECUTION_SPREAD`。
+2. **`BINARY_COMPLEMENT_ARBITRAGE_MAX_ORDER_SIZE_USDC` 命名与实现不符。** 它直接限制 share 数量；不同 token 价格下实际美元成本不同。
 3. **“成功”语义偏宽。** `OrderPairResult.success` 对单腿成交也为 true，仪表盘可能把非完整套利计作成功和理论 PnL。
 4. **仓位 outcome index 约定不完全统一。** Merge 辅助函数兼容 0/1 和 1/2；仓位同步展示及 PositionBalancer 仅按 0=YES、1=NO 解释。
 5. **Data API 持仓依赖 proxy 地址。** EOA 模式可以不带 funder 完成 CLOB 认证，但后台持仓同步默认开启，随后会因缺少 `POLYMARKET_PROXY_ADDRESS` 周期性失败。

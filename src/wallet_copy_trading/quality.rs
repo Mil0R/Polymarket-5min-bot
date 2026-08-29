@@ -58,14 +58,20 @@ pub struct WalletQualityPolicy {
 impl WalletQualityPolicy {
     pub fn from_env() -> Self {
         Self {
-            min_buy_samples: env_u64("COPY_ROTATION_MIN_BUY_SAMPLES", 50),
-            min_market_samples: env_u64("COPY_ROTATION_MIN_MARKET_SAMPLES", 10),
-            min_shadow_samples: env_u64("COPY_ROTATION_MIN_SHADOW_SAMPLES", 10),
-            min_fresh_ratio: env_ratio("COPY_ROTATION_MIN_FRESH_RATIO", 0.25),
-            min_actionable_ratio: env_ratio("COPY_ROTATION_MIN_ACTIONABLE_RATIO", 0.05),
-            min_market_pass_ratio: env_ratio("COPY_ROTATION_MIN_MARKET_PASS_RATIO", 0.15),
+            min_buy_samples: env_u64("WALLET_COPY_TRADING_ROTATION_MIN_BUY_SAMPLES", 50),
+            min_market_samples: env_u64("WALLET_COPY_TRADING_ROTATION_MIN_MARKET_SAMPLES", 10),
+            min_shadow_samples: env_u64("WALLET_COPY_TRADING_ROTATION_MIN_SHADOW_SAMPLES", 10),
+            min_fresh_ratio: env_ratio("WALLET_COPY_TRADING_ROTATION_MIN_FRESH_RATIO", 0.25),
+            min_actionable_ratio: env_ratio(
+                "WALLET_COPY_TRADING_ROTATION_MIN_ACTIONABLE_RATIO",
+                0.05,
+            ),
+            min_market_pass_ratio: env_ratio(
+                "WALLET_COPY_TRADING_ROTATION_MIN_MARKET_PASS_RATIO",
+                0.15,
+            ),
             min_shadow_executable_ratio: env_ratio(
-                "COPY_ROTATION_MIN_SHADOW_EXECUTABLE_RATIO",
+                "WALLET_COPY_TRADING_ROTATION_MIN_SHADOW_EXECUTABLE_RATIO",
                 0.15,
             ),
         }

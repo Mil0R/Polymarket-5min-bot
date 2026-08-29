@@ -23,8 +23,8 @@
 //! between polls or across restarts.
 //!
 //! Env:
-//!   COPY_ONCHAIN_FEED_ENABLED = true|false (default false)
-//!   COPY_ONCHAIN_RPC_URL      = Polygon RPC (default publicnode)
+//!   WALLET_COPY_TRADING_ONCHAIN_FEED_ENABLED = true|false (default false)
+//!   WALLET_COPY_TRADING_ONCHAIN_RPC_URL      = Polygon RPC (default publicnode)
 
 use crate::wallet_copy_trading::feed::{outcome_from_label, DomainClassifier};
 use crate::wallet_copy_trading::types::{DomainTag, OutcomeSide, SignalAction, SignalEvent};
@@ -85,11 +85,12 @@ impl OnChainTradeFeed {
             .await
             .context("RPC unreachable")?;
         info!(rpc = %rpc_url, "On-chain CTF transfer feed initialized");
-        let allowed_operators: HashSet<Address> = std::env::var("COPY_ONCHAIN_ALLOWED_OPERATORS")
-            .unwrap_or_default()
-            .split(',')
-            .filter_map(|s| s.trim().parse().ok())
-            .collect();
+        let allowed_operators: HashSet<Address> =
+            std::env::var("WALLET_COPY_TRADING_ONCHAIN_ALLOWED_OPERATORS")
+                .unwrap_or_default()
+                .split(',')
+                .filter_map(|s| s.trim().parse().ok())
+                .collect();
         if allowed_operators.is_empty() {
             tracing::warn!("On-chain feed has no allowed exchange operators; transfer-derived signals will be suppressed");
         }

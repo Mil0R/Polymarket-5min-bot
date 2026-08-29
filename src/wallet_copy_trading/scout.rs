@@ -985,7 +985,7 @@ impl CandidateScout {
             .collect::<Vec<_>>()
             .join(",");
         let env_text = format!(
-            "# Generated {} by copy-wallet-scout; review before copying into .env.\n# This file is PAPER-only and never enables live execution.\nCOPY_DRY_RUN=true\nCOPY_TARGET_WALLETS={}\n",
+            "# Generated {} by wallet-copy-scout; review before copying into .env.\n# This file is PAPER-only and never enables live execution.\nWALLET_COPY_TRADING_DRY_RUN=true\nWALLET_COPY_TRADING_TARGET_WALLETS={}\n",
             report.generated_at.to_rfc3339(), addresses
         );
         atomic_write(&env, &env_text)?;

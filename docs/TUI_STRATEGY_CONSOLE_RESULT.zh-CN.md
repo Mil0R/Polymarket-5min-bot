@@ -74,17 +74,17 @@ LIVE/CANARY 恢复必须再次按 `Y`，DRY RUN 可直接恢复。
 ## 启动配置
 
 ```dotenv
-ARBITRAGE_ENABLED=true
-WINNER_BUY_ENABLED=true
-COPY_TRADING_ENABLED=true
-ARBITRAGE_BUDGET_USDC=50
-WINNER_BUY_BUDGET_USDC=100
-COPY_TRADING_BUDGET_USDC=10000
+BINARY_COMPLEMENT_ARBITRAGE_ENABLED=true
+LATE_RESOLUTION_WINNER_TRADING_ENABLED=true
+WALLET_COPY_TRADING_ENABLED=true
+BINARY_COMPLEMENT_ARBITRAGE_BUDGET_USDC=50
+LATE_RESOLUTION_WINNER_TRADING_BUDGET_USDC=100
+WALLET_COPY_TRADING_BUDGET_USDC=10000
 ```
 
 配置决定进程启动时的初始策略状态。TUI 修改只影响当前进程，重启后恢复 `.env`。
 
-DRY RUN TUI 会预初始化 Late-Resolution Winner Trading 的只读数据和 paper journal 依赖，因此可以从初始关闭状态热启动。LIVE 模式下，如果 `WINNER_BUY_ENABLED=false`，Late-Resolution Winner Trading 显示为不可用并要求修改配置后重启，以保证凭据和策略兼容校验不会被绕过。
+DRY RUN TUI 会预初始化 Late-Resolution Winner Trading 的只读数据和 paper journal 依赖，因此可以从初始关闭状态热启动。LIVE 模式下，如果 `LATE_RESOLUTION_WINNER_TRADING_ENABLED=false`，Late-Resolution Winner Trading 显示为不可用并要求修改配置后重启，以保证凭据和策略兼容校验不会被绕过。
 
 Wallet-Copy Trading 当前以 PAPER-first 方式嵌入 polypulse：`DRY_RUN=true` 时与另外两个策略一同运行并接受 TUI 控制；`DRY_RUN=false` 时显示 `UNAVAILABLE`，继续阻止三策略共享账户实盘，直到统一账户资金预留和跨策略持仓归属完成。三个策略的 PAPER 现金/风险额度彼此独立，修改额度不会自动修改单笔订单上限。
 

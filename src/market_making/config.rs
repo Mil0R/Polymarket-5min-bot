@@ -64,64 +64,73 @@ impl MarketMakingResearchConfig {
                 .unwrap_or_else(|_| "https://gamma-api.polymarket.com".to_string()),
             data_url: env::var("DATA_API_URL")
                 .unwrap_or_else(|_| "https://data-api.polymarket.com".to_string()),
-            results_file: PathBuf::from(env::var("MAKER_RESULTS_FILE").unwrap_or_else(|_| {
-                "results/market-making/shadow-run-003/events.ndjson".to_string()
-            })),
-            max_markets: parse("MAKER_MAX_MARKETS", "5")?,
-            discovery_pages: parse("MAKER_DISCOVERY_PAGES", "3")?,
-            enrichment_limit: parse("MAKER_ENRICHMENT_LIMIT", "100")?,
-            request_concurrency: parse("MAKER_REQUEST_CONCURRENCY", "8")?,
-            min_daily_reward_usdc: decimal_env("MAKER_MIN_DAILY_REWARD_USDC", dec!(3))?,
-            max_rewards_min_size: decimal_env("MAKER_MAX_REWARDS_MIN_SIZE", dec!(100))?,
-            min_liquidity_usdc: decimal_env("MAKER_MIN_LIQUIDITY_USDC", dec!(50))?,
-            min_volume_24h_usdc: decimal_env("MAKER_MIN_VOLUME_24H_USDC", dec!(1000))?,
-            max_fee_rate: decimal_env("MAKER_MAX_FEE_RATE", dec!(0.05))?,
-            high_fee_threshold: decimal_env("MAKER_HIGH_FEE_THRESHOLD", dec!(0.04))?,
-            high_fee_volume_multiplier: decimal_env("MAKER_HIGH_FEE_VOLUME_MULTIPLIER", dec!(2))?,
-            max_observed_spread: decimal_env("MAKER_MAX_OBSERVED_SPREAD", dec!(0.12))?,
-            min_midpoint: decimal_env("MAKER_MIN_MIDPOINT", dec!(0.10))?,
-            max_midpoint: decimal_env("MAKER_MAX_MIDPOINT", dec!(0.90))?,
-            market_filter: env::var("MAKER_MARKET_FILTER")
+            results_file: PathBuf::from(env::var("MARKET_MAKING_RESULTS_FILE").unwrap_or_else(
+                |_| "results/market-making/shadow-run-003/events.ndjson".to_string(),
+            )),
+            max_markets: parse("MARKET_MAKING_MAX_MARKETS", "5")?,
+            discovery_pages: parse("MARKET_MAKING_DISCOVERY_PAGES", "3")?,
+            enrichment_limit: parse("MARKET_MAKING_ENRICHMENT_LIMIT", "100")?,
+            request_concurrency: parse("MARKET_MAKING_REQUEST_CONCURRENCY", "8")?,
+            min_daily_reward_usdc: decimal_env("MARKET_MAKING_MIN_DAILY_REWARD_USDC", dec!(3))?,
+            max_rewards_min_size: decimal_env("MARKET_MAKING_MAX_REWARDS_MIN_SIZE", dec!(100))?,
+            min_liquidity_usdc: decimal_env("MARKET_MAKING_MIN_LIQUIDITY_USDC", dec!(50))?,
+            min_volume_24h_usdc: decimal_env("MARKET_MAKING_MIN_VOLUME_24H_USDC", dec!(1000))?,
+            max_fee_rate: decimal_env("MARKET_MAKING_MAX_FEE_RATE", dec!(0.05))?,
+            high_fee_threshold: decimal_env("MARKET_MAKING_HIGH_FEE_THRESHOLD", dec!(0.04))?,
+            high_fee_volume_multiplier: decimal_env(
+                "MARKET_MAKING_HIGH_FEE_VOLUME_MULTIPLIER",
+                dec!(2),
+            )?,
+            max_observed_spread: decimal_env("MARKET_MAKING_MAX_OBSERVED_SPREAD", dec!(0.12))?,
+            min_midpoint: decimal_env("MARKET_MAKING_MIN_MIDPOINT", dec!(0.10))?,
+            max_midpoint: decimal_env("MARKET_MAKING_MAX_MIDPOINT", dec!(0.90))?,
+            market_filter: env::var("MARKET_MAKING_MARKET_FILTER")
                 .ok()
                 .map(|value| value.trim().to_ascii_lowercase())
                 .filter(|value| !value.is_empty()),
-            quote_size_shares: decimal_env("MAKER_QUOTE_SIZE_SHARES", dec!(20))?,
-            quote_half_spread: decimal_env("MAKER_QUOTE_HALF_SPREAD", dec!(0.01))?,
+            quote_size_shares: decimal_env("MARKET_MAKING_QUOTE_SIZE_SHARES", dec!(20))?,
+            quote_half_spread: decimal_env("MARKET_MAKING_QUOTE_HALF_SPREAD", dec!(0.01))?,
             quote_half_spread_grid: parse_decimal_list(
-                "MAKER_QUOTE_HALF_SPREAD_GRID",
-                &env::var("MAKER_QUOTE_HALF_SPREAD_GRID")
+                "MARKET_MAKING_QUOTE_HALF_SPREAD_GRID",
+                &env::var("MARKET_MAKING_QUOTE_HALF_SPREAD_GRID")
                     .unwrap_or_else(|_| "0.01,0.02,0.03".to_string()),
             )?,
-            dynamic_quote_distance: parse("MAKER_DYNAMIC_QUOTE_DISTANCE", "true")?,
-            max_midpoint_move: decimal_env("MAKER_MAX_MIDPOINT_MOVE", dec!(0.02))?,
-            midpoint_move_window_secs: parse("MAKER_MIDPOINT_MOVE_WINDOW_SECS", "30")?,
-            min_trades_1h: parse("MAKER_MIN_TRADES_1H", "3")?,
-            book_activity_window_secs: parse("MAKER_BOOK_ACTIVITY_WINDOW_SECS", "300")?,
-            min_book_updates: parse("MAKER_MIN_BOOK_UPDATES", "3")?,
-            max_inventory_shares: decimal_env("MAKER_MAX_INVENTORY_SHARES", dec!(40))?,
-            inventory_skew_per_share: decimal_env("MAKER_INVENTORY_SKEW_PER_SHARE", dec!(0.00025))?,
+            dynamic_quote_distance: parse("MARKET_MAKING_DYNAMIC_QUOTE_DISTANCE", "true")?,
+            max_midpoint_move: decimal_env("MARKET_MAKING_MAX_MIDPOINT_MOVE", dec!(0.02))?,
+            midpoint_move_window_secs: parse("MARKET_MAKING_MIDPOINT_MOVE_WINDOW_SECS", "30")?,
+            min_trades_1h: parse("MARKET_MAKING_MIN_TRADES_1H", "3")?,
+            book_activity_window_secs: parse("MARKET_MAKING_BOOK_ACTIVITY_WINDOW_SECS", "300")?,
+            min_book_updates: parse("MARKET_MAKING_MIN_BOOK_UPDATES", "3")?,
+            max_inventory_shares: decimal_env("MARKET_MAKING_MAX_INVENTORY_SHARES", dec!(40))?,
+            inventory_skew_per_share: decimal_env(
+                "MARKET_MAKING_INVENTORY_SKEW_PER_SHARE",
+                dec!(0.00025),
+            )?,
             max_consecutive_negative_markouts: parse(
-                "MAKER_MAX_CONSECUTIVE_NEGATIVE_MARKOUTS",
+                "MARKET_MAKING_MAX_CONSECUTIVE_NEGATIVE_MARKOUTS",
                 "3",
             )?,
-            max_quotes_per_market_hour: parse("MAKER_MAX_QUOTES_PER_MARKET_HOUR", "120")?,
-            reward_band_fraction: decimal_env("MAKER_REWARD_BAND_FRACTION", dec!(0.8))?,
-            book_poll_secs: parse("MAKER_BOOK_POLL_SECS", "5")?,
-            quote_interval_secs: parse("MAKER_QUOTE_INTERVAL_SECS", "30")?,
-            market_refresh_secs: parse("MAKER_MARKET_REFRESH_SECS", "300")?,
-            market_cooldown_secs: parse("MAKER_MARKET_COOLDOWN_SECS", "1800")?,
-            max_consecutive_market_errors: parse("MAKER_MAX_CONSECUTIVE_MARKET_ERRORS", "6")?,
-            min_time_to_end_secs: parse("MAKER_MIN_TIME_TO_END_SECS", "1800")?,
-            http_max_retries: parse("MAKER_HTTP_MAX_RETRIES", "3")?,
-            retry_base_ms: parse("MAKER_RETRY_BASE_MS", "250")?,
-            trade_cache_secs: parse("MAKER_TRADE_CACHE_SECS", "5")?,
-            websocket_books: parse("MAKER_WEBSOCKET_BOOKS", "true")?,
-            websocket_book_max_age_ms: parse("MAKER_WEBSOCKET_BOOK_MAX_AGE_MS", "15000")?,
+            max_quotes_per_market_hour: parse("MARKET_MAKING_MAX_QUOTES_PER_MARKET_HOUR", "120")?,
+            reward_band_fraction: decimal_env("MARKET_MAKING_REWARD_BAND_FRACTION", dec!(0.8))?,
+            book_poll_secs: parse("MARKET_MAKING_BOOK_POLL_SECS", "5")?,
+            quote_interval_secs: parse("MARKET_MAKING_QUOTE_INTERVAL_SECS", "30")?,
+            market_refresh_secs: parse("MARKET_MAKING_MARKET_REFRESH_SECS", "300")?,
+            market_cooldown_secs: parse("MARKET_MAKING_MARKET_COOLDOWN_SECS", "1800")?,
+            max_consecutive_market_errors: parse(
+                "MARKET_MAKING_MAX_CONSECUTIVE_MARKET_ERRORS",
+                "6",
+            )?,
+            min_time_to_end_secs: parse("MARKET_MAKING_MIN_TIME_TO_END_SECS", "1800")?,
+            http_max_retries: parse("MARKET_MAKING_HTTP_MAX_RETRIES", "3")?,
+            retry_base_ms: parse("MARKET_MAKING_RETRY_BASE_MS", "250")?,
+            trade_cache_secs: parse("MARKET_MAKING_TRADE_CACHE_SECS", "5")?,
+            websocket_books: parse("MARKET_MAKING_WEBSOCKET_BOOKS", "true")?,
+            websocket_book_max_age_ms: parse("MARKET_MAKING_WEBSOCKET_BOOK_MAX_AGE_MS", "15000")?,
             markout_horizons_secs: parse_horizons(
-                &env::var("MAKER_MARKOUT_HORIZONS_SECS")
+                &env::var("MARKET_MAKING_MARKOUT_HORIZONS_SECS")
                     .unwrap_or_else(|_| "1,5,30,60".to_string()),
             )?,
-            duration_secs: parse("MAKER_SHADOW_DURATION_SECS", "0")?,
+            duration_secs: parse("MARKET_MAKING_SHADOW_DURATION_SECS", "0")?,
         };
         config.validate()?;
         Ok(config)
@@ -135,44 +144,56 @@ impl MarketMakingResearchConfig {
             bail!("maker research endpoints must use https://");
         }
         if self.max_markets == 0 || self.max_markets > 25 {
-            bail!("MAKER_MAX_MARKETS must be in [1, 25]");
+            bail!("MARKET_MAKING_MAX_MARKETS must be in [1, 25]");
         }
         if self.discovery_pages == 0 || self.discovery_pages > 10 {
-            bail!("MAKER_DISCOVERY_PAGES must be in [1, 10]");
+            bail!("MARKET_MAKING_DISCOVERY_PAGES must be in [1, 10]");
         }
         if self.enrichment_limit < self.max_markets || self.enrichment_limit > 500 {
-            bail!("MAKER_ENRICHMENT_LIMIT must be >= MAKER_MAX_MARKETS and <= 500");
+            bail!("MARKET_MAKING_ENRICHMENT_LIMIT must be >= MARKET_MAKING_MAX_MARKETS and <= 500");
         }
         if self.request_concurrency == 0 || self.request_concurrency > 32 {
-            bail!("MAKER_REQUEST_CONCURRENCY must be in [1, 32]");
+            bail!("MARKET_MAKING_REQUEST_CONCURRENCY must be in [1, 32]");
         }
         for (name, value) in [
-            ("MAKER_MIN_DAILY_REWARD_USDC", self.min_daily_reward_usdc),
-            ("MAKER_MAX_REWARDS_MIN_SIZE", self.max_rewards_min_size),
-            ("MAKER_QUOTE_SIZE_SHARES", self.quote_size_shares),
-            ("MAKER_QUOTE_HALF_SPREAD", self.quote_half_spread),
-            ("MAKER_MIN_VOLUME_24H_USDC", self.min_volume_24h_usdc),
             (
-                "MAKER_HIGH_FEE_VOLUME_MULTIPLIER",
+                "MARKET_MAKING_MIN_DAILY_REWARD_USDC",
+                self.min_daily_reward_usdc,
+            ),
+            (
+                "MARKET_MAKING_MAX_REWARDS_MIN_SIZE",
+                self.max_rewards_min_size,
+            ),
+            ("MARKET_MAKING_QUOTE_SIZE_SHARES", self.quote_size_shares),
+            ("MARKET_MAKING_QUOTE_HALF_SPREAD", self.quote_half_spread),
+            (
+                "MARKET_MAKING_MIN_VOLUME_24H_USDC",
+                self.min_volume_24h_usdc,
+            ),
+            (
+                "MARKET_MAKING_HIGH_FEE_VOLUME_MULTIPLIER",
                 self.high_fee_volume_multiplier,
             ),
-            ("MAKER_MAX_INVENTORY_SHARES", self.max_inventory_shares),
+            (
+                "MARKET_MAKING_MAX_INVENTORY_SHARES",
+                self.max_inventory_shares,
+            ),
         ] {
             if value <= Decimal::ZERO {
                 bail!("{name} must be greater than zero");
             }
         }
         if self.min_liquidity_usdc < Decimal::ZERO {
-            bail!("MAKER_MIN_LIQUIDITY_USDC cannot be negative");
+            bail!("MARKET_MAKING_MIN_LIQUIDITY_USDC cannot be negative");
         }
         if self.max_fee_rate < Decimal::ZERO || self.max_fee_rate > dec!(1) {
-            bail!("MAKER_MAX_FEE_RATE must be in [0, 1]");
+            bail!("MARKET_MAKING_MAX_FEE_RATE must be in [0, 1]");
         }
         if self.high_fee_threshold < Decimal::ZERO || self.high_fee_threshold > self.max_fee_rate {
-            bail!("MAKER_HIGH_FEE_THRESHOLD must be in [0, MAKER_MAX_FEE_RATE]");
+            bail!("MARKET_MAKING_HIGH_FEE_THRESHOLD must be in [0, MARKET_MAKING_MAX_FEE_RATE]");
         }
         if self.inventory_skew_per_share < Decimal::ZERO {
-            bail!("MAKER_INVENTORY_SKEW_PER_SHARE cannot be negative");
+            bail!("MARKET_MAKING_INVENTORY_SKEW_PER_SHARE cannot be negative");
         }
         if self.quote_half_spread_grid.is_empty()
             || self
@@ -180,13 +201,13 @@ impl MarketMakingResearchConfig {
                 .iter()
                 .any(|value| *value <= Decimal::ZERO)
         {
-            bail!("MAKER_QUOTE_HALF_SPREAD_GRID must contain positive values");
+            bail!("MARKET_MAKING_QUOTE_HALF_SPREAD_GRID must contain positive values");
         }
         if self.max_midpoint_move <= Decimal::ZERO || self.max_midpoint_move >= dec!(1) {
-            bail!("MAKER_MAX_MIDPOINT_MOVE must be in (0, 1)");
+            bail!("MARKET_MAKING_MAX_MIDPOINT_MOVE must be in (0, 1)");
         }
         if self.midpoint_move_window_secs == 0 || self.midpoint_move_window_secs > 3_600 {
-            bail!("MAKER_MIDPOINT_MOVE_WINDOW_SECS must be in [1, 3600]");
+            bail!("MARKET_MAKING_MIDPOINT_MOVE_WINDOW_SECS must be in [1, 3600]");
         }
         if self.min_trades_1h > 10_000
             || self.book_activity_window_secs == 0
@@ -198,10 +219,10 @@ impl MarketMakingResearchConfig {
         if self.max_consecutive_negative_markouts == 0
             || self.max_consecutive_negative_markouts > 1_000
         {
-            bail!("MAKER_MAX_CONSECUTIVE_NEGATIVE_MARKOUTS must be in [1, 1000]");
+            bail!("MARKET_MAKING_MAX_CONSECUTIVE_NEGATIVE_MARKOUTS must be in [1, 1000]");
         }
         if self.max_quotes_per_market_hour == 0 || self.max_quotes_per_market_hour > 3_600 {
-            bail!("MAKER_MAX_QUOTES_PER_MARKET_HOUR must be in [1, 3600]");
+            bail!("MARKET_MAKING_MAX_QUOTES_PER_MARKET_HOUR must be in [1, 3600]");
         }
         if self.http_max_retries == 0
             || self.http_max_retries > 10
@@ -214,7 +235,7 @@ impl MarketMakingResearchConfig {
             bail!("maker HTTP/cache/WebSocket settings are invalid");
         }
         if self.max_observed_spread <= Decimal::ZERO || self.max_observed_spread >= dec!(1) {
-            bail!("MAKER_MAX_OBSERVED_SPREAD must be in (0, 1)");
+            bail!("MARKET_MAKING_MAX_OBSERVED_SPREAD must be in (0, 1)");
         }
         if self.min_midpoint < Decimal::ZERO
             || self.max_midpoint > dec!(1)
@@ -223,7 +244,7 @@ impl MarketMakingResearchConfig {
             bail!("MAKER midpoint range is invalid");
         }
         if self.reward_band_fraction <= Decimal::ZERO || self.reward_band_fraction > dec!(1) {
-            bail!("MAKER_REWARD_BAND_FRACTION must be in (0, 1]");
+            bail!("MARKET_MAKING_REWARD_BAND_FRACTION must be in (0, 1]");
         }
         if self.book_poll_secs == 0
             || self.book_poll_secs > 60
@@ -240,7 +261,7 @@ impl MarketMakingResearchConfig {
             bail!("maker market refresh/cooldown intervals are invalid");
         }
         if self.max_consecutive_market_errors == 0 || self.max_consecutive_market_errors > 1_000 {
-            bail!("MAKER_MAX_CONSECUTIVE_MARKET_ERRORS must be in [1, 1000]");
+            bail!("MARKET_MAKING_MAX_CONSECUTIVE_MARKET_ERRORS must be in [1, 1000]");
         }
         if self
             .markout_horizons_secs
@@ -280,14 +301,14 @@ fn parse_horizons(raw: &str) -> Result<Vec<u64>> {
             value
                 .trim()
                 .parse::<u64>()
-                .context("MAKER_MARKOUT_HORIZONS_SECS contains an invalid value")
+                .context("MARKET_MAKING_MARKOUT_HORIZONS_SECS contains an invalid value")
         })
         .collect::<Result<Vec<_>>>()?;
     values.retain(|value| *value > 0);
     values.sort_unstable();
     values.dedup();
     if values.is_empty() {
-        bail!("MAKER_MARKOUT_HORIZONS_SECS cannot be empty");
+        bail!("MARKET_MAKING_MARKOUT_HORIZONS_SECS cannot be empty");
     }
     Ok(values)
 }

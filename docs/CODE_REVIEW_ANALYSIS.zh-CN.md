@@ -106,7 +106,7 @@
 1. 整个运行期双腿套利没有成交，末尾指标显示 `opportunities_admitted=0`、`depth_rejections=1692`，本次运行主要验证到了 Late-Resolution Winner Trading 路径。
 2. 日志出现约 96 次 WebSocket `ConnectionClosed` 或握手异常，但 `stream_reconnects` 最终仍为 0，连接健康指标没有准确反映底层断线。
 3. 最后一笔仅成交 3.75/20.83，说明 FAK/模拟盘口能够体现部分成交；但 Late-Resolution Winner Trading 的收益统计使用信号限价而不是完整成交均价，后续应统一按真实 fill 明细记账。
-4. `PAPER_INITIAL_BALANCE_USDC=100`，而 Late-Resolution Winner Trading 累计模拟成本约 143.55 USDC。当前路径没有完整接入 paper reservation/commit 和待赎回资金占用，虚拟额度不能可靠约束该策略。
+4. `LATE_RESOLUTION_WINNER_TRADING_PAPER_INITIAL_BALANCE_USDC=100`，而 Late-Resolution Winner Trading 累计模拟成本约 143.55 USDC。当前路径没有完整接入 paper reservation/commit 和待赎回资金占用，虚拟额度不能可靠约束该策略。
 
 ---
 
@@ -250,7 +250,7 @@ EV = p_model × (1 - effective_price)
 
 **建议**：检测和风控阶段保留原始精度；只在构造最终订单时按实际 market tick 规范化一次；最终报价后重新计算净利润并决定是否下单。
 
-### 12. `WINNER_BUY_MAX_PER_WINDOW` 实际限制扫描轮次而非订单/成交
+### 12. `LATE_RESOLUTION_WINNER_TRADING_MAX_PER_WINDOW` 实际限制扫描轮次而非订单/成交
 
 - **涉及文件**：`src/main.rs:863-940`
 - **严重等级**：中危（Medium）
@@ -412,8 +412,8 @@ results/late-resolution-winner-trading/live/orders.ndjson
 7. **自动化测试**：新增 Late-Resolution Winner Trading 现金占用/终局释放/重启恢复、canary 名义金额和亏损预算、PositionBalancer 双方向保护，以及 PositionTracker API 成本优先级测试。
 8. **持久化策略/资产亏损熔断**：新增 Late-Resolution Winner Trading 策略累计已实现亏损、单资产累计已实现亏损和连续亏损三道门槛。BTC、ETH 等资产分别累计；状态从 journal 重放恢复，重启不能绕过熔断。
 9. **全链路 journal**：每次真正提交执行器前先记录 `attempted`；随后按结果记录 `no_fill`、`failed` 或 `pending`，终局记录 `settled`，胜出仓位继续记录 `redeem_submitted` 和 `redeemed`。旧版 `pending/settled` journal 保持向后兼容。
-10. **赎回状态机与失败关闭**：dry-run 模拟 payout 的提交和确认；live 仅在 `WINNER_BUY_AUTO_REDEEM=true` 且代理钱包/Builder 凭据校验通过时自动调用链上赎回。赎回确认前仓位继续占用 PositionTracker 并保持 WindDown 保护；若提交后未确认，重启会识别为不确定写入、保持仓位并关闭安全门，禁止盲目重试。
-11. **配置补充**：新增 `WINNER_BUY_MAX_STRATEGY_LOSS_USDC`、`WINNER_BUY_MAX_ASSET_LOSS_USDC`、`WINNER_BUY_MAX_CONSECUTIVE_LOSSES` 和 `WINNER_BUY_AUTO_REDEEM`。当前 `.env` 保持自动赎回关闭，dry-run 不受影响。
+10. **赎回状态机与失败关闭**：dry-run 模拟 payout 的提交和确认；live 仅在 `LATE_RESOLUTION_WINNER_TRADING_AUTO_REDEEM=true` 且代理钱包/Builder 凭据校验通过时自动调用链上赎回。赎回确认前仓位继续占用 PositionTracker 并保持 WindDown 保护；若提交后未确认，重启会识别为不确定写入、保持仓位并关闭安全门，禁止盲目重试。
+11. **配置补充**：新增 `LATE_RESOLUTION_WINNER_TRADING_MAX_STRATEGY_LOSS_USDC`、`LATE_RESOLUTION_WINNER_TRADING_MAX_ASSET_LOSS_USDC`、`LATE_RESOLUTION_WINNER_TRADING_MAX_CONSECUTIVE_LOSSES` 和 `LATE_RESOLUTION_WINNER_TRADING_AUTO_REDEEM`。当前 `.env` 保持自动赎回关闭，dry-run 不受影响。
 
 验证结果：
 
@@ -439,10 +439,10 @@ P1 验收项现已关闭：虚拟资金不会超额占用；未结算或待赎�
 2. **窗口基准价与数据真实性门槛**：按 Chainlink observation timestamp 保存 10 分钟历史；只接受与窗口起点时间偏差在配置范围内的 opening TWAP。程序中途启动、断线后无回放、价格过期、样本不足或时钟异常时全部 fail closed，不使用 Gamma/CLOB/第三方现货代替。
 3. **独立概率模型**：用当前 TWAP 相对 opening TWAP 的方向性距离、近期 TWAP 变化率估计和剩余秒数计算保守 `p_model`。BTC、ETH 和其他资产分别配置最低波动率与模型风险缓冲，不再把 ask 本身当作胜率。
 4. **可反转边界**：要求方向性 margin 大于 `固定最小 margin + reversal_sigma × 剩余时间波动标准差`；即使 CLOB 已显示 0.98，仍可能因为剩余时间内可反转而被拒绝。
-5. **净 EV 门槛**：统一计算 `net_ev = p_model - effective_price - model_risk_buffer`；P2 最初使用固定 fee buffer，已在 2026-08-21 的 P4A 改为 CLOB V2 市场动态费率。只有 `net_ev >= WINNER_BUY_MIN_NET_EV` 才能进入执行流程。
+5. **净 EV 门槛**：统一计算 `net_ev = p_model - effective_price - model_risk_buffer`；P2 最初使用固定 fee buffer，已在 2026-08-21 的 P4A 改为 CLOB V2 市场动态费率。只有 `net_ev >= LATE_RESOLUTION_WINNER_TRADING_MIN_NET_EV` 才能进入执行流程。
 6. **盘口质量过滤**：候选方向必须同时存在真实 bid/ask；spread 不得超过配置上限，卖一深度折算 USDC 不得低于最小深度。
 7. **连续确认**：必须由若干个不同的 Chainlink observation 确认相同方向；主循环重复读取同一条 TWAP 不会增加确认数。P4A 已进一步将确认状态与瞬时盘口可执行性解耦：缺盘口、无信号、数据暂时不可用和盘口/EV 拒绝只暂停计数；方向变化、明确越过反转边界或 TTL 过期才重置。
-8. **次数语义与有限重试**：`WINNER_BUY_MAX_PER_WINDOW` 改为统计真正进入执行器的订单尝试，不再在扫描前消耗；循环内每笔尝试后立即复核总额度，避免 BTC、ETH 同轮突破上限。新增每 market 的 `WINNER_BUY_MAX_ATTEMPTS_PER_MARKET`。
+8. **次数语义与有限重试**：`LATE_RESOLUTION_WINNER_TRADING_MAX_PER_WINDOW` 改为统计真正进入执行器的订单尝试，不再在扫描前消耗；循环内每笔尝试后立即复核总额度，避免 BTC、ETH 同轮突破上限。新增每 market 的 `LATE_RESOLUTION_WINNER_TRADING_MAX_ATTEMPTS_PER_MARKET`。
 9. **可回放证据**：每个 admitted attempt 在 journal 中保存 opening/current TWAP、Chainlink observation timestamp、`p_model`、净 EV、方向 margin、反转边界、spread 和深度；拒绝路径输出同一组结构化诊断字段和明确原因。
 10. **配置与 dry-run 默认值**：`.env`、`.env.example` 和 README 已加入 RTDS、freshness、opening skew、波动率、确认次数、margin、spread、深度、净 EV 以及 BTC/ETH 独立参数。当前仍为 `DRY_RUN=true`。
 
@@ -485,8 +485,8 @@ P0～P3 的代码整改已完成，但这不等于已经证明策略可盈利或
 1. **盘口主数据源改造**：Late-Resolution Winner Trading 优先复用已订阅的 SDK 公共 WebSocket 盘口缓存，不再每秒对两个 outcome 发起 REST 请求。只有尚未收到 WS snapshot 时才回退 SDK 的 CLOB REST `order_book`，并复用统一的瞬时读取重试策略。
 2. **REST 错误不再吞掉**：YES/NO 回退失败分别输出带 token 和错误的 debug 日志，并计入 `late_resolution_winner_trading_book_read_errors_total`；不再用 `unwrap_or_default()` 把传输错误伪装成空盘口。
 3. **合法单边盘口保留**：top-of-book 的 bid、ask 和 ask size 改为独立可选字段。双边都没有报价才算 no-book；只有 ask 的尾盘盘口仍可用于方向候选识别，但进入 spread/深度模型前若缺 bid 会明确计入 incomplete-book 并暂停。
-4. **确认状态与执行条件解耦**：瞬时缺盘口、无候选、数据缺失、spread/depth 或净 EV 不通过不会抹掉已取得的独立 Chainlink observation。方向反转、明确不满足 reversal boundary 或超过 `3 × WINNER_BUY_FEED_MAX_AGE_MS` 的 TTL 才重新从一次确认开始。
-5. **CLOB V2 动态费率**：每个 condition 在窗口开始时读取 `/clob-markets/{condition}` 的 `fee_details` 并缓存；每份费用按 `rate × [price × (1-price)]^exponent` 计算。该费用同时进入模型 effective price、计划资金预留和 dry-run 成交成本。费率读取失败时 fail closed 跳过该市场，不再以固定 `ARBITRAGE_FEE_BUFFER` 代替 Late-Resolution Winner Trading 手续费。
+4. **确认状态与执行条件解耦**：瞬时缺盘口、无候选、数据缺失、spread/depth 或净 EV 不通过不会抹掉已取得的独立 Chainlink observation。方向反转、明确不满足 reversal boundary 或超过 `3 × LATE_RESOLUTION_WINNER_TRADING_FEED_MAX_AGE_MS` 的 TTL 才重新从一次确认开始。
+5. **CLOB V2 动态费率**：每个 condition 在窗口开始时读取 `/clob-markets/{condition}` 的 `fee_details` 并缓存；每份费用按 `rate × [price × (1-price)]^exponent` 计算。该费用同时进入模型 effective price、计划资金预留和 dry-run 成交成本。费率读取失败时 fail closed 跳过该市场，不再以固定 `BINARY_COMPLEMENT_ARBITRAGE_FEE_BUFFER` 代替 Late-Resolution Winner Trading 手续费。
 6. **模型拒绝细分**：除原有 data/market/boundary/EV 汇总外，新增 no-price-history、stale-price、no-opening-reference、invalid-price、insufficient-observations 独立计数；日志保留 asset、slug、窗口、价格、fee、概率和净 EV，能够直接定位漏斗阻塞点。
 7. **连接状态闭环**：RTDS 新增连接、断开、连接失败、有效 observation 数及最后 observation timestamp；30 秒无任何消息会主动重连。SDK 公共市场流和认证用户流均通过 SDK 暴露的内部 connection state 统计 reconnect/recovery，市场流另记录最后收到的盘口 timestamp；任一流未连接时 Late-Resolution Winner Trading 暂停入场，不再只依赖外层 stream 是否结束。
 8. **反事实评估 journal**：每个能够完成模型计算的候选（包括被拒绝、等待确认、无成交）写入独立追加式 NDJSON，记录唯一 evaluation id、完整模型和盘口输入、动态费用及 rejection。终局关闭后按 slug 自动补写实际方向和每份反事实净盈亏；重启会恢复尚未终局的 evaluation，避免只分析 admitted/fill 样本造成幸存者偏差。

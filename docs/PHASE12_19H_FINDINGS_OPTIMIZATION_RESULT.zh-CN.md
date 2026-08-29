@@ -8,7 +8,7 @@
 ### 1.1 Late-Resolution Winner Trading 盘口回退
 
 - REST 请求完成后使用新的检查时刻计算 `received_at_ms` 年龄，避免请求前的旧时间把正常响应判为“来自未来”；
-- 保持原有 `MAX_BOOK_AGE_MS` 上限，不放宽真正的过期盘口保护；
+- 保持原有 `BINARY_COMPLEMENT_ARBITRAGE_MAX_BOOK_AGE_MS` 上限，不放宽真正的过期盘口保护；
 - 新增指标：
   - `late_resolution_winner_trading_ws_missing_books`；
   - `late_resolution_winner_trading_rest_successes`；
@@ -20,7 +20,7 @@
 ### 1.2 Binary Complement Arbitrage 影子候选
 
 - `DepthRejected` 现在携带结构化候选，不再只有一个计数；
-- 新增 `ARBITRAGE_SHADOW_LOG_FILE`，当前 paper 路径为 `results/binary-complement-arbitrage/paper/shadow-candidates.ndjson`；
+- 新增 `BINARY_COMPLEMENT_ARBITRAGE_SHADOW_LOG_FILE`，当前 paper 路径为 `results/binary-complement-arbitrage/paper/shadow-candidates.ndjson`；
 - 每条记录包含 YES/NO 价格、显示 size、两腿 USDC 深度、共同份额、总价、利润比例、盘口年龄/时间差、首次发现时间和连续存在时间；
 - 预计算边际 0.1%/0.5%/1%/2%/3% 与深度 1/2/3/5 USDC 网格；
 - 同一市场、同一价格组合连续存在至少 250 ms 时标记 `survives_250ms=true`；
@@ -43,7 +43,7 @@
 ## 2. 配置变化
 
 ```dotenv
-ARBITRAGE_SHADOW_LOG_FILE=results/binary-complement-arbitrage/paper/shadow-candidates.ndjson
+BINARY_COMPLEMENT_ARBITRAGE_SHADOW_LOG_FILE=results/binary-complement-arbitrage/paper/shadow-candidates.ndjson
 RUST_LOG=info,polypulse::strategy::late_resolution_winner_trading=debug,polypulse::late_resolution_winner_model=debug,polymarket_client_sdk::serde_helpers=error
 LOG_ROTATE_MAX_BYTES=20971520
 LOG_ROTATE_FILES=5

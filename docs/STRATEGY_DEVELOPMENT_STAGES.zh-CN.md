@@ -92,7 +92,7 @@ TUI_ENABLED=false
 ```
 
 即使服务器 `.env` 写成 live，独立入口也不能下真实订单。`wallet_copy_trading` 若发现
-`COPY_DRY_RUN=false` 会拒绝启动。Market Making 和 Cross-Market Probability Arbitrage
+`WALLET_COPY_TRADING_DRY_RUN=false` 会拒绝启动。Market Making 和 Cross-Market Probability Arbitrage
 binary 本身不包含签名和订单写入。
 
 每轮调整应使用新的日志/结果边界，至少覆盖正常窗口、重连、API 限速、异常退出恢复、

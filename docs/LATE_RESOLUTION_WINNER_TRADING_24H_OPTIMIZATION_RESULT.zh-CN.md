@@ -64,7 +64,7 @@ evaluation journal 在解析一个 slug 时，除逐 evaluation 写入 `resolved
 新增配置：
 
 ```dotenv
-PAPER_WINNER_BUY_DELAY_MS=250
+LATE_RESOLUTION_WINNER_TRADING_PAPER_EXECUTION_DELAY_MS=250
 ```
 
 Dry-run Late-Resolution Winner Trading 在通过模型和风险检查后：
@@ -100,14 +100,14 @@ polypulse_late_resolution_winner_trading_asset_evaluations_total{asset="eth"} 8
 
 ### 2.7 最大订单额度包含手续费
 
-份额计算现在使用 `ask + fee_per_share` 作为有效入场价，因此 `WINNER_BUY_MAX_ORDER_USDC` 表示包含手续费的现金上限，不会再出现名义本金等于上限、加上手续费后实际计划成本略微超限的情况。
+份额计算现在使用 `ask + fee_per_share` 作为有效入场价，因此 `LATE_RESOLUTION_WINNER_TRADING_MAX_ORDER_USDC` 表示包含手续费的现金上限，不会再出现名义本金等于上限、加上手续费后实际计划成本略微超限的情况。
 
 ## 3. 配置变更
 
 `.env` 和 `.env.example` 已加入：
 
 ```dotenv
-PAPER_WINNER_BUY_DELAY_MS=250
+LATE_RESOLUTION_WINNER_TRADING_PAPER_EXECUTION_DELAY_MS=250
 ```
 
 其余 Late-Resolution Winner Trading 阈值保持不变。当前仍应使用：
@@ -134,8 +134,8 @@ DRY_RUN=true
 
 以下事项有意延后，而不是遗漏：
 
-- 不降低 `WINNER_BUY_MIN_DEPTH_USDC`。
-- 不放宽 `WINNER_BUY_REVERSAL_SIGMA`。
+- 不降低 `LATE_RESOLUTION_WINNER_TRADING_MIN_DEPTH_USDC`。
+- 不放宽 `LATE_RESOLUTION_WINNER_TRADING_REVERSAL_SIGMA`。
 - 不降低资产模型风险缓冲。
 - 不扩大真实资金订单额度。
 - 暂不使用可见深度动态扩大仓位。

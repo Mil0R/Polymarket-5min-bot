@@ -98,37 +98,37 @@ Get these from Polymarket → Settings → Builder.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `CRYPTO_SYMBOLS` | `btc,eth,sol,xrp` | Symbols to monitor, comma-separated |
-| `ARBITRAGE_EXECUTION_SPREAD` | `0.01` | Execute when `yes + no <= 1 - spread` |
-| `MAX_ORDER_SIZE_USDC` | `100.0` | Maximum notional per leg, converted to shares at the final limit price |
-| `RISK_MAX_EXPOSURE_USDC` | `1000.0` | Maximum account-wide position and pending-order exposure |
-| `ARBITRAGE_FEE_BUFFER` | `0.002` | Fee/rounding buffer required after slippage |
+| `BINARY_COMPLEMENT_ARBITRAGE_EXECUTION_SPREAD` | `0.01` | Execute when `yes + no <= 1 - spread` |
+| `BINARY_COMPLEMENT_ARBITRAGE_MAX_ORDER_SIZE_USDC` | `100.0` | Maximum notional per leg, converted to shares at the final limit price |
+| `BINARY_COMPLEMENT_ARBITRAGE_MAX_EXPOSURE_USDC` | `1000.0` | Maximum account-wide position and pending-order exposure |
+| `BINARY_COMPLEMENT_ARBITRAGE_FEE_BUFFER` | `0.002` | Fee/rounding buffer required after slippage |
 | `DRY_RUN` | `false` | Use live read-only data and simulated fills without account writes |
 | `CANARY_MODE` | `false` | Tiny live-money hard gate; live canary requires FOK/FAK |
 | `CANARY_MAX_PAIR_NOTIONAL_USDC` / `CANARY_MAX_TOTAL_NOTIONAL_USDC` | `3.0` / `3.0` | Per-pair and process-total planned notional limits |
 | `CANARY_MAX_LOSS_USDC` | `2.0` | Conservative downside budget; permanently pauses entries for the process when reached |
 | `CANARY_MAX_PAIRS_PER_WINDOW` / `CANARY_MAX_PAIRS_TOTAL` | `1` / `1` | Hard pair-count limits per window and process |
-| `WINNER_BUY_MAX_STRATEGY_LOSS_USDC` / `WINNER_BUY_MAX_ASSET_LOSS_USDC` | `20.0` / `10.0` | Persisted Late-Resolution Winner Trading realized-loss circuit breakers, globally and per asset |
-| `WINNER_BUY_MAX_CONSECUTIVE_LOSSES` | `3` | Persisted consecutive-loss circuit breaker; `0` disables it |
-| `WINNER_BUY_AUTO_REDEEM` | `false` | Automatically redeem confirmed winning tokens in live mode; requires proxy/builder credentials |
-| `WINNER_BUY_RTDS_URL` / `WINNER_BUY_FEED_MAX_AGE_MS` | official RTDS / `5000` | Chainlink 60-second TWAP source and fail-closed freshness limit |
-| `WINNER_BUY_CONFIRMATION_OBSERVATIONS` / `WINNER_BUY_MAX_ATTEMPTS_PER_MARKET` | `3` / `1` | Distinct Chainlink updates required and finite per-market execution retries |
-| `WINNER_BUY_MIN_MARGIN_BPS` / `WINNER_BUY_REVERSAL_SIGMA` | `3.0` / `2.0` | Directional TWAP margin and remaining-time reversal boundary |
-| `WINNER_BUY_MAX_SPREAD` / `WINNER_BUY_MIN_DEPTH_USDC` | `0.03` / `10.0` | Selected outcome book-quality filters |
-| `WINNER_BUY_MIN_NET_EV` | `0.002` | Minimum `p_model - effective_price - model_risk_buffer` |
-| `WINNER_BUY_HYBRID_PAPER_ENABLED` | `false` | PAPER-only research path for price `0.96–0.98`, positive winner payoff, Chainlink-direction agreement, and normal spread/depth/confirmation gates; live mode rejects this setting |
-| `ARBITRAGE_ENABLED` / `WINNER_BUY_ENABLED` | `true` / `false` | Initial strategy states; the TUI can pause/resume entries for the current process |
-| `PAPER_INITIAL_BALANCE_USDC` | `50.0` | Independent virtual cash budget for Dry-run |
-| `PAPER_LIQUIDITY_HAIRCUT` | `0.75` | Fraction of displayed depth treated as executable in paper fills |
-| `PAPER_SECOND_LEG_DELAY_MS` | `250` | Delay before fetching a fresh live book for the opposite leg |
-| `PAPER_WINNER_BUY_DELAY_MS` | `250` | Dry-run latency before Late-Resolution Winner Trading re-reads the live book and simulates the fill |
-| `MAX_BOOK_AGE_MS` / `MAX_BOOK_SKEW_MS` | `2000` / `1000` | Reject stale or mutually skewed leg snapshots |
-| `SIGNAL_COOLDOWN_MS` | `3000` | Cooldown for identical market/price signals |
-| `ARBITRAGE_STATE_JOURNAL_FILE` | `results/binary-complement-arbitrage/{paper|live}/orders.ndjson` | Arbitrage order-pair/recovery journal; legacy `STATE_JOURNAL_FILE` remains supported |
-| `WINNER_BUY_STATE_JOURNAL_FILE` | `results/late-resolution-winner-trading/{paper|live}/orders.ndjson` | Late-Resolution Winner Trading order, fill, and settlement journal |
-| `WINNER_BUY_EVALUATION_JOURNAL_FILE` | `results/late-resolution-winner-trading/{paper|live}/evaluations.ndjson` | Late-Resolution Winner Trading candidate and counterfactual evaluations |
-| `ARBITRAGE_SHADOW_LOG_FILE` | unset | Optional NDJSON research log for price-positive candidates rejected by depth; never changes admission |
+| `LATE_RESOLUTION_WINNER_TRADING_MAX_STRATEGY_LOSS_USDC` / `LATE_RESOLUTION_WINNER_TRADING_MAX_ASSET_LOSS_USDC` | `20.0` / `10.0` | Persisted Late-Resolution Winner Trading realized-loss circuit breakers, globally and per asset |
+| `LATE_RESOLUTION_WINNER_TRADING_MAX_CONSECUTIVE_LOSSES` | `3` | Persisted consecutive-loss circuit breaker; `0` disables it |
+| `LATE_RESOLUTION_WINNER_TRADING_AUTO_REDEEM` | `false` | Automatically redeem confirmed winning tokens in live mode; requires proxy/builder credentials |
+| `LATE_RESOLUTION_WINNER_TRADING_RTDS_URL` / `LATE_RESOLUTION_WINNER_TRADING_FEED_MAX_AGE_MS` | official RTDS / `5000` | Chainlink 60-second TWAP source and fail-closed freshness limit |
+| `LATE_RESOLUTION_WINNER_TRADING_CONFIRMATION_OBSERVATIONS` / `LATE_RESOLUTION_WINNER_TRADING_MAX_ATTEMPTS_PER_MARKET` | `3` / `1` | Distinct Chainlink updates required and finite per-market execution retries |
+| `LATE_RESOLUTION_WINNER_TRADING_MIN_MARGIN_BPS` / `LATE_RESOLUTION_WINNER_TRADING_REVERSAL_SIGMA` | `3.0` / `2.0` | Directional TWAP margin and remaining-time reversal boundary |
+| `LATE_RESOLUTION_WINNER_TRADING_MAX_SPREAD` / `LATE_RESOLUTION_WINNER_TRADING_MIN_DEPTH_USDC` | `0.03` / `10.0` | Selected outcome book-quality filters |
+| `LATE_RESOLUTION_WINNER_TRADING_MIN_NET_EV` | `0.002` | Minimum `p_model - effective_price - model_risk_buffer` |
+| `LATE_RESOLUTION_WINNER_TRADING_HYBRID_PAPER_ENABLED` | `false` | PAPER-only research path for price `0.96–0.98`, positive winner payoff, Chainlink-direction agreement, and normal spread/depth/confirmation gates; live mode rejects this setting |
+| `BINARY_COMPLEMENT_ARBITRAGE_ENABLED` / `LATE_RESOLUTION_WINNER_TRADING_ENABLED` | `true` / `false` | Initial strategy states; the TUI can pause/resume entries for the current process |
+| `LATE_RESOLUTION_WINNER_TRADING_PAPER_INITIAL_BALANCE_USDC` | `50.0` | Independent virtual cash budget for Dry-run |
+| `LATE_RESOLUTION_WINNER_TRADING_PAPER_LIQUIDITY_HAIRCUT` | `0.75` | Fraction of displayed depth treated as executable in paper fills |
+| `BINARY_COMPLEMENT_ARBITRAGE_PAPER_SECOND_LEG_DELAY_MS` | `250` | Delay before fetching a fresh live book for the opposite leg |
+| `LATE_RESOLUTION_WINNER_TRADING_PAPER_EXECUTION_DELAY_MS` | `250` | Dry-run latency before Late-Resolution Winner Trading re-reads the live book and simulates the fill |
+| `BINARY_COMPLEMENT_ARBITRAGE_MAX_BOOK_AGE_MS` / `BINARY_COMPLEMENT_ARBITRAGE_MAX_BOOK_SKEW_MS` | `2000` / `1000` | Reject stale or mutually skewed leg snapshots |
+| `BINARY_COMPLEMENT_ARBITRAGE_SIGNAL_COOLDOWN_MS` | `3000` | Cooldown for identical market/price signals |
+| `BINARY_COMPLEMENT_ARBITRAGE_STATE_JOURNAL_FILE` | `results/binary-complement-arbitrage/{paper|live}/orders.ndjson` | Binary Complement Arbitrage order-pair/recovery journal |
+| `LATE_RESOLUTION_WINNER_TRADING_STATE_JOURNAL_FILE` | `results/late-resolution-winner-trading/{paper|live}/orders.ndjson` | Late-Resolution Winner Trading order, fill, and settlement journal |
+| `LATE_RESOLUTION_WINNER_TRADING_EVALUATION_JOURNAL_FILE` | `results/late-resolution-winner-trading/{paper|live}/evaluations.ndjson` | Late-Resolution Winner Trading candidate and counterfactual evaluations |
+| `BINARY_COMPLEMENT_ARBITRAGE_SHADOW_LOG_FILE` | unset | Optional NDJSON research log for price-positive candidates rejected by depth; never changes admission |
 | `LOG_FILE` | `logs/system.log` in TUI mode | System log; strategy events move to their configured strategy file without duplication |
-| `ARBITRAGE_STRATEGY_LOG_FILE` / `WINNER_BUY_STRATEGY_LOG_FILE` | unset | Optional mutually exclusive per-strategy text logs |
+| `BINARY_COMPLEMENT_ARBITRAGE_STRATEGY_LOG_FILE` / `LATE_RESOLUTION_WINNER_TRADING_STRATEGY_LOG_FILE` | unset | Optional mutually exclusive per-strategy text logs |
 | `MERGE_INTERVAL_MINUTES` | `0` | Scheduled Merge interval (minutes); `0` = disabled |
 | `WIND_DOWN_BEFORE_WINDOW_END_MINUTES` | `0` | Wind-down before window end (minutes); `0` = disabled |
 | `RUST_LOG` | `info` | Log level |
@@ -140,9 +140,9 @@ Other settings (CLOB URL, signature type, slippage, order type, position sync, e
 
 Startup reconciles cumulative CLOB fills and Data API positions, then restores manageable recovery tasks. New journal records carry a version and SHA-256 checksum. A crash-damaged final line is isolated to a `.corrupt-*` file while the valid prefix is retained; corruption in the middle still blocks startup. Legacy records without enough context block live startup by default. `ALLOW_UNRESOLVED_STATE=true` only permits the reconciliation/recovery process to run; unresolved state still blocks new live entries.
 
-For the first tiny live validation, use `DRY_RUN=false`, `CANARY_MODE=true`, and `ARBITRAGE_ORDER_TYPE=FAK`. `/readyz` returns 200 only when initialization, market/user-stream connectivity, journal writability, disk capacity, unresolved-order state, and the process-wide live safety gate are all healthy. Any ambiguous CLOB write pauses new entries across windows and requires a restart plus account/order reconciliation; it cannot be cleared in-process.
+For the first tiny live validation, use `DRY_RUN=false`, `CANARY_MODE=true`, and `BINARY_COMPLEMENT_ARBITRAGE_ORDER_TYPE=FAK`. `/readyz` returns 200 only when initialization, market/user-stream connectivity, journal writability, disk capacity, unresolved-order state, and the process-wide live safety gate are all healthy. Any ambiguous CLOB write pauses new entries across windows and requires a restart plus account/order reconciliation; it cannot be cleared in-process.
 
-With `DRY_RUN=true`, paper execution walks the real multi-level CLOB book for the harder leg, waits `PAPER_SECOND_LEG_DELAY_MS`, fetches a fresh live book for the opposite leg, and applies FOK/FAK/immediate-fill semantics to the confirmed virtual first-leg amount. It never restores real recovery tasks, syncs real positions, places/cancels orders, merges, or sells. Prometheus exposes paper pair/one-sided/PnL metrics, CLOB connect-failure/reconnect/recovery counters, and the Late-Resolution Winner Trading scan → signal → model rejection/confirmation → attempt → fill → pending → resolved → redeemed funnel. The TUI keeps estimated winner payout separate from realized settlement PnL.
+With `DRY_RUN=true`, paper execution walks the real multi-level CLOB book for the harder leg, waits `BINARY_COMPLEMENT_ARBITRAGE_PAPER_SECOND_LEG_DELAY_MS`, fetches a fresh live book for the opposite leg, and applies FOK/FAK/immediate-fill semantics to the confirmed virtual first-leg amount. It never restores real recovery tasks, syncs real positions, places/cancels orders, merges, or sells. Prometheus exposes paper pair/one-sided/PnL metrics, CLOB connect-failure/reconnect/recovery counters, and the Late-Resolution Winner Trading scan → signal → model rejection/confirmation → attempt → fill → pending → resolved → redeemed funnel. The TUI keeps estimated winner payout separate from realized settlement PnL.
 
 ### Strategy development stages
 

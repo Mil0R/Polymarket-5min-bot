@@ -10,7 +10,7 @@
 - 评价近期活跃度、独立已结算市场数、数据覆盖率、ROI、Profit Factor、胜率、利润集中度和滚动30天一致性；
 - 抽样近期市场的实时盘口，评价点差和目标金额的 Top-5 深度；
 - 为每个不合格钱包保存机器可读的拒绝原因；
-- 生成只包含 `COPY_DRY_RUN=true` 的 PAPER 候选 env 文件。
+- 生成只包含 `WALLET_COPY_TRADING_DRY_RUN=true` 的 PAPER 候选 env 文件。
 
 二级分类是本地、带版本号的规则分类，不是 Polymarket 官方枚举。历史仓位接口不提供真实开仓时间，因此滚动窗口采用可观测的仓位结算时间。公开接口也不能可靠重建每次信号后5/15/30/60秒的真实可成交盘口，所以当前 `live_execution_fit` 只表示近期市场的**当前**点差/深度适配度，不冒充历史延迟收益回测。
 
@@ -109,9 +109,9 @@ Polypulse 可以在 PAPER 运行期间读取 scout 的 `report.json` 作为候�
 对应配置：
 
 ```dotenv
-COPY_AUTO_ROTATION_ENABLED=true
-COPY_WALLET_QUALITY_AUDIT_MINUTES=360
-COPY_ROTATION_CANDIDATE_REPORT=results/wallet-copy-candidates/rotation-current/report.json
+WALLET_COPY_TRADING_AUTO_ROTATION_ENABLED=true
+WALLET_COPY_TRADING_WALLET_QUALITY_AUDIT_MINUTES=360
+WALLET_COPY_TRADING_ROTATION_CANDIDATE_REPORT=results/wallet-copy-candidates/rotation-current/report.json
 ```
 
 候选必须同时满足 scout `accepted=true`、`runtime_compatible=true`，重新拉取历史后仍通过运行时漏斗，并覆盖被替换钱包的领域。自动替换只在 PAPER 模式生效；LIVE 模式不会自动更换资金信号源。scout 使用原子方式写报告，因此可以在 Polypulse 运行期间定时重新扫描。

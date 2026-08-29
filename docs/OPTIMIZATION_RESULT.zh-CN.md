@@ -34,14 +34,14 @@
 
   ```text
   1 - yes_limit - no_limit
-      >= max(MIN_PROFIT_THRESHOLD, ARBITRAGE_EXECUTION_SPREAD)
-         + ARBITRAGE_FEE_BUFFER
+      >= max(BINARY_COMPLEMENT_ARBITRAGE_MIN_PROFIT_THRESHOLD, BINARY_COMPLEMENT_ARBITRAGE_EXECUTION_SPREAD)
+         + BINARY_COMPLEMENT_ARBITRAGE_FEE_BUFFER
   ```
 
-- 新增 `ARBITRAGE_FEE_BUFFER`，默认 `0.002`，用于预留手续费和舍入误差。
+- 新增 `BINARY_COMPLEMENT_ARBITRAGE_FEE_BUFFER`，默认 `0.002`，用于预留手续费和舍入误差。
 - 限价被约束到 `[0.01, 0.99]`，避免负滑点或异常配置产生非法价格。
-- `MIN_PROFIT_THRESHOLD` 已真正参与 detector 和最终报价判断，不再是无效配置。
-- `MAX_ORDER_SIZE_USDC` 现在按最终限价换算 share，确保每一腿名义金额不超过配置值。
+- `BINARY_COMPLEMENT_ARBITRAGE_MIN_PROFIT_THRESHOLD` 已真正参与 detector 和最终报价判断，不再是无效配置。
+- `BINARY_COMPLEMENT_ARBITRAGE_MAX_ORDER_SIZE_USDC` 现在按最终限价换算 share，确保每一腿名义金额不超过配置值。
 
 涉及文件：`src/trading/executor.rs`、`src/monitor/arbitrage.rs`、`src/config.rs`。
 
@@ -115,7 +115,7 @@ Data API 未平仓位保守成本
 新增测试覆盖：
 
 - 非法订单类型和滑点格式；
-- `MIN_PROFIT_THRESHOLD` 实际生效；
+- `BINARY_COMPLEMENT_ARBITRAGE_MIN_PROFIT_THRESHOLD` 实际生效；
 - 最优 ask 档位和机会边界；
 - 滑点吞噬利润时拒绝最终报价；
 - 每腿美元名义上限到 share 的换算；
@@ -144,7 +144,7 @@ git diff --check
 - proxy 地址格式错误会立即报错。
 - 非 EOA 交易必须有 funder；EOA 若开启 Data API 仓位同步、Merge 或 Wind-down，也必须提供查询地址。
 - 更新 `.env.example` 和中英文 README，明确美元名义上限、全账户敞口与 fee buffer 语义。
-- 新增可选 `ARBITRAGE_LOG_FILE`，机会记录改为标准 NDJSON；未配置时不产生文件。
+- 新增可选 `BINARY_COMPLEMENT_ARBITRAGE_LOG_FILE`，机会记录改为标准 NDJSON；未配置时不产生文件。
 
 涉及文件：`src/config.rs`、`.env.example`、`README.md`、`README.zh-CN.md`、`src/utils/arbitrage_logger.rs`。
 
@@ -193,11 +193,11 @@ PositionBalancer 和持仓同步展示现在会按 condition 检测索引约定�
 
 ## 5. 配置迁移提示
 
-- 新增 `ARBITRAGE_FEE_BUFFER=0.002`。最终所需 edge 是 spread/min-profit 与该 buffer 之和；原本较激进的滑点配置可能因此不再下单。
-- `MAX_ORDER_SIZE_USDC` 现在真正表示每腿美元名义上限，同一配置下 share 数量可能与旧版本不同。
+- 新增 `BINARY_COMPLEMENT_ARBITRAGE_FEE_BUFFER=0.002`。最终所需 edge 是 spread/min-profit 与该 buffer 之和；原本较激进的滑点配置可能因此不再下单。
+- `BINARY_COMPLEMENT_ARBITRAGE_MAX_ORDER_SIZE_USDC` 现在真正表示每腿美元名义上限，同一配置下 share 数量可能与旧版本不同。
 - 非法数字、未知订单类型、非法地址现在会阻止启动，请先修正 `.env`。
 - EOA 模式若没有 `POLYMARKET_PROXY_ADDRESS`，需要将 `POSITION_SYNC_INTERVAL_SECS=0`、`MERGE_INTERVAL_MINUTES=0`、`WIND_DOWN_BEFORE_WINDOW_END_MINUTES=0`；否则需提供 Data API 查询地址。
-- 如需机会文件日志，配置 `ARBITRAGE_LOG_FILE=arbitrage.ndjson`。
+- 如需机会文件日志，配置 `BINARY_COMPLEMENT_ARBITRAGE_LOG_FILE=arbitrage.ndjson`。
 
 ## 6. 结果总结
 

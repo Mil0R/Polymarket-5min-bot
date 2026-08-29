@@ -94,10 +94,10 @@ impl ConsensusEngine {
         }
     }
 
-    /// Loads correlated pairs from `COPY_CORRELATED_WALLET_PAIRS`
+    /// Loads correlated pairs from `WALLET_COPY_TRADING_CORRELATED_WALLET_PAIRS`
     /// (comma-separated `addr1:addr2` pairs).
     pub fn load_correlated_from_env(&self) {
-        if let Ok(raw) = std::env::var("COPY_CORRELATED_WALLET_PAIRS") {
+        if let Ok(raw) = std::env::var("WALLET_COPY_TRADING_CORRELATED_WALLET_PAIRS") {
             for pair in raw.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
                 let mut parts = pair.split(':');
                 if let (Some(a), Some(b)) = (parts.next(), parts.next()) {

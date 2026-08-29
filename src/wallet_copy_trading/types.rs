@@ -435,162 +435,162 @@ impl WalletCopyTradingConfig {
     pub fn from_env() -> Self {
         let mut cfg = Self::default();
 
-        if let Ok(v) = std::env::var("COPY_MIN_SETTLED_EVENTS") {
+        if let Ok(v) = std::env::var("WALLET_COPY_TRADING_MIN_SETTLED_EVENTS") {
             if let Ok(val) = v.trim().parse::<usize>() {
                 cfg.min_settled_events = val;
             }
         }
-        if let Ok(v) = std::env::var("COPY_MIN_ACTIVE_DAYS") {
+        if let Ok(v) = std::env::var("WALLET_COPY_TRADING_MIN_ACTIVE_DAYS") {
             if let Ok(val) = v.trim().parse::<u32>() {
                 cfg.min_active_days = val;
             }
         }
-        if let Ok(v) = std::env::var("COPY_MIN_AVG_ENTRY_PRICE") {
+        if let Ok(v) = std::env::var("WALLET_COPY_TRADING_MIN_AVG_ENTRY_PRICE") {
             if let Ok(val) = v.trim().parse::<Decimal>() {
                 cfg.min_avg_entry_price = val;
             }
         }
-        if let Ok(v) = std::env::var("COPY_MAX_AVG_ENTRY_PRICE") {
+        if let Ok(v) = std::env::var("WALLET_COPY_TRADING_MAX_AVG_ENTRY_PRICE") {
             if let Ok(val) = v.trim().parse::<Decimal>() {
                 cfg.max_avg_entry_price = val;
             }
         }
-        if let Ok(v) = std::env::var("COPY_MAX_SINGLE_PROFIT_RATIO") {
+        if let Ok(v) = std::env::var("WALLET_COPY_TRADING_MAX_SINGLE_PROFIT_RATIO") {
             if let Ok(val) = v.trim().parse::<Decimal>() {
                 cfg.max_single_profit_ratio = val;
             }
         }
-        if let Ok(v) = std::env::var("COPY_MAX_MAKER_RATIO") {
+        if let Ok(v) = std::env::var("WALLET_COPY_TRADING_MAX_MAKER_RATIO") {
             if let Ok(val) = v.trim().parse::<Decimal>() {
                 cfg.max_maker_ratio = val;
             }
         }
-        if let Ok(v) = std::env::var("COPY_MAX_SPREAD") {
+        if let Ok(v) = std::env::var("WALLET_COPY_TRADING_MAX_SPREAD") {
             if let Ok(val) = v.trim().parse::<Decimal>() {
                 cfg.max_spread = val;
             }
         }
-        if let Ok(v) = std::env::var("COPY_MIN_24H_VOLUME_USDC") {
+        if let Ok(v) = std::env::var("WALLET_COPY_TRADING_MIN_24H_VOLUME_USDC") {
             if let Ok(val) = v.trim().parse::<Decimal>() {
                 cfg.min_24h_volume_usdc = val;
             }
         }
-        if let Ok(v) = std::env::var("COPY_MIN_HOURS_TO_EXPIRY") {
+        if let Ok(v) = std::env::var("WALLET_COPY_TRADING_MIN_HOURS_TO_EXPIRY") {
             if let Ok(val) = v.trim().parse::<Decimal>() {
                 cfg.min_hours_to_expiry = val;
             }
         }
-        if let Ok(v) = std::env::var("COPY_MAX_SLIPPAGE_PCT") {
+        if let Ok(v) = std::env::var("WALLET_COPY_TRADING_MAX_SLIPPAGE_PCT") {
             if let Ok(val) = v.trim().parse::<Decimal>() {
                 cfg.max_slippage_pct = val;
             }
         }
-        if let Ok(v) = std::env::var("COPY_MAX_PRICE_OFFSET_USD") {
+        if let Ok(v) = std::env::var("WALLET_COPY_TRADING_MAX_PRICE_OFFSET_USD") {
             if let Ok(val) = v.trim().parse::<Decimal>() {
                 cfg.max_price_offset_usd = val;
             }
         }
-        if let Ok(v) = std::env::var("COPY_DEFAULT_TTL_SECONDS") {
+        if let Ok(v) = std::env::var("WALLET_COPY_TRADING_DEFAULT_TTL_SECONDS") {
             if let Ok(val) = v.trim().parse::<u64>() {
                 cfg.default_ttl_seconds = val;
             }
         }
-        if let Ok(v) = std::env::var("COPY_MAX_TOP5_DEPTH_PCT") {
+        if let Ok(v) = std::env::var("WALLET_COPY_TRADING_MAX_TOP5_DEPTH_PCT") {
             if let Ok(val) = v.trim().parse::<Decimal>() {
                 cfg.max_top5_depth_pct = val;
             }
         }
-        if let Ok(v) = std::env::var("COPY_SINGLE_TRADE_ALLOCATION_PCT") {
+        if let Ok(v) = std::env::var("WALLET_COPY_TRADING_SINGLE_TRADE_ALLOCATION_PCT") {
             if let Ok(val) = v.trim().parse::<Decimal>() {
                 cfg.single_trade_allocation_pct = val;
             }
         }
-        if let Ok(v) = std::env::var("COPY_MAX_SINGLE_MARKET_EXPOSURE_PCT") {
+        if let Ok(v) = std::env::var("WALLET_COPY_TRADING_MAX_SINGLE_MARKET_EXPOSURE_PCT") {
             if let Ok(val) = v.trim().parse::<Decimal>() {
                 cfg.max_single_market_exposure_pct = val;
             }
         }
-        if let Ok(v) = std::env::var("COPY_MAX_TOTAL_EXPOSURE_PCT") {
+        if let Ok(v) = std::env::var("WALLET_COPY_TRADING_MAX_TOTAL_EXPOSURE_PCT") {
             if let Ok(val) = v.trim().parse::<Decimal>() {
                 cfg.max_total_exposure_pct = val;
             }
         }
-        if let Ok(v) = std::env::var("COPY_DAILY_MAX_DRAWDOWN_PCT") {
+        if let Ok(v) = std::env::var("WALLET_COPY_TRADING_DAILY_MAX_DRAWDOWN_PCT") {
             if let Ok(val) = v.trim().parse::<Decimal>() {
                 cfg.daily_max_drawdown_pct = val;
             }
         }
-        if let Ok(v) = std::env::var("COPY_CONSENSUS_WINDOW_HOURS") {
+        if let Ok(v) = std::env::var("WALLET_COPY_TRADING_CONSENSUS_WINDOW_HOURS") {
             if let Ok(val) = v.trim().parse::<i64>() {
                 cfg.consensus_window_hours = val;
             }
         }
-        if let Ok(v) = std::env::var("COPY_MIN_CONSENSUS_WALLETS") {
+        if let Ok(v) = std::env::var("WALLET_COPY_TRADING_MIN_CONSENSUS_WALLETS") {
             if let Ok(val) = v.trim().parse::<usize>() {
                 cfg.min_consensus_wallets = val;
             }
         }
-        if let Ok(v) = std::env::var("COPY_MIN_SIGNAL_NOTIONAL_USDC") {
+        if let Ok(v) = std::env::var("WALLET_COPY_TRADING_MIN_SIGNAL_NOTIONAL_USDC") {
             if let Ok(val) = v.trim().parse::<Decimal>() {
                 cfg.min_signal_notional_usdc = val;
             }
         }
-        if let Ok(v) = std::env::var("COPY_SHADOW_MIN_SIGNAL_NOTIONAL_USDC") {
+        if let Ok(v) = std::env::var("WALLET_COPY_TRADING_SHADOW_MIN_SIGNAL_NOTIONAL_USDC") {
             if let Ok(val) = v.trim().parse::<Decimal>() {
                 cfg.shadow_min_signal_notional_usdc = val;
             }
         }
-        if let Ok(v) = std::env::var("COPY_MIN_SIGNAL_VWAP") {
+        if let Ok(v) = std::env::var("WALLET_COPY_TRADING_MIN_SIGNAL_VWAP") {
             if let Ok(val) = v.trim().parse::<Decimal>() {
                 cfg.min_signal_vwap = val;
             }
         }
-        if let Ok(v) = std::env::var("COPY_MAX_SIGNAL_VWAP") {
+        if let Ok(v) = std::env::var("WALLET_COPY_TRADING_MAX_SIGNAL_VWAP") {
             if let Ok(val) = v.trim().parse::<Decimal>() {
                 cfg.max_signal_vwap = val;
             }
         }
-        if let Ok(v) = std::env::var("COPY_MAX_SIGNAL_AGE_SECONDS") {
+        if let Ok(v) = std::env::var("WALLET_COPY_TRADING_MAX_SIGNAL_AGE_SECONDS") {
             if let Ok(val) = v.trim().parse::<i64>() {
                 cfg.max_signal_age_seconds = val.max(1);
             }
         }
-        if let Ok(v) = std::env::var("COPY_SHADOW_MAX_SIGNAL_AGE_SECONDS") {
+        if let Ok(v) = std::env::var("WALLET_COPY_TRADING_SHADOW_MAX_SIGNAL_AGE_SECONDS") {
             if let Ok(val) = v.trim().parse::<i64>() {
                 cfg.shadow_max_signal_age_seconds = val.max(1);
             }
         }
-        if let Ok(v) = std::env::var("COPY_PAPER_EXECUTION_DELAY_MS") {
+        if let Ok(v) = std::env::var("WALLET_COPY_TRADING_PAPER_EXECUTION_DELAY_MS") {
             if let Ok(val) = v.trim().parse::<u64>() {
                 cfg.paper_execution_delay_ms = val.min(30_000);
             }
         }
-        if let Ok(v) = std::env::var("COPY_EXIT_TRIGGER_REDUCTION_PCT") {
+        if let Ok(v) = std::env::var("WALLET_COPY_TRADING_EXIT_TRIGGER_REDUCTION_PCT") {
             if let Ok(val) = v.trim().parse::<Decimal>() {
                 cfg.exit_trigger_reduction_pct = val;
             }
         }
-        if let Ok(v) = std::env::var("COPY_ISOLATE_MULTI_OUTCOME") {
+        if let Ok(v) = std::env::var("WALLET_COPY_TRADING_ISOLATE_MULTI_OUTCOME") {
             if let Ok(val) = v.trim().parse::<bool>() {
                 cfg.isolate_multi_outcome = val;
             }
         }
-        if let Ok(v) = std::env::var("COPY_MIN_ORDER_NOTIONAL_USDC") {
+        if let Ok(v) = std::env::var("WALLET_COPY_TRADING_MIN_ORDER_NOTIONAL_USDC") {
             if let Ok(val) = v.trim().parse::<Decimal>() {
                 cfg.min_order_notional_usdc = val;
             }
         }
-        if let Ok(v) = std::env::var("COPY_CIRCUIT_BREAKER_COOLDOWN_HOURS") {
+        if let Ok(v) = std::env::var("WALLET_COPY_TRADING_CIRCUIT_BREAKER_COOLDOWN_HOURS") {
             if let Ok(val) = v.trim().parse::<u32>() {
                 cfg.circuit_breaker_cooldown_hours = val;
             }
         }
-        if let Ok(v) = std::env::var("COPY_MAX_ACCEPTABLE_BRIER_SCORE") {
+        if let Ok(v) = std::env::var("WALLET_COPY_TRADING_MAX_ACCEPTABLE_BRIER_SCORE") {
             if let Ok(val) = v.trim().parse::<Decimal>() {
                 cfg.max_acceptable_brier_score = val;
             }
         }
-        if let Ok(v) = std::env::var("COPY_MAX_CONSECUTIVE_DIRECTION_ERRORS") {
+        if let Ok(v) = std::env::var("WALLET_COPY_TRADING_MAX_CONSECUTIVE_DIRECTION_ERRORS") {
             if let Ok(val) = v.trim().parse::<u32>() {
                 cfg.max_consecutive_direction_errors = val;
             }

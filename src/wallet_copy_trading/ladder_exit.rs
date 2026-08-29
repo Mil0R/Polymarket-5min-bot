@@ -7,9 +7,9 @@
 //! cleared without dumping into the book.
 //!
 //! Env config:
-//!   COPY_EXIT_LADDER_ENABLED      = true (default)
-//!   COPY_EXIT_LADDER_MAX_ATTEMPTS = 3
-//!   COPY_EXIT_LADDER_STEP         = 0.005 (price descent per attempt)
+//!   WALLET_COPY_TRADING_EXIT_LADDER_ENABLED      = true (default)
+//!   WALLET_COPY_TRADING_EXIT_LADDER_MAX_ATTEMPTS = 3
+//!   WALLET_COPY_TRADING_EXIT_LADDER_STEP         = 0.005 (price descent per attempt)
 
 use crate::wallet_copy_trading::coordinator::WalletCopyTradingCoordinator;
 use crate::wallet_copy_trading::feed::BookFetcher;
@@ -42,14 +42,14 @@ impl Default for LadderExitConfig {
 
 impl LadderExitConfig {
     pub fn from_env() -> Self {
-        let enabled = env::var("COPY_EXIT_LADDER_ENABLED")
+        let enabled = env::var("WALLET_COPY_TRADING_EXIT_LADDER_ENABLED")
             .map(|v| v.trim().to_lowercase() != "false" && v.trim() != "0")
             .unwrap_or(true);
-        let max_attempts = env::var("COPY_EXIT_LADDER_MAX_ATTEMPTS")
+        let max_attempts = env::var("WALLET_COPY_TRADING_EXIT_LADDER_MAX_ATTEMPTS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(3);
-        let step = env::var("COPY_EXIT_LADDER_STEP")
+        let step = env::var("WALLET_COPY_TRADING_EXIT_LADDER_STEP")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(dec!(0.005));

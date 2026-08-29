@@ -43,20 +43,20 @@ async fn main() -> Result<()> {
     dotenv().ok();
     init_wallet_copy_trading_logging("logs/wallet-copy-trading.log")?;
 
-    let configured_dry_run = env::var("COPY_DRY_RUN")
+    let configured_dry_run = env::var("WALLET_COPY_TRADING_DRY_RUN")
         .map(|value| value.trim() == "1" || value.trim().eq_ignore_ascii_case("true"))
         .unwrap_or(true);
     if !configured_dry_run {
         anyhow::bail!(
-            "standalone wallet_copy_trading is restricted to stage-2 PAPER mode; set COPY_DRY_RUN=true. Real execution is only allowed through the interactive polypulse TUI"
+            "standalone wallet_copy_trading is restricted to stage-2 PAPER mode; set WALLET_COPY_TRADING_DRY_RUN=true. Real execution is only allowed through the interactive polypulse TUI"
         );
     }
 
-    let enabled = env::var("COPY_TRADING_ENABLED")
+    let enabled = env::var("WALLET_COPY_TRADING_ENABLED")
         .map(|v| v.trim().to_lowercase() != "false" && v.trim() != "0")
         .unwrap_or(true);
     if !enabled {
-        info!("COPY_TRADING_ENABLED=false — wallet-copy-trading disabled, exiting.");
+        info!("WALLET_COPY_TRADING_ENABLED=false — wallet-copy-trading disabled, exiting.");
         return Ok(());
     }
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -77,7 +77,7 @@ async fn run_wallet_copy_trading(
     budget_override: Option<Decimal>,
     embedded: bool,
 ) -> Result<()> {
-    let lock_path = env::var("COPY_RUNTIME_LOCK_FILE")
+    let lock_path = env::var("WALLET_COPY_TRADING_RUNTIME_LOCK_FILE")
         .unwrap_or_else(|_| "data/wallet-copy-trading-runtime.lock".into());
     if let Some(parent) = std::path::Path::new(&lock_path).parent() {
         std::fs::create_dir_all(parent)?;
@@ -103,19 +103,19 @@ async fn run_wallet_copy_trading(
     let config = WalletCopyTradingConfig::from_env();
     config.validate().map_err(anyhow::Error::msg)?;
     let configured_nav = budget_override.unwrap_or_else(|| {
-        env::var("COPY_TRADING_BUDGET_USDC")
-            .or_else(|_| env::var("COPY_INITIAL_NAV_USDC"))
+        env::var("WALLET_COPY_TRADING_BUDGET_USDC")
+            .or_else(|_| env::var("WALLET_COPY_TRADING_INITIAL_NAV_USDC"))
             .ok()
             .and_then(|v| v.trim().parse::<Decimal>().ok())
             .unwrap_or(dec!(10_000.0))
     });
 
     let dry_run = embedded
-        || env::var("COPY_DRY_RUN")
+        || env::var("WALLET_COPY_TRADING_DRY_RUN")
             .map(|v| v.trim().to_lowercase() == "true" || v.trim() == "1")
             .unwrap_or(true);
     let poll_interval = Duration::from_secs(
-        env::var("COPY_POLL_INTERVAL_SECONDS")
+        env::var("WALLET_COPY_TRADING_POLL_INTERVAL_SECONDS")
             .ok()
             .and_then(|value| value.trim().parse::<u64>().ok())
             .unwrap_or(15)
@@ -123,7 +123,7 @@ async fn run_wallet_copy_trading(
     );
     let wallet_reevaluation_loops =
         (Duration::from_secs(24 * 60 * 60).as_secs() / poll_interval.as_secs()).max(1);
-    let quality_audit_minutes = env::var("COPY_WALLET_QUALITY_AUDIT_MINUTES")
+    let quality_audit_minutes = env::var("WALLET_COPY_TRADING_WALLET_QUALITY_AUDIT_MINUTES")
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
         .unwrap_or(360)
@@ -132,14 +132,15 @@ async fn run_wallet_copy_trading(
         / poll_interval.as_secs())
     .max(1);
     let auto_rotation = dry_run
-        && env::var("COPY_AUTO_ROTATION_ENABLED")
+        && env::var("WALLET_COPY_TRADING_AUTO_ROTATION_ENABLED")
             .map(|value| value.trim() == "1" || value.trim().eq_ignore_ascii_case("true"))
             .unwrap_or(false);
-    let rotation_report = env::var("COPY_ROTATION_CANDIDATE_REPORT").unwrap_or_else(|_| {
-        "results/wallet-copy-candidates/rotation-current/report.json".to_string()
-    });
+    let rotation_report =
+        env::var("WALLET_COPY_TRADING_ROTATION_CANDIDATE_REPORT").unwrap_or_else(|_| {
+            "results/wallet-copy-candidates/rotation-current/report.json".to_string()
+        });
     let quality_policy = WalletQualityPolicy::from_env();
-    let quality_state_file = env::var("COPY_WALLET_QUALITY_STATE_FILE")
+    let quality_state_file = env::var("WALLET_COPY_TRADING_WALLET_QUALITY_STATE_FILE")
         .unwrap_or_else(|_| "data/copy-wallet-quality.json".to_string());
     let quality_tracker = WalletQualityTracker::new_with_state(&quality_state_file);
 
@@ -200,11 +201,11 @@ async fn run_wallet_copy_trading(
     let run_id = uuid::Uuid::new_v4().to_string();
     let journal = CopyTradeJournal::new(run_id.clone());
     let processed_signals = ProcessedSignalStore::open(
-        env::var("COPY_SIGNAL_STATE_FILE")
+        env::var("WALLET_COPY_TRADING_SIGNAL_STATE_FILE")
             .unwrap_or_else(|_| "data/copy-signals-seen.json".to_string()),
         50_000,
     );
-    let results_dir = env::var("COPY_TRADING_RESULTS_DIR")
+    let results_dir = env::var("WALLET_COPY_TRADING_RESULTS_DIR")
         .unwrap_or_else(|_| format!("results/wallet-copy-trading/{}", mode));
     let events_file = format!("{}/events.ndjson", results_dir);
     match journal.enable(&events_file) {
@@ -218,7 +219,7 @@ async fn run_wallet_copy_trading(
         serde_json::json!({
             "initialNav": initial_nav.to_string(),
             "dryRun": dry_run,
-            "targetWallets": env::var("COPY_TARGET_WALLETS").unwrap_or_default(),
+            "targetWallets": env::var("WALLET_COPY_TRADING_TARGET_WALLETS").unwrap_or_default(),
             "maxSignalAgeSeconds": config.max_signal_age_seconds,
             "shadowMaxSignalAgeSeconds": config.shadow_max_signal_age_seconds,
             "minSignalNotional": config.min_signal_notional_usdc.to_string(),
@@ -235,9 +236,9 @@ async fn run_wallet_copy_trading(
     let now = Utc::now();
     // Whitelist persistence (Opinion 4): profiles + strike counters survive
     // restarts, enabling warm-start without re-fetching all Data-API history.
-    let whitelist_state_file = env::var("COPY_WHITELIST_STATE_FILE")
+    let whitelist_state_file = env::var("WALLET_COPY_TRADING_WHITELIST_STATE_FILE")
         .unwrap_or_else(|_| "data/copy-whitelist.json".to_string());
-    let risk_state_file = env::var("COPY_RISK_STATE_FILE")
+    let risk_state_file = env::var("WALLET_COPY_TRADING_RISK_STATE_FILE")
         .unwrap_or_else(|_| format!("data/copy-risk-{}.json", mode));
     let coordinator = Arc::new(WalletCopyTradingCoordinator::new_with_state_paths(
         config.clone(),
@@ -299,11 +300,13 @@ async fn run_wallet_copy_trading(
 
     // Optional on-chain OrderFilled feed (Opinion 1): bypasses the Data-API
     // indexing delay for whitelisted wallet fills.
-    let onchain_feed: Option<Arc<OnChainTradeFeed>> = if env::var("COPY_ONCHAIN_FEED_ENABLED")
-        .map(|v| v.trim().to_lowercase() == "true" || v.trim() == "1")
-        .unwrap_or(false)
+    let onchain_feed: Option<Arc<OnChainTradeFeed>> = if env::var(
+        "WALLET_COPY_TRADING_ONCHAIN_FEED_ENABLED",
+    )
+    .map(|v| v.trim().to_lowercase() == "true" || v.trim() == "1")
+    .unwrap_or(false)
     {
-        let rpc = env::var("COPY_ONCHAIN_RPC_URL")
+        let rpc = env::var("WALLET_COPY_TRADING_ONCHAIN_RPC_URL")
             .unwrap_or_else(|_| "https://polygon-bor-rpc.publicnode.com".to_string());
         match OnChainTradeFeed::new(&rpc).await {
             Ok(feed) => {
@@ -320,7 +323,7 @@ async fn run_wallet_copy_trading(
     };
 
     // 4. Seed target wallets from env, or discover from the profit leaderboard
-    let configured_wallets: Vec<String> = env::var("COPY_TARGET_WALLETS")
+    let configured_wallets: Vec<String> = env::var("WALLET_COPY_TRADING_TARGET_WALLETS")
         .unwrap_or_default()
         .split(',')
         .map(|s| s.trim().to_string())
@@ -328,10 +331,12 @@ async fn run_wallet_copy_trading(
         .collect();
     let target_wallets: Vec<String> = if configured_wallets.is_empty() {
         if !dry_run {
-            anyhow::bail!("COPY_TARGET_WALLETS must be explicitly configured in live mode");
+            anyhow::bail!(
+                "WALLET_COPY_TRADING_TARGET_WALLETS must be explicitly configured in live mode"
+            );
         }
         info!(
-            "No COPY_TARGET_WALLETS specified. Discovering candidates from profit leaderboard..."
+            "No WALLET_COPY_TRADING_TARGET_WALLETS specified. Discovering candidates from profit leaderboard..."
         );
         match history.discover_candidates(30).await {
             Ok(cands) => cands,
@@ -345,13 +350,13 @@ async fn run_wallet_copy_trading(
     };
 
     if target_wallets.is_empty() {
-        warn!("No target wallets available; wallet-copy-trading will idle until COPY_TARGET_WALLETS is configured.");
+        warn!("No target wallets available; wallet-copy-trading will idle until WALLET_COPY_TRADING_TARGET_WALLETS is configured.");
     } else {
         info!(
             "Profiling {} target wallets from real Polymarket history...",
             target_wallets.len()
         );
-        let refresh_days = env::var("COPY_WHITELIST_REFRESH_DAYS")
+        let refresh_days = env::var("WALLET_COPY_TRADING_WHITELIST_REFRESH_DAYS")
             .ok()
             .and_then(|v| v.parse::<i64>().ok())
             .unwrap_or(7);
@@ -777,7 +782,7 @@ async fn rotate_wallets_from_report(
             return;
         }
     };
-    let max_report_age_hours = env::var("COPY_ROTATION_MAX_REPORT_AGE_HOURS")
+    let max_report_age_hours = env::var("WALLET_COPY_TRADING_ROTATION_MAX_REPORT_AGE_HOURS")
         .ok()
         .and_then(|value| value.trim().parse::<i64>().ok())
         .unwrap_or(24)
@@ -1602,11 +1607,11 @@ fn signal_prefilter_reason(
 /// spread) must never feed the drawdown breaker or exposure caps. When the live
 /// book fails the filters, the PREVIOUS valid mark is retained.
 fn mark_filter_config() -> (Decimal, Decimal) {
-    let max_spread = env::var("COPY_MARK_MAX_SPREAD_PCT")
+    let max_spread = env::var("WALLET_COPY_TRADING_MARK_MAX_SPREAD_PCT")
         .ok()
         .and_then(|v| v.parse::<Decimal>().ok())
         .unwrap_or(dec!(0.05));
-    let min_depth = env::var("COPY_MARK_MIN_DEPTH_USDC")
+    let min_depth = env::var("WALLET_COPY_TRADING_MARK_MIN_DEPTH_USDC")
         .ok()
         .and_then(|v| v.parse::<Decimal>().ok())
         .unwrap_or(dec!(5.0));

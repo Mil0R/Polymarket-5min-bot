@@ -58,28 +58,55 @@ impl ReplayConfig {
             liquidity_haircut: env_decimal("BACKTEST_LIQUIDITY_HAIRCUT", "0.75")?,
             fee_rate,
             fee_exponent,
-            spread_min_edge: env_decimal("BACKTEST_SPREAD_MIN_EDGE", "0.005")?,
-            spread_min_net_profit: env_decimal("BACKTEST_SPREAD_MIN_NET_PROFIT_USDC", "0.01")?,
-            winner_before_end_secs: env_parse("WINNER_BUY_BEFORE_END_SECS", 30i64)?,
-            winner_min_price: env_decimal("WINNER_BUY_MIN_PRICE", "0.95")?,
-            winner_max_price: env_decimal("WINNER_BUY_MAX_PRICE", "0.98")?,
-            winner_confirmations: env_parse("WINNER_BUY_CONFIRMATION_OBSERVATIONS", 3u32)?,
+            spread_min_edge: env_decimal("BINARY_COMPLEMENT_ARBITRAGE_BACKTEST_MIN_EDGE", "0.005")?,
+            spread_min_net_profit: env_decimal(
+                "BINARY_COMPLEMENT_ARBITRAGE_BACKTEST_MIN_NET_PROFIT_USDC",
+                "0.01",
+            )?,
+            winner_before_end_secs: env_parse(
+                "LATE_RESOLUTION_WINNER_TRADING_BEFORE_END_SECS",
+                30i64,
+            )?,
+            winner_min_price: env_decimal("LATE_RESOLUTION_WINNER_TRADING_MIN_PRICE", "0.95")?,
+            winner_max_price: env_decimal("LATE_RESOLUTION_WINNER_TRADING_MAX_PRICE", "0.98")?,
+            winner_confirmations: env_parse(
+                "LATE_RESOLUTION_WINNER_TRADING_CONFIRMATION_OBSERVATIONS",
+                3u32,
+            )?,
             winner_policy: WinnerModelPolicy {
-                max_feed_age_ms: env_parse("WINNER_BUY_FEED_MAX_AGE_MS", 5000i64)?,
-                max_opening_skew_ms: env_parse("WINNER_BUY_OPENING_MAX_SKEW_MS", 5000i64)?,
-                volatility_lookback_secs: env_parse("WINNER_BUY_VOLATILITY_LOOKBACK_SECS", 120u64)?,
-                min_observations: env_parse("WINNER_BUY_MIN_OBSERVATIONS", 10usize)?,
+                max_feed_age_ms: env_parse(
+                    "LATE_RESOLUTION_WINNER_TRADING_FEED_MAX_AGE_MS",
+                    5000i64,
+                )?,
+                max_opening_skew_ms: env_parse(
+                    "LATE_RESOLUTION_WINNER_TRADING_OPENING_MAX_SKEW_MS",
+                    5000i64,
+                )?,
+                volatility_lookback_secs: env_parse(
+                    "LATE_RESOLUTION_WINNER_TRADING_VOLATILITY_LOOKBACK_SECS",
+                    120u64,
+                )?,
+                min_observations: env_parse(
+                    "LATE_RESOLUTION_WINNER_TRADING_MIN_OBSERVATIONS",
+                    10usize,
+                )?,
                 min_volatility_bps_per_sqrt_second: env_parse(
-                    "WINNER_BUY_BTC_MIN_VOLATILITY_BPS",
+                    "LATE_RESOLUTION_WINNER_TRADING_BTC_MIN_VOLATILITY_BPS",
                     0.8f64,
                 )?,
-                min_margin_bps: env_parse("WINNER_BUY_MIN_MARGIN_BPS", 3.0f64)?,
-                reversal_sigma_multiplier: env_parse("WINNER_BUY_REVERSAL_SIGMA", 2.0f64)?,
-                max_spread: env_decimal("WINNER_BUY_MAX_SPREAD", "0.03")?,
-                min_depth_usdc: env_decimal("WINNER_BUY_MIN_DEPTH_USDC", "10")?,
+                min_margin_bps: env_parse("LATE_RESOLUTION_WINNER_TRADING_MIN_MARGIN_BPS", 3.0f64)?,
+                reversal_sigma_multiplier: env_parse(
+                    "LATE_RESOLUTION_WINNER_TRADING_REVERSAL_SIGMA",
+                    2.0f64,
+                )?,
+                max_spread: env_decimal("LATE_RESOLUTION_WINNER_TRADING_MAX_SPREAD", "0.03")?,
+                min_depth_usdc: env_decimal("LATE_RESOLUTION_WINNER_TRADING_MIN_DEPTH_USDC", "10")?,
                 fee_buffer: winner_fee,
-                model_risk_buffer: env_decimal("WINNER_BUY_BTC_MODEL_RISK_BUFFER", "0.01")?,
-                min_net_ev: env_decimal("WINNER_BUY_MIN_NET_EV", "0.002")?,
+                model_risk_buffer: env_decimal(
+                    "LATE_RESOLUTION_WINNER_TRADING_BTC_MODEL_RISK_BUFFER",
+                    "0.01",
+                )?,
+                min_net_ev: env_decimal("LATE_RESOLUTION_WINNER_TRADING_MIN_NET_EV", "0.002")?,
             },
         })
     }
@@ -101,7 +128,7 @@ impl ReplayConfig {
             bail!("BACKTEST_LIQUIDITY_HAIRCUT must be in (0,1]");
         }
         if self.winner_confirmations == 0 {
-            bail!("WINNER_BUY_CONFIRMATION_OBSERVATIONS must be greater than zero");
+            bail!("LATE_RESOLUTION_WINNER_TRADING_CONFIRMATION_OBSERVATIONS must be greater than zero");
         }
         Ok(())
     }

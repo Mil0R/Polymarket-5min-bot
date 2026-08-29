@@ -149,7 +149,7 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    WindowTimeCheck["1秒心跳检查剩余时间: seconds_until_end"] --> CheckLateResolutionWinnerTrading{"WINNER_BUY_ENABLED && seconds_until_end <= 30s?"}
+    WindowTimeCheck["1秒心跳检查剩余时间: seconds_until_end"] --> CheckLateResolutionWinnerTrading{"LATE_RESOLUTION_WINNER_TRADING_ENABLED && seconds_until_end <= 30s?"}
 
     %% Late-Resolution Winner Trading 分支
     CheckLateResolutionWinnerTrading -- "是" --> FetchRestAsks["REST API 查询 YES 和 NO 的真实买卖深度"]

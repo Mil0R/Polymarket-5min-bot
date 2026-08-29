@@ -40,14 +40,14 @@ EXECUTION FIT:
   --max-live-spread FLOAT
   --min-live-execution-fit FLOAT
   --min-compatible-market-ratio FLOAT  Share passing binary/NegRisk/expiry/volume gates
-  --min-actionable-signal-ratio FLOAT  Recent BUY share above COPY_MIN_SIGNAL_NOTIONAL_USDC
+  --min-actionable-signal-ratio FLOAT  Recent BUY share above WALLET_COPY_TRADING_MIN_SIGNAL_NOTIONAL_USDC
 
 OUTPUT:
   --top N                          Accepted wallets written to recommended PAPER env
   --output DIR                     Default: results/wallet-copy-candidates
   -h, --help
 
-The generated recommended-paper.env always contains COPY_DRY_RUN=true and never
+The generated recommended-paper.env always contains WALLET_COPY_TRADING_DRY_RUN=true and never
 enables live trading. Historical delay P&L is not claimed: live_execution_fit is
 a current-book spread/depth measurement for recent markets.
 "#;

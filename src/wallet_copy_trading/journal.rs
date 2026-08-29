@@ -157,7 +157,7 @@ pub fn init_wallet_copy_trading_logging(default_log_file: &str) -> Result<()> {
     // healthy startup into thousands of misleading lines. Keep actual SDK
     // errors visible and suppress only this compatibility target, including
     // when a shell-level `RUST_LOG=info` overrides the .env filter.
-    let show_sdk_schema_warnings = std::env::var("COPY_SHOW_SDK_SCHEMA_WARNINGS")
+    let show_sdk_schema_warnings = std::env::var("WALLET_COPY_TRADING_SHOW_SDK_SCHEMA_WARNINGS")
         .map(|v| v.trim().eq_ignore_ascii_case("true") || v.trim() == "1")
         .unwrap_or(false);
     if !show_sdk_schema_warnings {
@@ -168,7 +168,7 @@ pub fn init_wallet_copy_trading_logging(default_log_file: &str) -> Result<()> {
         );
     }
 
-    let log_path = std::env::var("COPY_TRADING_LOG_FILE")
+    let log_path = std::env::var("WALLET_COPY_TRADING_LOG_FILE")
         .or_else(|_| std::env::var("LOG_FILE"))
         .unwrap_or_else(|_| default_log_file.to_string());
     let file_writer = RotatingFileWriter::new(&log_path)?;
@@ -185,7 +185,7 @@ pub fn init_wallet_copy_trading_logging(default_log_file: &str) -> Result<()> {
         .init();
     info!(log_file = %log_path, "File logging enabled");
     if !show_sdk_schema_warnings {
-        info!("SDK schema compatibility warnings suppressed; set COPY_SHOW_SDK_SCHEMA_WARNINGS=true to diagnose API field changes");
+        info!("SDK schema compatibility warnings suppressed; set WALLET_COPY_TRADING_SHOW_SDK_SCHEMA_WARNINGS=true to diagnose API field changes");
     }
     Ok(())
 }

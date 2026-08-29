@@ -1,7 +1,7 @@
 # 策略正式名称与兼容约定
 
-项目中的策略名称采用能够直接说明收益来源和风险类型的行业术语。旧名称仅作为迁移
-别名保留，不再用于新代码模块、可执行文件、TUI 标题或新建结果目录。
+项目中的策略名称采用能够直接说明收益来源和风险类型的行业术语。旧名称仅用于识别
+历史资料，不再作为代码模块、可执行文件、TUI 标题、结果目录或环境变量接口。
 
 | 正式英文名称 | 中文名称 | 旧名称 | 策略性质 | 核心逻辑 |
 |---|---|---|---|---|
@@ -21,10 +21,23 @@
 | Market Making | `market_making` | `market_making` | `results/market-making/` |
 | Cross-Market Probability Arbitrage | `cross_market_probability_arbitrage` | `cross_market_probability_arbitrage` | `results/cross-market-probability-arbitrage/` |
 
-## 兼容与迁移
+## 环境变量前缀
 
-- 现有环境变量键继续有效，例如 `ARBITRAGE_*`、`WINNER_BUY_*`、
-  `COPY_TRADING_*`、`MAKER_*` 和 `BAYESIAN_*`。这些键属于部署接口，暂不进行破坏性改名。
+| 正式名称 | 新环境变量前缀 | 旧前缀（不再读取） |
+|---|---|---|
+| Binary Complement Arbitrage | `BINARY_COMPLEMENT_ARBITRAGE_*` | `ARBITRAGE_*` 以及无前缀的套利参数 |
+| Late-Resolution Winner Trading | `LATE_RESOLUTION_WINNER_TRADING_*` | `WINNER_BUY_*` |
+| Wallet-Copy Trading | `WALLET_COPY_TRADING_*` | `COPY_TRADING_*`、`COPY_*` |
+| Market Making | `MARKET_MAKING_*` | `MAKER_*` |
+| Cross-Market Probability Arbitrage | `CROSS_MARKET_PROBABILITY_ARBITRAGE_*` | `BAYESIAN_*` |
+
+通用连接、签名、日志和运行模式参数（例如 `CLOB_API_URL`、`SIGNATURE_TYPE`、
+`DRY_RUN`、`RUST_LOG`）继续由多个策略共享，因此不添加策略前缀。
+
+## 部署与历史数据
+
+- 本次是一次破坏性环境变量迁移：程序不再读取旧策略键，也不再读取旧的
+  `STATE_JOURNAL_FILE` 别名。服务器必须用新的 `.env` 完整覆盖旧文件，不能只追加。
 - `.env.example` 和程序默认值已指向新的日志及结果目录；本地 `.env` 的路径值也应使用
   新目录。
 - 历史 `results/spread-arbitrage/`、`results/winner-buy/`、

@@ -17,7 +17,9 @@ fn parse_arbitrage_order_type(s: &str) -> Result<OrderType> {
         "GTD" => Ok(OrderType::GTD),
         "FOK" => Ok(OrderType::FOK),
         "FAK" => Ok(OrderType::FAK),
-        other => bail!("ARBITRAGE_ORDER_TYPE must be GTC, GTD, FOK or FAK; got {other}"),
+        other => bail!(
+            "BINARY_COMPLEMENT_ARBITRAGE_ORDER_TYPE must be GTC, GTD, FOK or FAK; got {other}"
+        ),
     }
 }
 
@@ -29,14 +31,16 @@ fn parse_slippage(s: &str) -> Result<[f64; 2]> {
         .map(|x| {
             x.trim()
                 .parse::<f64>()
-                .context("SLIPPAGE contains an invalid number")
+                .context("BINARY_COMPLEMENT_ARBITRAGE_SLIPPAGE contains an invalid number")
         })
         .collect::<Result<_>>()?;
     let parsed = match parts.as_slice() {
-        [] => bail!("SLIPPAGE cannot be empty"),
+        [] => bail!("BINARY_COMPLEMENT_ARBITRAGE_SLIPPAGE cannot be empty"),
         [one] => [*one, *one],
         [first, second] => [*first, *second],
-        _ => bail!("SLIPPAGE accepts one or two comma-separated numbers"),
+        _ => {
+            bail!("BINARY_COMPLEMENT_ARBITRAGE_SLIPPAGE accepts one or two comma-separated numbers")
+        }
     };
     Ok(parsed)
 }
@@ -269,39 +273,43 @@ impl Config {
 
         let dry_run = env_bool("DRY_RUN", false)?;
         let mode = if dry_run { "paper" } else { "live" };
-        let state_journal_file = env::var("ARBITRAGE_STATE_JOURNAL_FILE")
-            .or_else(|_| env::var("STATE_JOURNAL_FILE"))
+        let state_journal_file = env::var("BINARY_COMPLEMENT_ARBITRAGE_STATE_JOURNAL_FILE")
             .unwrap_or_else(|_| {
                 format!("results/binary-complement-arbitrage/{mode}/orders.ndjson")
             });
         let late_resolution_winner_trading_state_journal_file =
-            env::var("WINNER_BUY_STATE_JOURNAL_FILE").unwrap_or_else(|_| {
+            env::var("LATE_RESOLUTION_WINNER_TRADING_STATE_JOURNAL_FILE").unwrap_or_else(|_| {
                 format!("results/late-resolution-winner-trading/{mode}/orders.ndjson")
             });
         let late_resolution_winner_trading_evaluation_journal_file =
-            env::var("WINNER_BUY_EVALUATION_JOURNAL_FILE").unwrap_or_else(|_| {
-                format!("results/late-resolution-winner-trading/{mode}/evaluations.ndjson")
-            });
-        let risk_max_exposure_usdc = env_parse("RISK_MAX_EXPOSURE_USDC", "1000.0")?;
-        let paper_initial_balance_usdc = env_parse("PAPER_INITIAL_BALANCE_USDC", "50.0")?;
-        let arbitrage_budget_usdc = env::var("ARBITRAGE_BUDGET_USDC")
+            env::var("LATE_RESOLUTION_WINNER_TRADING_EVALUATION_JOURNAL_FILE").unwrap_or_else(
+                |_| format!("results/late-resolution-winner-trading/{mode}/evaluations.ndjson"),
+            );
+        let risk_max_exposure_usdc =
+            env_parse("BINARY_COMPLEMENT_ARBITRAGE_MAX_EXPOSURE_USDC", "1000.0")?;
+        let paper_initial_balance_usdc = env_parse(
+            "LATE_RESOLUTION_WINNER_TRADING_PAPER_INITIAL_BALANCE_USDC",
+            "50.0",
+        )?;
+        let arbitrage_budget_usdc = env::var("BINARY_COMPLEMENT_ARBITRAGE_BUDGET_USDC")
             .ok()
             .map(|value| value.trim().parse::<f64>())
             .transpose()
-            .context("ARBITRAGE_BUDGET_USDC has an invalid value")?
+            .context("BINARY_COMPLEMENT_ARBITRAGE_BUDGET_USDC has an invalid value")?
             .unwrap_or(risk_max_exposure_usdc);
-        let late_resolution_winner_trading_budget_usdc = env::var("WINNER_BUY_BUDGET_USDC")
-            .ok()
-            .map(|value| value.trim().parse::<f64>())
-            .transpose()
-            .context("WINNER_BUY_BUDGET_USDC has an invalid value")?
-            .unwrap_or(paper_initial_balance_usdc);
-        let wallet_copy_trading_budget_usdc = env::var("COPY_TRADING_BUDGET_USDC")
-            .or_else(|_| env::var("COPY_INITIAL_NAV_USDC"))
+        let late_resolution_winner_trading_budget_usdc =
+            env::var("LATE_RESOLUTION_WINNER_TRADING_BUDGET_USDC")
+                .ok()
+                .map(|value| value.trim().parse::<f64>())
+                .transpose()
+                .context("LATE_RESOLUTION_WINNER_TRADING_BUDGET_USDC has an invalid value")?
+                .unwrap_or(paper_initial_balance_usdc);
+        let wallet_copy_trading_budget_usdc = env::var("WALLET_COPY_TRADING_BUDGET_USDC")
+            .or_else(|_| env::var("WALLET_COPY_TRADING_INITIAL_NAV_USDC"))
             .unwrap_or_else(|_| "10000.0".into())
             .trim()
             .parse::<f64>()
-            .context("COPY_TRADING_BUDGET_USDC has an invalid value")?;
+            .context("WALLET_COPY_TRADING_BUDGET_USDC has an invalid value")?;
 
         let config = Config {
             private_key: normalize_private_key(
@@ -312,9 +320,18 @@ impl Config {
             clob_api_url: env::var("CLOB_API_URL")
                 .unwrap_or_else(|_| CLOB_API_URL_DEFAULT.to_string()),
             signature_type: env::var("SIGNATURE_TYPE").unwrap_or_else(|_| "Poly1271".to_string()),
-            min_profit_threshold: env_parse("MIN_PROFIT_THRESHOLD", "0.001")?,
-            min_ask_depth_usdc: env_parse("MIN_ASK_DEPTH_USDC", "10.0")?,
-            max_order_size_usdc: env_parse("MAX_ORDER_SIZE_USDC", "100.0")?,
+            min_profit_threshold: env_parse(
+                "BINARY_COMPLEMENT_ARBITRAGE_MIN_PROFIT_THRESHOLD",
+                "0.001",
+            )?,
+            min_ask_depth_usdc: env_parse(
+                "BINARY_COMPLEMENT_ARBITRAGE_MIN_ASK_DEPTH_USDC",
+                "10.0",
+            )?,
+            max_order_size_usdc: env_parse(
+                "BINARY_COMPLEMENT_ARBITRAGE_MAX_ORDER_SIZE_USDC",
+                "100.0",
+            )?,
             crypto_symbols: env::var("CRYPTO_SYMBOLS")
                 .unwrap_or_else(|_| "btc,eth,xrp,sol".to_string())
                 .split(',')
@@ -327,124 +344,164 @@ impl Config {
             risk_imbalance_threshold: env_parse("RISK_IMBALANCE_THRESHOLD", "0.1")?,
             hedge_take_profit_pct: env_parse("HEDGE_TAKE_PROFIT_PCT", "0.05")?,
             hedge_stop_loss_pct: env_parse("HEDGE_STOP_LOSS_PCT", "0.05")?,
-            arbitrage_execution_spread: env_parse("ARBITRAGE_EXECUTION_SPREAD", "0.01")?,
-            arbitrage_fee_buffer: env_parse("ARBITRAGE_FEE_BUFFER", "0.002")?,
-            arbitrage_dynamic_fee_gate_paper: env_bool("ARBITRAGE_DYNAMIC_FEE_GATE_PAPER", false)?,
+            arbitrage_execution_spread: env_parse(
+                "BINARY_COMPLEMENT_ARBITRAGE_EXECUTION_SPREAD",
+                "0.01",
+            )?,
+            arbitrage_fee_buffer: env_parse("BINARY_COMPLEMENT_ARBITRAGE_FEE_BUFFER", "0.002")?,
+            arbitrage_dynamic_fee_gate_paper: env_bool(
+                "BINARY_COMPLEMENT_ARBITRAGE_DYNAMIC_FEE_GATE_PAPER",
+                false,
+            )?,
             slippage: parse_slippage(
-                &env::var("SLIPPAGE").unwrap_or_else(|_| "0,0.01".to_string()),
+                &env::var("BINARY_COMPLEMENT_ARBITRAGE_SLIPPAGE")
+                    .unwrap_or_else(|_| "0,0.01".to_string()),
             )?,
-            gtd_expiration_secs: env_parse("GTD_EXPIRATION_SECS", "300")?,
+            gtd_expiration_secs: env_parse(
+                "BINARY_COMPLEMENT_ARBITRAGE_GTD_EXPIRATION_SECS",
+                "300",
+            )?,
             arbitrage_order_type: parse_arbitrage_order_type(
-                &env::var("ARBITRAGE_ORDER_TYPE").unwrap_or_else(|_| "GTD".to_string()),
+                &env::var("BINARY_COMPLEMENT_ARBITRAGE_ORDER_TYPE")
+                    .unwrap_or_else(|_| "GTD".to_string()),
             )?,
-            stop_arbitrage_before_end_minutes: env_parse("STOP_ARBITRAGE_BEFORE_END_MINUTES", "0")?,
-            arbitrage_enabled: env_bool("ARBITRAGE_ENABLED", true)?,
-            late_resolution_winner_trading_enabled: env_bool("WINNER_BUY_ENABLED", false)?,
-            wallet_copy_trading_enabled: env_bool("COPY_TRADING_ENABLED", false)?,
+            stop_arbitrage_before_end_minutes: env_parse(
+                "BINARY_COMPLEMENT_ARBITRAGE_STOP_BEFORE_END_MINUTES",
+                "0",
+            )?,
+            arbitrage_enabled: env_bool("BINARY_COMPLEMENT_ARBITRAGE_ENABLED", true)?,
+            late_resolution_winner_trading_enabled: env_bool(
+                "LATE_RESOLUTION_WINNER_TRADING_ENABLED",
+                false,
+            )?,
+            wallet_copy_trading_enabled: env_bool("WALLET_COPY_TRADING_ENABLED", false)?,
             late_resolution_winner_trading_budget_usdc,
             wallet_copy_trading_budget_usdc,
             late_resolution_winner_trading_before_end_secs: env_parse(
-                "WINNER_BUY_BEFORE_END_SECS",
+                "LATE_RESOLUTION_WINNER_TRADING_BEFORE_END_SECS",
                 "30",
             )?,
-            late_resolution_winner_trading_min_price: env_parse("WINNER_BUY_MIN_PRICE", "0.95")?,
-            late_resolution_winner_trading_max_price: env_parse("WINNER_BUY_MAX_PRICE", "0.99")?,
+            late_resolution_winner_trading_min_price: env_parse(
+                "LATE_RESOLUTION_WINNER_TRADING_MIN_PRICE",
+                "0.95",
+            )?,
+            late_resolution_winner_trading_max_price: env_parse(
+                "LATE_RESOLUTION_WINNER_TRADING_MAX_PRICE",
+                "0.99",
+            )?,
             late_resolution_winner_trading_hybrid_paper_enabled: env_bool(
-                "WINNER_BUY_HYBRID_PAPER_ENABLED",
+                "LATE_RESOLUTION_WINNER_TRADING_HYBRID_PAPER_ENABLED",
                 false,
             )?,
             late_resolution_winner_trading_max_order_usdc: env_parse(
-                "WINNER_BUY_MAX_ORDER_USDC",
+                "LATE_RESOLUTION_WINNER_TRADING_MAX_ORDER_USDC",
                 "50.0",
             )?,
             late_resolution_winner_trading_max_per_window: env_parse(
-                "WINNER_BUY_MAX_PER_WINDOW",
+                "LATE_RESOLUTION_WINNER_TRADING_MAX_PER_WINDOW",
                 "1",
             )?,
             late_resolution_winner_trading_max_strategy_loss_usdc: env_parse(
-                "WINNER_BUY_MAX_STRATEGY_LOSS_USDC",
+                "LATE_RESOLUTION_WINNER_TRADING_MAX_STRATEGY_LOSS_USDC",
                 "20.0",
             )?,
             late_resolution_winner_trading_max_asset_loss_usdc: env_parse(
-                "WINNER_BUY_MAX_ASSET_LOSS_USDC",
+                "LATE_RESOLUTION_WINNER_TRADING_MAX_ASSET_LOSS_USDC",
                 "10.0",
             )?,
             late_resolution_winner_trading_max_consecutive_losses: env_parse(
-                "WINNER_BUY_MAX_CONSECUTIVE_LOSSES",
+                "LATE_RESOLUTION_WINNER_TRADING_MAX_CONSECUTIVE_LOSSES",
                 "3",
             )?,
-            late_resolution_winner_trading_auto_redeem: env_bool("WINNER_BUY_AUTO_REDEEM", false)?,
-            late_resolution_winner_trading_rtds_url: env::var("WINNER_BUY_RTDS_URL")
-                .unwrap_or_else(|_| "wss://ws-live-data.polymarket.com".to_string()),
+            late_resolution_winner_trading_auto_redeem: env_bool(
+                "LATE_RESOLUTION_WINNER_TRADING_AUTO_REDEEM",
+                false,
+            )?,
+            late_resolution_winner_trading_rtds_url: env::var(
+                "LATE_RESOLUTION_WINNER_TRADING_RTDS_URL",
+            )
+            .unwrap_or_else(|_| "wss://ws-live-data.polymarket.com".to_string()),
             late_resolution_winner_trading_max_book_age_ms: env_parse(
-                "WINNER_BUY_MAX_BOOK_AGE_MS",
+                "LATE_RESOLUTION_WINNER_TRADING_MAX_BOOK_AGE_MS",
                 "1000",
             )?,
             late_resolution_winner_trading_feed_max_age_ms: env_parse(
-                "WINNER_BUY_FEED_MAX_AGE_MS",
+                "LATE_RESOLUTION_WINNER_TRADING_FEED_MAX_AGE_MS",
                 "5000",
             )?,
             late_resolution_winner_trading_opening_max_skew_ms: env_parse(
-                "WINNER_BUY_OPENING_MAX_SKEW_MS",
+                "LATE_RESOLUTION_WINNER_TRADING_OPENING_MAX_SKEW_MS",
                 "5000",
             )?,
             late_resolution_winner_trading_volatility_lookback_secs: env_parse(
-                "WINNER_BUY_VOLATILITY_LOOKBACK_SECS",
+                "LATE_RESOLUTION_WINNER_TRADING_VOLATILITY_LOOKBACK_SECS",
                 "120",
             )?,
             late_resolution_winner_trading_min_observations: env_parse(
-                "WINNER_BUY_MIN_OBSERVATIONS",
+                "LATE_RESOLUTION_WINNER_TRADING_MIN_OBSERVATIONS",
                 "10",
             )?,
             late_resolution_winner_trading_confirmation_observations: env_parse(
-                "WINNER_BUY_CONFIRMATION_OBSERVATIONS",
+                "LATE_RESOLUTION_WINNER_TRADING_CONFIRMATION_OBSERVATIONS",
                 "3",
             )?,
             late_resolution_winner_trading_max_attempts_per_market: env_parse(
-                "WINNER_BUY_MAX_ATTEMPTS_PER_MARKET",
+                "LATE_RESOLUTION_WINNER_TRADING_MAX_ATTEMPTS_PER_MARKET",
                 "1",
             )?,
             late_resolution_winner_trading_min_margin_bps: env_parse(
-                "WINNER_BUY_MIN_MARGIN_BPS",
+                "LATE_RESOLUTION_WINNER_TRADING_MIN_MARGIN_BPS",
                 "3.0",
             )?,
             late_resolution_winner_trading_reversal_sigma: env_parse(
-                "WINNER_BUY_REVERSAL_SIGMA",
+                "LATE_RESOLUTION_WINNER_TRADING_REVERSAL_SIGMA",
                 "2.0",
             )?,
-            late_resolution_winner_trading_max_spread: env_parse("WINNER_BUY_MAX_SPREAD", "0.03")?,
+            late_resolution_winner_trading_max_spread: env_parse(
+                "LATE_RESOLUTION_WINNER_TRADING_MAX_SPREAD",
+                "0.03",
+            )?,
             late_resolution_winner_trading_min_depth_usdc: env_parse(
-                "WINNER_BUY_MIN_DEPTH_USDC",
+                "LATE_RESOLUTION_WINNER_TRADING_MIN_DEPTH_USDC",
                 "10.0",
             )?,
-            late_resolution_winner_trading_min_net_ev: env_parse("WINNER_BUY_MIN_NET_EV", "0.002")?,
+            late_resolution_winner_trading_min_net_ev: env_parse(
+                "LATE_RESOLUTION_WINNER_TRADING_MIN_NET_EV",
+                "0.002",
+            )?,
             late_resolution_winner_trading_btc_min_volatility_bps: env_parse(
-                "WINNER_BUY_BTC_MIN_VOLATILITY_BPS",
+                "LATE_RESOLUTION_WINNER_TRADING_BTC_MIN_VOLATILITY_BPS",
                 "0.8",
             )?,
             late_resolution_winner_trading_eth_min_volatility_bps: env_parse(
-                "WINNER_BUY_ETH_MIN_VOLATILITY_BPS",
+                "LATE_RESOLUTION_WINNER_TRADING_ETH_MIN_VOLATILITY_BPS",
                 "1.2",
             )?,
             late_resolution_winner_trading_other_min_volatility_bps: env_parse(
-                "WINNER_BUY_OTHER_MIN_VOLATILITY_BPS",
+                "LATE_RESOLUTION_WINNER_TRADING_OTHER_MIN_VOLATILITY_BPS",
                 "1.5",
             )?,
             late_resolution_winner_trading_btc_model_risk_buffer: env_parse(
-                "WINNER_BUY_BTC_MODEL_RISK_BUFFER",
+                "LATE_RESOLUTION_WINNER_TRADING_BTC_MODEL_RISK_BUFFER",
                 "0.01",
             )?,
             late_resolution_winner_trading_eth_model_risk_buffer: env_parse(
-                "WINNER_BUY_ETH_MODEL_RISK_BUFFER",
+                "LATE_RESOLUTION_WINNER_TRADING_ETH_MODEL_RISK_BUFFER",
                 "0.015",
             )?,
             late_resolution_winner_trading_other_model_risk_buffer: env_parse(
-                "WINNER_BUY_OTHER_MODEL_RISK_BUFFER",
+                "LATE_RESOLUTION_WINNER_TRADING_OTHER_MODEL_RISK_BUFFER",
                 "0.02",
             )?,
             merge_interval_minutes: env_parse("MERGE_INTERVAL_MINUTES", "0")?,
-            min_yes_price_threshold: env_parse("MIN_YES_PRICE_THRESHOLD", "0.0")?,
-            min_no_price_threshold: env_parse("MIN_NO_PRICE_THRESHOLD", "0.0")?,
+            min_yes_price_threshold: env_parse(
+                "BINARY_COMPLEMENT_ARBITRAGE_MIN_YES_PRICE_THRESHOLD",
+                "0.0",
+            )?,
+            min_no_price_threshold: env_parse(
+                "BINARY_COMPLEMENT_ARBITRAGE_MIN_NO_PRICE_THRESHOLD",
+                "0.0",
+            )?,
             position_sync_interval_secs: env_parse("POSITION_SYNC_INTERVAL_SECS", "10")?,
             position_balance_interval_secs: env_parse("POSITION_BALANCE_INTERVAL_SECS", "60")?,
             position_balance_threshold: env_parse("POSITION_BALANCE_THRESHOLD", "2.0")?,
@@ -454,10 +511,10 @@ impl Config {
                 "0",
             )?,
             wind_down_sell_price: env_parse("WIND_DOWN_SELL_PRICE", "0.01")?,
-            arbitrage_log_file: env::var("ARBITRAGE_LOG_FILE")
+            arbitrage_log_file: env::var("BINARY_COMPLEMENT_ARBITRAGE_LOG_FILE")
                 .ok()
                 .filter(|value| !value.trim().is_empty()),
-            arbitrage_shadow_log_file: env::var("ARBITRAGE_SHADOW_LOG_FILE")
+            arbitrage_shadow_log_file: env::var("BINARY_COMPLEMENT_ARBITRAGE_SHADOW_LOG_FILE")
                 .ok()
                 .filter(|value| !value.trim().is_empty()),
             late_resolution_winner_trading_state_journal_file,
@@ -471,28 +528,40 @@ impl Config {
             canary_max_pairs_total: env_parse("CANARY_MAX_PAIRS_TOTAL", "1")?,
             one_sided_max_consecutive: env_parse("ONE_SIDED_MAX_CONSECUTIVE", "3")?,
             paper_initial_balance_usdc,
-            paper_liquidity_haircut: env_parse("PAPER_LIQUIDITY_HAIRCUT", "0.75")?,
-            arbitrage_paper_liquidity_haircut: env_parse(
-                "ARBITRAGE_PAPER_LIQUIDITY_HAIRCUT",
+            paper_liquidity_haircut: env_parse(
+                "LATE_RESOLUTION_WINNER_TRADING_PAPER_LIQUIDITY_HAIRCUT",
                 "0.75",
             )?,
-            paper_second_leg_delay_ms: env_parse("PAPER_SECOND_LEG_DELAY_MS", "250")?,
-            paper_late_resolution_winner_trading_delay_ms: env_parse(
-                "PAPER_WINNER_BUY_DELAY_MS",
+            arbitrage_paper_liquidity_haircut: env_parse(
+                "BINARY_COMPLEMENT_ARBITRAGE_PAPER_LIQUIDITY_HAIRCUT",
+                "0.75",
+            )?,
+            paper_second_leg_delay_ms: env_parse(
+                "BINARY_COMPLEMENT_ARBITRAGE_PAPER_SECOND_LEG_DELAY_MS",
                 "250",
             )?,
-            max_book_age_ms: env_parse("MAX_BOOK_AGE_MS", "2000")?,
-            max_book_skew_ms: env_parse("MAX_BOOK_SKEW_MS", "1000")?,
-            signal_cooldown_ms: env_parse("SIGNAL_COOLDOWN_MS", "3000")?,
-            arbitrage_signal_confirmation_ms: env_parse("ARBITRAGE_SIGNAL_CONFIRMATION_MS", "100")?,
+            paper_late_resolution_winner_trading_delay_ms: env_parse(
+                "LATE_RESOLUTION_WINNER_TRADING_PAPER_EXECUTION_DELAY_MS",
+                "250",
+            )?,
+            max_book_age_ms: env_parse("BINARY_COMPLEMENT_ARBITRAGE_MAX_BOOK_AGE_MS", "2000")?,
+            max_book_skew_ms: env_parse("BINARY_COMPLEMENT_ARBITRAGE_MAX_BOOK_SKEW_MS", "1000")?,
+            signal_cooldown_ms: env_parse(
+                "BINARY_COMPLEMENT_ARBITRAGE_SIGNAL_COOLDOWN_MS",
+                "3000",
+            )?,
+            arbitrage_signal_confirmation_ms: env_parse(
+                "BINARY_COMPLEMENT_ARBITRAGE_SIGNAL_CONFIRMATION_MS",
+                "100",
+            )?,
             arbitrage_rest_shadow_delays_ms: parse_millisecond_list(
-                "ARBITRAGE_REST_SHADOW_DELAYS_MS",
-                &env::var("ARBITRAGE_REST_SHADOW_DELAYS_MS")
+                "BINARY_COMPLEMENT_ARBITRAGE_REST_SHADOW_DELAYS_MS",
+                &env::var("BINARY_COMPLEMENT_ARBITRAGE_REST_SHADOW_DELAYS_MS")
                     .unwrap_or_else(|_| "0,50,100,250".to_string()),
             )?,
             arbitrage_rest_shadow_notionals_usdc: parse_positive_decimal_list(
-                "ARBITRAGE_REST_SHADOW_NOTIONALS_USDC",
-                &env::var("ARBITRAGE_REST_SHADOW_NOTIONALS_USDC")
+                "BINARY_COMPLEMENT_ARBITRAGE_REST_SHADOW_NOTIONALS_USDC",
+                &env::var("BINARY_COMPLEMENT_ARBITRAGE_REST_SHADOW_NOTIONALS_USDC")
                     .unwrap_or_else(|_| "1,2,3,5".to_string()),
             )?,
             state_journal_file,
@@ -539,14 +608,26 @@ impl Config {
             );
         }
         for (name, value) in [
-            ("MIN_PROFIT_THRESHOLD", self.min_profit_threshold),
             (
-                "ARBITRAGE_EXECUTION_SPREAD",
+                "BINARY_COMPLEMENT_ARBITRAGE_MIN_PROFIT_THRESHOLD",
+                self.min_profit_threshold,
+            ),
+            (
+                "BINARY_COMPLEMENT_ARBITRAGE_EXECUTION_SPREAD",
                 self.arbitrage_execution_spread,
             ),
-            ("ARBITRAGE_FEE_BUFFER", self.arbitrage_fee_buffer),
-            ("MIN_YES_PRICE_THRESHOLD", self.min_yes_price_threshold),
-            ("MIN_NO_PRICE_THRESHOLD", self.min_no_price_threshold),
+            (
+                "BINARY_COMPLEMENT_ARBITRAGE_FEE_BUFFER",
+                self.arbitrage_fee_buffer,
+            ),
+            (
+                "BINARY_COMPLEMENT_ARBITRAGE_MIN_YES_PRICE_THRESHOLD",
+                self.min_yes_price_threshold,
+            ),
+            (
+                "BINARY_COMPLEMENT_ARBITRAGE_MIN_NO_PRICE_THRESHOLD",
+                self.min_no_price_threshold,
+            ),
             ("HEDGE_TAKE_PROFIT_PCT", self.hedge_take_profit_pct),
             ("HEDGE_STOP_LOSS_PCT", self.hedge_stop_loss_pct),
         ] {
@@ -555,16 +636,28 @@ impl Config {
             }
         }
         for (name, value) in [
-            ("MAX_ORDER_SIZE_USDC", self.max_order_size_usdc),
-            ("MIN_ASK_DEPTH_USDC", self.min_ask_depth_usdc),
-            ("RISK_MAX_EXPOSURE_USDC", self.risk_max_exposure_usdc),
-            ("ARBITRAGE_BUDGET_USDC", self.arbitrage_budget_usdc),
             (
-                "WINNER_BUY_BUDGET_USDC",
+                "BINARY_COMPLEMENT_ARBITRAGE_MAX_ORDER_SIZE_USDC",
+                self.max_order_size_usdc,
+            ),
+            (
+                "BINARY_COMPLEMENT_ARBITRAGE_MIN_ASK_DEPTH_USDC",
+                self.min_ask_depth_usdc,
+            ),
+            (
+                "BINARY_COMPLEMENT_ARBITRAGE_MAX_EXPOSURE_USDC",
+                self.risk_max_exposure_usdc,
+            ),
+            (
+                "BINARY_COMPLEMENT_ARBITRAGE_BUDGET_USDC",
+                self.arbitrage_budget_usdc,
+            ),
+            (
+                "LATE_RESOLUTION_WINNER_TRADING_BUDGET_USDC",
                 self.late_resolution_winner_trading_budget_usdc,
             ),
             (
-                "COPY_TRADING_BUDGET_USDC",
+                "WALLET_COPY_TRADING_BUDGET_USDC",
                 self.wallet_copy_trading_budget_usdc,
             ),
             (
@@ -585,15 +678,15 @@ impl Config {
             ),
             ("CANARY_MAX_LOSS_USDC", self.canary_max_loss_usdc),
             (
-                "PAPER_INITIAL_BALANCE_USDC",
+                "LATE_RESOLUTION_WINNER_TRADING_PAPER_INITIAL_BALANCE_USDC",
                 self.paper_initial_balance_usdc,
             ),
             (
-                "WINNER_BUY_MAX_STRATEGY_LOSS_USDC",
+                "LATE_RESOLUTION_WINNER_TRADING_MAX_STRATEGY_LOSS_USDC",
                 self.late_resolution_winner_trading_max_strategy_loss_usdc,
             ),
             (
-                "WINNER_BUY_MAX_ASSET_LOSS_USDC",
+                "LATE_RESOLUTION_WINNER_TRADING_MAX_ASSET_LOSS_USDC",
                 self.late_resolution_winner_trading_max_asset_loss_usdc,
             ),
         ] {
@@ -605,13 +698,13 @@ impl Config {
             || !(0.0..=1.0).contains(&self.paper_liquidity_haircut)
             || self.paper_liquidity_haircut == 0.0
         {
-            bail!("PAPER_LIQUIDITY_HAIRCUT must be in (0, 1]");
+            bail!("LATE_RESOLUTION_WINNER_TRADING_PAPER_LIQUIDITY_HAIRCUT must be in (0, 1]");
         }
         if !self.arbitrage_paper_liquidity_haircut.is_finite()
             || !(0.0..=1.0).contains(&self.arbitrage_paper_liquidity_haircut)
             || self.arbitrage_paper_liquidity_haircut == 0.0
         {
-            bail!("ARBITRAGE_PAPER_LIQUIDITY_HAIRCUT must be in (0, 1]");
+            bail!("BINARY_COMPLEMENT_ARBITRAGE_PAPER_LIQUIDITY_HAIRCUT must be in (0, 1]");
         }
         if self.paper_second_leg_delay_ms > 30_000
             || self.paper_late_resolution_winner_trading_delay_ms > 30_000
@@ -632,18 +725,18 @@ impl Config {
         if self.late_resolution_winner_trading_max_asset_loss_usdc
             > self.late_resolution_winner_trading_max_strategy_loss_usdc
         {
-            bail!("WINNER_BUY_MAX_ASSET_LOSS_USDC cannot exceed WINNER_BUY_MAX_STRATEGY_LOSS_USDC");
+            bail!("LATE_RESOLUTION_WINNER_TRADING_MAX_ASSET_LOSS_USDC cannot exceed LATE_RESOLUTION_WINNER_TRADING_MAX_STRATEGY_LOSS_USDC");
         }
         if self.max_order_size_usdc > self.arbitrage_budget_usdc {
-            bail!("MAX_ORDER_SIZE_USDC cannot exceed ARBITRAGE_BUDGET_USDC");
+            bail!("BINARY_COMPLEMENT_ARBITRAGE_MAX_ORDER_SIZE_USDC cannot exceed BINARY_COMPLEMENT_ARBITRAGE_BUDGET_USDC");
         }
         if self.arbitrage_dynamic_fee_gate_paper && !self.dry_run {
-            bail!("ARBITRAGE_DYNAMIC_FEE_GATE_PAPER can only be enabled with DRY_RUN=true");
+            bail!("BINARY_COMPLEMENT_ARBITRAGE_DYNAMIC_FEE_GATE_PAPER can only be enabled with DRY_RUN=true");
         }
         if self.late_resolution_winner_trading_max_order_usdc
             > self.late_resolution_winner_trading_budget_usdc
         {
-            bail!("WINNER_BUY_MAX_ORDER_USDC cannot exceed WINNER_BUY_BUDGET_USDC");
+            bail!("LATE_RESOLUTION_WINNER_TRADING_MAX_ORDER_USDC cannot exceed LATE_RESOLUTION_WINNER_TRADING_BUDGET_USDC");
         }
         if !self.late_resolution_winner_trading_min_price.is_finite()
             || !self.late_resolution_winner_trading_max_price.is_finite()
@@ -652,10 +745,10 @@ impl Config {
                 > self.late_resolution_winner_trading_max_price
             || self.late_resolution_winner_trading_max_price >= 1.0
         {
-            bail!("Late-Resolution Winner Trading prices require 0 < WINNER_BUY_MIN_PRICE <= WINNER_BUY_MAX_PRICE < 1");
+            bail!("Late-Resolution Winner Trading prices require 0 < LATE_RESOLUTION_WINNER_TRADING_MIN_PRICE <= LATE_RESOLUTION_WINNER_TRADING_MAX_PRICE < 1");
         }
         if self.late_resolution_winner_trading_hybrid_paper_enabled && !self.dry_run {
-            bail!("WINNER_BUY_HYBRID_PAPER_ENABLED can only be enabled with DRY_RUN=true");
+            bail!("LATE_RESOLUTION_WINNER_TRADING_HYBRID_PAPER_ENABLED can only be enabled with DRY_RUN=true");
         }
         if self.canary_max_pairs_per_window == 0
             || self.canary_max_pairs_per_window > 1
@@ -668,20 +761,20 @@ impl Config {
             && !self.dry_run
             && !matches!(self.arbitrage_order_type, OrderType::FOK | OrderType::FAK)
         {
-            bail!("live CANARY_MODE requires ARBITRAGE_ORDER_TYPE=FOK or FAK");
+            bail!("live CANARY_MODE requires BINARY_COMPLEMENT_ARBITRAGE_ORDER_TYPE=FOK or FAK");
         }
         if self
             .slippage
             .iter()
             .any(|v| !v.is_finite() || *v <= -1.0 || *v >= 1.0)
         {
-            bail!("SLIPPAGE values must be finite and in (-1, 1)");
+            bail!("BINARY_COMPLEMENT_ARBITRAGE_SLIPPAGE values must be finite and in (-1, 1)");
         }
         if !(0.0..=1.0).contains(&self.wind_down_sell_price) {
             bail!("WIND_DOWN_SELL_PRICE must be in [0, 1]");
         }
         if matches!(self.arbitrage_order_type, OrderType::GTD) && self.gtd_expiration_secs == 0 {
-            bail!("GTD_EXPIRATION_SECS must be greater than 0 for GTD orders");
+            bail!("BINARY_COMPLEMENT_ARBITRAGE_GTD_EXPIRATION_SECS must be greater than 0 for GTD orders");
         }
         if self
             .arbitrage_execution_spread
@@ -689,50 +782,50 @@ impl Config {
             + self.arbitrage_fee_buffer
             >= 1.0
         {
-            bail!("max(ARBITRAGE_EXECUTION_SPREAD, MIN_PROFIT_THRESHOLD) + ARBITRAGE_FEE_BUFFER must be below 1");
+            bail!("max(BINARY_COMPLEMENT_ARBITRAGE_EXECUTION_SPREAD, BINARY_COMPLEMENT_ARBITRAGE_MIN_PROFIT_THRESHOLD) + BINARY_COMPLEMENT_ARBITRAGE_FEE_BUFFER must be below 1");
         }
         if self.market_refresh_advance_secs > 300 {
             bail!("MARKET_REFRESH_ADVANCE_SECS cannot exceed the 300-second window");
         }
         if self.max_book_age_ms <= 0 || self.max_book_skew_ms < 0 {
-            bail!("MAX_BOOK_AGE_MS must be positive and MAX_BOOK_SKEW_MS cannot be negative");
+            bail!("BINARY_COMPLEMENT_ARBITRAGE_MAX_BOOK_AGE_MS must be positive and BINARY_COMPLEMENT_ARBITRAGE_MAX_BOOK_SKEW_MS cannot be negative");
         }
         if self
             .arbitrage_rest_shadow_delays_ms
             .last()
             .is_some_and(|delay| *delay > 10_000)
         {
-            bail!("ARBITRAGE_REST_SHADOW_DELAYS_MS values cannot exceed 10000ms");
+            bail!("BINARY_COMPLEMENT_ARBITRAGE_REST_SHADOW_DELAYS_MS values cannot exceed 10000ms");
         }
         if self
             .arbitrage_rest_shadow_notionals_usdc
             .last()
             .is_some_and(|notional| *notional > self.arbitrage_budget_usdc)
         {
-            bail!("ARBITRAGE_REST_SHADOW_NOTIONALS_USDC cannot exceed ARBITRAGE_BUDGET_USDC");
+            bail!("BINARY_COMPLEMENT_ARBITRAGE_REST_SHADOW_NOTIONALS_USDC cannot exceed BINARY_COMPLEMENT_ARBITRAGE_BUDGET_USDC");
         }
         if self.state_journal_file.trim().is_empty() {
-            bail!("ARBITRAGE_STATE_JOURNAL_FILE cannot be empty");
+            bail!("BINARY_COMPLEMENT_ARBITRAGE_STATE_JOURNAL_FILE cannot be empty");
         }
         if self
             .late_resolution_winner_trading_state_journal_file
             .trim()
             .is_empty()
         {
-            bail!("WINNER_BUY_STATE_JOURNAL_FILE cannot be empty");
+            bail!("LATE_RESOLUTION_WINNER_TRADING_STATE_JOURNAL_FILE cannot be empty");
         }
         if self
             .late_resolution_winner_trading_evaluation_journal_file
             .trim()
             .is_empty()
         {
-            bail!("WINNER_BUY_EVALUATION_JOURNAL_FILE cannot be empty");
+            bail!("LATE_RESOLUTION_WINNER_TRADING_EVALUATION_JOURNAL_FILE cannot be empty");
         }
         if !self
             .late_resolution_winner_trading_rtds_url
             .starts_with("wss://")
         {
-            bail!("WINNER_BUY_RTDS_URL must use wss://");
+            bail!("LATE_RESOLUTION_WINNER_TRADING_RTDS_URL must use wss://");
         }
         if self.late_resolution_winner_trading_max_book_age_ms <= 0
             || self.late_resolution_winner_trading_max_book_age_ms > 30_000
@@ -747,27 +840,27 @@ impl Config {
         }
         for (name, value) in [
             (
-                "WINNER_BUY_MIN_MARGIN_BPS",
+                "LATE_RESOLUTION_WINNER_TRADING_MIN_MARGIN_BPS",
                 self.late_resolution_winner_trading_min_margin_bps,
             ),
             (
-                "WINNER_BUY_REVERSAL_SIGMA",
+                "LATE_RESOLUTION_WINNER_TRADING_REVERSAL_SIGMA",
                 self.late_resolution_winner_trading_reversal_sigma,
             ),
             (
-                "WINNER_BUY_BTC_MIN_VOLATILITY_BPS",
+                "LATE_RESOLUTION_WINNER_TRADING_BTC_MIN_VOLATILITY_BPS",
                 self.late_resolution_winner_trading_btc_min_volatility_bps,
             ),
             (
-                "WINNER_BUY_ETH_MIN_VOLATILITY_BPS",
+                "LATE_RESOLUTION_WINNER_TRADING_ETH_MIN_VOLATILITY_BPS",
                 self.late_resolution_winner_trading_eth_min_volatility_bps,
             ),
             (
-                "WINNER_BUY_OTHER_MIN_VOLATILITY_BPS",
+                "LATE_RESOLUTION_WINNER_TRADING_OTHER_MIN_VOLATILITY_BPS",
                 self.late_resolution_winner_trading_other_min_volatility_bps,
             ),
             (
-                "WINNER_BUY_MIN_DEPTH_USDC",
+                "LATE_RESOLUTION_WINNER_TRADING_MIN_DEPTH_USDC",
                 self.late_resolution_winner_trading_min_depth_usdc,
             ),
         ] {
@@ -777,23 +870,23 @@ impl Config {
         }
         for (name, value) in [
             (
-                "WINNER_BUY_MAX_SPREAD",
+                "LATE_RESOLUTION_WINNER_TRADING_MAX_SPREAD",
                 self.late_resolution_winner_trading_max_spread,
             ),
             (
-                "WINNER_BUY_MIN_NET_EV",
+                "LATE_RESOLUTION_WINNER_TRADING_MIN_NET_EV",
                 self.late_resolution_winner_trading_min_net_ev,
             ),
             (
-                "WINNER_BUY_BTC_MODEL_RISK_BUFFER",
+                "LATE_RESOLUTION_WINNER_TRADING_BTC_MODEL_RISK_BUFFER",
                 self.late_resolution_winner_trading_btc_model_risk_buffer,
             ),
             (
-                "WINNER_BUY_ETH_MODEL_RISK_BUFFER",
+                "LATE_RESOLUTION_WINNER_TRADING_ETH_MODEL_RISK_BUFFER",
                 self.late_resolution_winner_trading_eth_model_risk_buffer,
             ),
             (
-                "WINNER_BUY_OTHER_MODEL_RISK_BUFFER",
+                "LATE_RESOLUTION_WINNER_TRADING_OTHER_MODEL_RISK_BUFFER",
                 self.late_resolution_winner_trading_other_model_risk_buffer,
             ),
         ] {
@@ -836,7 +929,7 @@ impl Config {
             && self.late_resolution_winner_trading_auto_redeem
         {
             if self.proxy_address.is_none() {
-                bail!("live WINNER_BUY_AUTO_REDEEM requires POLYMARKET_PROXY_ADDRESS");
+                bail!("live LATE_RESOLUTION_WINNER_TRADING_AUTO_REDEEM requires POLYMARKET_PROXY_ADDRESS");
             }
             if [
                 "POLY_BUILDER_API_KEY",
@@ -846,7 +939,7 @@ impl Config {
             .iter()
             .any(|name| env::var(name).map(|v| v.trim().is_empty()).unwrap_or(true))
             {
-                bail!("live WINNER_BUY_AUTO_REDEEM requires all POLY_BUILDER_* credentials");
+                bail!("live LATE_RESOLUTION_WINNER_TRADING_AUTO_REDEEM requires all POLY_BUILDER_* credentials");
             }
         }
         Ok(())
@@ -860,7 +953,7 @@ fn validate_strategy_compatibility(
 ) -> Result<()> {
     if !dry_run && late_resolution_winner_trading_enabled && wind_down_before_window_end_minutes > 0
     {
-        bail!("live WINNER_BUY_ENABLED and WIND_DOWN_BEFORE_WINDOW_END_MINUTES cannot be enabled together");
+        bail!("live LATE_RESOLUTION_WINNER_TRADING_ENABLED and WIND_DOWN_BEFORE_WINDOW_END_MINUTES cannot be enabled together");
     }
     Ok(())
 }

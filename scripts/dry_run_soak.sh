@@ -16,10 +16,10 @@ timeout --signal=INT --kill-after=10s "${duration_seconds}s" \
   env \
     DRY_RUN=true \
     CANARY_MODE=false \
-    ARBITRAGE_STATE_JOURNAL_FILE=results/binary-complement-arbitrage/paper/orders.ndjson \
-    WINNER_BUY_STATE_JOURNAL_FILE=results/late-resolution-winner-trading/paper/orders.ndjson \
-    WINNER_BUY_EVALUATION_JOURNAL_FILE=results/late-resolution-winner-trading/paper/evaluations.ndjson \
-    ARBITRAGE_LOG_FILE=results/binary-complement-arbitrage/paper/opportunities.ndjson \
+    BINARY_COMPLEMENT_ARBITRAGE_STATE_JOURNAL_FILE=results/binary-complement-arbitrage/paper/orders.ndjson \
+    LATE_RESOLUTION_WINNER_TRADING_STATE_JOURNAL_FILE=results/late-resolution-winner-trading/paper/orders.ndjson \
+    LATE_RESOLUTION_WINNER_TRADING_EVALUATION_JOURNAL_FILE=results/late-resolution-winner-trading/paper/evaluations.ndjson \
+    BINARY_COMPLEMENT_ARBITRAGE_LOG_FILE=results/binary-complement-arbitrage/paper/opportunities.ndjson \
     POSITION_SYNC_INTERVAL_SECS=0 \
     POSITION_BALANCE_INTERVAL_SECS=0 \
     MERGE_INTERVAL_MINUTES=0 \

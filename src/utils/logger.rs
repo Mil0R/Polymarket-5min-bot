@@ -28,9 +28,11 @@ pub fn init_logger(quiet_stdout: bool) -> Result<()> {
         BoxMakeWriter::new(std::io::stdout)
     };
 
-    let split_binary_complement_arbitrage = log_path_configured("ARBITRAGE_STRATEGY_LOG_FILE");
-    let split_late_resolution_winner_trading = log_path_configured("WINNER_BUY_STRATEGY_LOG_FILE");
-    let split_wallet_copy_trading = log_path_configured("COPY_TRADING_LOG_FILE");
+    let split_binary_complement_arbitrage =
+        log_path_configured("BINARY_COMPLEMENT_ARBITRAGE_STRATEGY_LOG_FILE");
+    let split_late_resolution_winner_trading =
+        log_path_configured("LATE_RESOLUTION_WINNER_TRADING_STRATEGY_LOG_FILE");
+    let split_wallet_copy_trading = log_path_configured("WALLET_COPY_TRADING_LOG_FILE");
     let mut log_layers: Vec<LogLayer> = vec![tracing_subscriber::fmt::layer()
         .with_writer(system_writer)
         .with_ansi(false)
@@ -43,20 +45,21 @@ pub fn init_logger(quiet_stdout: bool) -> Result<()> {
         }))
         .boxed()];
     if let Some(layer) = strategy_log_layer(
-        "ARBITRAGE_STRATEGY_LOG_FILE",
+        "BINARY_COMPLEMENT_ARBITRAGE_STRATEGY_LOG_FILE",
         is_binary_complement_arbitrage_metadata,
     )? {
         log_layers.push(layer);
     }
     if let Some(layer) = strategy_log_layer(
-        "WINNER_BUY_STRATEGY_LOG_FILE",
+        "LATE_RESOLUTION_WINNER_TRADING_STRATEGY_LOG_FILE",
         is_late_resolution_winner_trading_metadata,
     )? {
         log_layers.push(layer);
     }
-    if let Some(layer) =
-        strategy_log_layer("COPY_TRADING_LOG_FILE", is_wallet_copy_trading_metadata)?
-    {
+    if let Some(layer) = strategy_log_layer(
+        "WALLET_COPY_TRADING_LOG_FILE",
+        is_wallet_copy_trading_metadata,
+    )? {
         log_layers.push(layer);
     }
 

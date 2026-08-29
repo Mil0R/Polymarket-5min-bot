@@ -158,7 +158,10 @@ fn main() -> Result<()> {
     let path = std::env::args_os()
         .nth(1)
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("WINNER_BUY_EVALUATION_JOURNAL_FILE").map(PathBuf::from))
+        .or_else(|| {
+            std::env::var_os("LATE_RESOLUTION_WINNER_TRADING_EVALUATION_JOURNAL_FILE")
+                .map(PathBuf::from)
+        })
         .unwrap_or_else(|| {
             PathBuf::from("results/late-resolution-winner-trading/paper/evaluations.ndjson")
         });

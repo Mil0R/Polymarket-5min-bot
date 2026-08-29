@@ -6,7 +6,7 @@ use polypulse::wallet_copy_trading::OnChainTradeFeed;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let rpc = std::env::var("COPY_ONCHAIN_RPC_URL")
+    let rpc = std::env::var("WALLET_COPY_TRADING_ONCHAIN_RPC_URL")
         .unwrap_or_else(|_| "https://polygon-bor-rpc.publicnode.com".to_string());
     let feed = OnChainTradeFeed::new(&rpc).await?;
     let maker: alloy::primitives::Address = std::env::args()

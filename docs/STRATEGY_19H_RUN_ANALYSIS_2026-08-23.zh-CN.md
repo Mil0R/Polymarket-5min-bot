@@ -65,10 +65,10 @@
 
 当前检测器先要求：
 
-1. YES 与 NO 最优卖价之和产生至少 `MIN_PROFIT_THRESHOLD=0.001` 的原始边际；
+1. YES 与 NO 最优卖价之和产生至少 `BINARY_COMPLEMENT_ARBITRAGE_MIN_PROFIT_THRESHOLD=0.001` 的原始边际；
 2. 两腿按可共同成交份额计算时，每腿名义金额至少 1 USDC；
-3. 两腿在最优卖价处的累计深度均不低于 `MIN_ASK_DEPTH_USDC=3.0`；
-4. 进入准入后，还要求总价满足 `ARBITRAGE_EXECUTION_SPREAD=0.03` 等安全条件；
+3. 两腿在最优卖价处的累计深度均不低于 `BINARY_COMPLEMENT_ARBITRAGE_MIN_ASK_DEPTH_USDC=3.0`；
+4. 进入准入后，还要求总价满足 `BINARY_COMPLEMENT_ARBITRAGE_EXECUTION_SPREAD=0.03` 等安全条件；
 5. 最终 paper 执行还会应用 75% 流动性折扣和 250 ms 第二腿延迟。
 
 本次所有初始候选都停在第 3 步，后续非原子双腿模拟路径没有得到验证。
@@ -79,7 +79,7 @@
 
 - 4,154 次深度拒绝表明存在瞬时、浅薄价差；它们可能是极小挂单、短暂不同步或不可触达流动性。
 - 因缺少被拒候选的价格和深度明细，不能排除其中有少量 1～3 USDC 的小额机会，也不能证明其能覆盖手续费、滑点、250 ms 第二腿变化以及非原子成交风险。
-- 没有任何深度充足候选进入 3% 执行边际检查，因此直接降低 `ARBITRAGE_EXECUTION_SPREAD` 在本次样本上不会增加机会；首先限制策略的是盘口深度。
+- 没有任何深度充足候选进入 3% 执行边际检查，因此直接降低 `BINARY_COMPLEMENT_ARBITRAGE_EXECUTION_SPREAD` 在本次样本上不会增加机会；首先限制策略的是盘口深度。
 - 不应据此直接降低 3 USDC 深度保护。应当先以不下单的影子网格统计不同边际和深度阈值下的机会数量及持续时间。
 
 ### 3.4 是否值得完善
@@ -252,7 +252,7 @@ Late-Resolution Winner Trading 反事实评估出现 475 次“闭市查询返�
 2. Binary Complement Arbitrage 至少运行 7～14 天，覆盖不同时段；
 3. Late-Resolution Winner Trading 初步分析至少积累 500 个独立已结算市场，按资产、YES/NO、买价、剩余秒数、深度、spread 和模型边际分层；
 4. 是否进入真实资金决策建议累计 1,000～2,000 个独立市场，并进行训练期/验证期分离，检查胜率置信区间、净收益、最大回撤、尾部失败聚集和参数稳定性；
-5. 在新数据证明正期望前，不降低 `WINNER_BUY_MIN_NET_EV`、反转边界或深度保护，也不根据本次 13/13 的 NO 小样本调整方向开关。
+5. 在新数据证明正期望前，不降低 `LATE_RESOLUTION_WINNER_TRADING_MIN_NET_EV`、反转边界或深度保护，也不根据本次 13/13 的 NO 小样本调整方向开关。
 
 ## 8. 最终判断
 

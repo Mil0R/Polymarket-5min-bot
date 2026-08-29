@@ -39,15 +39,15 @@ YES/NO 行情配对
 
 新增：
 
-- `MAX_BOOK_AGE_MS`：任一腿快照允许的最大年龄，默认 2000ms；
-- `MAX_BOOK_SKEW_MS`：YES/NO 时间戳最大偏差，默认 1000ms；
+- `BINARY_COMPLEMENT_ARBITRAGE_MAX_BOOK_AGE_MS`：任一腿快照允许的最大年龄，默认 2000ms；
+- `BINARY_COMPLEMENT_ARBITRAGE_MAX_BOOK_SKEW_MS`：YES/NO 时间戳最大偏差，默认 1000ms；
 - 对明显位于未来的异常时间戳拒绝交易。
 
 订单簿监控仍允许任一腿先更新并复用另一腿缓存，但只有通过年龄和偏差检查的组合才进入套利检测。
 
 ### 2.3 信号去重
 
-新增 `SIGNAL_COOLDOWN_MS`，默认 3000ms。相同 condition、相同 YES/NO 最优价在冷却期内只准入一次；价格变化可立即形成新信号。
+新增 `BINARY_COMPLEMENT_ARBITRAGE_SIGNAL_COOLDOWN_MS`，默认 3000ms。相同 condition、相同 YES/NO 最优价在冷却期内只准入一次；价格变化可立即形成新信号。
 
 它与账户级最短交易间隔职责不同：信号去重减少同一行情重复排队，最短交易间隔继续限制实际下单频率。
 

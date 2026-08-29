@@ -28,7 +28,7 @@ YES(较晚截止日) + NO(较早截止日)
 - 全部 YES：最低支付 1；
 - 全部 NO：N 个结果时最低支付 N-1。
 
-腿数超过 `BAYESIAN_MAX_PARTITION_LEGS` 的集合会跳过。
+腿数超过 `CROSS_MARKET_PROBABILITY_ARBITRAGE_MAX_PARTITION_LEGS` 的集合会跳过。
 
 ## 成本模型
 
@@ -41,8 +41,8 @@ net_edge   = net_profit / guaranteed_payout
 
 任一腿缺失盘口或深度不足，整个组合 fail-closed。
 
-主判定仍使用 `BAYESIAN_EXECUTION_BUFFER_PCT=0.003`。同一个规模档位还会按
-`BAYESIAN_EXECUTION_BUFFER_CURVE_PCT=0,0.003,0.005,0.01` 同时计算多条缓冲曲线，
+主判定仍使用 `CROSS_MARKET_PROBABILITY_ARBITRAGE_EXECUTION_BUFFER_PCT=0.003`。同一个规模档位还会按
+`CROSS_MARKET_PROBABILITY_ARBITRAGE_EXECUTION_BUFFER_CURVE_PCT=0,0.003,0.005,0.01` 同时计算多条缓冲曲线，
 用于判断表面价差对延迟、滑点和多腿非原子执行是否敏感。这些曲线不会改变主判定阈值。
 
 ## 运行
@@ -65,19 +65,19 @@ net_edge   = net_profit / guaranteed_payout
 
 ## 变化触发和分级日志
 
-持续模式优先使用 WebSocket 盘口缓存，在每个 `BAYESIAN_POLL_SECONDS` 周期只重新评估
-盘口签名发生变化的关系；为避免丢失事件，每 `BAYESIAN_FULL_SCAN_SECONDS` 执行一次全量评估。
-WebSocket 数据超过 `BAYESIAN_WEBSOCKET_BOOK_MAX_AGE_MS` 后自动回退到 HTTP 快照。
+持续模式优先使用 WebSocket 盘口缓存，在每个 `CROSS_MARKET_PROBABILITY_ARBITRAGE_POLL_SECONDS` 周期只重新评估
+盘口签名发生变化的关系；为避免丢失事件，每 `CROSS_MARKET_PROBABILITY_ARBITRAGE_FULL_SCAN_SECONDS` 执行一次全量评估。
+WebSocket 数据超过 `CROSS_MARKET_PROBABILITY_ARBITRAGE_WEBSOCKET_BOOK_MAX_AGE_MS` 后自动回退到 HTTP 快照。
 
-- 净边际达到 `BAYESIAN_NEAR_MISS_EDGE` 但未达成交阈值时，记录 `near_miss_entered`；
-- 近阈值关系按 `BAYESIAN_NEAR_MISS_LOG_SECONDS` 保留明细心跳；
-- 普通负边际关系按 `BAYESIAN_ORDINARY_LOG_SECONDS` 保留明细心跳；
-- `near_miss` 只是研究标签，不会放宽 `BAYESIAN_MIN_NET_EDGE` 或触发下单。
+- 净边际达到 `CROSS_MARKET_PROBABILITY_ARBITRAGE_NEAR_MISS_EDGE` 但未达成交阈值时，记录 `near_miss_entered`；
+- 近阈值关系按 `CROSS_MARKET_PROBABILITY_ARBITRAGE_NEAR_MISS_LOG_SECONDS` 保留明细心跳；
+- 普通负边际关系按 `CROSS_MARKET_PROBABILITY_ARBITRAGE_ORDINARY_LOG_SECONDS` 保留明细心跳；
+- `near_miss` 只是研究标签，不会放宽 `CROSS_MARKET_PROBABILITY_ARBITRAGE_MIN_NET_EDGE` 或触发下单。
 
 
 ## 语义审核文件
 
-`BAYESIAN_SEMANTIC_REVIEW_FILE` 指向一个以 `relationship_id` 为键的 JSON 对象：
+`CROSS_MARKET_PROBABILITY_ARBITRAGE_SEMANTIC_REVIEW_FILE` 指向一个以 `relationship_id` 为键的 JSON 对象：
 
 ```json
 {
@@ -95,13 +95,13 @@ WebSocket 数据超过 `BAYESIAN_WEBSOCKET_BOOK_MAX_AGE_MS` 后自动回退到 H
 
 持续模式还会：
 
-- 按 `BAYESIAN_RELATIONSHIP_REFRESH_SECONDS` 重新发现关系，并记录新增/移除关系；
+- 按 `CROSS_MARKET_PROBABILITY_ARBITRAGE_RELATIONSHIP_REFRESH_SECONDS` 重新发现关系，并记录新增/移除关系；
 - 为每个关系保存完整的 `1/2/5/10/20/50/100` 股规模曲线，而不只保存最终选中档位；
 - 为每个完整规模档位保存多执行缓冲情景；
 - 用 `discovery_summary` 解释 NegRisk 候选因不可交易、缺少 Other 或腿数超限而被排除的数量；
-- 按 `BAYESIAN_SUMMARY_SECONDS` 记录扫描摘要；
-- 按 `BAYESIAN_RESULTS_MAX_BYTES` 轮转结果，并保留 `BAYESIAN_RESULTS_RETENTION_FILES` 个分片。
-- `BAYESIAN_SEMANTIC_ALLOWLIST` 可标记已经人工核对的 relationship ID，但只改变研究标签，不会令关系获得实盘资格。
+- 按 `CROSS_MARKET_PROBABILITY_ARBITRAGE_SUMMARY_SECONDS` 记录扫描摘要；
+- 按 `CROSS_MARKET_PROBABILITY_ARBITRAGE_RESULTS_MAX_BYTES` 轮转结果，并保留 `CROSS_MARKET_PROBABILITY_ARBITRAGE_RESULTS_RETENTION_FILES` 个分片。
+- `CROSS_MARKET_PROBABILITY_ARBITRAGE_SEMANTIC_ALLOWLIST` 可标记已经人工核对的 relationship ID，但只改变研究标签，不会令关系获得实盘资格。
 
 ## 结果事件
 

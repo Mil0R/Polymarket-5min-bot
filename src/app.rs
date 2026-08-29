@@ -66,15 +66,15 @@ fn apply_runtime_profile(profile: RuntimeProfile) {
     std::env::set_var("TUI_ENABLED", "false");
     std::env::set_var("MERGE_INTERVAL_MINUTES", "0");
     std::env::set_var("WIND_DOWN_BEFORE_WINDOW_END_MINUTES", "0");
-    std::env::set_var("COPY_TRADING_ENABLED", "false");
+    std::env::set_var("WALLET_COPY_TRADING_ENABLED", "false");
     match profile {
         RuntimeProfile::BinaryComplementArbitrageDryRun => {
-            std::env::set_var("ARBITRAGE_ENABLED", "true");
-            std::env::set_var("WINNER_BUY_ENABLED", "false");
+            std::env::set_var("BINARY_COMPLEMENT_ARBITRAGE_ENABLED", "true");
+            std::env::set_var("LATE_RESOLUTION_WINNER_TRADING_ENABLED", "false");
         }
         RuntimeProfile::LateResolutionWinnerTradingDryRun => {
-            std::env::set_var("ARBITRAGE_ENABLED", "false");
-            std::env::set_var("WINNER_BUY_ENABLED", "true");
+            std::env::set_var("BINARY_COMPLEMENT_ARBITRAGE_ENABLED", "false");
+            std::env::set_var("LATE_RESOLUTION_WINNER_TRADING_ENABLED", "true");
         }
         RuntimeProfile::Integrated => unreachable!(),
     }

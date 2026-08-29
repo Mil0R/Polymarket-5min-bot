@@ -12,8 +12,8 @@
 //!
 //! Env config:
 //!   POLYMARKET_PRIVATE_KEY / POLYMARKET_PROXY_ADDRESS / SIGNATURE_TYPE / CLOB_API_URL
-//!   COPY_ORDER_TYPE      = FAK (default) | FOK | GTC | GTD
-//!   COPY_FEE_BUFFER_PCT  = 0.01 (fraction of notional reserved for fees)
+//!   WALLET_COPY_TRADING_ORDER_TYPE      = FAK (default) | FOK | GTC | GTD
+//!   WALLET_COPY_TRADING_FEE_BUFFER_PCT  = 0.01 (fraction of notional reserved for fees)
 
 use crate::clob_v2::{
     create_authenticated_clob_client, parse_signature_type, AuthenticatedClobClient,
@@ -97,20 +97,20 @@ impl CopyTradeExecutor {
                     "CLOB authentication failed (check POLYMARKET_PRIVATE_KEY / proxy / network)",
                 )?;
 
-        let order_type = match std::env::var("COPY_ORDER_TYPE")
+        let order_type = match std::env::var("WALLET_COPY_TRADING_ORDER_TYPE")
             .unwrap_or_else(|_| "FAK".to_string())
             .to_ascii_uppercase()
             .as_str()
         {
             "FOK" => OrderType::FOK,
             "GTC" | "GTD" => anyhow::bail!(
-                "COPY_ORDER_TYPE={} is disabled until durable resting-order reconciliation is configured; use FAK or FOK",
-                std::env::var("COPY_ORDER_TYPE").unwrap_or_default()
+                "WALLET_COPY_TRADING_ORDER_TYPE={} is disabled until durable resting-order reconciliation is configured; use FAK or FOK",
+                std::env::var("WALLET_COPY_TRADING_ORDER_TYPE").unwrap_or_default()
             ),
             _ => OrderType::FAK,
         };
 
-        let fee_buffer_pct = std::env::var("COPY_FEE_BUFFER_PCT")
+        let fee_buffer_pct = std::env::var("WALLET_COPY_TRADING_FEE_BUFFER_PCT")
             .ok()
             .and_then(|v| v.parse::<Decimal>().ok())
             .unwrap_or(dec!(0.01));
@@ -190,7 +190,7 @@ impl CopyTradeExecutor {
 
     /// Computes the fee-buffered size: the largest share count whose notional
     /// PLUS expected taker fee stays inside the proposal's budget.
-    /// Falls back to the flat `COPY_FEE_BUFFER_PCT` when fee details are missing.
+    /// Falls back to the flat `WALLET_COPY_TRADING_FEE_BUFFER_PCT` when fee details are missing.
     async fn fee_buffered_size(
         &self,
         condition_id: &str,
