@@ -11,11 +11,12 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::config::CrossMarketProbabilityArbitrageConfig;
 use super::model::{
-    BookLevel, BookSnapshot, FeePolicy, MarketRelationship, Outcome, RelationLeg, RelationshipKind,
+    BookLevel, BookSnapshot, BookSource, FeePolicy, MarketRelationship, Outcome, RelationLeg,
+    RelationshipKind,
 };
 
 #[derive(Debug, Clone)]
@@ -37,9 +38,56 @@ pub struct DiscoveryDiagnostics {
     pub neg_risk_rejections: BTreeMap<String, u64>,
     #[serde(default)]
     pub neg_risk_market_rejections: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub neg_risk_constraint_failures: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub neg_risk_rejection_examples: BTreeMap<String, Vec<NegRiskRejectionExample>>,
     pub relationships_before_limit: usize,
     pub relationships_emitted: usize,
     pub relationships_truncated: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NegRiskRejectionExample {
+    pub event_id: String,
+    pub event_title: String,
+    pub deployed_markets: usize,
+    pub tradable_markets: usize,
+    pub tradable_other_markets: usize,
+    pub market_rejections: BTreeMap<String, usize>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BookFetchDiagnostics {
+    pub requested_tokens: usize,
+    pub returned_books: usize,
+    pub websocket_hits: usize,
+    pub rest_successes: usize,
+    pub rest_failures: usize,
+    pub rest_latency_total_ms: u64,
+    pub rest_latency_max_ms: u64,
+}
+
+impl BookFetchDiagnostics {
+    pub fn merge(&mut self, other: &Self) {
+        self.requested_tokens += other.requested_tokens;
+        self.returned_books += other.returned_books;
+        self.websocket_hits += other.websocket_hits;
+        self.rest_successes += other.rest_successes;
+        self.rest_failures += other.rest_failures;
+        self.rest_latency_total_ms += other.rest_latency_total_ms;
+        self.rest_latency_max_ms = self.rest_latency_max_ms.max(other.rest_latency_max_ms);
+    }
+
+    pub fn rest_latency_average_ms(&self) -> Option<u64> {
+        (self.rest_successes > 0).then(|| self.rest_latency_total_ms / self.rest_successes as u64)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct BookFetchBatch {
+    pub books: HashMap<String, BookSnapshot>,
+    pub diagnostics: BookFetchDiagnostics,
 }
 
 #[derive(Debug, Clone)]
@@ -110,6 +158,8 @@ struct GammaFeeSchedule {
 #[derive(Debug, Deserialize)]
 struct ClobBookResponse {
     #[serde(default)]
+    bids: Vec<ClobLevel>,
+    #[serde(default)]
     asks: Vec<ClobLevel>,
     #[serde(default)]
     timestamp: Option<Value>,
@@ -179,6 +229,8 @@ impl CrossMarketProbabilityResearchClient {
             neg_risk_relationships_generated: 0,
             neg_risk_rejections: BTreeMap::new(),
             neg_risk_market_rejections: BTreeMap::new(),
+            neg_risk_constraint_failures: BTreeMap::new(),
+            neg_risk_rejection_examples: BTreeMap::new(),
             relationships_before_limit: 0,
             relationships_emitted: 0,
             relationships_truncated: 0,
@@ -194,6 +246,21 @@ impl CrossMarketProbabilityResearchClient {
 
             if event.neg_risk || event.enable_neg_risk {
                 diagnostics.neg_risk_events_seen += 1;
+                let constraint_failures =
+                    neg_risk_constraint_failures(&event, self.config.max_partition_legs);
+                for reason in &constraint_failures {
+                    *diagnostics
+                        .neg_risk_constraint_failures
+                        .entry((*reason).to_string())
+                        .or_default() += 1;
+                    let examples = diagnostics
+                        .neg_risk_rejection_examples
+                        .entry((*reason).to_string())
+                        .or_default();
+                    if examples.len() < 3 {
+                        examples.push(neg_risk_rejection_example(&event));
+                    }
+                }
                 for market in event
                     .markets
                     .iter()
@@ -267,6 +334,13 @@ impl CrossMarketProbabilityResearchClient {
         &self,
         relationships: &[MarketRelationship],
     ) -> HashMap<String, BookSnapshot> {
+        self.fetch_books_with_diagnostics(relationships).await.books
+    }
+
+    pub async fn fetch_books_with_diagnostics(
+        &self,
+        relationships: &[MarketRelationship],
+    ) -> BookFetchBatch {
         self.start_book_stream(relationships);
         let token_ids = relationships
             .iter()
@@ -279,19 +353,41 @@ impl CrossMarketProbabilityResearchClient {
                 (token_id, result)
             }
         });
-        stream::iter(requests)
+        let requested_tokens = requests.len();
+        let results = stream::iter(requests)
             .buffer_unordered(self.config.request_concurrency)
-            .filter_map(|(token_id, result)| async move {
-                match result {
-                    Ok(book) => Some((token_id, book)),
-                    Err(error) => {
-                        tracing::debug!(%token_id, %error, "cross-market probability book request failed");
-                        None
+            .collect::<Vec<_>>()
+            .await;
+        let mut books = HashMap::new();
+        let mut diagnostics = BookFetchDiagnostics {
+            requested_tokens,
+            ..BookFetchDiagnostics::default()
+        };
+        for (token_id, result) in results {
+            match result {
+                Ok(book) => {
+                    diagnostics.returned_books += 1;
+                    match book.source {
+                        BookSource::Websocket => diagnostics.websocket_hits += 1,
+                        BookSource::Rest => {
+                            diagnostics.rest_successes += 1;
+                            if let Some(latency) = book.request_latency_ms {
+                                diagnostics.rest_latency_total_ms += latency;
+                                diagnostics.rest_latency_max_ms =
+                                    diagnostics.rest_latency_max_ms.max(latency);
+                            }
+                        }
+                        BookSource::Unknown => {}
                     }
+                    books.insert(token_id, book);
                 }
-            })
-            .collect()
-            .await
+                Err(error) => {
+                    diagnostics.rest_failures += 1;
+                    tracing::debug!(%token_id, %error, "cross-market probability book request failed");
+                }
+            }
+        }
+        BookFetchBatch { books, diagnostics }
     }
 
     async fn fetch_events(&self) -> Result<Vec<GammaEvent>> {
@@ -338,6 +434,7 @@ impl CrossMarketProbabilityResearchClient {
                 return Ok(book.clone());
             }
         }
+        let request_started = Instant::now();
         let response: ClobBookResponse = self
             .http
             .get(format!("{}/book", self.config.clob_url))
@@ -350,6 +447,17 @@ impl CrossMarketProbabilityResearchClient {
             .json()
             .await
             .context("Cross-market probability CLOB book response is invalid")?;
+        let request_latency_ms = request_started.elapsed().as_millis() as u64;
+        let mut bids = response
+            .bids
+            .into_iter()
+            .filter_map(|level| {
+                let price = Decimal::from_str(&level.price).ok()?;
+                let size = Decimal::from_str(&level.size).ok()?;
+                (price > Decimal::ZERO && size > Decimal::ZERO).then_some(BookLevel { price, size })
+            })
+            .collect::<Vec<_>>();
+        bids.sort_by_key(|level| std::cmp::Reverse(level.price));
         let mut asks = response
             .asks
             .into_iter()
@@ -364,6 +472,9 @@ impl CrossMarketProbabilityResearchClient {
             token_id: token_id.to_string(),
             observed_at: Utc::now(),
             exchange_timestamp_ms: response.timestamp.as_ref().and_then(value_i64),
+            source: BookSource::Rest,
+            request_latency_ms: Some(request_latency_ms),
+            bids,
             asks,
         })
     }
@@ -420,6 +531,16 @@ impl CrossMarketProbabilityResearchClient {
 }
 
 fn websocket_book_snapshot(book: BookUpdate) -> BookSnapshot {
+    let mut bids = book
+        .bids
+        .into_iter()
+        .filter(|level| level.price > Decimal::ZERO && level.size > Decimal::ZERO)
+        .map(|level| BookLevel {
+            price: level.price,
+            size: level.size,
+        })
+        .collect::<Vec<_>>();
+    bids.sort_by_key(|level| std::cmp::Reverse(level.price));
     let mut asks = book
         .asks
         .into_iter()
@@ -434,6 +555,9 @@ fn websocket_book_snapshot(book: BookUpdate) -> BookSnapshot {
         token_id: book.asset_id.to_string(),
         observed_at: Utc::now(),
         exchange_timestamp_ms: Some(book.timestamp),
+        source: BookSource::Websocket,
+        request_latency_ms: None,
+        bids,
         asks,
     }
 }
@@ -551,6 +675,62 @@ fn neg_risk_eligibility(
         Err("missing_tradable_neg_risk_other")
     } else {
         Ok(())
+    }
+}
+
+fn neg_risk_constraint_failures(event: &GammaEvent, max_legs: usize) -> Vec<&'static str> {
+    let deployed = event
+        .markets
+        .iter()
+        .filter(|market| !market.condition_id.is_empty())
+        .count();
+    let markets = event
+        .markets
+        .iter()
+        .filter_map(tradable_market)
+        .collect::<Vec<_>>();
+    let mut failures = Vec::new();
+    if markets.len() != deployed {
+        failures.push("some_deployed_markets_not_tradable");
+    }
+    if markets.len() < 2 {
+        failures.push("fewer_than_two_tradable_markets");
+    }
+    if markets.len() > max_legs {
+        failures.push("partition_leg_limit_exceeded");
+    }
+    if !markets.iter().any(|market| market.neg_risk_other) {
+        failures.push("missing_tradable_neg_risk_other");
+    }
+    failures
+}
+
+fn neg_risk_rejection_example(event: &GammaEvent) -> NegRiskRejectionExample {
+    let deployed = event
+        .markets
+        .iter()
+        .filter(|market| !market.condition_id.is_empty())
+        .collect::<Vec<_>>();
+    let tradable = deployed
+        .iter()
+        .filter_map(|market| tradable_market(market))
+        .collect::<Vec<_>>();
+    let mut market_rejections = BTreeMap::new();
+    for market in &deployed {
+        if let Some(reason) = market_tradability_rejection(market) {
+            *market_rejections.entry(reason.to_string()).or_default() += 1;
+        }
+    }
+    NegRiskRejectionExample {
+        event_id: event.id.clone(),
+        event_title: event.title.clone(),
+        deployed_markets: deployed.len(),
+        tradable_markets: tradable.len(),
+        tradable_other_markets: tradable
+            .iter()
+            .filter(|market| market.neg_risk_other)
+            .count(),
+        market_rejections,
     }
 }
 
@@ -817,6 +997,14 @@ mod tests {
             neg_risk_eligibility(&event, 10),
             Err("some_deployed_markets_not_tradable")
         );
+        let failures = neg_risk_constraint_failures(&event, 10);
+        assert!(failures.contains(&"some_deployed_markets_not_tradable"));
+        assert!(failures.contains(&"missing_tradable_neg_risk_other"));
+        let example = neg_risk_rejection_example(&event);
+        assert_eq!(example.deployed_markets, 2);
+        assert_eq!(example.tradable_markets, 1);
+        assert_eq!(example.tradable_other_markets, 0);
+        assert_eq!(example.market_rejections.get("inactive"), Some(&1));
     }
 
     #[test]

@@ -17,7 +17,7 @@
 |---|---|---|---|
 | Binary Complement Arbitrage | 主运行时中的互补订单簿检测模块 | `binary_complement_arbitrage` | `results/binary-complement-arbitrage/` |
 | Late-Resolution Winner Trading | `late_resolution_winner_trading` | `late_resolution_winner_trading`、`late_resolution_winner_report` | `results/late-resolution-winner-trading/` |
-| Wallet-Copy Trading | `wallet_copy_trading` | `wallet_copy_trading`、`wallet_copy_trading_sim`、`wallet_copy_scout` | `results/wallet-copy-trading/`、`results/wallet-copy-candidates/` |
+| Wallet-Copy Trading | `wallet_copy_trading` | `wallet_copy_trading`、`wallet_copy_trading_sim`、`wallet_copy_scout`、`wallet_copy_audit` | `results/wallet-copy-trading/`、`results/wallet-copy-candidates/`、`results/wallet-copy-audits/` |
 | Market Making | `market_making` | `market_making` | `results/market-making/` |
 | Cross-Market Probability Arbitrage | `cross_market_probability_arbitrage` | `cross_market_probability_arbitrage` | `results/cross-market-probability-arbitrage/` |
 

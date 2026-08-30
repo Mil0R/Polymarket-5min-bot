@@ -45,6 +45,19 @@ net_edge   = net_profit / guaranteed_payout
 `CROSS_MARKET_PROBABILITY_ARBITRAGE_EXECUTION_BUFFER_CURVE_PCT=0,0.003,0.005,0.01` 同时计算多条缓冲曲线，
 用于判断表面价差对延迟、滑点和多腿非原子执行是否敏感。这些曲线不会改变主判定阈值。
 
+## 条件式 Maker/Taker 研究
+
+`CROSS_MARKET_PROBABILITY_ARBITRAGE_MAKER_TAKER_SHADOW=true` 会另外计算一个完全隔离的研究模型：
+
+- 选择一条腿在当前 best bid 挂 post-only 买单；
+- 假定该 Maker 腿完整成交后，其余腿立即按 ask 深度 Taker 对冲；
+- Maker 腿按零手续费保守计算，不预估 rebate；
+- 使用独立的 `2%` 最低边际和 `0.5%` 执行缓冲；
+- 记录 best bid 前方可见队列，但当前不会推断实际成交。
+
+该模型只回答“如果 Maker 腿先完整成交，此刻对冲是否仍有利润”。它没有模拟排队位置、成交概率、逆向选择或单腿暴露，
+所以 `conditional_maker_taker_candidate` 不能视为套利机会、订单成交或收益。
+
 ## 运行
 
 ```bash
@@ -58,7 +71,7 @@ net_edge   = net_profit / guaranteed_payout
 ./target/release/cross_market_probability_arbitrage report results/cross-market-probability-arbitrage/shadow-run-003/events.ndjson
 ```
 
-报告会自动合并同一路径的 `.1`、`.2` 等轮转分片。第三轮默认输出：
+报告会自动合并同一路径的 `.1`、`.2` 等轮转分片，列出所有 `run_id`，并默认详细分析最新一次正常结束的 Shadow 运行，避免把中断运行和重复快照混为独立样本。第三轮默认输出：
 
 - `events.ndjson`：关系明细、近阈值进出、机会快照；
 - `summary.ndjson`：运行生命周期、发现摘要、关系刷新和周期摘要。
@@ -68,6 +81,7 @@ net_edge   = net_profit / guaranteed_payout
 持续模式优先使用 WebSocket 盘口缓存，在每个 `CROSS_MARKET_PROBABILITY_ARBITRAGE_POLL_SECONDS` 周期只重新评估
 盘口签名发生变化的关系；为避免丢失事件，每 `CROSS_MARKET_PROBABILITY_ARBITRAGE_FULL_SCAN_SECONDS` 执行一次全量评估。
 WebSocket 数据超过 `CROSS_MARKET_PROBABILITY_ARBITRAGE_WEBSOCKET_BOOK_MAX_AGE_MS` 后自动回退到 HTTP 快照。
+每次评估还会记录盘口来源、REST 延迟、盘口年龄、本地接收时间差和交易所时间戳差；缺失交易所时间戳时不会伪造时间差。
 
 - 净边际达到 `CROSS_MARKET_PROBABILITY_ARBITRAGE_NEAR_MISS_EDGE` 但未达成交阈值时，记录 `near_miss_entered`；
 - 近阈值关系按 `CROSS_MARKET_PROBABILITY_ARBITRAGE_NEAR_MISS_LOG_SECONDS` 保留明细心跳；
@@ -98,7 +112,7 @@ WebSocket 数据超过 `CROSS_MARKET_PROBABILITY_ARBITRAGE_WEBSOCKET_BOOK_MAX_AG
 - 按 `CROSS_MARKET_PROBABILITY_ARBITRAGE_RELATIONSHIP_REFRESH_SECONDS` 重新发现关系，并记录新增/移除关系；
 - 为每个关系保存完整的 `1/2/5/10/20/50/100` 股规模曲线，而不只保存最终选中档位；
 - 为每个完整规模档位保存多执行缓冲情景；
-- 用 `discovery_summary` 解释 NegRisk 候选因不可交易、缺少 Other 或腿数超限而被排除的数量；
+- 用 `discovery_summary` 解释 NegRisk 候选因不可交易、缺少 Other 或腿数超限而被排除的数量，同时保留每种约束的事件样例；这些诊断不会放宽完整集合检查；
 - 按 `CROSS_MARKET_PROBABILITY_ARBITRAGE_SUMMARY_SECONDS` 记录扫描摘要；
 - 按 `CROSS_MARKET_PROBABILITY_ARBITRAGE_RESULTS_MAX_BYTES` 轮转结果，并保留 `CROSS_MARKET_PROBABILITY_ARBITRAGE_RESULTS_RETENTION_FILES` 个分片。
 - `CROSS_MARKET_PROBABILITY_ARBITRAGE_SEMANTIC_ALLOWLIST` 可标记已经人工核对的 relationship ID，但只改变研究标签，不会令关系获得实盘资格。
@@ -111,6 +125,10 @@ WebSocket 数据超过 `CROSS_MARKET_PROBABILITY_ARBITRAGE_WEBSOCKET_BOOK_MAX_AG
 - `discovery_summary`：发现覆盖和 NegRisk 淘汰原因；
 - `relationship_added` / `relationship_removed`：刷新后的关系变化；
 - `cycle_summary`：周期数、完整盘口数、最佳边际及累计机会数；
+- `book_fetch_summary`：单次扫描的 WebSocket/REST 命中、失败和延迟；
+- `conditional_maker_taker_evaluation`：条件式 Maker 成交后再 Taker 对冲的研究报价；
+- `conditional_maker_taker_candidate`：达到独立条件边际的报价，仍不代表 Maker 成交；
+- `final_cycle_summary`：退出时无条件保存最终收益边际、盘口质量和请求统计；
 - `shadow_opportunity`：达到净边际及最低组合金额的快照；
 - `run_started` / `run_stopped`：运行配置和计数。
 

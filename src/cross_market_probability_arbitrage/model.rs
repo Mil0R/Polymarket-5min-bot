@@ -55,11 +55,26 @@ pub struct BookLevel {
     pub size: Decimal,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum BookSource {
+    Websocket,
+    Rest,
+    #[default]
+    Unknown,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BookSnapshot {
     pub token_id: String,
     pub observed_at: DateTime<Utc>,
     pub exchange_timestamp_ms: Option<i64>,
+    #[serde(default)]
+    pub source: BookSource,
+    #[serde(default)]
+    pub request_latency_ms: Option<u64>,
+    #[serde(default)]
+    pub bids: Vec<BookLevel>,
     pub asks: Vec<BookLevel>,
 }
 
@@ -73,6 +88,16 @@ pub struct EvaluatedLeg {
     pub shares: Decimal,
     pub raw_cost_usdc: Decimal,
     pub taker_fee_usdc: Decimal,
+    #[serde(default)]
+    pub book_source: BookSource,
+    #[serde(default)]
+    pub book_observed_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub exchange_timestamp_ms: Option<i64>,
+    #[serde(default)]
+    pub book_age_ms: Option<i64>,
+    #[serde(default)]
+    pub request_latency_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -96,6 +121,20 @@ pub struct RelationshipEvaluation {
     pub net_edge: Option<Decimal>,
     pub qualifies: bool,
     pub rejection_reason: Option<String>,
+    #[serde(default)]
+    pub websocket_books: usize,
+    #[serde(default)]
+    pub rest_books: usize,
+    #[serde(default)]
+    pub unknown_source_books: usize,
+    #[serde(default)]
+    pub max_book_age_ms: Option<i64>,
+    #[serde(default)]
+    pub max_observed_at_skew_ms: Option<i64>,
+    #[serde(default)]
+    pub max_exchange_timestamp_skew_ms: Option<i64>,
+    #[serde(default)]
+    pub max_rest_latency_ms: Option<u64>,
     pub legs: Vec<EvaluatedLeg>,
     /// Complete research curve for every configured size. Older journals omit it.
     #[serde(default)]
@@ -131,10 +170,48 @@ pub struct BufferEvaluation {
     pub qualifies: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MakerTakerEvaluation {
+    pub relationship_id: String,
+    pub event_slug: String,
+    pub event_title: String,
+    pub kind: RelationshipKind,
+    pub semantic_status: String,
+    pub observed_at: DateTime<Utc>,
+    pub size_shares: Decimal,
+    pub maker_leg_index: usize,
+    pub maker_token_id: String,
+    pub maker_outcome: Outcome,
+    pub maker_price: Decimal,
+    pub visible_queue_ahead_shares: Decimal,
+    pub guaranteed_payout_usdc: Decimal,
+    pub raw_cost_usdc: Decimal,
+    pub taker_fee_usdc: Decimal,
+    pub execution_buffer_usdc: Decimal,
+    pub conditional_profit_usdc: Decimal,
+    pub conditional_edge: Decimal,
+    pub research_candidate: bool,
+    pub max_book_age_ms: Option<i64>,
+    pub max_observed_at_skew_ms: Option<i64>,
+    pub max_exchange_timestamp_skew_ms: Option<i64>,
+    pub assumption: String,
+}
+
 struct FillQuote {
     average_price: Decimal,
     raw_cost: Decimal,
     fee: Decimal,
+}
+
+#[derive(Default)]
+struct BookTelemetry {
+    websocket_books: usize,
+    rest_books: usize,
+    unknown_source_books: usize,
+    max_book_age_ms: Option<i64>,
+    max_observed_at_skew_ms: Option<i64>,
+    max_exchange_timestamp_skew_ms: Option<i64>,
+    max_rest_latency_ms: Option<u64>,
 }
 
 pub fn evaluate_relationship(
@@ -169,6 +246,7 @@ pub fn evaluate_relationship_with_buffers(
     execution_buffer_curve_pct: &[Decimal],
     now: DateTime<Utc>,
 ) -> RelationshipEvaluation {
+    let telemetry = book_telemetry(relationship, books, now);
     let mut best: Option<RelationshipEvaluation> = None;
     let mut last_failure = "no_size_has_complete_ask_depth".to_string();
     let mut size_evaluations = Vec::with_capacity(size_ladder.len());
@@ -199,6 +277,15 @@ pub fn evaluate_relationship_with_buffers(
                 shares: *size,
                 raw_cost_usdc: fill.raw_cost,
                 taker_fee_usdc: fill.fee,
+                book_source: book.source,
+                book_observed_at: Some(book.observed_at),
+                exchange_timestamp_ms: book.exchange_timestamp_ms,
+                book_age_ms: Some(
+                    now.signed_duration_since(book.observed_at)
+                        .num_milliseconds()
+                        .max(0),
+                ),
+                request_latency_ms: book.request_latency_ms,
             });
         }
         if !complete {
@@ -293,6 +380,13 @@ pub fn evaluate_relationship_with_buffers(
             net_edge: Some(edge),
             qualifies,
             rejection_reason,
+            websocket_books: telemetry.websocket_books,
+            rest_books: telemetry.rest_books,
+            unknown_source_books: telemetry.unknown_source_books,
+            max_book_age_ms: telemetry.max_book_age_ms,
+            max_observed_at_skew_ms: telemetry.max_observed_at_skew_ms,
+            max_exchange_timestamp_skew_ms: telemetry.max_exchange_timestamp_skew_ms,
+            max_rest_latency_ms: telemetry.max_rest_latency_ms,
             legs,
             size_evaluations: Vec::new(),
         };
@@ -337,11 +431,183 @@ pub fn evaluate_relationship_with_buffers(
         net_edge: None,
         qualifies: false,
         rejection_reason: Some(last_failure),
+        websocket_books: telemetry.websocket_books,
+        rest_books: telemetry.rest_books,
+        unknown_source_books: telemetry.unknown_source_books,
+        max_book_age_ms: telemetry.max_book_age_ms,
+        max_observed_at_skew_ms: telemetry.max_observed_at_skew_ms,
+        max_exchange_timestamp_skew_ms: telemetry.max_exchange_timestamp_skew_ms,
+        max_rest_latency_ms: telemetry.max_rest_latency_ms,
         legs: Vec::new(),
         size_evaluations: Vec::new(),
     });
     result.size_evaluations = size_evaluations;
     result
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_maker_taker_relationship(
+    relationship: &MarketRelationship,
+    books: &HashMap<String, BookSnapshot>,
+    size_ladder: &[Decimal],
+    min_bundle_notional: Decimal,
+    min_net_edge: Decimal,
+    execution_buffer_pct: Decimal,
+    now: DateTime<Utc>,
+) -> Option<MakerTakerEvaluation> {
+    let telemetry = book_telemetry(relationship, books, now);
+    let mut best = None::<MakerTakerEvaluation>;
+    for size in size_ladder {
+        for (maker_leg_index, maker_leg) in relationship.legs.iter().enumerate() {
+            let Some(maker_book) = books.get(&maker_leg.token_id) else {
+                continue;
+            };
+            let Some(maker_price) = maker_book
+                .bids
+                .iter()
+                .filter(|level| {
+                    level.price > Decimal::ZERO
+                        && level.price < Decimal::ONE
+                        && level.size > Decimal::ZERO
+                })
+                .map(|level| level.price)
+                .max()
+            else {
+                continue;
+            };
+            if maker_book
+                .asks
+                .iter()
+                .filter(|level| level.price > Decimal::ZERO && level.size > Decimal::ZERO)
+                .map(|level| level.price)
+                .min()
+                .is_some_and(|best_ask| maker_price >= best_ask)
+            {
+                continue;
+            }
+            let queue_ahead = maker_book
+                .bids
+                .iter()
+                .filter(|level| level.price == maker_price)
+                .map(|level| level.size)
+                .sum::<Decimal>();
+            let mut raw_cost = maker_price * *size;
+            let mut taker_fee = Decimal::ZERO;
+            let mut complete = true;
+            for (leg_index, leg) in relationship.legs.iter().enumerate() {
+                if leg_index == maker_leg_index {
+                    continue;
+                }
+                let Some(book) = books.get(&leg.token_id) else {
+                    complete = false;
+                    break;
+                };
+                let Some(fill) = walk_asks(book, *size, &leg.fee) else {
+                    complete = false;
+                    break;
+                };
+                raw_cost += fill.raw_cost;
+                taker_fee += fill.fee;
+            }
+            if !complete {
+                continue;
+            }
+            let payout = relationship.minimum_payout_per_share * *size;
+            if payout <= Decimal::ZERO {
+                continue;
+            }
+            let buffer = payout * execution_buffer_pct;
+            let profit = payout - raw_cost - taker_fee - buffer;
+            let edge = profit / payout;
+            let candidate = MakerTakerEvaluation {
+                relationship_id: relationship.relationship_id.clone(),
+                event_slug: relationship.event_slug.clone(),
+                event_title: relationship.event_title.clone(),
+                kind: relationship.kind,
+                semantic_status: relationship.semantic_status.clone(),
+                observed_at: now,
+                size_shares: *size,
+                maker_leg_index,
+                maker_token_id: maker_leg.token_id.clone(),
+                maker_outcome: maker_leg.outcome,
+                maker_price,
+                visible_queue_ahead_shares: queue_ahead,
+                guaranteed_payout_usdc: payout,
+                raw_cost_usdc: raw_cost,
+                taker_fee_usdc: taker_fee,
+                execution_buffer_usdc: buffer,
+                conditional_profit_usdc: profit,
+                conditional_edge: edge,
+                research_candidate: raw_cost >= min_bundle_notional && edge >= min_net_edge,
+                max_book_age_ms: telemetry.max_book_age_ms,
+                max_observed_at_skew_ms: telemetry.max_observed_at_skew_ms,
+                max_exchange_timestamp_skew_ms: telemetry.max_exchange_timestamp_skew_ms,
+                assumption: "conditional_on_full_post_only_maker_fill_then_immediate_taker_hedge; maker_fill_probability_queue_position_and_adverse_selection_not_simulated".into(),
+            };
+            if best.as_ref().is_none_or(|current| {
+                candidate.conditional_edge > current.conditional_edge
+                    || (candidate.conditional_edge == current.conditional_edge
+                        && candidate.conditional_profit_usdc > current.conditional_profit_usdc)
+            }) {
+                best = Some(candidate);
+            }
+        }
+    }
+    best
+}
+
+fn book_telemetry(
+    relationship: &MarketRelationship,
+    books: &HashMap<String, BookSnapshot>,
+    now: DateTime<Utc>,
+) -> BookTelemetry {
+    let relationship_books = relationship
+        .legs
+        .iter()
+        .filter_map(|leg| books.get(&leg.token_id))
+        .collect::<Vec<_>>();
+    let mut telemetry = BookTelemetry::default();
+    let mut observed_times = Vec::new();
+    let mut exchange_times = Vec::new();
+    for book in relationship_books {
+        match book.source {
+            BookSource::Websocket => telemetry.websocket_books += 1,
+            BookSource::Rest => telemetry.rest_books += 1,
+            BookSource::Unknown => telemetry.unknown_source_books += 1,
+        }
+        let age_ms = now
+            .signed_duration_since(book.observed_at)
+            .num_milliseconds()
+            .max(0);
+        telemetry.max_book_age_ms = Some(
+            telemetry
+                .max_book_age_ms
+                .map_or(age_ms, |current| current.max(age_ms)),
+        );
+        if let Some(latency) = book.request_latency_ms {
+            telemetry.max_rest_latency_ms = Some(
+                telemetry
+                    .max_rest_latency_ms
+                    .map_or(latency, |current| current.max(latency)),
+            );
+        }
+        observed_times.push(book.observed_at.timestamp_millis());
+        if let Some(timestamp) = book.exchange_timestamp_ms {
+            exchange_times.push(timestamp);
+        }
+    }
+    telemetry.max_observed_at_skew_ms = range_ms(&observed_times);
+    if exchange_times.len() == relationship.legs.len() {
+        telemetry.max_exchange_timestamp_skew_ms = range_ms(&exchange_times);
+    }
+    telemetry
+}
+
+fn range_ms(values: &[i64]) -> Option<i64> {
+    (values.len() >= 2).then(|| {
+        values.iter().max().copied().unwrap_or_default()
+            - values.iter().min().copied().unwrap_or_default()
+    })
 }
 
 fn walk_asks(book: &BookSnapshot, shares: Decimal, fee: &FeePolicy) -> Option<FillQuote> {
@@ -406,6 +672,9 @@ mod tests {
             token_id: token.into(),
             observed_at: Utc::now(),
             exchange_timestamp_ms: None,
+            source: BookSource::Unknown,
+            request_latency_ms: None,
+            bids: vec![],
             asks: vec![BookLevel { price: ask, size }],
         }
     }
@@ -485,6 +754,45 @@ mod tests {
         );
         assert!(!result.qualifies);
         assert!(result.net_profit_usdc.unwrap() < Decimal::ZERO);
+    }
+
+    #[test]
+    fn maker_taker_quote_is_isolated_and_conditional() {
+        let relation = MarketRelationship {
+            relationship_id: "maker-r".into(),
+            event_id: "e".into(),
+            event_slug: "maker".into(),
+            event_title: "Maker conditional".into(),
+            kind: RelationshipKind::DeadlineImplication,
+            semantic_status: "shadow".into(),
+            evidence: vec![],
+            minimum_payout_per_share: Decimal::ONE,
+            live_eligible: false,
+            legs: vec![leg("a", "a", Outcome::Yes), leg("b", "b", Outcome::No)],
+        };
+        let mut maker_book = book("a", dec!(0.50), dec!(100));
+        maker_book.bids = vec![BookLevel {
+            price: dec!(0.48),
+            size: dec!(25),
+        }];
+        let books = HashMap::from([
+            ("a".into(), maker_book),
+            ("b".into(), book("b", dec!(0.49), dec!(100))),
+        ]);
+        let evaluation = evaluate_maker_taker_relationship(
+            &relation,
+            &books,
+            &[dec!(10)],
+            dec!(1),
+            dec!(0.02),
+            Decimal::ZERO,
+            Utc::now(),
+        )
+        .expect("maker/taker route");
+        assert_eq!(evaluation.maker_token_id, "a");
+        assert_eq!(evaluation.conditional_edge, dec!(0.03));
+        assert!(evaluation.research_candidate);
+        assert!(evaluation.assumption.contains("not_simulated"));
     }
 
     #[test]

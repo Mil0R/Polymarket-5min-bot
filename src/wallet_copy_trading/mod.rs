@@ -1,3 +1,4 @@
+pub mod audit;
 pub mod consensus;
 pub mod coordinator;
 pub mod execution;
@@ -17,6 +18,7 @@ pub mod signal_store;
 pub mod types;
 pub mod whitelist;
 
+pub use audit::{WalletAuditConfig, WalletAuditReport, WalletAuditor};
 pub use consensus::ConsensusEngine;
 pub use coordinator::WalletCopyTradingCoordinator;
 pub use execution::SmartExecutionEngine;

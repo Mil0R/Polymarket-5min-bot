@@ -36,6 +36,10 @@ pub struct CrossMarketProbabilityArbitrageConfig {
     pub websocket_books: bool,
     pub websocket_book_max_age_ms: i64,
     pub semantic_allowlist: Vec<String>,
+    pub maker_taker_shadow: bool,
+    pub maker_taker_min_net_edge: Decimal,
+    pub maker_taker_execution_buffer_pct: Decimal,
+    pub maker_taker_log_seconds: u64,
 }
 
 impl CrossMarketProbabilityArbitrageConfig {
@@ -138,6 +142,22 @@ impl CrossMarketProbabilityArbitrageConfig {
             semantic_allowlist: parse_string_list(
                 "CROSS_MARKET_PROBABILITY_ARBITRAGE_SEMANTIC_ALLOWLIST",
             ),
+            maker_taker_shadow: parse(
+                "CROSS_MARKET_PROBABILITY_ARBITRAGE_MAKER_TAKER_SHADOW",
+                "true",
+            )?,
+            maker_taker_min_net_edge: decimal_env(
+                "CROSS_MARKET_PROBABILITY_ARBITRAGE_MAKER_TAKER_MIN_NET_EDGE",
+                dec!(0.02),
+            )?,
+            maker_taker_execution_buffer_pct: decimal_env(
+                "CROSS_MARKET_PROBABILITY_ARBITRAGE_MAKER_TAKER_EXECUTION_BUFFER_PCT",
+                dec!(0.005),
+            )?,
+            maker_taker_log_seconds: parse(
+                "CROSS_MARKET_PROBABILITY_ARBITRAGE_MAKER_TAKER_LOG_SECONDS",
+                "60",
+            )?,
         };
         config.validate()?;
         Ok(config)
@@ -227,6 +247,18 @@ impl CrossMarketProbabilityArbitrageConfig {
         }
         if self.websocket_book_max_age_ms <= 0 || self.websocket_book_max_age_ms > 300_000 {
             bail!("CROSS_MARKET_PROBABILITY_ARBITRAGE_WEBSOCKET_BOOK_MAX_AGE_MS must be in [1, 300000]");
+        }
+        if self.maker_taker_min_net_edge < Decimal::ZERO || self.maker_taker_min_net_edge >= dec!(1)
+        {
+            bail!("CROSS_MARKET_PROBABILITY_ARBITRAGE_MAKER_TAKER_MIN_NET_EDGE must be in [0, 1)");
+        }
+        if self.maker_taker_execution_buffer_pct < Decimal::ZERO
+            || self.maker_taker_execution_buffer_pct >= dec!(0.25)
+        {
+            bail!("CROSS_MARKET_PROBABILITY_ARBITRAGE_MAKER_TAKER_EXECUTION_BUFFER_PCT must be in [0, 0.25)");
+        }
+        if self.maker_taker_log_seconds < self.poll_seconds {
+            bail!("CROSS_MARKET_PROBABILITY_ARBITRAGE_MAKER_TAKER_LOG_SECONDS must be >= poll interval");
         }
         Ok(())
     }

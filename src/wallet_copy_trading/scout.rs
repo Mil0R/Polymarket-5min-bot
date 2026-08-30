@@ -307,6 +307,17 @@ impl CandidateScout {
     }
 
     pub async fn run(&self) -> Result<ScoutReport> {
+        self.run_internal(true).await
+    }
+
+    /// Evaluates candidates without writing the scout's replace-in-place
+    /// discovery artifacts. Standalone audits use this and append their own
+    /// immutable NDJSON record instead.
+    pub async fn run_without_outputs(&self) -> Result<ScoutReport> {
+        self.run_internal(false).await
+    }
+
+    async fn run_internal(&self, write_outputs: bool) -> Result<ScoutReport> {
         let now = Utc::now();
         let (mut seeds, mut partial_failures) = self.discover().await;
         for address in &self.config.explicit_wallets {
@@ -352,7 +363,9 @@ impl CandidateScout {
             partial_failures,
             candidates,
         };
-        self.write_outputs(&report)?;
+        if write_outputs {
+            self.write_outputs(&report)?;
+        }
         Ok(report)
     }
 
