@@ -10,6 +10,7 @@ use polymarket_client_sdk_v2::POLYGON;
 use rust_decimal_macros::dec;
 use std::collections::HashSet;
 use std::str::FromStr;
+use std::sync::Mutex;
 use std::time::Instant;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -112,6 +113,10 @@ pub struct LateResolutionWinnerTradingExecution {
     pub cost: Decimal,
     pub average_price: Decimal,
     pub estimated_fee: Decimal,
+    /// Actual CLOB request round-trip, excluding the configured PAPER delay.
+    pub request_latency_ms: u64,
+    /// End-to-end execution time, including the configured PAPER delay.
+    pub total_latency_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -303,6 +308,38 @@ fn apply_dynamic_fee(mut fill: PaperFill, quote: &ExecutionQuote) -> PaperFill {
     fill
 }
 
+fn prorate_paper_fill(fill: PaperFill, shares: Decimal) -> PaperFill {
+    if fill.filled <= dec!(0) || shares <= dec!(0) {
+        return PaperFill {
+            requested: shares,
+            filled: dec!(0),
+            cost: dec!(0),
+            fee: dec!(0),
+            average_price: dec!(0),
+        };
+    }
+    let filled = shares.min(fill.filled);
+    PaperFill {
+        requested: filled,
+        filled,
+        cost: fill.cost * filled / fill.filled,
+        fee: fill.fee * filled / fill.filled,
+        average_price: fill.average_price,
+    }
+}
+
+fn paired_paper_pnl(yes: PaperFill, no: PaperFill) -> Decimal {
+    let paired = yes.filled.min(no.filled);
+    if paired <= dec!(0) {
+        return dec!(0);
+    }
+    paired - yes.cost * paired / yes.filled - no.cost * paired / no.filled
+}
+
+fn elapsed_ms(started_at: Instant) -> u64 {
+    u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
 fn round_buy_price_to_tick(price: Decimal, tick: Decimal) -> Result<Decimal> {
     if tick <= dec!(0) || tick >= dec!(1) {
         anyhow::bail!("invalid market tick size {tick}");
@@ -324,12 +361,55 @@ pub struct TradingExecutor {
     gtd_expiration_secs: u64,
     arbitrage_order_type: OrderType,
     dry_run: bool,
+    arbitrage_paper_emergency_unwind_delay_ms: u64,
+    arbitrage_paper_emergency_unwind_min_price: Decimal,
     paper_late_resolution_winner_trading_delay_ms: u64,
     arbitrage_paper: PaperTradingEngine,
     winner_paper: PaperTradingEngine,
+    arbitrage_paper_telemetry: Mutex<PaperArbitrageTelemetry>,
     /// token_id -> minimum tick size, cached to avoid an HTTP round-trip per quote.
     tick_cache: DashMap<U256, Decimal>,
     market_rules_cache: DashMap<B256, ArbitrageMarketRules>,
+}
+
+#[derive(Debug, Default)]
+struct PaperArbitrageTelemetry {
+    preflight_attempts: u64,
+    preflight_passes: u64,
+    preflight_rest_ms_total: u64,
+    preflight_rest_ms_max: u64,
+    second_leg_attempts: u64,
+    second_leg_failures: u64,
+    second_leg_rest_ms_total: u64,
+    second_leg_rest_ms_max: u64,
+    emergency_unwind_attempts: u64,
+    emergency_unwind_successes: u64,
+    emergency_unwind_rest_ms_total: u64,
+    emergency_unwind_rest_ms_max: u64,
+    unrecovered_executions: u64,
+    paired_executions: u64,
+    realized_pnl: Decimal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PaperArbitrageSummary {
+    pub preflight_attempts: u64,
+    pub preflight_passes: u64,
+    pub preflight_rest_ms_total: u64,
+    pub preflight_rest_ms_max: u64,
+    pub second_leg_attempts: u64,
+    pub second_leg_failures: u64,
+    pub second_leg_rest_ms_total: u64,
+    pub second_leg_rest_ms_max: u64,
+    pub emergency_unwind_attempts: u64,
+    pub emergency_unwind_successes: u64,
+    pub emergency_unwind_rest_ms_total: u64,
+    pub emergency_unwind_rest_ms_max: u64,
+    pub unrecovered_executions: u64,
+    pub paired_executions: u64,
+    pub realized_pnl: Decimal,
+    pub cumulative_paper_pnl: Decimal,
+    pub unmatched_cost: Decimal,
 }
 
 #[derive(Debug, Clone)]
@@ -348,6 +428,8 @@ pub struct ExecutionPolicy {
     pub paper_liquidity_haircut: f64,
     pub arbitrage_paper_liquidity_haircut: f64,
     pub paper_second_leg_delay_ms: u64,
+    pub arbitrage_paper_emergency_unwind_delay_ms: u64,
+    pub arbitrage_paper_emergency_unwind_min_price: f64,
     pub paper_late_resolution_winner_trading_delay_ms: u64,
 }
 
@@ -437,6 +519,12 @@ impl TradingExecutor {
             gtd_expiration_secs: policy.gtd_expiration_secs,
             arbitrage_order_type: policy.order_type,
             dry_run: policy.dry_run,
+            arbitrage_paper_emergency_unwind_delay_ms: policy
+                .arbitrage_paper_emergency_unwind_delay_ms,
+            arbitrage_paper_emergency_unwind_min_price: Decimal::try_from(
+                policy.arbitrage_paper_emergency_unwind_min_price,
+            )
+            .unwrap_or(dec!(0.01)),
             paper_late_resolution_winner_trading_delay_ms: policy
                 .paper_late_resolution_winner_trading_delay_ms,
             arbitrage_paper: PaperTradingEngine::new(PaperSettings {
@@ -455,6 +543,7 @@ impl TradingExecutor {
                     .unwrap_or(dec!(0.75)),
                 second_leg_delay_ms: policy.paper_second_leg_delay_ms,
             }),
+            arbitrage_paper_telemetry: Mutex::new(PaperArbitrageTelemetry::default()),
             tick_cache: DashMap::new(),
             market_rules_cache: DashMap::new(),
         }
@@ -467,6 +556,81 @@ impl TradingExecutor {
             .await
             .map_err(|e| anyhow::anyhow!("Auth verification failed: API error: {}", e))?;
         Ok(())
+    }
+
+    pub fn paper_arbitrage_summary(&self) -> PaperArbitrageSummary {
+        let telemetry = self
+            .arbitrage_paper_telemetry
+            .lock()
+            .expect("paper arbitrage telemetry lock poisoned");
+        let ledger = self.arbitrage_paper.snapshot();
+        PaperArbitrageSummary {
+            preflight_attempts: telemetry.preflight_attempts,
+            preflight_passes: telemetry.preflight_passes,
+            preflight_rest_ms_total: telemetry.preflight_rest_ms_total,
+            preflight_rest_ms_max: telemetry.preflight_rest_ms_max,
+            second_leg_attempts: telemetry.second_leg_attempts,
+            second_leg_failures: telemetry.second_leg_failures,
+            second_leg_rest_ms_total: telemetry.second_leg_rest_ms_total,
+            second_leg_rest_ms_max: telemetry.second_leg_rest_ms_max,
+            emergency_unwind_attempts: telemetry.emergency_unwind_attempts,
+            emergency_unwind_successes: telemetry.emergency_unwind_successes,
+            emergency_unwind_rest_ms_total: telemetry.emergency_unwind_rest_ms_total,
+            emergency_unwind_rest_ms_max: telemetry.emergency_unwind_rest_ms_max,
+            unrecovered_executions: telemetry.unrecovered_executions,
+            paired_executions: telemetry.paired_executions,
+            realized_pnl: telemetry.realized_pnl,
+            cumulative_paper_pnl: ledger.theoretical_pnl,
+            unmatched_cost: ledger.unmatched_cost,
+        }
+    }
+
+    fn record_paper_preflight(&self, rest_ms: u64, passed: bool) {
+        let mut telemetry = self
+            .arbitrage_paper_telemetry
+            .lock()
+            .expect("paper arbitrage telemetry lock poisoned");
+        telemetry.preflight_attempts += 1;
+        telemetry.preflight_passes += u64::from(passed);
+        telemetry.preflight_rest_ms_total =
+            telemetry.preflight_rest_ms_total.saturating_add(rest_ms);
+        telemetry.preflight_rest_ms_max = telemetry.preflight_rest_ms_max.max(rest_ms);
+    }
+
+    fn record_paper_second_leg(&self, rest_ms: u64, failed: bool) {
+        let mut telemetry = self
+            .arbitrage_paper_telemetry
+            .lock()
+            .expect("paper arbitrage telemetry lock poisoned");
+        telemetry.second_leg_attempts += 1;
+        telemetry.second_leg_failures += u64::from(failed);
+        telemetry.second_leg_rest_ms_total =
+            telemetry.second_leg_rest_ms_total.saturating_add(rest_ms);
+        telemetry.second_leg_rest_ms_max = telemetry.second_leg_rest_ms_max.max(rest_ms);
+    }
+
+    fn record_paper_unwind(&self, rest_ms: u64, succeeded: bool) {
+        let mut telemetry = self
+            .arbitrage_paper_telemetry
+            .lock()
+            .expect("paper arbitrage telemetry lock poisoned");
+        telemetry.emergency_unwind_attempts += 1;
+        telemetry.emergency_unwind_successes += u64::from(succeeded);
+        telemetry.emergency_unwind_rest_ms_total = telemetry
+            .emergency_unwind_rest_ms_total
+            .saturating_add(rest_ms);
+        telemetry.emergency_unwind_rest_ms_max =
+            telemetry.emergency_unwind_rest_ms_max.max(rest_ms);
+    }
+
+    fn record_paper_execution(&self, paired: bool, unrecovered: bool, realized_pnl: Decimal) {
+        let mut telemetry = self
+            .arbitrage_paper_telemetry
+            .lock()
+            .expect("paper arbitrage telemetry lock poisoned");
+        telemetry.paired_executions += u64::from(paired);
+        telemetry.unrecovered_executions += u64::from(unrecovered);
+        telemetry.realized_pnl += realized_pnl;
     }
 
     pub async fn winner_book_top(&self, token_id: U256) -> Result<Option<WinnerBookTop>> {
@@ -549,6 +713,7 @@ impl TradingExecutor {
         size: Decimal,
         fee_per_share: Decimal,
     ) -> Result<LateResolutionWinnerTradingExecution> {
+        let execution_started = Instant::now();
         if self.dry_run {
             let reservation = self.winner_paper.reserve(self.winner_planned_cost(
                 limit_price,
@@ -570,6 +735,10 @@ impl TradingExecutor {
                 filled = %fill.filled,
                 average_price = %fill.average_price,
                 cost = %fill.cost,
+                estimated_fee = %fill.fee,
+                expected_profit_if_wins = %(fill.filled - fill.cost),
+                execution_request_latency_ms = execution.request_latency_ms,
+                execution_total_latency_ms = execution.total_latency_ms,
                 cash_remaining = %paper.cash_remaining,
                 winner_positions_open = paper.winner_positions_open,
                 "PAPER late-resolution-winner-trading cash committed"
@@ -580,7 +749,9 @@ impl TradingExecutor {
         let signed = self
             .build_and_sign_buy(token_id, limit_price, size, expiration)
             .await?;
+        let request_started = Instant::now();
         let response = self.client.post_order(signed).await?;
+        let request_latency_ms = elapsed_ms(request_started);
         let filled =
             outcome_shares_filled(&Side::Buy, response.making_amount, response.taking_amount);
         let cost = if filled > dec!(0) {
@@ -605,6 +776,8 @@ impl TradingExecutor {
             },
             average_price,
             estimated_fee: dec!(0),
+            request_latency_ms,
+            total_latency_ms: elapsed_ms(execution_started),
         })
     }
 
@@ -633,13 +806,16 @@ impl TradingExecutor {
         size: Decimal,
         fee_per_share: Decimal,
     ) -> Result<LateResolutionWinnerTradingExecution> {
+        let execution_started = Instant::now();
         if self.paper_late_resolution_winner_trading_delay_ms > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(
                 self.paper_late_resolution_winner_trading_delay_ms,
             ))
             .await;
         }
+        let request_started = Instant::now();
         let book = self.live_paper_book(token_id).await?;
+        let request_latency_ms = elapsed_ms(request_started);
         let mut fill = self.winner_paper.simulate_buy(
             &book.asks,
             limit_price,
@@ -657,6 +833,8 @@ impl TradingExecutor {
             cost: fill.cost,
             average_price: fill.average_price,
             estimated_fee,
+            request_latency_ms,
+            total_latency_ms: elapsed_ms(execution_started),
         })
     }
 
@@ -1045,11 +1223,30 @@ impl TradingExecutor {
         // quotes that vanish on touch) are the main source of one-sided fills:
         // the WS snapshot saw both asks, but by execution time the losing side
         // has no sellers. Abort cleanly here instead of eating one-sided exposure.
+        let preflight_started = Instant::now();
         let (first_book_pre, second_book_pre) = tokio::join!(
             self.live_paper_book(first_token),
             self.live_paper_book(second_token),
         );
-        let (first_book_pre, second_book_pre) = (first_book_pre?, second_book_pre?);
+        let preflight_rest_ms = elapsed_ms(preflight_started);
+        let (first_book_pre, second_book_pre) = match (first_book_pre, second_book_pre) {
+            (Ok(first), Ok(second)) => (first, second),
+            (first, second) => {
+                self.record_paper_preflight(preflight_rest_ms, false);
+                let first_error = first.err().map(|error| error.to_string());
+                let second_error = second.err().map(|error| error.to_string());
+                warn!(
+                    ?first_leg,
+                    preflight_rest_ms,
+                    ?first_error,
+                    ?second_error,
+                    "PAPER pre-flight REST read failed"
+                );
+                return Err(anyhow::anyhow!(
+                    "PAPER pre-flight REST read failed after {preflight_rest_ms}ms"
+                ));
+            }
+        };
         let first_pre = self.arbitrage_paper.simulate_buy(
             &first_book_pre.asks,
             first_limit,
@@ -1066,8 +1263,10 @@ impl TradingExecutor {
         let paired_edge = quote.net_edge_at(first_pre.average_price, second_pre.average_price);
         let required_edge = self.min_profit_threshold + self.fee_buffer;
         if !full_size_fillable || paired_edge < required_edge {
+            self.record_paper_preflight(preflight_rest_ms, false);
             warn!(
                 ?first_leg,
+                preflight_rest_ms,
                 first_fill = %first_pre.filled,
                 second_fill = %second_pre.filled,
                 %paired_edge,
@@ -1078,6 +1277,18 @@ impl TradingExecutor {
                 "opportunity disappeared before execution (full-size REST pre-flight)"
             ));
         }
+        self.record_paper_preflight(preflight_rest_ms, true);
+        info!(
+            ?first_leg,
+            preflight_rest_ms,
+            first_fill = %first_pre.filled,
+            second_fill = %second_pre.filled,
+            first_vwap = %first_pre.average_price,
+            second_vwap = %second_pre.average_price,
+            %paired_edge,
+            %required_edge,
+            "✅ PAPER pre-flight passed"
+        );
         let paper_reservation = self.arbitrage_paper.reserve(quote.total_cost)?;
 
         // First leg consumes the pre-flight book so the simulated fill matches
@@ -1091,12 +1302,17 @@ impl TradingExecutor {
             ),
             quote,
         );
+        let mut second_leg_rest_ms = None;
         let second_fill = if first_fill.filled > dec!(0) {
             tokio::time::sleep(std::time::Duration::from_millis(
                 self.arbitrage_paper.second_leg_delay_ms(),
             ))
             .await;
-            match self.live_paper_book(second_token).await {
+            let second_leg_started = Instant::now();
+            let second_book = self.live_paper_book(second_token).await;
+            let rest_ms = elapsed_ms(second_leg_started);
+            second_leg_rest_ms = Some(rest_ms);
+            match second_book {
                 Ok(second_book) => apply_dynamic_fee(
                     self.arbitrage_paper.simulate_buy(
                         &second_book.asks,
@@ -1126,13 +1342,96 @@ impl TradingExecutor {
                 average_price: dec!(0),
             }
         };
+        if let Some(rest_ms) = second_leg_rest_ms {
+            let failed = second_fill.filled < first_fill.filled;
+            self.record_paper_second_leg(rest_ms, failed);
+            info!(
+                ?first_leg,
+                second_leg_rest_ms = rest_ms,
+                requested = %first_fill.filled,
+                filled = %second_fill.filled,
+                vwap = %second_fill.average_price,
+                failed,
+                "PAPER second-leg REST result"
+            );
+        }
+
+        let unmatched_first = (first_fill.filled - second_fill.filled).max(dec!(0));
+        let emergency_unwind = if unmatched_first > dec!(0) {
+            tokio::time::sleep(std::time::Duration::from_millis(
+                self.arbitrage_paper_emergency_unwind_delay_ms,
+            ))
+            .await;
+            let unwind_started = Instant::now();
+            let unwind_book = self.live_paper_book(first_token).await;
+            let unwind_rest_ms = elapsed_ms(unwind_started);
+            let result = match unwind_book {
+                Ok(first_book) => {
+                    let mut sold = self.arbitrage_paper.simulate_sell(
+                        &first_book.bids,
+                        self.arbitrage_paper_emergency_unwind_min_price,
+                        unmatched_first,
+                        &OrderType::FOK,
+                    );
+                    if sold.filled > dec!(0) {
+                        sold.fee = quote.fee_per_share(sold.average_price) * sold.filled;
+                        let purchased = prorate_paper_fill(first_fill, unmatched_first);
+                        warn!(
+                            ?first_leg,
+                            shares = %sold.filled,
+                            buy_cost = %purchased.cost,
+                            gross_proceeds = %sold.proceeds,
+                            sell_fee = %sold.fee,
+                            unwind_pnl = %(sold.proceeds - sold.fee - purchased.cost),
+                            unwind_rest_ms,
+                            "PAPER second leg failed; first-leg exposure sold back via emergency FOK"
+                        );
+                        Some((purchased, sold))
+                    } else {
+                        warn!(
+                            ?first_leg,
+                            shares = %unmatched_first,
+                            min_price = %self.arbitrage_paper_emergency_unwind_min_price,
+                            unwind_rest_ms,
+                            "PAPER emergency FOK could not fully exit unmatched first leg"
+                        );
+                        None
+                    }
+                }
+                Err(error) => {
+                    warn!(%error, unwind_rest_ms, "PAPER emergency unwind book refresh failed");
+                    None
+                }
+            };
+            self.record_paper_unwind(unwind_rest_ms, result.is_some());
+            result
+        } else {
+            None
+        };
 
         let (yes_fill, no_fill) = match first_leg {
             OutcomeLeg::Yes => (first_fill, second_fill),
             OutcomeLeg::No => (second_fill, first_fill),
         };
-        let paper_snapshot = paper_reservation.commit(yes_fill, no_fill);
         let paired = yes_fill.filled.min(no_fill.filled);
+        let paired_pnl = paired_paper_pnl(yes_fill, no_fill);
+        let emergency_unwind_pnl = emergency_unwind
+            .map(|(purchased, sold)| sold.proceeds - sold.fee - purchased.cost)
+            .unwrap_or(dec!(0));
+        let trade_pnl = paired_pnl + emergency_unwind_pnl;
+        let unrecovered = unmatched_first > dec!(0) && emergency_unwind.is_none();
+        let unrecovered_cost = if unrecovered {
+            prorate_paper_fill(first_fill, unmatched_first).cost
+        } else {
+            dec!(0)
+        };
+        let paper_snapshot = match emergency_unwind {
+            Some((purchased, sold)) => {
+                paper_reservation.commit_with_unwind(yes_fill, no_fill, purchased, sold)
+            }
+            None => paper_reservation.commit(yes_fill, no_fill),
+        };
+        self.record_paper_execution(paired > dec!(0), unrecovered, trade_pnl);
         let target_size = first_fill.filled.max(quote.size.min(dec!(0.01)));
         let first_order_id = format!("paper-{:?}-{}", first_leg, Uuid::new_v4());
         let second_order_id = if first_fill.filled > dec!(0) {
@@ -1144,16 +1443,24 @@ impl TradingExecutor {
             OutcomeLeg::Yes => (first_order_id, second_order_id),
             OutcomeLeg::No => (second_order_id, first_order_id),
         };
-        info!(
+        info!(target: "polypulse::console::binary_complement_arbitrage",
             ?first_leg,
             yes_filled = %yes_fill.filled,
             no_filled = %no_fill.filled,
             yes_vwap = %yes_fill.average_price,
             no_vwap = %no_fill.average_price,
             paired = %paired,
+            expected_profit = %(quote.edge_per_share * quote.size),
+            paired_pnl = %paired_pnl,
+            emergency_unwind_pnl = %emergency_unwind_pnl,
+            realized_trade_pnl = %trade_pnl,
+            unrecovered_cost = %unrecovered_cost,
             cash_remaining = %paper_snapshot.cash_remaining,
-            paper_pnl = %paper_snapshot.theoretical_pnl,
+            cumulative_paper_pnl = %paper_snapshot.theoretical_pnl,
             unmatched_cost = %paper_snapshot.unmatched_cost,
+            unrecovered,
+            emergency_unwinds = paper_snapshot.emergency_unwinds,
+            emergency_unwind_pnl = %paper_snapshot.emergency_unwind_pnl,
             "🧪 PAPER live-book execution"
         );
 
@@ -1994,6 +2301,38 @@ mod tests {
         assert_eq!(
             decide_after_first_leg(dec!(3.456), true, dec!(10), dec!(0.5)),
             FirstLegDecision::SubmitOpposite { size: dec!(3.45) }
+        );
+    }
+
+    #[test]
+    fn paired_paper_pnl_is_incremental_and_fee_inclusive() {
+        let yes = PaperFill {
+            requested: dec!(10),
+            filled: dec!(10),
+            cost: dec!(4.1),
+            fee: dec!(0.1),
+            average_price: dec!(0.4),
+        };
+        let no = PaperFill {
+            requested: dec!(10),
+            filled: dec!(8),
+            cost: dec!(4.08),
+            fee: dec!(0.08),
+            average_price: dec!(0.5),
+        };
+        assert_eq!(paired_paper_pnl(yes, no), dec!(0.64));
+        assert_eq!(
+            paired_paper_pnl(
+                yes,
+                PaperFill {
+                    filled: dec!(0),
+                    cost: dec!(0),
+                    fee: dec!(0),
+                    average_price: dec!(0),
+                    ..no
+                }
+            ),
+            dec!(0)
         );
     }
 }

@@ -11,6 +11,9 @@ pub struct MarketMakingResearchConfig {
     pub gamma_url: String,
     pub data_url: String,
     pub results_file: PathBuf,
+    pub reward_audit_file: PathBuf,
+    pub reward_audit_enabled: bool,
+    pub reward_poll_secs: u64,
     pub max_markets: usize,
     pub discovery_pages: usize,
     pub enrichment_limit: usize,
@@ -52,6 +55,14 @@ pub struct MarketMakingResearchConfig {
     pub websocket_books: bool,
     pub websocket_book_max_age_ms: i64,
     pub markout_horizons_secs: Vec<u64>,
+    pub min_independent_fill_samples: usize,
+    pub min_reward_capture_ratio: Decimal,
+    pub target_reward_capture_ratio: Decimal,
+    pub canary_max_markets: usize,
+    pub canary_max_quote_notional_usdc: Decimal,
+    pub canary_max_inventory_usdc: Decimal,
+    pub canary_max_midpoint_move: Decimal,
+    pub news_halt_file: PathBuf,
     pub duration_secs: u64,
 }
 
@@ -67,6 +78,13 @@ impl MarketMakingResearchConfig {
             results_file: PathBuf::from(env::var("MARKET_MAKING_RESULTS_FILE").unwrap_or_else(
                 |_| "results/market-making/shadow-run-003/events.ndjson".to_string(),
             )),
+            reward_audit_file: PathBuf::from(
+                env::var("MARKET_MAKING_REWARD_AUDIT_FILE").unwrap_or_else(|_| {
+                    "results/market-making/reward-audit/snapshots.ndjson".to_string()
+                }),
+            ),
+            reward_audit_enabled: parse("MARKET_MAKING_REWARD_AUDIT_ENABLED", "false")?,
+            reward_poll_secs: parse("MARKET_MAKING_REWARD_POLL_SECS", "3600")?,
             max_markets: parse("MARKET_MAKING_MAX_MARKETS", "5")?,
             discovery_pages: parse("MARKET_MAKING_DISCOVERY_PAGES", "3")?,
             enrichment_limit: parse("MARKET_MAKING_ENRICHMENT_LIMIT", "100")?,
@@ -128,8 +146,37 @@ impl MarketMakingResearchConfig {
             websocket_book_max_age_ms: parse("MARKET_MAKING_WEBSOCKET_BOOK_MAX_AGE_MS", "15000")?,
             markout_horizons_secs: parse_horizons(
                 &env::var("MARKET_MAKING_MARKOUT_HORIZONS_SECS")
-                    .unwrap_or_else(|_| "1,5,30,60".to_string()),
+                    .unwrap_or_else(|_| "1,5,30,60,300,1800".to_string()),
             )?,
+            min_independent_fill_samples: parse(
+                "MARKET_MAKING_MIN_INDEPENDENT_FILL_SAMPLES",
+                "100",
+            )?,
+            min_reward_capture_ratio: decimal_env(
+                "MARKET_MAKING_MIN_REWARD_CAPTURE_RATIO",
+                dec!(0.01),
+            )?,
+            target_reward_capture_ratio: decimal_env(
+                "MARKET_MAKING_TARGET_REWARD_CAPTURE_RATIO",
+                dec!(0.05),
+            )?,
+            canary_max_markets: parse("MARKET_MAKING_CANARY_MAX_MARKETS", "2")?,
+            canary_max_quote_notional_usdc: decimal_env(
+                "MARKET_MAKING_CANARY_MAX_QUOTE_NOTIONAL_USDC",
+                dec!(5),
+            )?,
+            canary_max_inventory_usdc: decimal_env(
+                "MARKET_MAKING_CANARY_MAX_INVENTORY_USDC",
+                dec!(10),
+            )?,
+            canary_max_midpoint_move: decimal_env(
+                "MARKET_MAKING_CANARY_MAX_MIDPOINT_MOVE",
+                dec!(0.01),
+            )?,
+            news_halt_file: PathBuf::from(
+                env::var("MARKET_MAKING_NEWS_HALT_FILE")
+                    .unwrap_or_else(|_| "data/market-making/news-halts.txt".to_string()),
+            ),
             duration_secs: parse("MARKET_MAKING_SHADOW_DURATION_SECS", "0")?,
         };
         config.validate()?;
@@ -145,6 +192,9 @@ impl MarketMakingResearchConfig {
         }
         if self.max_markets == 0 || self.max_markets > 25 {
             bail!("MARKET_MAKING_MAX_MARKETS must be in [1, 25]");
+        }
+        if self.reward_poll_secs < 300 || self.reward_poll_secs > 86_400 {
+            bail!("MARKET_MAKING_REWARD_POLL_SECS must be in [300, 86400]");
         }
         if self.discovery_pages == 0 || self.discovery_pages > 10 {
             bail!("MARKET_MAKING_DISCOVERY_PAGES must be in [1, 10]");
@@ -269,6 +319,30 @@ impl MarketMakingResearchConfig {
             .is_some_and(|horizon| *horizon > 3_600)
         {
             bail!("maker markout horizons cannot exceed 3600 seconds");
+        }
+        if !self.markout_horizons_secs.contains(&300) || !self.markout_horizons_secs.contains(&1800)
+        {
+            bail!("MARKET_MAKING_MARKOUT_HORIZONS_SECS must include 300 and 1800");
+        }
+        if self.min_independent_fill_samples == 0 || self.min_independent_fill_samples > 100_000 {
+            bail!("MARKET_MAKING_MIN_INDEPENDENT_FILL_SAMPLES must be in [1, 100000]");
+        }
+        if self.min_reward_capture_ratio < Decimal::ZERO
+            || self.target_reward_capture_ratio <= self.min_reward_capture_ratio
+            || self.target_reward_capture_ratio > Decimal::ONE
+        {
+            bail!("maker reward capture ratios require 0 <= minimum < target <= 1");
+        }
+        if self.canary_max_markets == 0
+            || self.canary_max_markets > 3
+            || self.canary_max_quote_notional_usdc <= Decimal::ZERO
+            || self.canary_max_quote_notional_usdc > dec!(10)
+            || self.canary_max_inventory_usdc <= Decimal::ZERO
+            || self.canary_max_inventory_usdc > dec!(20)
+            || self.canary_max_midpoint_move <= Decimal::ZERO
+            || self.canary_max_midpoint_move > dec!(0.02)
+        {
+            bail!("maker canary limits exceed the research safety envelope");
         }
         Ok(())
     }

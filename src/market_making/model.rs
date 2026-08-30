@@ -164,12 +164,28 @@ pub struct ShadowMarkout {
     pub no_fill_proxy_shares: Decimal,
     pub current_yes_mid: Decimal,
     pub current_no_mid: Decimal,
+    /// Best executable bids at the observation time. Unlike midpoint markout,
+    /// these are conservative top-of-book exit prices (depth is not assumed).
+    #[serde(default)]
+    pub current_yes_best_bid: Option<Decimal>,
+    #[serde(default)]
+    pub current_no_best_bid: Option<Decimal>,
     pub yes_markout_per_share: Option<Decimal>,
     pub no_markout_per_share: Option<Decimal>,
     pub inventory_markout_usdc: Decimal,
     pub estimated_rebate_usdc: Decimal,
     pub markout_plus_rebate_usdc: Decimal,
     pub paired_locked_pnl_usdc: Option<Decimal>,
+    /// PnL if filled inventory were immediately sold through visible bid depth.
+    /// Any inventory beyond visible depth is conservatively valued at zero.
+    #[serde(default)]
+    pub executable_exit_pnl_usdc: Option<Decimal>,
+    /// Final payout scenarios. The realized settlement PnL must fall between
+    /// these values for a valid binary market, before any additional exit cost.
+    #[serde(default)]
+    pub settlement_pnl_if_yes_usdc: Option<Decimal>,
+    #[serde(default)]
+    pub settlement_pnl_if_no_usdc: Option<Decimal>,
 }
 
 pub fn classify_market(question: &str, slug: &str) -> String {
@@ -561,6 +577,17 @@ pub fn markout_observation(
         Decimal::ZERO
     };
     let estimated_rebate_usdc = yes_rebate + no_rebate;
+    let purchase_cost_usdc =
+        quote.yes_bid * yes_fill_proxy_shares + quote.no_bid * no_fill_proxy_shares;
+    let current_yes_best_bid = yes_book.best_bid();
+    let current_no_best_bid = no_book.best_bid();
+    let has_fill = yes_fill_proxy_shares + no_fill_proxy_shares > Decimal::ZERO;
+    let executable_exit_pnl_usdc = has_fill.then(|| {
+        executable_sell_proceeds(yes_book, yes_fill_proxy_shares)
+            + executable_sell_proceeds(no_book, no_fill_proxy_shares)
+            - purchase_cost_usdc
+            + estimated_rebate_usdc
+    });
     let both_touched = yes_touched && no_touched;
     Ok(ShadowMarkout {
         quote_id: quote.quote_id.clone(),
@@ -583,6 +610,8 @@ pub fn markout_observation(
         no_fill_proxy_shares,
         current_yes_mid: yes_mid,
         current_no_mid: no_mid,
+        current_yes_best_bid,
+        current_no_best_bid,
         yes_markout_per_share: yes_markout,
         no_markout_per_share: no_markout,
         inventory_markout_usdc,
@@ -594,6 +623,11 @@ pub fn markout_observation(
                 quote.complete_set_discount_per_share
                     * yes_fill_proxy_shares.min(no_fill_proxy_shares),
             ),
+        executable_exit_pnl_usdc,
+        settlement_pnl_if_yes_usdc: has_fill
+            .then_some(yes_fill_proxy_shares - purchase_cost_usdc + estimated_rebate_usdc),
+        settlement_pnl_if_no_usdc: has_fill
+            .then_some(no_fill_proxy_shares - purchase_cost_usdc + estimated_rebate_usdc),
     })
 }
 
@@ -607,6 +641,26 @@ fn queue_ahead(book: &BookSnapshot, quote_bid: Decimal) -> Decimal {
         .filter(|level| level.size > Decimal::ZERO && level.price >= quote_bid)
         .map(|level| level.size)
         .sum()
+}
+
+fn executable_sell_proceeds(book: &BookSnapshot, shares: Decimal) -> Decimal {
+    let mut levels = book
+        .bids
+        .iter()
+        .filter(|level| level.price > Decimal::ZERO && level.size > Decimal::ZERO)
+        .collect::<Vec<_>>();
+    levels.sort_by_key(|level| std::cmp::Reverse(level.price));
+    let mut remaining = shares.max(Decimal::ZERO);
+    let mut proceeds = Decimal::ZERO;
+    for level in levels {
+        if remaining <= Decimal::ZERO {
+            break;
+        }
+        let filled = remaining.min(level.size);
+        proceeds += filled * level.price;
+        remaining -= filled;
+    }
+    proceeds
 }
 
 fn maker_bid(
@@ -714,6 +768,9 @@ mod tests {
             gamma_url: "https://gamma.test".into(),
             data_url: "https://data.test".into(),
             results_file: "events.ndjson".into(),
+            reward_audit_file: "reward.ndjson".into(),
+            reward_audit_enabled: false,
+            reward_poll_secs: 3600,
             max_markets: 5,
             discovery_pages: 1,
             enrichment_limit: 10,
@@ -754,7 +811,15 @@ mod tests {
             trade_cache_secs: 5,
             websocket_books: false,
             websocket_book_max_age_ms: 15_000,
-            markout_horizons_secs: vec![1, 5, 30, 60],
+            markout_horizons_secs: vec![1, 5, 30, 60, 300, 1800],
+            min_independent_fill_samples: 100,
+            min_reward_capture_ratio: dec!(0.01),
+            target_reward_capture_ratio: dec!(0.05),
+            canary_max_markets: 2,
+            canary_max_quote_notional_usdc: dec!(5),
+            canary_max_inventory_usdc: dec!(10),
+            canary_max_midpoint_move: dec!(0.01),
+            news_halt_file: "news-halts.txt".into(),
             duration_secs: 0,
         }
     }
@@ -809,6 +874,27 @@ mod tests {
     }
 
     #[test]
+    fn executable_exit_walks_visible_depth_and_zero_values_remainder() {
+        let snapshot = BookSnapshot {
+            token_id: "1".into(),
+            observed_at: Utc::now(),
+            exchange_timestamp_ms: None,
+            bids: vec![
+                BookLevel {
+                    price: dec!(0.40),
+                    size: dec!(2),
+                },
+                BookLevel {
+                    price: dec!(0.45),
+                    size: dec!(3),
+                },
+            ],
+            asks: vec![],
+        };
+        assert_eq!(executable_sell_proceeds(&snapshot, dec!(10)), dec!(2.15));
+    }
+
+    #[test]
     fn touched_quotes_record_adverse_markout_and_rebate() {
         let created = Utc::now();
         let quote = generate_shadow_quote(
@@ -843,6 +929,12 @@ mod tests {
         assert_eq!(markout.yes_fill_proxy_shares, dec!(7));
         assert!(markout.yes_markout_per_share.unwrap() < Decimal::ZERO);
         assert!(markout.estimated_rebate_usdc > Decimal::ZERO);
+        assert_eq!(markout.current_yes_best_bid, Some(dec!(0.46)));
+        assert!(markout.executable_exit_pnl_usdc.unwrap() < Decimal::ZERO);
+        assert!(
+            markout.settlement_pnl_if_yes_usdc.unwrap()
+                > markout.settlement_pnl_if_no_usdc.unwrap()
+        );
     }
 
     #[test]

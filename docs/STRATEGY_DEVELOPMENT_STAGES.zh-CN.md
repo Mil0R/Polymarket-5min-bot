@@ -42,23 +42,58 @@ cargo build --release --bin polypulse
 ./target/release/late_resolution_winner_trading backtest
 ```
 
-回放只以只读方式打开 SQLite，不初始化网络客户端、签名器或账户。报告使用时间戳文件名：
+回放只以只读方式打开 SQLite，不初始化网络客户端、签名器或账户。两个策略每轮都使用独立目录：
 
 ```text
-results/backtests/binary-complement-arbitrage/run-YYYYMMDDTHHMMSSZ-<uuid>.json
-results/backtests/late-resolution-winner-trading/run-YYYYMMDDTHHMMSSZ-<uuid>.json
+results/backtests/binary-complement-arbitrage/run-YYYYMMDDTHHMMSSZ-<uuid>/
+├── run.log
+├── report.json
+└── analysis.zh-CN.md
+results/backtests/late-resolution-winner-trading/run-YYYYMMDDTHHMMSSZ-<uuid>/
+├── run.log
+├── report.json
+└── analysis.zh-CN.md
 ```
 
 报告同时包含候选、模型准入、模拟成交、胜负、毛收益、费用、净收益以及按原因聚合的
 `rejections` 漏斗，便于不同参数轮次做回归对比。
 
-Binary Complement Arbitrage 回放规则：在发现价差后等待 `BACKTEST_EXECUTION_DELAY_MS`，使用第一条达到延迟
-的快照，按完整 ask 深度、流动性折扣、两腿费用和最小净利润撮合；同一五分钟市场最多
-建立一个非重叠仓位。
+Binary Complement Arbitrage 回放规则：先要求价差和可信 ask 深度连续存在到场景确认时间，再经过场景化
+预检延迟用同一快照检查双腿及第二腿深度覆盖倍数，并先成交信号中较薄的一腿。第二腿按 FOK 语义在后续
+快照撮合；失败后按场景延迟读取第一腿 bid 并尝试完整紧急卖回，无法退出才按真实 winner 结算方向性风险。
+完整撮合还应用流动性折扣、信号限价、双腿最低 $1、fee buffer 和最小净利润。同一五分钟市场每个场景
+最多建立一个非重叠仓位。
 
 Late-Resolution Winner Trading 回放规则：只接纳 `coin_twap_source=chainlink_twap`，复用生产模型的开盘参考、
 数据新鲜度、波动率、反转边界、spread、深度和净 EV 检查；必须由不同的 TWAP
 observation 连续确认，再在延迟后的完整盘口撮合，并用市场真实 winner 结算。
+
+Binary Complement 使用“生产基准 + 单变量敏感性 + 两个组合压力场景”，避免高维笛卡尔组合造成过拟合；
+由于 Polybacktest 是离散快照而不是逐条 CLOB 事件，回测额外保留一组 `preflight=0` 的快速研究场景，
+用于分别观察确认时间、第二腿延迟、覆盖倍数和退出延迟。它只代表“同一快照内可成交”的乐观上界；
+任意正预检延迟可能直接落到下一张快照，是保守下界，不能据此推断真实 25–250ms REST 延迟表现。
+Late-Resolution Winner Trading 分别使用 BTC、ETH、SOL/其他资产的 `MIN_VOLATILITY_BPS` 和
+`MODEL_RISK_BUFFER`：
+
+```dotenv
+BINARY_COMPLEMENT_ARBITRAGE_BACKTEST_ORDER_SIZES_USDC=2.5,5,10
+BINARY_COMPLEMENT_ARBITRAGE_BACKTEST_CONFIRMATION_MS=100,250,500,1000
+BINARY_COMPLEMENT_ARBITRAGE_BACKTEST_PREFLIGHT_DELAYS_MS=0,50,100,250
+BINARY_COMPLEMENT_ARBITRAGE_BACKTEST_SECOND_LEG_DELAYS_MS=0,25,50,100,250,500
+BINARY_COMPLEMENT_ARBITRAGE_BACKTEST_LIQUIDITY_HAIRCUTS=0.50,0.75,1.0
+BINARY_COMPLEMENT_ARBITRAGE_BACKTEST_SECOND_LEG_DEPTH_MULTIPLIERS=1,2,3,5
+BINARY_COMPLEMENT_ARBITRAGE_BACKTEST_EMERGENCY_UNWIND_DELAYS_MS=0,25,50,100
+BINARY_COMPLEMENT_ARBITRAGE_BACKTEST_MAX_SLIPPAGE_PER_SHARE=0.01
+# 紧急退出后最终未恢复单腿率上限
+BINARY_COMPLEMENT_ARBITRAGE_BACKTEST_MAX_ONE_SIDED_RATE=0.01
+LATE_RESOLUTION_WINNER_TRADING_BACKTEST_DELAYS_MS=100,250,500,1000
+LATE_RESOLUTION_WINNER_TRADING_BACKTEST_LIQUIDITY_HAIRCUTS=0.50,0.75,1.0
+BACKTEST_PROGRESS_EVERY_MARKETS=100
+BACKTEST_MARKET_OFFSET=0
+BACKTEST_MAX_MARKETS=0
+```
+
+程序只读取每个市场快照一次，并同时评估所有场景。`report.json` 保存总体和分资产漏斗、成交、胜负、费用与 PnL；`analysis.zh-CN.md` 自动比较场景稳定性并列出主要拒绝原因；`run.log` 保存启动、进度、耗时和产物路径。可设置 `BACKTEST_MARKET_OFFSET` 和 `BACKTEST_MAX_MARKETS=100` 做指定区段的 smoke test，正式分析必须把两者恢复为 `0`。
 
 当前数据没有历史逐市场 fee rate/exponent，因此 `BACKTEST_FEE_RATE` 和
 `BACKTEST_FEE_EXPONENT` 是明确的保守假设。报告会保留这一限制，不能把回放结果直接
@@ -73,6 +108,30 @@ observation 连续确认，再在延迟后的完整盘口撮合，并用市场�
 5. 只有在保守成本下仍有稳定样本，才进入服务器 dry-run。
 
 ## 第二阶段：服务器真实行情 dry-run
+
+Binary Complement 的 PAPER 执行在第二腿全部或部分失败时，会等待配置的退出延迟，重新读取第一腿 bid，
+并按 FOK 尝试卖回未配对 shares。完整回卖会释放 `unmatched_cost`，同时累计已实现的
+`emergency_unwind_pnl`；盘口不足时仍保留单腿敞口，不能把紧急退出假设成必然成交。
+
+```dotenv
+BINARY_COMPLEMENT_ARBITRAGE_ORDER_TYPE=FOK
+BINARY_COMPLEMENT_ARBITRAGE_PAPER_SECOND_LEG_DELAY_MS=250
+BINARY_COMPLEMENT_ARBITRAGE_PAPER_EMERGENCY_UNWIND_DELAY_MS=50
+BINARY_COMPLEMENT_ARBITRAGE_PAPER_EMERGENCY_UNWIND_MIN_PRICE=0.01
+BINARY_COMPLEMENT_ARBITRAGE_PAPER_SUMMARY_INTERVAL_SECS=60
+LATE_RESOLUTION_WINNER_TRADING_PAPER_EXECUTION_DELAY_MS=250
+LATE_RESOLUTION_WINNER_TRADING_PAPER_SUMMARY_INTERVAL_SECS=60
+```
+
+纯文本 dry-run 会输出四类关键事件：可执行机会（盘口、深度、费用、预期收益、行情年龄）、双腿预检与
+第二腿 REST 延迟、单次成交的配对/紧急退出/已实现 PnL，以及按上述间隔输出的累计漏斗、失败率、
+REST 平均/最大延迟和未恢复敞口汇总。`realized_trade_pnl` 不包含仍未退出仓位的方向性终值；这部分会以
+`unrecovered_cost` 和汇总中的 `unmatched_cost` 单独显示，避免把未结算风险误报为已实现亏损或收益。
+
+Late-Resolution Winner Trading 的 PAPER 日志会在每次模拟成交时输出 fee-inclusive 的单笔预期收益、
+实际 REST 请求延迟和包含配置等待时间的总执行延迟；市场终局后输出该仓位实际收益和进程累计实际收益。
+独立周期汇总包含扫描/信号/确认/尝试/成交/结算漏斗、成交率、胜率、盘口 fallback REST 与执行 REST
+平均/最大延迟、待结算成本、预期收益和实际收益。
 
 ```bash
 ./target/release/binary_complement_arbitrage dry-run

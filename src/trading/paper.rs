@@ -24,6 +24,15 @@ pub struct PaperFill {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PaperSellFill {
+    pub requested: Decimal,
+    pub filled: Decimal,
+    pub proceeds: Decimal,
+    pub fee: Decimal,
+    pub average_price: Decimal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PaperSnapshot {
     pub initial_balance: Decimal,
     pub cash_remaining: Decimal,
@@ -35,6 +44,8 @@ pub struct PaperSnapshot {
     pub winner_realized_pnl: Decimal,
     pub winner_positions_open: u64,
     pub pairs_attempted: u64,
+    pub emergency_unwinds: u64,
+    pub emergency_unwind_pnl: Decimal,
 }
 
 struct PaperLedger {
@@ -47,6 +58,8 @@ struct PaperLedger {
     winner_realized_pnl: Decimal,
     winner_positions_open: u64,
     pairs_attempted: u64,
+    emergency_unwinds: u64,
+    emergency_unwind_pnl: Decimal,
 }
 
 pub struct PaperTradingEngine {
@@ -67,6 +80,8 @@ impl PaperTradingEngine {
                 winner_realized_pnl: dec!(0),
                 winner_positions_open: 0,
                 pairs_attempted: 0,
+                emergency_unwinds: 0,
+                emergency_unwind_pnl: dec!(0),
             }),
             settings,
         }
@@ -74,6 +89,11 @@ impl PaperTradingEngine {
 
     pub fn second_leg_delay_ms(&self) -> u64 {
         self.settings.second_leg_delay_ms
+    }
+
+    pub fn snapshot(&self) -> PaperSnapshot {
+        let ledger = self.ledger.lock().expect("paper ledger lock poisoned");
+        snapshot(&self.settings, &ledger)
     }
 
     pub fn reserve(&self, planned_cost: Decimal) -> Result<PaperReservation<'_>> {
@@ -104,6 +124,22 @@ impl PaperTradingEngine {
         simulate_buy(
             asks,
             limit,
+            requested,
+            self.settings.liquidity_haircut,
+            order_type,
+        )
+    }
+
+    pub fn simulate_sell(
+        &self,
+        bids: &[OrderSummary],
+        minimum_price: Decimal,
+        requested: Decimal,
+        order_type: &OrderType,
+    ) -> PaperSellFill {
+        simulate_sell(
+            bids,
+            minimum_price,
             requested,
             self.settings.liquidity_haircut,
             order_type,
@@ -162,6 +198,25 @@ impl PaperReservation<'_> {
             .expect("paper ledger lock poisoned");
         ledger.cash_reserved = (ledger.cash_reserved - self.planned_cost).max(dec!(0));
         record_fills(&mut ledger, yes, no);
+        self.active = false;
+        snapshot(&self.engine.settings, &ledger)
+    }
+
+    pub fn commit_with_unwind(
+        mut self,
+        yes: PaperFill,
+        no: PaperFill,
+        purchased: PaperFill,
+        sold: PaperSellFill,
+    ) -> PaperSnapshot {
+        let mut ledger = self
+            .engine
+            .ledger
+            .lock()
+            .expect("paper ledger lock poisoned");
+        ledger.cash_reserved = (ledger.cash_reserved - self.planned_cost).max(dec!(0));
+        record_fills(&mut ledger, yes, no);
+        record_emergency_unwind(&mut ledger, purchased, sold);
         self.active = false;
         snapshot(&self.engine.settings, &ledger)
     }
@@ -225,6 +280,19 @@ fn record_fills(ledger: &mut PaperLedger, yes: PaperFill, no: PaperFill) {
         + (no.filled - paired).max(dec!(0)) * (no.average_price + no_fee_per_share);
 }
 
+fn record_emergency_unwind(ledger: &mut PaperLedger, purchased: PaperFill, sold: PaperSellFill) {
+    if purchased.filled <= dec!(0) || sold.filled != purchased.filled {
+        return;
+    }
+    let net_proceeds = (sold.proceeds - sold.fee).max(dec!(0));
+    let purchase_cost = purchased.cost;
+    ledger.cash_remaining += net_proceeds;
+    ledger.unmatched_cost = (ledger.unmatched_cost - purchase_cost).max(dec!(0));
+    ledger.theoretical_pnl += net_proceeds - purchase_cost;
+    ledger.emergency_unwinds += 1;
+    ledger.emergency_unwind_pnl += net_proceeds - purchase_cost;
+}
+
 fn snapshot(settings: &PaperSettings, ledger: &PaperLedger) -> PaperSnapshot {
     PaperSnapshot {
         initial_balance: settings.initial_balance,
@@ -237,6 +305,8 @@ fn snapshot(settings: &PaperSettings, ledger: &PaperLedger) -> PaperSnapshot {
         winner_realized_pnl: ledger.winner_realized_pnl,
         winner_positions_open: ledger.winner_positions_open,
         pairs_attempted: ledger.pairs_attempted,
+        emergency_unwinds: ledger.emergency_unwinds,
+        emergency_unwind_pnl: ledger.emergency_unwind_pnl,
     }
 }
 
@@ -300,6 +370,64 @@ fn simulate_buy(
     }
 }
 
+fn simulate_sell(
+    bids: &[OrderSummary],
+    minimum_price: Decimal,
+    requested: Decimal,
+    liquidity_haircut: Decimal,
+    order_type: &OrderType,
+) -> PaperSellFill {
+    let mut eligible: Vec<_> = bids
+        .iter()
+        .filter(|level| level.price >= minimum_price && level.size > dec!(0))
+        .collect();
+    eligible.sort_by_key(|level| std::cmp::Reverse(level.price));
+
+    let available: Decimal = eligible
+        .iter()
+        .map(|level| level.size * liquidity_haircut)
+        .sum();
+    if matches!(order_type, OrderType::FOK) && available < requested {
+        return PaperSellFill {
+            requested,
+            filled: dec!(0),
+            proceeds: dec!(0),
+            fee: dec!(0),
+            average_price: dec!(0),
+        };
+    }
+
+    let mut remaining = requested;
+    let mut filled = dec!(0);
+    let mut proceeds = dec!(0);
+    for level in eligible {
+        if remaining <= dec!(0) {
+            break;
+        }
+        let take = remaining.min(level.size * liquidity_haircut);
+        filled += take;
+        proceeds += take * level.price;
+        remaining -= take;
+    }
+    let filled = (filled * dec!(100)).floor() / dec!(100);
+    let proceeds = if filled > dec!(0) {
+        proceeds * filled / (requested - remaining)
+    } else {
+        dec!(0)
+    };
+    PaperSellFill {
+        requested,
+        filled,
+        proceeds,
+        fee: dec!(0),
+        average_price: if filled > dec!(0) {
+            proceeds / filled
+        } else {
+            dec!(0)
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,6 +478,69 @@ mod tests {
                 .filled,
             dec!(5)
         );
+    }
+
+    #[test]
+    fn emergency_sell_walks_best_bids_and_requires_full_fok_depth() {
+        let engine = PaperTradingEngine::new(PaperSettings {
+            initial_balance: dec!(100),
+            liquidity_haircut: dec!(0.5),
+            second_leg_delay_ms: 0,
+        });
+        let bids = [
+            level(dec!(0.40), dec!(4)),
+            level(dec!(0.38), dec!(6)),
+            level(dec!(0.01), dec!(100)),
+        ];
+        let fill = engine.simulate_sell(&bids, dec!(0.10), dec!(5), &OrderType::FOK);
+        assert_eq!(fill.filled, dec!(5));
+        assert_eq!(fill.proceeds, dec!(1.94));
+        assert_eq!(fill.average_price, dec!(0.388));
+        assert_eq!(
+            engine
+                .simulate_sell(&bids, dec!(0.10), dec!(5.01), &OrderType::FOK)
+                .filled,
+            dec!(0)
+        );
+    }
+
+    #[test]
+    fn emergency_unwind_releases_unmatched_cost_and_records_realized_loss() {
+        let engine = PaperTradingEngine::new(PaperSettings {
+            initial_balance: dec!(10),
+            liquidity_haircut: dec!(1),
+            second_leg_delay_ms: 0,
+        });
+        let purchased = PaperFill {
+            requested: dec!(10),
+            filled: dec!(10),
+            cost: dec!(4.1),
+            fee: dec!(0.1),
+            average_price: dec!(0.4),
+        };
+        let empty = PaperFill {
+            requested: dec!(10),
+            filled: dec!(0),
+            cost: dec!(0),
+            fee: dec!(0),
+            average_price: dec!(0),
+        };
+        let sold = PaperSellFill {
+            requested: dec!(10),
+            filled: dec!(10),
+            proceeds: dec!(3.8),
+            fee: dec!(0.1),
+            average_price: dec!(0.38),
+        };
+        let snapshot = engine
+            .reserve(dec!(5))
+            .unwrap()
+            .commit_with_unwind(purchased, empty, purchased, sold);
+        assert_eq!(snapshot.cash_remaining, dec!(9.6));
+        assert_eq!(snapshot.unmatched_cost, dec!(0));
+        assert_eq!(snapshot.theoretical_pnl, dec!(-0.4));
+        assert_eq!(snapshot.emergency_unwinds, 1);
+        assert_eq!(snapshot.emergency_unwind_pnl, dec!(-0.4));
     }
 
     #[test]

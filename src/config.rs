@@ -238,8 +238,16 @@ pub struct Config {
     pub paper_liquidity_haircut: f64,
     pub arbitrage_paper_liquidity_haircut: f64,
     pub paper_second_leg_delay_ms: u64,
+    /// PAPER-only delay before attempting to sell an unmatched first leg.
+    pub arbitrage_paper_emergency_unwind_delay_ms: u64,
+    /// Lowest bid accepted by the PAPER emergency unwind simulation.
+    pub arbitrage_paper_emergency_unwind_min_price: f64,
+    /// Console summary cadence for Binary Complement PAPER telemetry.
+    pub arbitrage_paper_summary_interval_secs: u64,
     /// Dry-run latency before re-reading the live book for Late-Resolution Winner Trading fills.
     pub paper_late_resolution_winner_trading_delay_ms: u64,
+    /// Console summary cadence for Late-Resolution Winner Trading PAPER telemetry.
+    pub late_resolution_winner_trading_paper_summary_interval_secs: u64,
     /// Reject orderbook snapshots older than this many milliseconds.
     pub max_book_age_ms: i64,
     /// Reject YES/NO snapshots farther apart than this many milliseconds.
@@ -540,9 +548,25 @@ impl Config {
                 "BINARY_COMPLEMENT_ARBITRAGE_PAPER_SECOND_LEG_DELAY_MS",
                 "250",
             )?,
+            arbitrage_paper_emergency_unwind_delay_ms: env_parse(
+                "BINARY_COMPLEMENT_ARBITRAGE_PAPER_EMERGENCY_UNWIND_DELAY_MS",
+                "50",
+            )?,
+            arbitrage_paper_emergency_unwind_min_price: env_parse(
+                "BINARY_COMPLEMENT_ARBITRAGE_PAPER_EMERGENCY_UNWIND_MIN_PRICE",
+                "0.01",
+            )?,
+            arbitrage_paper_summary_interval_secs: env_parse(
+                "BINARY_COMPLEMENT_ARBITRAGE_PAPER_SUMMARY_INTERVAL_SECS",
+                "60",
+            )?,
             paper_late_resolution_winner_trading_delay_ms: env_parse(
                 "LATE_RESOLUTION_WINNER_TRADING_PAPER_EXECUTION_DELAY_MS",
                 "250",
+            )?,
+            late_resolution_winner_trading_paper_summary_interval_secs: env_parse(
+                "LATE_RESOLUTION_WINNER_TRADING_PAPER_SUMMARY_INTERVAL_SECS",
+                "60",
             )?,
             max_book_age_ms: env_parse("BINARY_COMPLEMENT_ARBITRAGE_MAX_BOOK_AGE_MS", "2000")?,
             max_book_skew_ms: env_parse("BINARY_COMPLEMENT_ARBITRAGE_MAX_BOOK_SKEW_MS", "1000")?,
@@ -707,9 +731,15 @@ impl Config {
             bail!("BINARY_COMPLEMENT_ARBITRAGE_PAPER_LIQUIDITY_HAIRCUT must be in (0, 1]");
         }
         if self.paper_second_leg_delay_ms > 30_000
+            || self.arbitrage_paper_emergency_unwind_delay_ms > 30_000
             || self.paper_late_resolution_winner_trading_delay_ms > 30_000
         {
             bail!("paper execution delays cannot exceed 30000ms");
+        }
+        if !self.arbitrage_paper_emergency_unwind_min_price.is_finite()
+            || !(0.0..1.0).contains(&self.arbitrage_paper_emergency_unwind_min_price)
+        {
+            bail!("BINARY_COMPLEMENT_ARBITRAGE_PAPER_EMERGENCY_UNWIND_MIN_PRICE must be in (0, 1)");
         }
         if self.canary_max_pair_notional_usdc > ABSOLUTE_CANARY_PAIR_LIMIT_USDC
             || self.canary_max_total_notional_usdc > ABSOLUTE_CANARY_TOTAL_LIMIT_USDC
@@ -826,6 +856,14 @@ impl Config {
             .starts_with("wss://")
         {
             bail!("LATE_RESOLUTION_WINNER_TRADING_RTDS_URL must use wss://");
+        }
+        if !(5..=3600).contains(&self.arbitrage_paper_summary_interval_secs) {
+            bail!("BINARY_COMPLEMENT_ARBITRAGE_PAPER_SUMMARY_INTERVAL_SECS must be in [5, 3600]");
+        }
+        if !(5..=3600).contains(&self.late_resolution_winner_trading_paper_summary_interval_secs) {
+            bail!(
+                "LATE_RESOLUTION_WINNER_TRADING_PAPER_SUMMARY_INTERVAL_SECS must be in [5, 3600]"
+            );
         }
         if self.late_resolution_winner_trading_max_book_age_ms <= 0
             || self.late_resolution_winner_trading_max_book_age_ms > 30_000

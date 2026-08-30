@@ -1,7 +1,7 @@
 use anyhow::{bail, Result};
 use polypulse::market_making::{
-    run_market_scan, run_report, run_shadow_maker, MarketMakingResearchClient,
-    MarketMakingResearchConfig,
+    record_reward_snapshot, run_market_scan, run_report, run_shadow_maker, watch_reward_snapshots,
+    MarketMakingResearchClient, MarketMakingResearchConfig,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -31,11 +31,22 @@ async fn main() -> Result<()> {
             let path = std::env::args()
                 .nth(2)
                 .map(std::path::PathBuf::from)
-                .unwrap_or(config.results_file);
-            run_report(&path)?;
+                .unwrap_or_else(|| config.results_file.clone());
+            run_report(&path, &config)?;
         }
+        "reward-audit" => {
+            let date = std::env::args()
+                .nth(2)
+                .map(|value| chrono::NaiveDate::parse_from_str(&value, "%Y-%m-%d"))
+                .transpose()?
+                .unwrap_or_else(|| chrono::Utc::now().date_naive());
+            record_reward_snapshot(&config, date).await?;
+        }
+        "reward-watch" => watch_reward_snapshots(config).await?,
         "help" | "--help" | "-h" => print_help(),
-        _ => bail!("unknown market_making command '{command}'; use scan, shadow, or report"),
+        _ => bail!(
+            "unknown market_making command '{command}'; use scan, shadow, report, reward-audit, or reward-watch"
+        ),
     }
     Ok(())
 }
@@ -43,10 +54,12 @@ async fn main() -> Result<()> {
 fn print_help() {
     println!(
         "market_making — read-only Polymarket maker feasibility research\n\n\
-         Usage:\n  market_making scan\n  market_making shadow\n  market_making report [events.ndjson]\n\n\
+         Usage:\n  market_making scan\n  market_making shadow\n  market_making report [events.ndjson]\n  market_making reward-audit [YYYY-MM-DD]\n  market_making reward-watch\n\n\
          scan    Discover and rank currently rewarded markets, then exit.\n\
          shadow  Continuously emit hypothetical post-only quotes and markouts.\n\n\
-         report  Summarize fill proxies, markouts, and estimated maker rebates.\n\n\
+         report        Summarize queue-aware fills, 5m/30m and exit/settlement PnL, and readiness gates.\n\
+         reward-audit  Append one authenticated per-market Liquidity Rewards snapshot.\n\
+         reward-watch  Append the current UTC day's reward snapshot once per configured interval.\n\n\
          This binary never signs, posts, or cancels an order."
     );
 }

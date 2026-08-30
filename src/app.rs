@@ -64,6 +64,8 @@ fn apply_runtime_profile(profile: RuntimeProfile) {
     std::env::set_var("DRY_RUN", "true");
     std::env::set_var("CANARY_MODE", "false");
     std::env::set_var("TUI_ENABLED", "false");
+    std::env::set_var("LOG_STDOUT_TEE", "true");
+    std::env::set_var("LOG_STDOUT_KEY_EVENTS_ONLY", "true");
     std::env::set_var("MERGE_INTERVAL_MINUTES", "0");
     std::env::set_var("WIND_DOWN_BEFORE_WINDOW_END_MINUTES", "0");
     std::env::set_var("WALLET_COPY_TRADING_ENABLED", "false");
@@ -336,6 +338,10 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
             paper_liquidity_haircut: config.paper_liquidity_haircut,
             arbitrage_paper_liquidity_haircut: config.arbitrage_paper_liquidity_haircut,
             paper_second_leg_delay_ms: config.paper_second_leg_delay_ms,
+            arbitrage_paper_emergency_unwind_delay_ms: config
+                .arbitrage_paper_emergency_unwind_delay_ms,
+            arbitrage_paper_emergency_unwind_min_price: config
+                .arbitrage_paper_emergency_unwind_min_price,
             paper_late_resolution_winner_trading_delay_ms: config
                 .paper_late_resolution_winner_trading_delay_ms,
         },
@@ -383,6 +389,27 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
             error!("Exiting. Please fix authentication before running again.");
             return Err(anyhow::anyhow!("Auth verification failed: {}", e));
         }
+    }
+
+    if config.dry_run && config.arbitrage_enabled {
+        let summary_executor = executor.clone();
+        let summary_metrics = runtime_metrics.clone();
+        let summary_shutdown = shutdown.clone();
+        let summary_interval_secs = config.arbitrage_paper_summary_interval_secs;
+        tokio::spawn(async move {
+            let interval = Duration::from_secs(summary_interval_secs);
+            loop {
+                sleep(interval).await;
+                if summary_shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
+                log_binary_complement_paper_summary(
+                    &summary_executor,
+                    &summary_metrics,
+                    summary_interval_secs,
+                );
+            }
+        });
     }
 
     let (startup_actions, restored_recoveries) = if config.dry_run {
@@ -514,6 +541,28 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
     ));
     if let Some(journal) = late_resolution_winner_trading_journal.as_ref() {
         runtime_metrics.set_late_resolution_winner_trading_pending(journal.pending().len());
+    }
+    if config.dry_run {
+        if let Some(summary_journal) = late_resolution_winner_trading_journal.clone() {
+            let summary_metrics = runtime_metrics.clone();
+            let summary_shutdown = shutdown.clone();
+            let summary_interval_secs =
+                config.late_resolution_winner_trading_paper_summary_interval_secs;
+            tokio::spawn(async move {
+                let interval = Duration::from_secs(summary_interval_secs);
+                loop {
+                    sleep(interval).await;
+                    if summary_shutdown.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    log_late_resolution_winner_paper_summary(
+                        &summary_metrics,
+                        &summary_journal,
+                        summary_interval_secs,
+                    );
+                }
+            });
+        }
     }
     let mut last_winner_settle_check = Instant::now();
     let mut winner_position_settlement_backoff = SettlementBackoff::default();
@@ -1244,13 +1293,26 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                                                     );
                                                 });
                                             } else {
-                                                info!(target: "polypulse::strategy::binary_complement_arbitrage",
-                                                    "⚡ Execute arbitrage | market:{} | profit:{:.2}% | size:{} | cost:{:.2} USD | exposure:{:.2} USD",
-                                                    market_display,
-                                                    quote.edge_per_share * dec!(100),
-                                                    order_size,
-                                                    total_cost,
-                                                    current_exposure
+                                                let observed_at_ms = Utc::now().timestamp_millis();
+                                                info!(target: "polypulse::console::binary_complement_arbitrage",
+                                                    market = %market_display,
+                                                    market_id = %opp.market_id,
+                                                    yes_ask = %opp.yes_ask_price,
+                                                    no_ask = %opp.no_ask_price,
+                                                    yes_signal_depth = %opp.yes_size,
+                                                    no_signal_depth = %opp.no_size,
+                                                    total_signal_price = %opp.total_cost,
+                                                    gross_edge_per_share = %quote.gross_edge_per_share,
+                                                    fee_per_share = %(quote.yes_fee_per_share + quote.no_fee_per_share),
+                                                    net_edge_per_share = %quote.edge_per_share,
+                                                    size = %order_size,
+                                                    execution_cost = %total_cost,
+                                                    expected_profit = %(quote.edge_per_share * order_size),
+                                                    yes_book_age_ms = observed_at_ms.saturating_sub(opp.yes_book_timestamp_ms),
+                                                    no_book_age_ms = observed_at_ms.saturating_sub(opp.no_book_timestamp_ms),
+                                                    book_skew_ms = (opp.yes_book_timestamp_ms - opp.no_book_timestamp_ms).abs(),
+                                                    exposure = %current_exposure,
+                                                    "⚡ Executable arbitrage opportunity"
                                                 );
                                             }
                                             window_session.spawn_trade(strategy_service.clone().execute(
@@ -1613,9 +1675,20 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                                                     pnl > dec!(0),
                                                 );
                                             });
-                                            info!(target: "polypulse::strategy::late_resolution_winner_trading",
+                                            let winner_summary = winner_journal.paper_summary();
+                                            info!(target: "polypulse::console::late_resolution_winner_trading",
+                                                position_id = %buy.position_id,
+                                                asset = %buy.asset_key(),
                                                 slug = %buy.slug,
-                                                %pnl,
+                                                side = if buy.token_is_yes { "YES" } else { "NO" },
+                                                entry_price = %buy.price,
+                                                filled = %buy.filled,
+                                                entry_cost = %cost,
+                                                payout = %payout,
+                                                expected_profit_if_wins = %(buy.filled * (dec!(1) - buy.price)),
+                                                realized_pnl = %pnl,
+                                                cumulative_realized_pnl = %winner_summary.realized_pnl,
+                                                open_positions = winner_summary.open_positions,
                                                 "🏁 Late-Resolution Winner Trading settled (realized)"
                                             );
                                         } else {
@@ -2309,7 +2382,7 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                                 continue;
                             }
                             let candidate_stage = if hybrid_paper_admitted {
-                                info!(target: "polypulse::strategy::late_resolution_winner_trading",
+                                info!(target: "polypulse::console::late_resolution_winner_trading",
                                     %evaluation_id,
                                     market = %market.crypto_symbol,
                                     ask_price = %signal.price,
@@ -2499,7 +2572,7 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                             runtime_metrics
                                 .record_late_resolution_winner_trading_asset_attempt(&market.crypto_symbol);
                             let side = if signal.buy_yes { "YES" } else { "NO" };
-                            info!(target: "polypulse::strategy::late_resolution_winner_trading",
+                            info!(target: "polypulse::console::late_resolution_winner_trading",
                                 market = %market.crypto_symbol,
                                 stage = %candidate_stage,
                                 %side,
@@ -2513,14 +2586,20 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                                 spread = %model.spread,
                                 depth_usdc = %model.depth_notional,
                                 %size,
+                                model_expected_profit = %(model.net_ev * size),
                                 secs_left = seconds_until_end,
                                 "🛒 Late-Resolution Winner Trading order submitted"
                             );
+                            let winner_execution_started = Instant::now();
                             match executor
                                 .buy_winner(token, signal.price, size, fee_per_share)
                                 .await
                             {
                                 Ok(execution) => {
+                                    runtime_metrics.record_late_resolution_winner_trading_execution_latency(
+                                        execution.request_latency_ms,
+                                        execution.total_latency_ms,
+                                    );
                                     if execution.filled > dec!(0) {
                                         let filled = execution.filled;
                                         let fill_price = execution.average_price;
@@ -2574,13 +2653,16 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                                                 service_health.set_safety_ok(false);
                                             }
                                         }
-                                        info!(target: "polypulse::strategy::late_resolution_winner_trading",
+                                        info!(target: "polypulse::console::late_resolution_winner_trading",
                                             market = %market.crypto_symbol,
                                             %side,
                                             price = %fill_price,
                                             %filled,
                                             cost = %execution.cost,
                                             fee = %execution.estimated_fee,
+                                            expected_profit_if_wins = %(filled - execution.cost),
+                                            execution_request_latency_ms = execution.request_latency_ms,
+                                            execution_total_latency_ms = execution.total_latency_ms,
                                             "✅ Late-Resolution Winner Trading filled; holding to settlement"
                                         );
                                     } else {
@@ -2592,15 +2674,21 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                                             ));
                                             service_health.set_safety_ok(false);
                                         }
-                                        warn!(target: "polypulse::strategy::late_resolution_winner_trading",
+                                        warn!(target: "polypulse::console::late_resolution_winner_trading",
                                             market = %market.crypto_symbol,
                                             %side,
                                             price = %signal.price,
+                                            execution_request_latency_ms = execution.request_latency_ms,
+                                            execution_total_latency_ms = execution.total_latency_ms,
                                             "Late-Resolution Winner Trading order not filled (no depth at limit)"
                                         );
                                     }
                                 }
                                 Err(e) => {
+                                    let execution_attempt_latency_ms = u64::try_from(
+                                        winner_execution_started.elapsed().as_millis(),
+                                    )
+                                    .unwrap_or(u64::MAX);
                                     if let Err(journal_error) =
                                         winner_journal.record_failed(&attempt, &e.to_string())
                                     {
@@ -2610,10 +2698,11 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                                         ));
                                         service_health.set_safety_ok(false);
                                     }
-                                    warn!(target: "polypulse::strategy::late_resolution_winner_trading",
+                                    warn!(target: "polypulse::console::late_resolution_winner_trading",
                                         market = %market.crypto_symbol,
                                         %side,
                                         error = %e,
+                                        execution_attempt_latency_ms,
                                         "Late-Resolution Winner Trading failed"
                                     );
                                 }
@@ -2809,5 +2898,107 @@ fn late_resolution_winner_model_policy(
             config.late_resolution_winner_trading_min_net_ev,
         )
         .unwrap_or(dec!(0.002)),
+    }
+}
+
+fn rate_pct(numerator: u64, denominator: u64) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        numerator as f64 / denominator as f64 * 100.0
+    }
+}
+
+fn log_binary_complement_paper_summary(
+    executor: &TradingExecutor,
+    runtime_metrics: &RuntimeMetrics,
+    summary_interval_secs: u64,
+) {
+    let paper = executor.paper_arbitrage_summary();
+    let metrics = runtime_metrics.snapshot();
+    info!(target: "polypulse::console::binary_complement_arbitrage",
+        opportunities_admitted = metrics.opportunities_admitted,
+        trades_started = metrics.trades_started,
+        preflight_attempts = paper.preflight_attempts,
+        preflight_passes = paper.preflight_passes,
+        preflight_pass_rate_pct = rate_pct(paper.preflight_passes, paper.preflight_attempts),
+        preflight_rest_avg_ms = average_u64(paper.preflight_rest_ms_total, paper.preflight_attempts),
+        preflight_rest_max_ms = paper.preflight_rest_ms_max,
+        second_leg_attempts = paper.second_leg_attempts,
+        second_leg_failures = paper.second_leg_failures,
+        second_leg_failure_rate_pct = rate_pct(paper.second_leg_failures, paper.second_leg_attempts),
+        second_leg_rest_avg_ms = average_u64(paper.second_leg_rest_ms_total, paper.second_leg_attempts),
+        second_leg_rest_max_ms = paper.second_leg_rest_ms_max,
+        emergency_unwind_attempts = paper.emergency_unwind_attempts,
+        emergency_unwind_successes = paper.emergency_unwind_successes,
+        emergency_unwind_success_rate_pct = rate_pct(paper.emergency_unwind_successes, paper.emergency_unwind_attempts),
+        emergency_unwind_rest_avg_ms = average_u64(paper.emergency_unwind_rest_ms_total, paper.emergency_unwind_attempts),
+        emergency_unwind_rest_max_ms = paper.emergency_unwind_rest_ms_max,
+        paired_executions = paper.paired_executions,
+        unrecovered_executions = paper.unrecovered_executions,
+        realized_pnl = %paper.realized_pnl,
+        cumulative_paper_pnl = %paper.cumulative_paper_pnl,
+        unmatched_cost = %paper.unmatched_cost,
+        summary_interval_secs,
+        "📊 Binary Complement PAPER periodic summary"
+    );
+}
+
+fn log_late_resolution_winner_paper_summary(
+    runtime_metrics: &RuntimeMetrics,
+    journal: &LateResolutionWinnerTradingJournal,
+    summary_interval_secs: u64,
+) {
+    let metrics = runtime_metrics.snapshot();
+    let paper = journal.paper_summary();
+    let fallback_rest_samples = metrics
+        .late_resolution_winner_trading_rest_successes
+        .saturating_add(metrics.late_resolution_winner_trading_rest_empty_books);
+    let settled = metrics
+        .late_resolution_winner_trading_wins
+        .saturating_add(metrics.late_resolution_winner_trading_losses);
+    info!(target: "polypulse::console::late_resolution_winner_trading",
+        scans = metrics.late_resolution_winner_trading_scans,
+        signals = metrics.late_resolution_winner_trading_signals,
+        signal_rate_pct = rate_pct(metrics.late_resolution_winner_trading_signals, metrics.late_resolution_winner_trading_scans),
+        evaluations = metrics.late_resolution_winner_trading_evaluations,
+        awaiting_confirmation = metrics.late_resolution_winner_trading_awaiting_confirmation,
+        attempts = metrics.late_resolution_winner_trading_attempts,
+        fills = metrics.late_resolution_winner_trading_fills,
+        fill_rate_pct = rate_pct(metrics.late_resolution_winner_trading_fills, metrics.late_resolution_winner_trading_attempts),
+        pending = metrics.late_resolution_winner_trading_pending,
+        resolved = metrics.late_resolution_winner_trading_resolved,
+        redeemed = metrics.late_resolution_winner_trading_redeemed,
+        wins = metrics.late_resolution_winner_trading_wins,
+        losses = metrics.late_resolution_winner_trading_losses,
+        win_rate_pct = rate_pct(metrics.late_resolution_winner_trading_wins, settled),
+        model_data_rejections = metrics.late_resolution_winner_trading_model_data_rejections,
+        model_market_rejections = metrics.late_resolution_winner_trading_model_market_rejections,
+        model_boundary_rejections = metrics.late_resolution_winner_trading_model_boundary_rejections,
+        model_ev_rejections = metrics.late_resolution_winner_trading_model_ev_rejections,
+        fallback_rest_samples,
+        fallback_rest_avg_ms = average_u64(metrics.late_resolution_winner_trading_rest_latency_ms_total, fallback_rest_samples),
+        fallback_rest_max_ms = metrics.late_resolution_winner_trading_rest_latency_ms_max,
+        execution_samples = metrics.late_resolution_winner_trading_execution_samples,
+        execution_request_avg_ms = average_u64(metrics.late_resolution_winner_trading_execution_request_latency_ms_total, metrics.late_resolution_winner_trading_execution_samples),
+        execution_request_max_ms = metrics.late_resolution_winner_trading_execution_request_latency_ms_max,
+        execution_total_avg_ms = average_u64(metrics.late_resolution_winner_trading_execution_total_latency_ms_total, metrics.late_resolution_winner_trading_execution_samples),
+        execution_total_max_ms = metrics.late_resolution_winner_trading_execution_total_latency_ms_max,
+        estimated_pnl = metrics.late_resolution_winner_trading_est_pnl_microusd as f64 / 1_000_000.0,
+        realized_pnl = metrics.late_resolution_winner_trading_realized_pnl_microusd as f64 / 1_000_000.0,
+        pending_cost = %paper.pending_cost,
+        total_spent = %paper.total_spent,
+        journal_realized_pnl = %paper.realized_pnl,
+        open_positions = paper.open_positions,
+        summary_interval_secs,
+        "📊 Late-Resolution Winner Trading PAPER periodic summary"
+    );
+}
+
+fn average_u64(total: u64, count: u64) -> f64 {
+    if count == 0 {
+        0.0
+    } else {
+        total as f64 / count as f64
     }
 }

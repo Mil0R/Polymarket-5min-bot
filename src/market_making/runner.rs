@@ -1,5 +1,5 @@
 use anyhow::{bail, Context, Result};
-use chrono::{DateTime, Timelike, Utc};
+use chrono::{DateTime, NaiveDate, Timelike, Utc};
 use futures::{stream, StreamExt};
 use rust_decimal::Decimal;
 use serde::Serialize;
@@ -18,6 +18,7 @@ use super::model::{
     fair_prices, generate_shadow_quote_controlled, markout_observation, BookSnapshot,
     MarketSelection, MarketTrade, ShadowMarkout, ShadowQuote,
 };
+use super::reward_audit::watch_reward_snapshots;
 
 struct ResearchJournal {
     writer: Mutex<File>,
@@ -42,7 +43,7 @@ impl ResearchJournal {
     fn record(&self, action: &'static str, data: &impl Serialize) -> Result<()> {
         let event = json!({
             "action": action,
-            "version": 2,
+            "version": 3,
             "run_id": self.run_id,
             "timestamp": Utc::now(),
             "data": data,
@@ -113,6 +114,10 @@ struct HorizonSummary {
     paired_locked_pnl_usdc: Decimal,
     filled_quote_ids: HashSet<String>,
     filled_capital_usdc: Decimal,
+    executable_exit_observations: u64,
+    executable_exit_pnl_usdc: Decimal,
+    settlement_worst_usdc: Decimal,
+    settlement_best_usdc: Decimal,
 }
 
 impl HorizonSummary {
@@ -127,6 +132,17 @@ impl HorizonSummary {
         self.estimated_rebate_usdc += markout.estimated_rebate_usdc;
         self.combined_usdc += markout.markout_plus_rebate_usdc;
         self.paired_locked_pnl_usdc += markout.paired_locked_pnl_usdc.unwrap_or_default();
+        if let Some(exit_pnl) = markout.executable_exit_pnl_usdc {
+            self.executable_exit_observations += 1;
+            self.executable_exit_pnl_usdc += exit_pnl;
+        }
+        if let (Some(if_yes), Some(if_no)) = (
+            markout.settlement_pnl_if_yes_usdc,
+            markout.settlement_pnl_if_no_usdc,
+        ) {
+            self.settlement_worst_usdc += if_yes.min(if_no);
+            self.settlement_best_usdc += if_yes.max(if_no);
+        }
         if markout.yes_fill_proxy_shares + markout.no_fill_proxy_shares > Decimal::ZERO {
             self.filled_quote_ids.insert(markout.quote_id.clone());
             if let Some(quote) = quote {
@@ -144,13 +160,14 @@ struct RunSummary {
     horizons: BTreeMap<u64, HorizonSummary>,
 }
 
-pub fn run_report(path: &Path) -> Result<()> {
+pub fn run_report(path: &Path, config: &MarketMakingResearchConfig) -> Result<()> {
     let reader = BufReader::new(
         File::open(path).with_context(|| format!("failed to open {}", path.display()))?,
     );
     let mut quotes = 0_u64;
     let mut selected = HashSet::new();
     let mut quote_details = HashMap::<String, ShadowQuote>::new();
+    let mut quote_active_until = HashMap::<String, DateTime<Utc>>::new();
     let mut cancelled_quotes = 0_u64;
     let mut schema_versions = BTreeSet::<u64>::new();
     let mut visible_reward_share_sum = Decimal::ZERO;
@@ -164,6 +181,7 @@ pub fn run_report(path: &Path) -> Result<()> {
     let mut experiment_horizons = BTreeMap::<(u64, Decimal), HorizonSummary>::new();
     let mut price_horizons = BTreeMap::<(u64, String), HorizonSummary>::new();
     let mut hour_horizons = BTreeMap::<(u64, String), HorizonSummary>::new();
+    let mut estimated_rewards = BTreeMap::<(NaiveDate, String), Decimal>::new();
     for (line_number, line) in reader.lines().enumerate() {
         let line = line.with_context(|| format!("failed reading line {}", line_number + 1))?;
         if line.trim().is_empty() {
@@ -208,14 +226,35 @@ pub fn run_report(path: &Path) -> Result<()> {
                 quotes += 1;
                 let quote: ShadowQuote = serde_json::from_value(event["data"].clone())
                     .with_context(|| format!("invalid shadow quote at line {}", line_number + 1))?;
-                if event.get("version").and_then(serde_json::Value::as_u64) == Some(2) {
+                if event
+                    .get("version")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some_and(|version| version >= 2)
+                {
                     visible_reward_share_sum += quote.estimated_visible_reward_share;
                     visible_daily_reward_sum += quote.estimated_daily_liquidity_reward_usdc;
                     v2_quote_count += 1;
                 }
                 quote_details.insert(quote.quote_id.clone(), quote);
             }
-            Some("shadow_quote_cancelled") => cancelled_quotes += 1,
+            Some("shadow_quote_cancelled") => {
+                cancelled_quotes += 1;
+                if let (Some(quote_id), Some(active_until)) = (
+                    event
+                        .pointer("/data/quote_id")
+                        .and_then(serde_json::Value::as_str),
+                    event.pointer("/data/active_until"),
+                ) {
+                    let active_until: DateTime<Utc> = serde_json::from_value(active_until.clone())
+                        .with_context(|| {
+                            format!(
+                                "invalid quote cancellation time at line {}",
+                                line_number + 1
+                            )
+                        })?;
+                    quote_active_until.insert(quote_id.to_string(), active_until);
+                }
+            }
             Some("markout") => {
                 let markout: ShadowMarkout = serde_json::from_value(event["data"].clone())
                     .with_context(|| format!("invalid markout at line {}", line_number + 1))?;
@@ -264,6 +303,23 @@ pub fn run_report(path: &Path) -> Result<()> {
             _ => {}
         }
     }
+    for quote in quote_details.values() {
+        let configured_lifetime_ms =
+            i64::try_from(config.quote_interval_secs * 1_000).unwrap_or(i64::MAX);
+        let active_ms = quote_active_until
+            .get(&quote.quote_id)
+            .map(|until| {
+                until
+                    .signed_duration_since(quote.created_at)
+                    .num_milliseconds()
+                    .clamp(0, configured_lifetime_ms)
+            })
+            .unwrap_or(configured_lifetime_ms);
+        let active_fraction = Decimal::from(active_ms) / Decimal::from(86_400_000_u64);
+        *estimated_rewards
+            .entry((quote.created_at.date_naive(), quote.condition_id.clone()))
+            .or_default() += quote.estimated_daily_liquidity_reward_usdc * active_fraction;
+    }
     println!("Market Making Shadow report: {}", path.display());
     println!(
         "markets={} quotes={} cancelled_quotes={} schema_versions={:?}",
@@ -273,12 +329,12 @@ pub fn run_report(path: &Path) -> Result<()> {
         schema_versions,
     );
     println!(
-        "horizon  obs  fills  trade_data  touched  through  proxy_shares  capital  combined  roi_pct  paired"
+        "horizon  obs  fills  trade_data  touched  through  proxy_shares  capital  mid+rebate  exit_pnl  settle_worst  settle_best"
     );
     let analysis_horizon = horizons.keys().next_back().copied();
     for (horizon, summary) in &horizons {
         println!(
-            "{:>6}s {:>5} {:>6} {:>11} {:>8} {:>8} {:>13} {:>8} {:>9} {:>8} {:>7}",
+            "{:>6}s {:>5} {:>6} {:>11} {:>8} {:>8} {:>13} {:>8} {:>8} {:>9} {:>13} {:>11}",
             horizon,
             summary.observations,
             summary.filled_quote_ids.len(),
@@ -288,13 +344,18 @@ pub fn run_report(path: &Path) -> Result<()> {
             summary.fill_proxy_shares.round_dp(4),
             summary.filled_capital_usdc.round_dp(4),
             summary.combined_usdc.round_dp(4),
-            if summary.filled_capital_usdc > Decimal::ZERO {
-                summary.combined_usdc / summary.filled_capital_usdc * Decimal::from(100)
-            } else {
-                Decimal::ZERO
-            }
-            .round_dp(4),
-            summary.paired_locked_pnl_usdc.round_dp(4),
+            optional_total(
+                summary.executable_exit_observations,
+                summary.executable_exit_pnl_usdc
+            ),
+            optional_total(
+                summary.executable_exit_observations,
+                summary.settlement_worst_usdc
+            ),
+            optional_total(
+                summary.executable_exit_observations,
+                summary.settlement_best_usdc
+            ),
         );
     }
     println!("runs={}", runs.len());
@@ -338,9 +399,41 @@ pub fn run_report(path: &Path) -> Result<()> {
             (visible_daily_reward_sum / denominator).round_dp(4),
         );
     }
+    print_reward_calibration(config, &estimated_rewards)?;
+    let independent_fills = analysis_horizon
+        .and_then(|horizon| horizons.get(&horizon))
+        .map_or(0, |summary| summary.filled_quote_ids.len());
+    let has_long_horizons = horizons.contains_key(&300) && horizons.contains_key(&1_800);
+    println!(
+        "research_gate: analysis_horizon={}s independent_queue_aware_fills={}/{} long_horizons={} sample_status={}",
+        analysis_horizon.unwrap_or_default(),
+        independent_fills,
+        config.min_independent_fill_samples,
+        has_long_horizons,
+        if independent_fills >= config.min_independent_fill_samples && has_long_horizons {
+            "PASS"
+        } else {
+            "COLLECT_MORE_DATA"
+        }
+    );
+    println!(
+        "canary_caps: post_only=true markets<={} quote_notional_usdc<={} inventory_usdc<={} midpoint_jump<={}",
+        config.canary_max_markets,
+        config.canary_max_quote_notional_usdc,
+        config.canary_max_inventory_usdc,
+        config.canary_max_midpoint_move,
+    );
+    println!(
+        "live_canary_status=BLOCKED (this binary remains read-only; reward calibration and sample gate must pass before adding an order executor)"
+    );
     if schema_versions.contains(&2) {
         println!(
             "Note: v2 fills subtract displayed queue-ahead and enforce quote lifetimes; actual queue changes and Liquidity Rewards allocation remain unavailable."
+        );
+    }
+    if schema_versions.contains(&3) {
+        println!(
+            "Note: v3 adds 5m/30m coverage plus visible-depth exit PnL and binary settlement PnL bounds. Inventory beyond visible bids is valued at zero."
         );
     }
     if schema_versions.contains(&1) {
@@ -348,6 +441,112 @@ pub fn run_report(path: &Path) -> Result<()> {
             "Warning: v1 observations use the legacy optimistic fill proxy and must not be mixed with v2 feasibility decisions."
         );
     }
+    Ok(())
+}
+
+fn optional_total(observations: u64, value: Decimal) -> String {
+    if observations == 0 {
+        "-".to_string()
+    } else {
+        value.round_dp(4).to_string()
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RewardAuditMarket {
+    condition_id: String,
+    earnings_usdc: Decimal,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RewardAuditData {
+    date: NaiveDate,
+    markets: Vec<RewardAuditMarket>,
+}
+
+fn print_reward_calibration(
+    config: &MarketMakingResearchConfig,
+    estimated: &BTreeMap<(NaiveDate, String), Decimal>,
+) -> Result<()> {
+    if !config.reward_audit_file.exists() {
+        println!(
+            "reward_calibration: unavailable (run `market_making reward-audit`; file={} does not exist)",
+            config.reward_audit_file.display()
+        );
+        return Ok(());
+    }
+    let reader = BufReader::new(File::open(&config.reward_audit_file).with_context(|| {
+        format!(
+            "failed to open reward audit {}",
+            config.reward_audit_file.display()
+        )
+    })?);
+    let mut latest = BTreeMap::<(NaiveDate, String), (DateTime<Utc>, Decimal)>::new();
+    for (line_number, line) in reader.lines().enumerate() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let event: serde_json::Value = serde_json::from_str(&line)
+            .with_context(|| format!("invalid reward audit NDJSON at line {}", line_number + 1))?;
+        if event.get("action").and_then(serde_json::Value::as_str) != Some("reward_snapshot") {
+            continue;
+        }
+        let timestamp: DateTime<Utc> = serde_json::from_value(event["timestamp"].clone())?;
+        let data: RewardAuditData = serde_json::from_value(event["data"].clone())?;
+        for market in data.markets {
+            let key = (data.date, market.condition_id);
+            if latest.get(&key).is_none_or(|(seen, _)| timestamp > *seen) {
+                latest.insert(key, (timestamp, market.earnings_usdc));
+            }
+        }
+    }
+    let mut estimated_overlap = Decimal::ZERO;
+    let mut actual_overlap = Decimal::ZERO;
+    let mut rows = Vec::new();
+    for (key, estimate) in estimated {
+        if let Some((_, actual)) = latest.get(key) {
+            estimated_overlap += *estimate;
+            actual_overlap += *actual;
+            rows.push((&key.0, &key.1, *estimate, *actual));
+        }
+    }
+    if estimated_overlap <= Decimal::ZERO {
+        println!(
+            "reward_calibration: no overlapping date/market between shadow estimates and authenticated snapshots"
+        );
+        return Ok(());
+    }
+    let capture = actual_overlap / estimated_overlap;
+    let status = if capture < config.min_reward_capture_ratio {
+        "STOP"
+    } else if capture < config.target_reward_capture_ratio {
+        "RESEARCH_ONLY"
+    } else {
+        "REWARD_GATE_PASS"
+    };
+    println!(
+        "reward_calibration: overlap_markets={} estimated=${} actual=${} capture={}%, status={} (stop_below={}%, target={}%)",
+        rows.len(),
+        estimated_overlap.round_dp(6),
+        actual_overlap.round_dp(6),
+        (capture * Decimal::from(100)).round_dp(3),
+        status,
+        (config.min_reward_capture_ratio * Decimal::from(100)).round_dp(2),
+        (config.target_reward_capture_ratio * Decimal::from(100)).round_dp(2),
+    );
+    for (date, condition_id, estimate, actual) in rows.into_iter().take(20) {
+        println!(
+            "  reward_market date={} condition={} estimated=${} actual=${}",
+            date,
+            condition_id,
+            estimate.round_dp(6),
+            actual.round_dp(6),
+        );
+    }
+    println!(
+        "Warning: capture ratio is meaningful only when authenticated canary orders mirror the shadow quote set; pure shadow quotes cannot earn rewards."
+    );
     Ok(())
 }
 
@@ -401,6 +600,9 @@ fn print_dimension(
 
 pub async fn run_shadow_maker(client: MarketMakingResearchClient) -> Result<()> {
     let config = client.config().clone();
+    let reward_audit_task = config
+        .reward_audit_enabled
+        .then(|| tokio::spawn(watch_reward_snapshots(config.clone())));
     let selections = client.discover().await?;
     if selections.is_empty() {
         bail!("no reward markets passed Market Making research filters");
@@ -623,18 +825,25 @@ pub async fn run_shadow_maker(client: MarketMakingResearchClient) -> Result<()> 
                 {
                     state.quote_times.pop_front();
                 }
-                let pause_reason =
-                    if fair_yes < config.min_midpoint || fair_yes > config.max_midpoint {
-                        Some("runtime_midpoint_out_of_range")
-                    } else if recent_trade_count < config.min_trades_1h {
-                        Some("insufficient_recent_trades")
-                    } else if state.book_updates.len() < config.min_book_updates {
-                        Some("insufficient_book_updates")
-                    } else if state.quote_times.len() >= config.max_quotes_per_market_hour {
-                        Some("quote_rate_limit")
-                    } else {
-                        None
-                    };
+                let manually_halted = news_halt_matches(
+                    &config.news_halt_file,
+                    &state.selection.market.condition_id,
+                    &state.selection.market.slug,
+                    &state.selection.market.category,
+                )?;
+                let pause_reason = if manually_halted {
+                    Some("manual_news_halt")
+                } else if fair_yes < config.min_midpoint || fair_yes > config.max_midpoint {
+                    Some("runtime_midpoint_out_of_range")
+                } else if recent_trade_count < config.min_trades_1h {
+                    Some("insufficient_recent_trades")
+                } else if state.book_updates.len() < config.min_book_updates {
+                    Some("insufficient_book_updates")
+                } else if state.quote_times.len() >= config.max_quotes_per_market_hour {
+                    Some("quote_rate_limit")
+                } else {
+                    None
+                };
                 if let Some(reason) = pause_reason {
                     journal.record(
                         "quote_paused",
@@ -729,6 +938,9 @@ pub async fn run_shadow_maker(client: MarketMakingResearchClient) -> Result<()> 
             "pending_quotes": states.iter().map(|state| state.pending.len()).sum::<usize>(),
         }),
     )?;
+    if let Some(task) = reward_audit_task {
+        task.abort();
+    }
     tracing::info!(
         quote_count,
         markout_count,
@@ -1095,7 +1307,7 @@ fn print_selections(selected: &[MarketSelection]) {
 }
 
 fn config_summary(config: &MarketMakingResearchConfig) -> serde_json::Value {
-    json!({
+    let mut summary = json!({
         "max_markets": config.max_markets,
         "min_daily_reward_usdc": config.min_daily_reward_usdc,
         "max_rewards_min_size": config.max_rewards_min_size,
@@ -1134,5 +1346,41 @@ fn config_summary(config: &MarketMakingResearchConfig) -> serde_json::Value {
         "websocket_book_max_age_ms": config.websocket_book_max_age_ms,
         "markout_horizons_secs": config.markout_horizons_secs,
         "duration_secs": config.duration_secs,
-    })
+    });
+    summary["evidence_gates"] = json!({
+        "reward_audit_enabled": config.reward_audit_enabled,
+        "reward_poll_secs": config.reward_poll_secs,
+        "min_independent_fill_samples": config.min_independent_fill_samples,
+        "min_reward_capture_ratio": config.min_reward_capture_ratio,
+        "target_reward_capture_ratio": config.target_reward_capture_ratio,
+    });
+    summary["canary_caps"] = json!({
+        "max_markets": config.canary_max_markets,
+        "max_quote_notional_usdc": config.canary_max_quote_notional_usdc,
+        "max_inventory_usdc": config.canary_max_inventory_usdc,
+        "max_midpoint_move": config.canary_max_midpoint_move,
+        "news_halt_file": config.news_halt_file,
+    });
+    summary
+}
+
+fn news_halt_matches(path: &Path, condition_id: &str, slug: &str, category: &str) -> Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read news halt file {}", path.display()))?;
+    let condition_id = condition_id.to_ascii_lowercase();
+    let slug = slug.to_ascii_lowercase();
+    let category = category.to_ascii_lowercase();
+    Ok(content.lines().any(|line| {
+        let token = line
+            .split('#')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        !token.is_empty()
+            && (token == "*" || token == condition_id || token == slug || token == category)
+    }))
 }

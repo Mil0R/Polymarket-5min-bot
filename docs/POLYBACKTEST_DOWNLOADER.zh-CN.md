@@ -151,6 +151,9 @@ coin_twap_source = 'chainlink_twap'
 不同 coin_twap_observed_at 才计为独立确认
 ```
 
+正式回放会按 BTC、ETH、SOL/其他资产分别应用波动率下限和模型风险缓冲，并在一次数据库扫描中运行配置的延迟 × 流动性折扣网格。每轮在
+`results/backtests/late-resolution-winner-trading/run-*/` 保存 `run.log`、`report.json` 和 `analysis.zh-CN.md`，旧结果不会被覆盖。
+
 Binary Complement Arbitrage 应从信号快照之后选择首个满足
 `time >= signal_time + configured_delay` 的快照成交，逐档读取压缩完整盘口，
 并在返回深度不足时判定不成交。不要使用 `snapshot-at` 的最近两秒近似接口。

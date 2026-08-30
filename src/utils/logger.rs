@@ -12,14 +12,22 @@ pub const BINARY_COMPLEMENT_ARBITRAGE_LOG_TARGET: &str =
     "polypulse::strategy::binary_complement_arbitrage";
 pub const LATE_RESOLUTION_WINNER_TRADING_LOG_TARGET: &str =
     "polypulse::strategy::late_resolution_winner_trading";
+pub const BINARY_COMPLEMENT_ARBITRAGE_CONSOLE_TARGET: &str =
+    "polypulse::console::binary_complement_arbitrage";
+pub const LATE_RESOLUTION_WINNER_TRADING_CONSOLE_TARGET: &str =
+    "polypulse::console::late_resolution_winner_trading";
 type LogLayer = Box<dyn Layer<tracing_subscriber::Registry> + Send + Sync>;
 
 pub fn init_logger(quiet_stdout: bool) -> Result<()> {
     // Logger setup happens before Config::from_env(), so load .env here as well.
     dotenvy::dotenv().ok();
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let stdout_key_events_only = std::env::var("LOG_STDOUT_KEY_EVENTS_ONLY")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
 
-    let system_writer = if quiet_stdout {
+    let system_log_configured = log_path_configured("LOG_FILE");
+    let system_writer = if quiet_stdout || stdout_key_events_only {
         let path = std::env::var("LOG_FILE").unwrap_or_else(|_| "logs/system.log".to_string());
         BoxMakeWriter::new(Mutex::new(open_log_writer(path)?))
     } else if let Ok(path) = std::env::var("LOG_FILE") {
@@ -33,6 +41,12 @@ pub fn init_logger(quiet_stdout: bool) -> Result<()> {
     let split_late_resolution_winner_trading =
         log_path_configured("LATE_RESOLUTION_WINNER_TRADING_STRATEGY_LOG_FILE");
     let split_wallet_copy_trading = log_path_configured("WALLET_COPY_TRADING_LOG_FILE");
+    let stdout_tee = std::env::var("LOG_STDOUT_TEE")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let any_strategy_split = split_binary_complement_arbitrage
+        || split_late_resolution_winner_trading
+        || split_wallet_copy_trading;
     let mut log_layers: Vec<LogLayer> = vec![tracing_subscriber::fmt::layer()
         .with_writer(system_writer)
         .with_ansi(false)
@@ -44,6 +58,34 @@ pub fn init_logger(quiet_stdout: bool) -> Result<()> {
                 || split_wallet_copy_trading && is_wallet_copy_trading_metadata(metadata))
         }))
         .boxed()];
+    if stdout_tee && stdout_key_events_only {
+        log_layers.push(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stdout)
+                .with_ansi(false)
+                .with_filter(filter_fn(is_console_key_event_metadata))
+                .boxed(),
+        );
+    } else if stdout_tee && (quiet_stdout || system_log_configured) {
+        log_layers.push(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stdout)
+                .with_ansi(false)
+                .boxed(),
+        );
+    } else if stdout_tee && any_strategy_split {
+        log_layers.push(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stdout)
+                .with_ansi(false)
+                .with_filter(filter_fn(move |metadata| {
+                    is_binary_complement_arbitrage_metadata(metadata)
+                        || is_late_resolution_winner_trading_metadata(metadata)
+                        || is_wallet_copy_trading_metadata(metadata)
+                }))
+                .boxed(),
+        );
+    }
     if let Some(layer) = strategy_log_layer(
         "BINARY_COMPLEMENT_ARBITRAGE_STRATEGY_LOG_FILE",
         is_binary_complement_arbitrage_metadata,
@@ -100,6 +142,7 @@ fn log_path_configured(variable: &str) -> bool {
 fn is_binary_complement_arbitrage_metadata(metadata: &Metadata<'_>) -> bool {
     let target = metadata.target();
     target == BINARY_COMPLEMENT_ARBITRAGE_LOG_TARGET
+        || target == BINARY_COMPLEMENT_ARBITRAGE_CONSOLE_TARGET
         || target.ends_with("::strategy_service")
         || target.ends_with("::monitor::arbitrage")
         || target.ends_with("::trading::executor")
@@ -108,8 +151,20 @@ fn is_binary_complement_arbitrage_metadata(metadata: &Metadata<'_>) -> bool {
 fn is_late_resolution_winner_trading_metadata(metadata: &Metadata<'_>) -> bool {
     let target = metadata.target();
     target == LATE_RESOLUTION_WINNER_TRADING_LOG_TARGET
+        || target == LATE_RESOLUTION_WINNER_TRADING_CONSOLE_TARGET
         || target.ends_with("::late_resolution_winner_trading")
         || target.ends_with("::late_resolution_winner_model")
+}
+
+fn is_console_key_event_metadata(metadata: &Metadata<'_>) -> bool {
+    is_console_key_event_target(metadata.target())
+}
+
+fn is_console_key_event_target(target: &str) -> bool {
+    matches!(
+        target,
+        BINARY_COMPLEMENT_ARBITRAGE_CONSOLE_TARGET | LATE_RESOLUTION_WINNER_TRADING_CONSOLE_TARGET
+    )
 }
 
 fn is_wallet_copy_trading_metadata(metadata: &Metadata<'_>) -> bool {
@@ -293,5 +348,22 @@ mod tests {
         assert_eq!(fs::read(rotated_path(&path, 1)).unwrap(), b"12345678");
         assert_eq!(fs::read(&path).unwrap(), b"next");
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn key_event_filter_accepts_only_dedicated_console_targets() {
+        assert!(is_console_key_event_target(
+            BINARY_COMPLEMENT_ARBITRAGE_CONSOLE_TARGET
+        ));
+        assert!(is_console_key_event_target(
+            LATE_RESOLUTION_WINNER_TRADING_CONSOLE_TARGET
+        ));
+        assert!(!is_console_key_event_target(
+            BINARY_COMPLEMENT_ARBITRAGE_LOG_TARGET
+        ));
+        assert!(!is_console_key_event_target(
+            LATE_RESOLUTION_WINNER_TRADING_LOG_TARGET
+        ));
+        assert!(!is_console_key_event_target("polypulse::app"));
     }
 }

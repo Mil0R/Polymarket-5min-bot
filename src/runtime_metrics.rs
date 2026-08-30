@@ -80,6 +80,11 @@ pub struct MetricsSnapshot {
     pub late_resolution_winner_trading_rest_empty_books: u64,
     pub late_resolution_winner_trading_rest_latency_ms_total: u64,
     pub late_resolution_winner_trading_rest_latency_ms_max: u64,
+    pub late_resolution_winner_trading_execution_samples: u64,
+    pub late_resolution_winner_trading_execution_request_latency_ms_total: u64,
+    pub late_resolution_winner_trading_execution_request_latency_ms_max: u64,
+    pub late_resolution_winner_trading_execution_total_latency_ms_total: u64,
+    pub late_resolution_winner_trading_execution_total_latency_ms_max: u64,
     pub late_resolution_winner_trading_fee_read_errors: u64,
     pub late_resolution_winner_trading_evaluations: u64,
     pub late_resolution_winner_trading_evaluations_resolved: u64,
@@ -178,6 +183,11 @@ pub struct RuntimeMetrics {
     late_resolution_winner_trading_rest_empty_books: AtomicU64,
     late_resolution_winner_trading_rest_latency_ms_total: AtomicU64,
     late_resolution_winner_trading_rest_latency_ms_max: AtomicU64,
+    late_resolution_winner_trading_execution_samples: AtomicU64,
+    late_resolution_winner_trading_execution_request_latency_ms_total: AtomicU64,
+    late_resolution_winner_trading_execution_request_latency_ms_max: AtomicU64,
+    late_resolution_winner_trading_execution_total_latency_ms_total: AtomicU64,
+    late_resolution_winner_trading_execution_total_latency_ms_max: AtomicU64,
     late_resolution_winner_trading_fee_read_errors: AtomicU64,
     late_resolution_winner_trading_evaluations: AtomicU64,
     late_resolution_winner_trading_evaluations_resolved: AtomicU64,
@@ -360,6 +370,23 @@ impl RuntimeMetrics {
             .fetch_add(latency_ms, Ordering::Relaxed);
         self.late_resolution_winner_trading_rest_latency_ms_max
             .fetch_max(latency_ms, Ordering::Relaxed);
+    }
+
+    pub fn record_late_resolution_winner_trading_execution_latency(
+        &self,
+        request_latency_ms: u64,
+        total_latency_ms: u64,
+    ) {
+        self.late_resolution_winner_trading_execution_samples
+            .fetch_add(1, Ordering::Relaxed);
+        self.late_resolution_winner_trading_execution_request_latency_ms_total
+            .fetch_add(request_latency_ms, Ordering::Relaxed);
+        self.late_resolution_winner_trading_execution_request_latency_ms_max
+            .fetch_max(request_latency_ms, Ordering::Relaxed);
+        self.late_resolution_winner_trading_execution_total_latency_ms_total
+            .fetch_add(total_latency_ms, Ordering::Relaxed);
+        self.late_resolution_winner_trading_execution_total_latency_ms_max
+            .fetch_max(total_latency_ms, Ordering::Relaxed);
     }
     incrementer!(
         record_late_resolution_winner_trading_evaluation,
@@ -731,6 +758,21 @@ impl RuntimeMetrics {
             late_resolution_winner_trading_rest_latency_ms_max: load(
                 &self.late_resolution_winner_trading_rest_latency_ms_max,
             ),
+            late_resolution_winner_trading_execution_samples: load(
+                &self.late_resolution_winner_trading_execution_samples,
+            ),
+            late_resolution_winner_trading_execution_request_latency_ms_total: load(
+                &self.late_resolution_winner_trading_execution_request_latency_ms_total,
+            ),
+            late_resolution_winner_trading_execution_request_latency_ms_max: load(
+                &self.late_resolution_winner_trading_execution_request_latency_ms_max,
+            ),
+            late_resolution_winner_trading_execution_total_latency_ms_total: load(
+                &self.late_resolution_winner_trading_execution_total_latency_ms_total,
+            ),
+            late_resolution_winner_trading_execution_total_latency_ms_max: load(
+                &self.late_resolution_winner_trading_execution_total_latency_ms_max,
+            ),
             late_resolution_winner_trading_fee_read_errors: load(
                 &self.late_resolution_winner_trading_fee_read_errors,
             ),
@@ -1013,6 +1055,18 @@ impl RuntimeMetrics {
                 snapshot.late_resolution_winner_trading_rest_latency_ms_total,
             ),
             (
+                "late_resolution_winner_trading_execution_samples_total",
+                snapshot.late_resolution_winner_trading_execution_samples,
+            ),
+            (
+                "late_resolution_winner_trading_execution_request_latency_ms_total",
+                snapshot.late_resolution_winner_trading_execution_request_latency_ms_total,
+            ),
+            (
+                "late_resolution_winner_trading_execution_total_latency_ms_total",
+                snapshot.late_resolution_winner_trading_execution_total_latency_ms_total,
+            ),
+            (
                 "late_resolution_winner_trading_fee_read_errors_total",
                 snapshot.late_resolution_winner_trading_fee_read_errors,
             ),
@@ -1188,6 +1242,20 @@ impl RuntimeMetrics {
                 .to_string(),
         );
         output.push('\n');
+        output.push_str("# TYPE polypulse_late_resolution_winner_trading_execution_request_latency_ms_max gauge\npolypulse_late_resolution_winner_trading_execution_request_latency_ms_max ");
+        output.push_str(
+            &snapshot
+                .late_resolution_winner_trading_execution_request_latency_ms_max
+                .to_string(),
+        );
+        output.push('\n');
+        output.push_str("# TYPE polypulse_late_resolution_winner_trading_execution_total_latency_ms_max gauge\npolypulse_late_resolution_winner_trading_execution_total_latency_ms_max ");
+        output.push_str(
+            &snapshot
+                .late_resolution_winner_trading_execution_total_latency_ms_max
+                .to_string(),
+        );
+        output.push('\n');
         output.push_str(
             "# TYPE polypulse_late_resolution_winner_trading_est_pnl_usd gauge\npolypulse_late_resolution_winner_trading_est_pnl_usd ",
         );
@@ -1254,6 +1322,8 @@ mod tests {
         metrics.record_late_resolution_winner_trading_rest_fallback();
         metrics.record_late_resolution_winner_trading_rest_result(25, true);
         metrics.record_late_resolution_winner_trading_rest_result(40, false);
+        metrics.record_late_resolution_winner_trading_execution_latency(123, 373);
+        metrics.record_late_resolution_winner_trading_execution_latency(77, 327);
         metrics.record_late_resolution_winner_model_rejection(ModelRejection::StalePrice);
         metrics.record_late_resolution_winner_trading_shadow_execution_attempt();
         metrics.record_late_resolution_winner_trading_shadow_execution_fill();
@@ -1299,6 +1369,23 @@ mod tests {
         assert_eq!(
             snapshot.late_resolution_winner_trading_rest_latency_ms_max,
             40
+        );
+        assert_eq!(snapshot.late_resolution_winner_trading_execution_samples, 2);
+        assert_eq!(
+            snapshot.late_resolution_winner_trading_execution_request_latency_ms_total,
+            200
+        );
+        assert_eq!(
+            snapshot.late_resolution_winner_trading_execution_request_latency_ms_max,
+            123
+        );
+        assert_eq!(
+            snapshot.late_resolution_winner_trading_execution_total_latency_ms_total,
+            700
+        );
+        assert_eq!(
+            snapshot.late_resolution_winner_trading_execution_total_latency_ms_max,
+            373
         );
         assert_eq!(snapshot.late_resolution_winner_trading_by_asset.len(), 1);
         assert_eq!(
@@ -1357,6 +1444,14 @@ mod tests {
         assert!(
             exposition.contains("polypulse_late_resolution_winner_trading_rest_latency_ms_max 40")
         );
+        assert!(exposition
+            .contains("polypulse_late_resolution_winner_trading_execution_samples_total 2"));
+        assert!(exposition.contains(
+            "polypulse_late_resolution_winner_trading_execution_request_latency_ms_max 123"
+        ));
+        assert!(exposition.contains(
+            "polypulse_late_resolution_winner_trading_execution_total_latency_ms_max 373"
+        ));
         assert!(exposition.contains(
             "polypulse_late_resolution_winner_trading_asset_scans_total{asset=\"btc\"} 1"
         ));
