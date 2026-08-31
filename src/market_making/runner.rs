@@ -16,7 +16,7 @@ use super::client::MarketMakingResearchClient;
 use super::config::MarketMakingResearchConfig;
 use super::model::{
     fair_prices, generate_shadow_quote_controlled, markout_observation, BookSnapshot,
-    MarketSelection, MarketTrade, ShadowMarkout, ShadowQuote,
+    MarketSelection, MarketTrade, ShadowMarkout, ShadowQuote, REWARD_BAND_INELIGIBLE_ERROR,
 };
 use super::reward_audit::watch_reward_snapshots;
 
@@ -43,7 +43,7 @@ impl ResearchJournal {
     fn record(&self, action: &'static str, data: &impl Serialize) -> Result<()> {
         let event = json!({
             "action": action,
-            "version": 3,
+            "version": 4,
             "run_id": self.run_id,
             "timestamp": Utc::now(),
             "data": data,
@@ -66,6 +66,8 @@ struct PendingQuote {
 
 struct MarketState {
     selection: MarketSelection,
+    active: bool,
+    selected_at: DateTime<Utc>,
     last_quote_attempt_at: Option<DateTime<Utc>>,
     consecutive_book_errors: u32,
     consecutive_quote_rejections: u32,
@@ -160,6 +162,14 @@ struct RunSummary {
     horizons: BTreeMap<u64, HorizonSummary>,
 }
 
+struct RewardEstimateInterval {
+    date: NaiveDate,
+    condition_id: String,
+    started_at: DateTime<Utc>,
+    ended_at: DateTime<Utc>,
+    estimated_daily_usdc: Decimal,
+}
+
 pub fn run_report(path: &Path, config: &MarketMakingResearchConfig) -> Result<()> {
     let reader = BufReader::new(
         File::open(path).with_context(|| format!("failed to open {}", path.display()))?,
@@ -182,6 +192,12 @@ pub fn run_report(path: &Path, config: &MarketMakingResearchConfig) -> Result<()
     let mut price_horizons = BTreeMap::<(u64, String), HorizonSummary>::new();
     let mut hour_horizons = BTreeMap::<(u64, String), HorizonSummary>::new();
     let mut estimated_rewards = BTreeMap::<(NaiveDate, String), Decimal>::new();
+    let mut reward_estimate_intervals = Vec::<RewardEstimateInterval>::new();
+    let mut latest_event_at = None::<DateTime<Utc>>;
+    let mut quote_horizons = HashMap::<String, HashSet<u64>>::new();
+    let mut abandoned_pending_markouts = 0_u64;
+    let mut inventory_limit_violations = 0_u64;
+    let mut max_abs_net_inventory = Decimal::ZERO;
     for (line_number, line) in reader.lines().enumerate() {
         let line = line.with_context(|| format!("failed reading line {}", line_number + 1))?;
         if line.trim().is_empty() {
@@ -189,6 +205,13 @@ pub fn run_report(path: &Path, config: &MarketMakingResearchConfig) -> Result<()
         }
         let event: serde_json::Value = serde_json::from_str(&line)
             .with_context(|| format!("invalid NDJSON at line {}", line_number + 1))?;
+        if let Some(timestamp) = event
+            .get("timestamp")
+            .and_then(|value| serde_json::from_value::<DateTime<Utc>>(value.clone()).ok())
+        {
+            latest_event_at =
+                Some(latest_event_at.map_or(timestamp, |latest| latest.max(timestamp)));
+        }
         if let Some(version) = event.get("version").and_then(serde_json::Value::as_u64) {
             schema_versions.insert(version);
         }
@@ -255,10 +278,30 @@ pub fn run_report(path: &Path, config: &MarketMakingResearchConfig) -> Result<()
                     quote_active_until.insert(quote_id.to_string(), active_until);
                 }
             }
+            Some("market_removed") => {
+                abandoned_pending_markouts += event
+                    .pointer("/data/abandoned_pending_markouts")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default();
+            }
+            Some("virtual_inventory_updated") => {
+                if let Some(net) = event
+                    .pointer("/data/net_inventory")
+                    .and_then(|value| serde_json::from_value::<Decimal>(value.clone()).ok())
+                {
+                    let absolute = net.abs();
+                    max_abs_net_inventory = max_abs_net_inventory.max(absolute);
+                    inventory_limit_violations += u64::from(absolute > config.max_inventory_shares);
+                }
+            }
             Some("markout") => {
                 let markout: ShadowMarkout = serde_json::from_value(event["data"].clone())
                     .with_context(|| format!("invalid markout at line {}", line_number + 1))?;
                 let quote = quote_details.get(&markout.quote_id);
+                quote_horizons
+                    .entry(markout.quote_id.clone())
+                    .or_default()
+                    .insert(markout.target_horizon_secs);
                 horizons
                     .entry(markout.target_horizon_secs)
                     .or_default()
@@ -316,9 +359,41 @@ pub fn run_report(path: &Path, config: &MarketMakingResearchConfig) -> Result<()
             })
             .unwrap_or(configured_lifetime_ms);
         let active_fraction = Decimal::from(active_ms) / Decimal::from(86_400_000_u64);
+        let ended_at = quote.created_at + chrono::Duration::milliseconds(active_ms);
+        reward_estimate_intervals.push(RewardEstimateInterval {
+            date: quote.created_at.date_naive(),
+            condition_id: quote.condition_id.clone(),
+            started_at: quote.created_at,
+            ended_at,
+            estimated_daily_usdc: quote.estimated_daily_liquidity_reward_usdc,
+        });
         *estimated_rewards
             .entry((quote.created_at.date_naive(), quote.condition_id.clone()))
             .or_default() += quote.estimated_daily_liquidity_reward_usdc * active_fraction;
+    }
+    let estimated_time_weighted_reward = estimated_rewards.values().copied().sum::<Decimal>();
+    let final_horizon = config
+        .markout_horizons_secs
+        .last()
+        .copied()
+        .unwrap_or_default();
+    let mut matured_quotes = 0_u64;
+    let mut not_due_quotes = 0_u64;
+    let mut missing_due_quotes = 0_u64;
+    for quote in quote_details.values() {
+        if quote_horizons
+            .get(&quote.quote_id)
+            .is_some_and(|horizons| horizons.contains(&final_horizon))
+        {
+            matured_quotes += 1;
+        } else if latest_event_at.is_some_and(|latest| {
+            latest.signed_duration_since(quote.created_at).num_seconds()
+                < i64::try_from(final_horizon).unwrap_or(i64::MAX)
+        }) {
+            not_due_quotes += 1;
+        } else {
+            missing_due_quotes += 1;
+        }
     }
     println!("Market Making Shadow report: {}", path.display());
     println!(
@@ -327,6 +402,16 @@ pub fn run_report(path: &Path, config: &MarketMakingResearchConfig) -> Result<()
         quotes,
         cancelled_quotes,
         schema_versions,
+    );
+    println!(
+        "data_integrity: final_horizon={}s matured_quotes={} not_due={} missing_due={} abandoned_pending={} inventory_limit_violations={} max_abs_net_inventory={}",
+        final_horizon,
+        matured_quotes,
+        not_due_quotes,
+        missing_due_quotes,
+        abandoned_pending_markouts,
+        inventory_limit_violations,
+        max_abs_net_inventory.round_dp(4),
     );
     println!(
         "horizon  obs  fills  trade_data  touched  through  proxy_shares  capital  mid+rebate  exit_pnl  settle_worst  settle_best"
@@ -398,19 +483,50 @@ pub fn run_report(path: &Path, config: &MarketMakingResearchConfig) -> Result<()
             (visible_reward_share_sum / denominator * Decimal::from(100)).round_dp(4),
             (visible_daily_reward_sum / denominator).round_dp(4),
         );
+        let loss_basis = analysis_horizon
+            .and_then(|horizon| horizons.get(&horizon))
+            .map(|summary| {
+                if summary.executable_exit_observations > 0 {
+                    summary.executable_exit_pnl_usdc
+                } else {
+                    summary.combined_usdc
+                }
+            })
+            .unwrap_or_default();
+        let break_even_capture = if estimated_time_weighted_reward > Decimal::ZERO {
+            (-loss_basis).max(Decimal::ZERO) / estimated_time_weighted_reward
+        } else {
+            Decimal::ZERO
+        };
+        let dynamic_target = config
+            .target_reward_capture_ratio
+            .max(break_even_capture + config.reward_break_even_margin_ratio);
+        println!(
+            "reward_economics: time_weighted_estimate=${} loss_basis=${} break_even_capture={}%, dynamic_target={}%, configured_target={}%, status={}",
+            estimated_time_weighted_reward.round_dp(6),
+            loss_basis.round_dp(6),
+            (break_even_capture * Decimal::from(100)).round_dp(3),
+            (dynamic_target * Decimal::from(100)).round_dp(3),
+            (config.target_reward_capture_ratio * Decimal::from(100)).round_dp(3),
+            if dynamic_target <= Decimal::ONE { "CALIBRATE" } else { "ECONOMICALLY_BLOCKED" },
+        );
     }
-    print_reward_calibration(config, &estimated_rewards)?;
+    print_reward_calibration(config, &reward_estimate_intervals)?;
     let independent_fills = analysis_horizon
         .and_then(|horizon| horizons.get(&horizon))
         .map_or(0, |summary| summary.filled_quote_ids.len());
     let has_long_horizons = horizons.contains_key(&300) && horizons.contains_key(&1_800);
+    let data_integrity_pass = missing_due_quotes == 0
+        && abandoned_pending_markouts == 0
+        && inventory_limit_violations == 0;
     println!(
-        "research_gate: analysis_horizon={}s independent_queue_aware_fills={}/{} long_horizons={} sample_status={}",
+        "research_gate: analysis_horizon={}s independent_queue_aware_fills={}/{} long_horizons={} data_integrity={} sample_status={}",
         analysis_horizon.unwrap_or_default(),
         independent_fills,
         config.min_independent_fill_samples,
         has_long_horizons,
-        if independent_fills >= config.min_independent_fill_samples && has_long_horizons {
+        data_integrity_pass,
+        if independent_fills >= config.min_independent_fill_samples && has_long_horizons && data_integrity_pass {
             "PASS"
         } else {
             "COLLECT_MORE_DATA"
@@ -434,6 +550,11 @@ pub fn run_report(path: &Path, config: &MarketMakingResearchConfig) -> Result<()
     if schema_versions.contains(&3) {
         println!(
             "Note: v3 adds 5m/30m coverage plus visible-depth exit PnL and binary settlement PnL bounds. Inventory beyond visible bids is valued at zero."
+        );
+    }
+    if schema_versions.contains(&4) {
+        println!(
+            "Note: v4 hard-caps per-leg inventory headroom, retains retired markets until markouts mature, and adds data-integrity/economic gates."
         );
     }
     if schema_versions.contains(&1) {
@@ -466,7 +587,7 @@ struct RewardAuditData {
 
 fn print_reward_calibration(
     config: &MarketMakingResearchConfig,
-    estimated: &BTreeMap<(NaiveDate, String), Decimal>,
+    estimated_intervals: &[RewardEstimateInterval],
 ) -> Result<()> {
     if !config.reward_audit_file.exists() {
         println!(
@@ -481,7 +602,7 @@ fn print_reward_calibration(
             config.reward_audit_file.display()
         )
     })?);
-    let mut latest = BTreeMap::<(NaiveDate, String), (DateTime<Utc>, Decimal)>::new();
+    let mut snapshots = BTreeMap::<(NaiveDate, String), Vec<(DateTime<Utc>, Decimal)>>::new();
     for (line_number, line) in reader.lines().enumerate() {
         let line = line?;
         if line.trim().is_empty() {
@@ -496,24 +617,50 @@ fn print_reward_calibration(
         let data: RewardAuditData = serde_json::from_value(event["data"].clone())?;
         for market in data.markets {
             let key = (data.date, market.condition_id);
-            if latest.get(&key).is_none_or(|(seen, _)| timestamp > *seen) {
-                latest.insert(key, (timestamp, market.earnings_usdc));
-            }
+            snapshots
+                .entry(key)
+                .or_default()
+                .push((timestamp, market.earnings_usdc));
         }
     }
     let mut estimated_overlap = Decimal::ZERO;
     let mut actual_overlap = Decimal::ZERO;
     let mut rows = Vec::new();
-    for (key, estimate) in estimated {
-        if let Some((_, actual)) = latest.get(key) {
-            estimated_overlap += *estimate;
-            actual_overlap += *actual;
-            rows.push((&key.0, &key.1, *estimate, *actual));
+    for (key, values) in &mut snapshots {
+        values.sort_by_key(|(timestamp, _)| *timestamp);
+        let Some((first_at, first_value)) = values.first().copied() else {
+            continue;
+        };
+        let Some((last_at, last_value)) = values.last().copied() else {
+            continue;
+        };
+        if last_at <= first_at {
+            continue;
+        }
+        let estimate = estimated_intervals
+            .iter()
+            .filter(|interval| interval.date == key.0 && interval.condition_id == key.1)
+            .map(|interval| {
+                let overlap_start = interval.started_at.max(first_at);
+                let overlap_end = interval.ended_at.min(last_at);
+                let overlap_ms = overlap_end
+                    .signed_duration_since(overlap_start)
+                    .num_milliseconds()
+                    .max(0);
+                interval.estimated_daily_usdc * Decimal::from(overlap_ms)
+                    / Decimal::from(86_400_000_u64)
+            })
+            .sum::<Decimal>();
+        if estimate > Decimal::ZERO {
+            let actual = (last_value - first_value).max(Decimal::ZERO);
+            estimated_overlap += estimate;
+            actual_overlap += actual;
+            rows.push((&key.0, &key.1, estimate, actual));
         }
     }
     if estimated_overlap <= Decimal::ZERO {
         println!(
-            "reward_calibration: no overlapping date/market between shadow estimates and authenticated snapshots"
+            "reward_calibration: no interval with at least two authenticated snapshots overlapping shadow quotes"
         );
         return Ok(());
     }
@@ -545,7 +692,7 @@ fn print_reward_calibration(
         );
     }
     println!(
-        "Warning: capture ratio is meaningful only when authenticated canary orders mirror the shadow quote set; pure shadow quotes cannot earn rewards."
+        "Warning: actual rewards are snapshot deltas aligned to the same market/time interval; the ratio is meaningful only when authenticated canary orders mirror the shadow quote set. Pure shadow quotes cannot earn rewards."
     );
     Ok(())
 }
@@ -623,10 +770,13 @@ pub async fn run_shadow_maker(client: MarketMakingResearchClient) -> Result<()> 
     for selection in &selections {
         journal.record("market_selected", selection)?;
     }
+    let started_at = Utc::now();
     let mut states = selections
         .into_iter()
         .map(|selection| MarketState {
             selection,
+            active: true,
+            selected_at: started_at,
             last_quote_attempt_at: None,
             consecutive_book_errors: 0,
             consecutive_quote_rejections: 0,
@@ -642,7 +792,6 @@ pub async fn run_shadow_maker(client: MarketMakingResearchClient) -> Result<()> 
             quote_times: VecDeque::new(),
         })
         .collect::<Vec<_>>();
-    let started_at = Utc::now();
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
     let mut ticker = interval(Duration::from_secs(config.book_poll_secs));
@@ -674,9 +823,9 @@ pub async fn run_shadow_maker(client: MarketMakingResearchClient) -> Result<()> 
         }
 
         cooldowns.retain(|_, until| *until > now);
-        let selected_market_is_cooled = states
-            .iter()
-            .any(|state| cooldowns.contains_key(&state.selection.market.condition_id));
+        let selected_market_is_cooled = states.iter().any(|state| {
+            state.active && cooldowns.contains_key(&state.selection.market.condition_id)
+        });
         if selected_market_is_cooled
             || now.signed_duration_since(last_market_refresh).num_seconds()
                 >= i64::try_from(config.market_refresh_secs).unwrap_or(i64::MAX)
@@ -691,20 +840,24 @@ pub async fn run_shadow_maker(client: MarketMakingResearchClient) -> Result<()> 
             last_market_refresh = now;
         }
 
-        let requests = states.iter().enumerate().map(|(index, state)| {
-            let client = client.clone();
-            let yes_token = state.selection.market.yes_token_id.clone();
-            let no_token = state.selection.market.no_token_id.clone();
-            let condition_id = state.selection.market.condition_id.clone();
-            async move {
-                let (yes, no, trades) = tokio::join!(
-                    client.fetch_book(&yes_token),
-                    client.fetch_book(&no_token),
-                    client.fetch_market_trades(&condition_id)
-                );
-                (index, yes, no, trades)
-            }
-        });
+        let requests = states
+            .iter()
+            .enumerate()
+            .filter(|(_, state)| state.active || !state.pending.is_empty())
+            .map(|(index, state)| {
+                let client = client.clone();
+                let yes_token = state.selection.market.yes_token_id.clone();
+                let no_token = state.selection.market.no_token_id.clone();
+                let condition_id = state.selection.market.condition_id.clone();
+                async move {
+                    let (yes, no, trades) = tokio::join!(
+                        client.fetch_book(&yes_token),
+                        client.fetch_book(&no_token),
+                        client.fetch_market_trades(&condition_id)
+                    );
+                    (index, yes, no, trades)
+                }
+            });
         let books = stream::iter(requests)
             .buffer_unordered(config.request_concurrency)
             .collect::<Vec<_>>()
@@ -773,6 +926,9 @@ pub async fn run_shadow_maker(client: MarketMakingResearchClient) -> Result<()> 
                 &mut markout_count,
                 &mut error_count,
             )?;
+            if !state.active {
+                continue;
+            }
             if state.consecutive_negative_markouts >= config.max_consecutive_negative_markouts {
                 cool_down_market(
                     &state.selection.market.condition_id,
@@ -877,7 +1033,8 @@ pub async fn run_shadow_maker(client: MarketMakingResearchClient) -> Result<()> 
                             market = %state.selection.market.slug,
                             yes_bid = %quote.yes_bid,
                             no_bid = %quote.no_bid,
-                            size = %quote.size_shares,
+                            yes_size = %quote.yes_size_shares,
+                            no_size = %quote.no_size_shares,
                             reward_score = %quote.two_sided_reward_score,
                             visible_reward_share = %quote.estimated_visible_reward_share,
                             estimated_daily_reward = %quote.estimated_daily_liquidity_reward_usdc,
@@ -898,6 +1055,19 @@ pub async fn run_shadow_maker(client: MarketMakingResearchClient) -> Result<()> 
                         quote_count += 1;
                     }
                     Err(error) => {
+                        if error.to_string() == REWARD_BAND_INELIGIBLE_ERROR {
+                            state.consecutive_quote_rejections = 0;
+                            journal.record(
+                                "quote_ineligible",
+                                &json!({
+                                    "condition_id": state.selection.market.condition_id,
+                                    "reason": "outside_reward_scoring_band",
+                                    "base_distance": base_distance,
+                                    "inventory_net": inventory_net,
+                                }),
+                            )?;
+                            continue;
+                        }
                         error_count += 1;
                         state.consecutive_quote_rejections =
                             state.consecutive_quote_rejections.saturating_add(1);
@@ -921,6 +1091,12 @@ pub async fn run_shadow_maker(client: MarketMakingResearchClient) -> Result<()> 
                 }
             }
         }
+        states.retain(|state| {
+            state.active
+                || !state.pending.is_empty()
+                || state.virtual_yes_inventory > Decimal::ZERO
+                || state.virtual_no_inventory > Decimal::ZERO
+        });
     }
 
     let stopped_at = Utc::now();
@@ -1194,23 +1370,67 @@ async fn refresh_market_states(
     cooldowns: &HashMap<String, DateTime<Utc>>,
     journal: &ResearchJournal,
 ) -> Result<()> {
+    let config = client.config();
+    let now = Utc::now();
     let excluded = cooldowns.keys().cloned().collect::<HashSet<_>>();
-    let selections = client.discover_excluding(&excluded).await?;
-    client.start_book_stream(&selections);
+    let discovered = client.discover_excluding(&excluded).await?;
     let mut old = states
         .drain(..)
         .map(|state| (state.selection.market.condition_id.clone(), state))
         .collect::<HashMap<_, _>>();
+    let mut candidates = discovered
+        .into_iter()
+        .map(|selection| (selection.market.condition_id.clone(), selection))
+        .collect::<HashMap<_, _>>();
+    for (condition_id, state) in &old {
+        if state.active && !excluded.contains(condition_id) {
+            candidates
+                .entry(condition_id.clone())
+                .or_insert_with(|| state.selection.clone());
+        }
+    }
+    let residency = chrono::Duration::seconds(
+        i64::try_from(config.min_market_residency_secs).unwrap_or(i64::MAX),
+    );
+    let mut selections = candidates.into_values().collect::<Vec<_>>();
+    selections.sort_by(|left, right| {
+        let left_state = old.get(&left.market.condition_id);
+        let right_state = old.get(&right.market.condition_id);
+        let left_forced = left_state.is_some_and(|state| {
+            state.active && now.signed_duration_since(state.selected_at) < residency
+        });
+        let right_forced = right_state.is_some_and(|state| {
+            state.active && now.signed_duration_since(state.selected_at) < residency
+        });
+        let adjusted = |selection: &MarketSelection, incumbent: Option<&MarketState>| {
+            if incumbent.is_some_and(|state| state.active) {
+                selection.selection_score * (Decimal::ONE + config.replacement_score_margin)
+            } else {
+                selection.selection_score
+            }
+        };
+        right_forced
+            .cmp(&left_forced)
+            .then_with(|| adjusted(right, right_state).cmp(&adjusted(left, left_state)))
+    });
+    selections.truncate(config.max_markets);
+    client.start_book_stream(&selections);
     let mut refreshed = Vec::with_capacity(selections.len());
     for selection in selections {
         let condition_id = selection.market.condition_id.clone();
         if let Some(mut state) = old.remove(&condition_id) {
+            if !state.active {
+                state.selected_at = now;
+            }
+            state.active = true;
             state.selection = selection;
             refreshed.push(state);
         } else {
             journal.record("market_selected", &selection)?;
             refreshed.push(MarketState {
                 selection,
+                active: true,
+                selected_at: now,
                 last_quote_attempt_at: None,
                 consecutive_book_errors: 0,
                 consecutive_quote_rejections: 0,
@@ -1228,19 +1448,30 @@ async fn refresh_market_states(
         }
     }
     for (_, mut removed) in old {
-        cancel_open_quote(&mut removed, Utc::now(), journal, "market_rotated")?;
-        journal.record(
-            "market_removed",
-            &json!({
-                "condition_id": removed.selection.market.condition_id,
-                "abandoned_pending_markouts": removed.pending.len(),
-            }),
-        )?;
+        if removed.active {
+            cancel_open_quote(&mut removed, now, journal, "market_rotated")?;
+            removed.active = false;
+            journal.record(
+                "market_removed",
+                &json!({
+                    "condition_id": removed.selection.market.condition_id,
+                    "pending_markouts_retained": removed.pending.len(),
+                    "abandoned_pending_markouts": 0,
+                }),
+            )?;
+        }
+        if !removed.pending.is_empty()
+            || removed.virtual_yes_inventory > Decimal::ZERO
+            || removed.virtual_no_inventory > Decimal::ZERO
+        {
+            refreshed.push(removed);
+        }
     }
     journal.record(
         "market_refresh",
         &json!({
-            "active_markets": refreshed.len(),
+            "active_markets": refreshed.iter().filter(|state| state.active).count(),
+            "retired_markout_markets": refreshed.iter().filter(|state| !state.active).count(),
             "cooldown_markets": cooldowns.len(),
         }),
     )?;
@@ -1336,6 +1567,8 @@ fn config_summary(config: &MarketMakingResearchConfig) -> serde_json::Value {
         "book_poll_secs": config.book_poll_secs,
         "quote_interval_secs": config.quote_interval_secs,
         "market_refresh_secs": config.market_refresh_secs,
+        "min_market_residency_secs": config.min_market_residency_secs,
+        "replacement_score_margin": config.replacement_score_margin,
         "market_cooldown_secs": config.market_cooldown_secs,
         "max_consecutive_market_errors": config.max_consecutive_market_errors,
         "min_time_to_end_secs": config.min_time_to_end_secs,
@@ -1353,6 +1586,7 @@ fn config_summary(config: &MarketMakingResearchConfig) -> serde_json::Value {
         "min_independent_fill_samples": config.min_independent_fill_samples,
         "min_reward_capture_ratio": config.min_reward_capture_ratio,
         "target_reward_capture_ratio": config.target_reward_capture_ratio,
+        "reward_break_even_margin_ratio": config.reward_break_even_margin_ratio,
     });
     summary["canary_caps"] = json!({
         "max_markets": config.canary_max_markets,

@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 
 use super::config::MarketMakingResearchConfig;
 
+pub const REWARD_BAND_INELIGIBLE_ERROR: &str =
+    "the proposed two-sided quote is outside the reward scoring band";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BookLevel {
     pub price: Decimal,
@@ -99,6 +102,12 @@ pub struct ShadowQuote {
     pub yes_bid: Decimal,
     pub no_bid: Decimal,
     pub size_shares: Decimal,
+    /// Per-leg sizes after applying the worst-case inventory headroom. These
+    /// default to `size_shares` when reading legacy journal rows.
+    #[serde(default)]
+    pub yes_size_shares: Decimal,
+    #[serde(default)]
+    pub no_size_shares: Decimal,
     #[serde(default)]
     pub base_quote_half_spread: Decimal,
     #[serde(default = "default_true")]
@@ -133,6 +142,28 @@ pub struct ShadowQuote {
     pub no_rebate_if_filled: Decimal,
     pub initial_yes_mid: Decimal,
     pub initial_no_mid: Decimal,
+}
+
+impl ShadowQuote {
+    pub fn effective_yes_size_shares(&self) -> Decimal {
+        if self.yes_size_shares > Decimal::ZERO {
+            self.yes_size_shares
+        } else if self.yes_active {
+            self.size_shares
+        } else {
+            Decimal::ZERO
+        }
+    }
+
+    pub fn effective_no_size_shares(&self) -> Decimal {
+        if self.no_size_shares > Decimal::ZERO {
+            self.no_size_shares
+        } else if self.no_active {
+            self.size_shares
+        } else {
+            Decimal::ZERO
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -260,6 +291,9 @@ pub fn rank_candidates(
         .into_iter()
         .filter(|market| market.daily_reward_usdc >= config.min_daily_reward_usdc)
         .filter(|market| market.rewards_min_size <= config.max_rewards_min_size)
+        // If the minimum scoring size is larger than the hard inventory cap,
+        // this strategy cannot place even one reward-eligible leg safely.
+        .filter(|market| market.rewards_min_size <= config.max_inventory_shares)
         .filter(|market| market.liquidity_usdc >= config.min_liquidity_usdc)
         .filter(|market| {
             let required_volume = if market.fee_rate >= config.high_fee_threshold {
@@ -389,8 +423,17 @@ pub fn generate_shadow_quote_controlled(
             desired_distance + inventory_skew,
         )
     };
-    let yes_active = inventory_net < config.max_inventory_shares;
-    let no_active = inventory_net > -config.max_inventory_shares;
+    let desired_size_shares = config
+        .quote_size_shares
+        .max(selection.market.rewards_min_size);
+    // Cap each leg by the inventory remaining after its own worst-case fill.
+    // A YES fill increases net inventory while a NO fill decreases it.
+    let yes_size_shares =
+        desired_size_shares.min((config.max_inventory_shares - inventory_net).max(Decimal::ZERO));
+    let no_size_shares =
+        desired_size_shares.min((config.max_inventory_shares + inventory_net).max(Decimal::ZERO));
+    let yes_active = yes_size_shares > Decimal::ZERO;
+    let no_active = no_size_shares > Decimal::ZERO;
     let tick = selection.market.tick_size.max(dec!(0.001));
     let yes_bid = maker_bid(
         fair_yes,
@@ -408,31 +451,29 @@ pub fn generate_shadow_quote_controlled(
     )?;
     let yes_queue_ahead_shares = queue_ahead(yes_book, yes_bid);
     let no_queue_ahead_shares = queue_ahead(no_book, no_bid);
-    let size_shares = config
-        .quote_size_shares
-        .max(selection.market.rewards_min_size);
+    let size_shares = desired_size_shares;
     let yes_distance = (fair_yes - yes_bid).abs();
     let no_distance = (fair_no - no_bid).abs();
-    let yes_reward_score = if yes_active {
-        reward_score(reward_max_distance, yes_distance, size_shares)
+    let yes_reward_score = if yes_active && yes_size_shares >= selection.market.rewards_min_size {
+        reward_score(reward_max_distance, yes_distance, yes_size_shares)
     } else {
         Decimal::ZERO
     };
-    let no_reward_score = if no_active {
-        reward_score(reward_max_distance, no_distance, size_shares)
+    let no_reward_score = if no_active && no_size_shares >= selection.market.rewards_min_size {
+        reward_score(reward_max_distance, no_distance, no_size_shares)
     } else {
         Decimal::ZERO
     };
     let two_sided_reward_score = yes_reward_score.min(no_reward_score);
-    if (yes_active && yes_reward_score <= Decimal::ZERO)
-        || (no_active && no_reward_score <= Decimal::ZERO)
+    if (yes_active && yes_distance >= reward_max_distance)
+        || (no_active && no_distance >= reward_max_distance)
     {
-        bail!("the proposed two-sided quote is outside the reward scoring band");
+        bail!(REWARD_BAND_INELIGIBLE_ERROR);
     }
     let visible_yes_competition = visible_reward_score(yes_book, fair_yes, reward_max_distance);
     let visible_no_competition = visible_reward_score(no_book, fair_no, reward_max_distance);
     let visible_competition_reward_score = visible_yes_competition.min(visible_no_competition);
-    let estimated_visible_reward_share = if yes_active && no_active {
+    let estimated_visible_reward_share = if two_sided_reward_score > Decimal::ZERO {
         two_sided_reward_score
             / (two_sided_reward_score + visible_competition_reward_score)
                 .max(two_sided_reward_score)
@@ -446,13 +487,13 @@ pub fn generate_shadow_quote_controlled(
         selection.market.fee_exponent,
         yes_bid,
     ) * selection.market.maker_rebate_rate
-        * size_shares;
+        * yes_size_shares;
     let no_rebate_if_filled = fee_per_share(
         selection.market.fee_rate,
         selection.market.fee_exponent,
         no_bid,
     ) * selection.market.maker_rebate_rate
-        * size_shares;
+        * no_size_shares;
     Ok(ShadowQuote {
         quote_id: uuid::Uuid::new_v4().to_string(),
         condition_id: selection.market.condition_id.clone(),
@@ -464,6 +505,8 @@ pub fn generate_shadow_quote_controlled(
         yes_bid,
         no_bid,
         size_shares,
+        yes_size_shares,
+        no_size_shares,
         base_quote_half_spread,
         yes_active,
         no_active,
@@ -487,9 +530,7 @@ pub fn generate_shadow_quote_controlled(
         visible_competition_reward_score,
         estimated_visible_reward_share,
         estimated_daily_liquidity_reward_usdc,
-        quoted_capital_usdc: (if yes_active { yes_bid } else { Decimal::ZERO }
-            + if no_active { no_bid } else { Decimal::ZERO })
-            * size_shares,
+        quoted_capital_usdc: yes_bid * yes_size_shares + no_bid * no_size_shares,
         complete_set_discount_per_share: dec!(1) - yes_bid - no_bid,
         yes_rebate_if_filled,
         no_rebate_if_filled,
@@ -556,23 +597,25 @@ pub fn markout_observation(
     // it and enforcing the active window avoids optimistic duplicate fills.
     let yes_fill_proxy_shares = (yes_volume - quote.yes_queue_ahead_shares)
         .max(Decimal::ZERO)
-        .min(quote.size_shares);
+        .min(quote.effective_yes_size_shares());
     let no_fill_proxy_shares = (no_volume - quote.no_queue_ahead_shares)
         .max(Decimal::ZERO)
-        .min(quote.size_shares);
+        .min(quote.effective_no_size_shares());
     let yes_touched = yes_book_crossed || yes_fill_proxy_shares > Decimal::ZERO;
     let no_touched = no_book_crossed || no_fill_proxy_shares > Decimal::ZERO;
     let yes_markout = (yes_fill_proxy_shares > Decimal::ZERO).then_some(yes_mid - quote.yes_bid);
     let no_markout = (no_fill_proxy_shares > Decimal::ZERO).then_some(no_mid - quote.no_bid);
     let inventory_markout_usdc = yes_markout.unwrap_or_default() * yes_fill_proxy_shares
         + no_markout.unwrap_or_default() * no_fill_proxy_shares;
-    let yes_rebate = if quote.size_shares > Decimal::ZERO {
-        quote.yes_rebate_if_filled * yes_fill_proxy_shares / quote.size_shares
+    let yes_size_shares = quote.effective_yes_size_shares();
+    let no_size_shares = quote.effective_no_size_shares();
+    let yes_rebate = if yes_size_shares > Decimal::ZERO {
+        quote.yes_rebate_if_filled * yes_fill_proxy_shares / yes_size_shares
     } else {
         Decimal::ZERO
     };
-    let no_rebate = if quote.size_shares > Decimal::ZERO {
-        quote.no_rebate_if_filled * no_fill_proxy_shares / quote.size_shares
+    let no_rebate = if no_size_shares > Decimal::ZERO {
+        quote.no_rebate_if_filled * no_fill_proxy_shares / no_size_shares
     } else {
         Decimal::ZERO
     };
@@ -803,6 +846,8 @@ mod tests {
             book_poll_secs: 5,
             quote_interval_secs: 30,
             market_refresh_secs: 300,
+            min_market_residency_secs: 1800,
+            replacement_score_margin: dec!(0.15),
             market_cooldown_secs: 1800,
             max_consecutive_market_errors: 6,
             min_time_to_end_secs: 1800,
@@ -815,6 +860,7 @@ mod tests {
             min_independent_fill_samples: 100,
             min_reward_capture_ratio: dec!(0.01),
             target_reward_capture_ratio: dec!(0.05),
+            reward_break_even_margin_ratio: dec!(0.02),
             canary_max_markets: 2,
             canary_max_quote_notional_usdc: dec!(5),
             canary_max_inventory_usdc: dec!(10),
@@ -838,6 +884,8 @@ mod tests {
         assert!(quote.no_bid < dec!(0.52));
         assert!(quote.two_sided_reward_score > Decimal::ZERO);
         assert_eq!(quote.size_shares, dec!(20));
+        assert_eq!(quote.yes_size_shares, dec!(20));
+        assert_eq!(quote.no_size_shares, dec!(20));
         assert_eq!(quote.complete_set_discount_per_share, dec!(0.02));
     }
 
@@ -858,6 +906,33 @@ mod tests {
         assert!(quote.no_active);
         assert_eq!(quote.quote_mode, "no-only");
         assert_eq!(quote.estimated_visible_reward_share, Decimal::ZERO);
+    }
+
+    #[test]
+    fn inventory_headroom_sizes_each_leg_without_breaching_limit() {
+        let config = config();
+        let quote = generate_shadow_quote_controlled(
+            &selection(),
+            &book("1", dec!(0.48), dec!(0.52)),
+            &book("2", dec!(0.48), dec!(0.52)),
+            &config,
+            Utc::now(),
+            dec!(0.01),
+            dec!(30),
+        )
+        .unwrap();
+        assert_eq!(quote.yes_size_shares, dec!(10));
+        assert_eq!(quote.no_size_shares, dec!(20));
+        assert!(quote.inventory_net_before + quote.yes_size_shares <= config.max_inventory_shares);
+        assert!(quote.inventory_net_before - quote.no_size_shares >= -config.max_inventory_shares);
+        assert_eq!(quote.two_sided_reward_score, Decimal::ZERO);
+    }
+
+    #[test]
+    fn reward_market_larger_than_inventory_cap_is_filtered_out() {
+        let mut candidate = selection().market;
+        candidate.rewards_min_size = dec!(50);
+        assert!(rank_candidates(vec![candidate], &config()).is_empty());
     }
 
     #[test]

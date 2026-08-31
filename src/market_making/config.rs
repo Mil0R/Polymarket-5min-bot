@@ -46,6 +46,8 @@ pub struct MarketMakingResearchConfig {
     pub book_poll_secs: u64,
     pub quote_interval_secs: u64,
     pub market_refresh_secs: u64,
+    pub min_market_residency_secs: u64,
+    pub replacement_score_margin: Decimal,
     pub market_cooldown_secs: u64,
     pub max_consecutive_market_errors: u32,
     pub min_time_to_end_secs: u64,
@@ -58,6 +60,7 @@ pub struct MarketMakingResearchConfig {
     pub min_independent_fill_samples: usize,
     pub min_reward_capture_ratio: Decimal,
     pub target_reward_capture_ratio: Decimal,
+    pub reward_break_even_margin_ratio: Decimal,
     pub canary_max_markets: usize,
     pub canary_max_quote_notional_usdc: Decimal,
     pub canary_max_inventory_usdc: Decimal,
@@ -133,6 +136,11 @@ impl MarketMakingResearchConfig {
             book_poll_secs: parse("MARKET_MAKING_BOOK_POLL_SECS", "5")?,
             quote_interval_secs: parse("MARKET_MAKING_QUOTE_INTERVAL_SECS", "30")?,
             market_refresh_secs: parse("MARKET_MAKING_MARKET_REFRESH_SECS", "300")?,
+            min_market_residency_secs: parse("MARKET_MAKING_MIN_MARKET_RESIDENCY_SECS", "1800")?,
+            replacement_score_margin: decimal_env(
+                "MARKET_MAKING_REPLACEMENT_SCORE_MARGIN",
+                dec!(0.15),
+            )?,
             market_cooldown_secs: parse("MARKET_MAKING_MARKET_COOLDOWN_SECS", "1800")?,
             max_consecutive_market_errors: parse(
                 "MARKET_MAKING_MAX_CONSECUTIVE_MARKET_ERRORS",
@@ -159,6 +167,10 @@ impl MarketMakingResearchConfig {
             target_reward_capture_ratio: decimal_env(
                 "MARKET_MAKING_TARGET_REWARD_CAPTURE_RATIO",
                 dec!(0.05),
+            )?,
+            reward_break_even_margin_ratio: decimal_env(
+                "MARKET_MAKING_REWARD_BREAK_EVEN_MARGIN_RATIO",
+                dec!(0.02),
             )?,
             canary_max_markets: parse("MARKET_MAKING_CANARY_MAX_MARKETS", "2")?,
             canary_max_quote_notional_usdc: decimal_env(
@@ -305,10 +317,17 @@ impl MarketMakingResearchConfig {
         }
         if self.market_refresh_secs < self.quote_interval_secs
             || self.market_refresh_secs > 86_400
+            || self.min_market_residency_secs < self.market_refresh_secs
+            || self.min_market_residency_secs > 604_800
             || self.market_cooldown_secs < self.market_refresh_secs
             || self.market_cooldown_secs > 604_800
         {
             bail!("maker market refresh/cooldown intervals are invalid");
+        }
+        if self.replacement_score_margin < Decimal::ZERO
+            || self.replacement_score_margin > Decimal::ONE
+        {
+            bail!("MARKET_MAKING_REPLACEMENT_SCORE_MARGIN must be in [0, 1]");
         }
         if self.max_consecutive_market_errors == 0 || self.max_consecutive_market_errors > 1_000 {
             bail!("MARKET_MAKING_MAX_CONSECUTIVE_MARKET_ERRORS must be in [1, 1000]");
@@ -330,8 +349,10 @@ impl MarketMakingResearchConfig {
         if self.min_reward_capture_ratio < Decimal::ZERO
             || self.target_reward_capture_ratio <= self.min_reward_capture_ratio
             || self.target_reward_capture_ratio > Decimal::ONE
+            || self.reward_break_even_margin_ratio < Decimal::ZERO
+            || self.reward_break_even_margin_ratio > Decimal::ONE
         {
-            bail!("maker reward capture ratios require 0 <= minimum < target <= 1");
+            bail!("maker reward capture ratios require 0 <= minimum < target <= 1 and a margin in [0, 1]");
         }
         if self.canary_max_markets == 0
             || self.canary_max_markets > 3
