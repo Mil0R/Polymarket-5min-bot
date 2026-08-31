@@ -156,6 +156,15 @@ interactive TUI terminal.
 
 See [the Chinese stage guide](docs/STRATEGY_DEVELOPMENT_STAGES.zh-CN.md) for the
 strategy/data compatibility matrix, commands, result paths, and promotion gates.
+
+Short-Duration Digital Fair Value supports an offline probability/Taker-cost
+replay and an independent public-data-only dry run. The live runner is locked to
+the 10-second checkpoint selected by validation and out-of-sample replay:
+
+```bash
+cargo run --release --bin short_duration_digital_fair_value -- backtest
+cargo run --release --bin short_duration_digital_fair_value -- dry-run
+```
 The canonical strategy names, legacy aliases, Rust modules, executables, and
 result directories are recorded in
 [the strategy naming guide](docs/STRATEGY_NAMING.zh-CN.md).

@@ -9,6 +9,7 @@
 |---|---|---:|---:|---:|
 | Binary Complement Arbitrage | `binary_complement_arbitrage` | 支持 | 支持 | `polypulse`，通过准入后 |
 | Late-Resolution Winner Trading | `late_resolution_winner_trading` | 支持，但受 TWAP/费用字段限制 | 支持 | `polypulse`，通过准入后 |
+| Short-Duration Digital Fair Value | `short_duration_digital_fair_value` | 支持方向、概率校准和 Taker 成本情景回测 | 支持；强制只读且锁定已通过的 10 秒检查点 | 尚未接入 |
 | Wallet-Copy Trading | `wallet_copy_trading` | 不支持：数据没有钱包逐笔交易、持仓与跟随时延 | 支持 | 当前仍禁用，等待账户级共享资金/订单归属账本 |
 | Market Making | `market_making` | 不支持：数据没有历史奖励参数、队列位置及可靠逐笔成交 | `scan` / `shadow` | 当前为只读研究策略，没有真实下单器 |
 | Cross-Market Probability Arbitrage | `cross_market_probability_arbitrage` | 不支持：BTC 5m 数据没有父子市场关系图和同步跨市场盘口 | `scan` / `shadow` | 当前为只读研究策略，没有真实下单器 |
@@ -23,6 +24,7 @@
 ```bash
 cargo build --release --bin binary_complement_arbitrage
 cargo build --release --bin late_resolution_winner_trading
+cargo build --release --bin short_duration_digital_fair_value
 cargo build --release --bin wallet_copy_trading
 cargo build --release --bin market_making
 cargo build --release --bin cross_market_probability_arbitrage
@@ -40,6 +42,7 @@ cargo build --release --bin polypulse
 ./target/release/polybacktest_downloader sync
 ./target/release/binary_complement_arbitrage backtest
 ./target/release/late_resolution_winner_trading backtest
+./target/release/short_duration_digital_fair_value backtest
 ```
 
 回放只以只读方式打开 SQLite，不初始化网络客户端、签名器或账户。两个策略每轮都使用独立目录：
@@ -53,7 +56,22 @@ results/backtests/late-resolution-winner-trading/run-YYYYMMDDTHHMMSSZ-<uuid>/
 ├── run.log
 ├── report.json
 └── analysis.zh-CN.md
+results/backtests/short-duration-digital-fair-value/run-YYYYMMDDTHHMMSSZ-<uuid>/
+├── run.log
+├── report.json
+└── analysis.zh-CN.md
 ```
+
+Short-Duration Digital Fair Value 在多个剩余时间检查点，以窗口开始附近的首个
+Chainlink TWAP observation 为 Price to Beat，并通过最终 TWAP 与 confirmed winner
+审计该映射；模型使用当时之前的 TWAP 变化估计短期波动率，输出方向准确率、
+Brier Score、Log Loss，并与同一时点的市场隐含概率比较。成本层使用延迟后的完整 L2
+逐档成交、动态费用假设和流动性折扣；每个检查点/执行情景在一个市场最多产生一笔仓位。
+准入仅使用按时间排序最后 20% 的样本外数据；成本检查点必须先在验证集为正，再在
+测试集为正，不能事后从测试集挑选盈利窗口。只有方向质量和至少一个最保守成本情景同时达到门槛，报告才会给出
+`READY_FOR_DRY_RUN_REVIEW`。独立 `dry-run` 使用公开 Gamma、RTDS 和 CLOB 数据，不构造
+私钥、API 凭据、签名器或交易客户端；当前只允许全量回测通过的剩余 10 秒检查点，其他
+检查点 fail-closed。
 
 报告同时包含候选、模型准入、模拟成交、胜负、毛收益、费用、净收益以及按原因聚合的
 `rejections` 漏斗，便于不同参数轮次做回归对比。
@@ -88,6 +106,11 @@ BINARY_COMPLEMENT_ARBITRAGE_BACKTEST_MAX_SLIPPAGE_PER_SHARE=0.01
 BINARY_COMPLEMENT_ARBITRAGE_BACKTEST_MAX_ONE_SIDED_RATE=0.01
 LATE_RESOLUTION_WINNER_TRADING_BACKTEST_DELAYS_MS=100,250,500,1000
 LATE_RESOLUTION_WINNER_TRADING_BACKTEST_LIQUIDITY_HAIRCUTS=0.50,0.75,1.0
+SHORT_DURATION_DIGITAL_FAIR_VALUE_CHECKPOINTS_SECS=240,180,120,60,30,10
+SHORT_DURATION_DIGITAL_FAIR_VALUE_BACKTEST_DELAYS_MS=100,250,500,1000
+SHORT_DURATION_DIGITAL_FAIR_VALUE_BACKTEST_LIQUIDITY_HAIRCUTS=0.50,0.75,1.0
+SHORT_DURATION_DIGITAL_FAIR_VALUE_BACKTEST_FEE_RATE=0.07
+SHORT_DURATION_DIGITAL_FAIR_VALUE_BACKTEST_FEE_EXPONENT=1
 BACKTEST_PROGRESS_EVERY_MARKETS=100
 BACKTEST_MARKET_OFFSET=0
 BACKTEST_MAX_MARKETS=0
@@ -108,6 +131,19 @@ BACKTEST_MAX_MARKETS=0
 5. 只有在保守成本下仍有稳定样本，才进入服务器 dry-run。
 
 ## 第二阶段：服务器真实行情 dry-run
+
+Short-Duration Digital Fair Value 独立运行：
+
+```bash
+./target/release/short_duration_digital_fair_value dry-run
+```
+
+它只在剩余 10 秒内比较模型概率与可成交 ask，候选通过后等待配置的 1000ms，再读取公开
+REST 完整盘口，按 50% 深度折扣逐档模拟成交。控制台和日志仅记录启动、机会、Shadow
+成交、结算及异常；所有机会、延迟后拒绝、成交和最终 0/1 PnL 追加写入
+`results/short-duration-digital-fair-value/paper/events.ndjson`。如果进程在等待结算期间退出，
+已写入的 Shadow 成交不会丢失，但当前版本不会在重启后自动恢复其在线结算任务，事后分析
+应按 slug 补查 winner。
 
 Binary Complement 的 PAPER 执行在第二腿全部或部分失败时，会等待配置的退出延迟，重新读取第一腿 bid，
 并按 FOK 尝试卖回未配对 shares。完整回卖会释放 `unmatched_cost`，同时累计已实现的

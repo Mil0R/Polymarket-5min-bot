@@ -29,6 +29,14 @@ pub struct ChainlinkTwapStore {
     samples: RwLock<HashMap<String, VecDeque<TwapSample>>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FairValueTwapSnapshot {
+    pub opening: Decimal,
+    pub current: Decimal,
+    pub observed_at_ms: i64,
+    pub volatility_bps_per_sqrt_second: f64,
+}
+
 impl ChainlinkTwapStore {
     pub fn ingest(&self, symbol: &str, sample: TwapSample) {
         if sample.value <= dec!(0) || sample.observed_at_ms <= 0 {
@@ -54,6 +62,51 @@ impl ChainlinkTwapStore {
         {
             samples.pop_front();
         }
+    }
+
+    /// Read-only state for independent fair-value research. The opening sample
+    /// must be close to the window boundary and every volatility observation is
+    /// known by `now_ms`; callers cannot obtain future samples through this API.
+    pub fn fair_value_snapshot(
+        &self,
+        asset: &str,
+        window_start_ms: i64,
+        now_ms: i64,
+        opening_max_skew_ms: i64,
+        max_feed_age_ms: i64,
+        volatility_lookback_secs: u64,
+        min_observations: usize,
+        min_volatility_bps_per_sqrt_second: f64,
+    ) -> Option<FairValueTwapSnapshot> {
+        let asset = normalize_asset(asset);
+        let all = self.samples.read().ok()?;
+        let samples = all.get(&asset)?;
+        let current = samples.back().copied()?;
+        let age_ms = now_ms.checked_sub(current.observed_at_ms)?;
+        if age_ms < 0 || age_ms > max_feed_age_ms {
+            return None;
+        }
+        let opening = samples
+            .iter()
+            .filter(|sample| (sample.observed_at_ms - window_start_ms).abs() <= opening_max_skew_ms)
+            .min_by_key(|sample| (sample.observed_at_ms - window_start_ms).abs())
+            .copied()?;
+        let cutoff = now_ms - i64::try_from(volatility_lookback_secs).ok()? * 1_000;
+        let history = samples
+            .iter()
+            .copied()
+            .filter(|sample| sample.observed_at_ms >= cutoff)
+            .collect::<Vec<_>>();
+        if history.len() < min_observations {
+            return None;
+        }
+        Some(FairValueTwapSnapshot {
+            opening: opening.value,
+            current: current.value,
+            observed_at_ms: current.observed_at_ms,
+            volatility_bps_per_sqrt_second: volatility_bps_per_sqrt_second(&history)
+                .max(min_volatility_bps_per_sqrt_second),
+        })
     }
 
     pub fn evaluate(&self, input: WinnerModelInput, policy: WinnerModelPolicy) -> ModelEvaluation {
@@ -492,6 +545,30 @@ fn normal_cdf(value: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fair_value_snapshot_is_past_only_and_uses_window_opening() {
+        let store = ChainlinkTwapStore::default();
+        for second in 0..30 {
+            store.ingest(
+                "btc",
+                TwapSample {
+                    observed_at_ms: 1_000_000 + second * 1_000,
+                    value: dec!(100) + Decimal::from(second) / dec!(100),
+                },
+            );
+        }
+        let snapshot = store
+            .fair_value_snapshot("btc", 1_000_000, 1_029_000, 1_000, 2_000, 30, 20, 0.1)
+            .unwrap();
+        assert_eq!(snapshot.opening, dec!(100));
+        assert_eq!(snapshot.current, dec!(100.29));
+        assert_eq!(snapshot.observed_at_ms, 1_029_000);
+        assert!(snapshot.volatility_bps_per_sqrt_second >= 0.1);
+        assert!(store
+            .fair_value_snapshot("btc", 1_000_000, 1_040_000, 1_000, 2_000, 30, 20, 0.1)
+            .is_none());
+    }
 
     fn policy() -> WinnerModelPolicy {
         WinnerModelPolicy {

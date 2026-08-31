@@ -46,6 +46,7 @@ pub use proxy_relay::{
 };
 
 pub mod cross_market_probability_arbitrage;
+pub mod digital_fair_value;
 pub mod market_making;
 pub mod merge;
 pub mod polybacktest;
