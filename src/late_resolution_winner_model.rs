@@ -1,5 +1,6 @@
 //! Independent Late-Resolution Winner Trading model based on Polymarket's official Chainlink TWAP feed.
 
+use chrono::Utc;
 use futures::{SinkExt, StreamExt};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
@@ -11,12 +12,27 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
+use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::runtime_metrics::RuntimeMetrics;
 
 const HISTORY_MILLIS: i64 = 10 * 60 * 1_000;
+// RTDS publisher timestamps have been observed a few seconds ahead of the
+// local host clock. Samples are already known when received, so tolerate a
+// small bounded publisher-clock skew while continuing to reject implausibly
+// future-dated data.
+const MAX_FUTURE_CLOCK_SKEW_MS: i64 = 10_000;
+
+fn effective_sample_age_ms(now_ms: i64, observed_at_ms: i64) -> Option<i64> {
+    let age_ms = now_ms.checked_sub(observed_at_ms)?;
+    if age_ms < -MAX_FUTURE_CLOCK_SKEW_MS {
+        None
+    } else {
+        Some(age_ms.max(0))
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TwapSample {
@@ -35,6 +51,27 @@ pub struct FairValueTwapSnapshot {
     pub current: Decimal,
     pub observed_at_ms: i64,
     pub volatility_bps_per_sqrt_second: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FairValueSnapshotReadiness {
+    Ready(FairValueTwapSnapshot),
+    NoPriceHistory,
+    StaleFeed,
+    NoOpeningReference,
+    InsufficientObservations,
+}
+
+impl FairValueSnapshotReadiness {
+    pub fn reason(self) -> Option<&'static str> {
+        match self {
+            Self::Ready(_) => None,
+            Self::NoPriceHistory => Some("no_price_history"),
+            Self::StaleFeed => Some("stale_feed"),
+            Self::NoOpeningReference => Some("no_opening_reference"),
+            Self::InsufficientObservations => Some("insufficient_observations"),
+        }
+    }
 }
 
 impl ChainlinkTwapStore {
@@ -67,6 +104,7 @@ impl ChainlinkTwapStore {
     /// Read-only state for independent fair-value research. The opening sample
     /// must be close to the window boundary and every volatility observation is
     /// known by `now_ms`; callers cannot obtain future samples through this API.
+    #[allow(dead_code)]
     pub fn fair_value_snapshot(
         &self,
         asset: &str,
@@ -78,35 +116,85 @@ impl ChainlinkTwapStore {
         min_observations: usize,
         min_volatility_bps_per_sqrt_second: f64,
     ) -> Option<FairValueTwapSnapshot> {
-        let asset = normalize_asset(asset);
-        let all = self.samples.read().ok()?;
-        let samples = all.get(&asset)?;
-        let current = samples.back().copied()?;
-        let age_ms = now_ms.checked_sub(current.observed_at_ms)?;
-        if age_ms < 0 || age_ms > max_feed_age_ms {
-            return None;
+        match self.fair_value_snapshot_readiness(
+            asset,
+            window_start_ms,
+            now_ms,
+            opening_max_skew_ms,
+            max_feed_age_ms,
+            volatility_lookback_secs,
+            min_observations,
+            min_volatility_bps_per_sqrt_second,
+        ) {
+            FairValueSnapshotReadiness::Ready(snapshot) => Some(snapshot),
+            _ => None,
         }
-        let opening = samples
+    }
+
+    pub fn fair_value_snapshot_readiness(
+        &self,
+        asset: &str,
+        window_start_ms: i64,
+        now_ms: i64,
+        opening_max_skew_ms: i64,
+        max_feed_age_ms: i64,
+        volatility_lookback_secs: u64,
+        min_observations: usize,
+        min_volatility_bps_per_sqrt_second: f64,
+    ) -> FairValueSnapshotReadiness {
+        let asset = normalize_asset(asset);
+        let Ok(all) = self.samples.read() else {
+            return FairValueSnapshotReadiness::NoPriceHistory;
+        };
+        let Some(samples) = all.get(&asset) else {
+            return FairValueSnapshotReadiness::NoPriceHistory;
+        };
+        let Some(current) = samples.back().copied() else {
+            return FairValueSnapshotReadiness::NoPriceHistory;
+        };
+        let Some(age_ms) = effective_sample_age_ms(now_ms, current.observed_at_ms) else {
+            return FairValueSnapshotReadiness::StaleFeed;
+        };
+        if age_ms > max_feed_age_ms {
+            return FairValueSnapshotReadiness::StaleFeed;
+        }
+        let Some(opening) = samples
             .iter()
             .filter(|sample| (sample.observed_at_ms - window_start_ms).abs() <= opening_max_skew_ms)
             .min_by_key(|sample| (sample.observed_at_ms - window_start_ms).abs())
-            .copied()?;
-        let cutoff = now_ms - i64::try_from(volatility_lookback_secs).ok()? * 1_000;
+            .copied()
+        else {
+            return FairValueSnapshotReadiness::NoOpeningReference;
+        };
+        let Ok(lookback_ms) = i64::try_from(volatility_lookback_secs) else {
+            return FairValueSnapshotReadiness::InsufficientObservations;
+        };
+        let cutoff = now_ms - lookback_ms * 1_000;
         let history = samples
             .iter()
             .copied()
             .filter(|sample| sample.observed_at_ms >= cutoff)
             .collect::<Vec<_>>();
         if history.len() < min_observations {
-            return None;
+            return FairValueSnapshotReadiness::InsufficientObservations;
         }
-        Some(FairValueTwapSnapshot {
+        FairValueSnapshotReadiness::Ready(FairValueTwapSnapshot {
             opening: opening.value,
             current: current.value,
             observed_at_ms: current.observed_at_ms,
             volatility_bps_per_sqrt_second: volatility_bps_per_sqrt_second(&history)
                 .max(min_volatility_bps_per_sqrt_second),
         })
+    }
+
+    pub fn latest_observed_at_ms(&self, asset: &str) -> Option<i64> {
+        let asset = normalize_asset(asset);
+        self.samples
+            .read()
+            .ok()?
+            .get(&asset)?
+            .back()
+            .map(|sample| sample.observed_at_ms)
     }
 
     pub fn evaluate(&self, input: WinnerModelInput, policy: WinnerModelPolicy) -> ModelEvaluation {
@@ -118,8 +206,10 @@ impl ChainlinkTwapStore {
         let Some(current) = samples.back().copied() else {
             return ModelEvaluation::rejected(ModelRejection::NoPriceHistory);
         };
-        let age_ms = input.now_ms.saturating_sub(current.observed_at_ms);
-        if age_ms < 0 || age_ms > policy.max_feed_age_ms {
+        let Some(age_ms) = effective_sample_age_ms(input.now_ms, current.observed_at_ms) else {
+            return ModelEvaluation::rejected(ModelRejection::StalePrice);
+        };
+        if age_ms > policy.max_feed_age_ms {
             return ModelEvaluation::rejected(ModelRejection::StalePrice);
         }
         let Some(open) = samples
@@ -375,8 +465,13 @@ pub async fn run_chainlink_twap_feed(
     metrics: Arc<RuntimeMetrics>,
 ) {
     while !shutdown.load(Ordering::Relaxed) {
-        match tokio_tungstenite::connect_async(&url).await {
-            Ok((mut socket, _)) => {
+        match timeout(
+            Duration::from_secs(10),
+            tokio_tungstenite::connect_async(&url),
+        )
+        .await
+        {
+            Ok(Ok((mut socket, _))) => {
                 metrics.record_late_resolution_winner_trading_rtds_connection();
                 let subscription = serde_json::json!({
                     "action": "subscribe",
@@ -445,9 +540,13 @@ pub async fn run_chainlink_twap_feed(
                     }
                 }
             }
-            Err(error) => {
+            Ok(Err(error)) => {
                 metrics.record_late_resolution_winner_trading_rtds_connect_failure();
                 warn!(%error, "Chainlink TWAP feed connection failed");
+            }
+            Err(_) => {
+                metrics.record_late_resolution_winner_trading_rtds_connect_failure();
+                warn!(url = %url, "Chainlink TWAP feed connection timed out");
             }
         }
         if !shutdown.load(Ordering::Relaxed) {
@@ -483,6 +582,13 @@ fn ingest_rtds_message(store: &ChainlinkTwapStore, metrics: &RuntimeMetrics, tex
             })
         });
     if let Some(value) = price {
+        trace!(
+            symbol,
+            observed_at_ms,
+            received_at_ms = Utc::now().timestamp_millis(),
+            age_ms = Utc::now().timestamp_millis().saturating_sub(observed_at_ms),
+            "Received Chainlink TWAP observation"
+        );
         metrics.record_late_resolution_winner_trading_rtds_observation(observed_at_ms);
         store.ingest(
             symbol,
@@ -672,6 +778,80 @@ mod tests {
                 )
                 .rejection,
             Some(ModelRejection::StalePrice)
+        );
+    }
+
+    #[test]
+    fn fair_value_readiness_explains_missing_stale_and_insufficient_data() {
+        let store = ChainlinkTwapStore::default();
+        let readiness = |window_start_ms, now_ms, max_age_ms, minimum| {
+            store.fair_value_snapshot_readiness(
+                "btc",
+                window_start_ms,
+                now_ms,
+                100,
+                max_age_ms,
+                120,
+                minimum,
+                0.8,
+            )
+        };
+        assert_eq!(
+            readiness(1_000, 2_000, 5_000, 2),
+            FairValueSnapshotReadiness::NoPriceHistory
+        );
+        store.ingest(
+            "btc",
+            TwapSample {
+                observed_at_ms: 1_000,
+                value: dec!(100),
+            },
+        );
+        store.ingest(
+            "btc",
+            TwapSample {
+                observed_at_ms: 2_000,
+                value: dec!(100.01),
+            },
+        );
+        assert_eq!(
+            readiness(1_000, 2_000, 5_000, 3),
+            FairValueSnapshotReadiness::InsufficientObservations
+        );
+        assert_eq!(
+            readiness(50_000, 2_000, 5_000, 2),
+            FairValueSnapshotReadiness::NoOpeningReference
+        );
+        assert_eq!(
+            readiness(1_000, 10_000, 100, 2),
+            FairValueSnapshotReadiness::StaleFeed
+        );
+        assert!(matches!(
+            readiness(1_000, 2_000, 5_000, 2),
+            FairValueSnapshotReadiness::Ready(_)
+        ));
+    }
+
+    #[test]
+    fn tolerates_bounded_rtds_publisher_clock_skew_but_rejects_far_future_samples() {
+        let store = ChainlinkTwapStore::default();
+        for index in 0..5_i64 {
+            store.ingest(
+                "btc",
+                TwapSample {
+                    observed_at_ms: 10_000 + index * 1_000,
+                    value: dec!(100) + Decimal::from(index) / dec!(100),
+                },
+            );
+        }
+
+        assert!(matches!(
+            store.fair_value_snapshot_readiness("btc", 10_000, 10_000, 1_000, 5_000, 120, 5, 0.8,),
+            FairValueSnapshotReadiness::Ready(_)
+        ));
+        assert_eq!(
+            store.fair_value_snapshot_readiness("btc", 10_000, 3_999, 1_000, 5_000, 120, 5, 0.8,),
+            FairValueSnapshotReadiness::StaleFeed
         );
     }
 

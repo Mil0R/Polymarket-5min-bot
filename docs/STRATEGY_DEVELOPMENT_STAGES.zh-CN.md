@@ -169,6 +169,13 @@ REST 完整盘口，按 50% 深度折扣逐档模拟成交。控制台和日志�
 已写入的 Shadow 成交不会丢失，但当前版本不会在重启后自动恢复其在线结算任务，事后分析
 应按 slug 补查 winner。
 
+独立 binary 强制把文本日志写入 `SHORT_DURATION_DIGITAL_FAIR_VALUE_LOG_FILE`，不会继续沿用
+TUI 的全局 `LOG_FILE`。启动时等待新鲜 RTDS 样本并输出 readiness；若在窗口中途启动，会明确
+标记首个窗口为 opening-reference 预热窗口。最后 10 秒内，WebSocket 盘口缺失、单边或过期时，
+程序按 `SHORT_DURATION_DIGITAL_FAIR_VALUE_REST_FALLBACK_COOLDOWN_MS` 限频读取公共 REST 双边盘口，
+不会降低 spread、深度、价格或净边际阈值。每个窗口追加一条 `window_summary`，包含模型数据、
+盘口、edge、REST fallback、延迟后拒绝、模拟成交及每市场最终原因，便于无机会时定位漏斗。
+
 Binary Complement 的 PAPER 执行在第二腿全部或部分失败时，会等待配置的退出延迟，重新读取第一腿 bid，
 并按 FOK 尝试卖回未配对 shares。完整回卖会释放 `unmatched_cost`，同时累计已实现的
 `emergency_unwind_pnl`；盘口不足时仍保留单腿敞口，不能把紧急退出假设成必然成交。

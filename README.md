@@ -159,7 +159,10 @@ strategy/data compatibility matrix, commands, result paths, and promotion gates.
 
 Short-Duration Digital Fair Value supports an offline probability/Taker-cost
 replay and an independent public-data-only dry run. The live runner is locked to
-the 10-second checkpoint selected by validation and out-of-sample replay:
+the 10-second checkpoint selected by validation and out-of-sample replay. Its
+standalone log is isolated from the TUI system log, stale/incomplete WebSocket
+books use a rate-limited public REST fallback, and each window writes an
+auditable rejection/fill summary:
 
 ```bash
 cargo run --release --bin short_duration_digital_fair_value -- backtest

@@ -24,11 +24,12 @@ use tokio::time::{sleep, timeout};
 use tracing::{info, warn};
 
 use crate::late_resolution_winner_model::{
-    run_chainlink_twap_feed, ChainlinkTwapStore, FairValueTwapSnapshot,
+    run_chainlink_twap_feed, ChainlinkTwapStore, FairValueSnapshotReadiness, FairValueTwapSnapshot,
 };
 use crate::market::{MarketDiscoverer, MarketInfo};
 use crate::monitor::OrderBookMonitor;
 use crate::runtime_metrics::RuntimeMetrics;
+use crate::trading::executor::WinnerBookTop;
 
 #[derive(Debug, Clone)]
 struct Config {
@@ -334,6 +335,8 @@ struct DryRunConfig {
     symbols: Vec<String>,
     checkpoint_secs: i64,
     scan_interval_ms: u64,
+    feed_ready_timeout_secs: u64,
+    rest_fallback_cooldown_ms: i64,
     execution_delay_ms: u64,
     max_book_age_ms: i64,
     max_feed_age_ms: i64,
@@ -397,6 +400,14 @@ impl DryRunConfig {
                 "SHORT_DURATION_DIGITAL_FAIR_VALUE_DRY_RUN_SCAN_INTERVAL_MS",
                 100,
             )?,
+            feed_ready_timeout_secs: env_parse(
+                "SHORT_DURATION_DIGITAL_FAIR_VALUE_FEED_READY_TIMEOUT_SECS",
+                15,
+            )?,
+            rest_fallback_cooldown_ms: env_parse(
+                "SHORT_DURATION_DIGITAL_FAIR_VALUE_REST_FALLBACK_COOLDOWN_MS",
+                1_000,
+            )?,
             execution_delay_ms: env_parse(
                 "SHORT_DURATION_DIGITAL_FAIR_VALUE_DRY_RUN_EXECUTION_DELAY_MS",
                 1_000,
@@ -438,6 +449,10 @@ impl DryRunConfig {
         if config.symbols.is_empty()
             || config.checkpoint_secs != 10
             || config.scan_interval_ms < 25
+            || config.feed_ready_timeout_secs == 0
+            || config.feed_ready_timeout_secs > 120
+            || config.rest_fallback_cooldown_ms < 250
+            || config.rest_fallback_cooldown_ms > 10_000
             || config.execution_delay_ms > 30_000
             || config.max_book_age_ms <= 0
             || config.max_feed_age_ms <= 0
@@ -455,6 +470,8 @@ impl DryRunConfig {
 #[derive(Debug, Deserialize)]
 struct LiveRestBook {
     #[serde(default)]
+    bids: Vec<LiveRestLevel>,
+    #[serde(default)]
     asks: Vec<LiveRestLevel>,
 }
 
@@ -462,6 +479,53 @@ struct LiveRestBook {
 struct LiveRestLevel {
     price: String,
     size: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LiveBookTop {
+    bid: Option<f64>,
+    ask: Option<f64>,
+    ask_size: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct DryRunWindowStats {
+    scan_ticks: u64,
+    market_evaluations: u64,
+    opportunities: u64,
+    shadow_rejections: u64,
+    shadow_fills: u64,
+    rest_fallback_attempts: u64,
+    rest_fallback_successes: u64,
+    rest_latency_samples: u64,
+    rest_latency_total_ms: u64,
+    rest_latency_max_ms: u64,
+    #[serde(default)]
+    rejection_counts: BTreeMap<String, u64>,
+    #[serde(default)]
+    terminal_reason_by_market: BTreeMap<String, String>,
+}
+
+impl DryRunWindowStats {
+    fn reject(&mut self, slug: &str, reason: &str) {
+        *self.rejection_counts.entry(reason.to_string()).or_default() += 1;
+        self.terminal_reason_by_market
+            .insert(slug.to_string(), reason.to_string());
+    }
+
+    fn record_rest_latency(&mut self, latency_ms: u64) {
+        self.rest_latency_samples = self.rest_latency_samples.saturating_add(1);
+        self.rest_latency_total_ms = self.rest_latency_total_ms.saturating_add(latency_ms);
+        self.rest_latency_max_ms = self.rest_latency_max_ms.max(latency_ms);
+    }
+
+    fn average_rest_latency_ms(&self) -> f64 {
+        if self.rest_latency_samples == 0 {
+            0.0
+        } else {
+            self.rest_latency_total_ms as f64 / self.rest_latency_samples as f64
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -498,14 +562,13 @@ impl EventJournal {
 /// constructed anywhere in this path.
 pub async fn run_dry_run() -> Result<()> {
     let config = DryRunConfig::from_env()?;
+    let run_started_ms = Utc::now().timestamp_millis();
     std::env::set_var("DRY_RUN", "true");
-    if std::env::var_os("LOG_FILE").is_none() {
-        std::env::set_var(
-            "LOG_FILE",
-            std::env::var("SHORT_DURATION_DIGITAL_FAIR_VALUE_LOG_FILE")
-                .unwrap_or_else(|_| "logs/short-duration-digital-fair-value.log".to_string()),
-        );
-    }
+    std::env::set_var(
+        "LOG_FILE",
+        std::env::var("SHORT_DURATION_DIGITAL_FAIR_VALUE_LOG_FILE")
+            .unwrap_or_else(|_| "logs/short-duration-digital-fair-value.log".to_string()),
+    );
     if std::env::var_os("LOG_STDOUT_TEE").is_none() {
         std::env::set_var("LOG_STDOUT_TEE", "true");
     }
@@ -527,6 +590,7 @@ pub async fn run_dry_run() -> Result<()> {
         shutdown.clone(),
         Arc::new(RuntimeMetrics::default()),
     ));
+    wait_for_feed_readiness(&config, &store, &shutdown).await;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()?;
@@ -539,7 +603,6 @@ pub async fn run_dry_run() -> Result<()> {
         results_file = %config.results_file.display(),
         "Short-Duration Digital Fair Value dry-run started (public read-only data)"
     );
-
     while !shutdown.load(Ordering::Relaxed) {
         let discoverer = MarketDiscoverer::new(config.symbols.clone(), 5);
         let now = Utc::now();
@@ -555,9 +618,23 @@ pub async fn run_dry_run() -> Result<()> {
             monitor.subscribe_market(market)?;
         }
         let mut stream = monitor.create_orderbook_stream()?;
-        let mut attempted = std::collections::HashSet::new();
+        let attempted = Arc::new(Mutex::new(std::collections::HashSet::new()));
+        let stats = Arc::new(Mutex::new(DryRunWindowStats::default()));
+        let mut rest_fallback_last_ms = HashMap::new();
         let mut ticker = tokio::time::interval(Duration::from_millis(config.scan_interval_ms));
         info!(target: LIVE_TARGET, window_start, markets = markets.len(), "Monitoring live window");
+        if run_started_ms > window_start * 1_000 + config.opening_max_skew_ms {
+            warn!(target: LIVE_TARGET,
+                window_start,
+                next_window_start = window_start + 300,
+                "Current window started before the process could capture its opening TWAP; warming up until the next full window"
+            );
+            if let Ok(mut guard) = stats.lock() {
+                for market in &markets {
+                    guard.reject(&market.slug, "startup_window_missing_opening_reference");
+                }
+            }
+        }
         loop {
             if shutdown.load(Ordering::Relaxed) || Utc::now().timestamp_millis() >= window_end_ms {
                 break;
@@ -583,10 +660,33 @@ pub async fn run_dry_run() -> Result<()> {
                         &monitor,
                         &client,
                         &journal,
-                        &mut attempted,
+                        &attempted,
+                        &stats,
+                        &mut rest_fallback_last_ms,
                     );
                 }
             }
+        }
+        if shutdown.load(Ordering::Relaxed) {
+            finalize_window_summary(
+                journal.clone(),
+                stats,
+                window_start * 1_000,
+                window_end_ms,
+                markets.len(),
+                0,
+            )
+            .await;
+        } else {
+            let summary_delay_ms = config.execution_delay_ms.saturating_add(6_500);
+            tokio::spawn(finalize_window_summary(
+                journal.clone(),
+                stats,
+                window_start * 1_000,
+                window_end_ms,
+                markets.len(),
+                summary_delay_ms,
+            ));
         }
         if !shutdown.load(Ordering::Relaxed) {
             sleep(Duration::from_millis(250)).await;
@@ -594,6 +694,43 @@ pub async fn run_dry_run() -> Result<()> {
     }
     info!(target: LIVE_TARGET, "Short-Duration Digital Fair Value dry-run stopped");
     Ok(())
+}
+
+async fn wait_for_feed_readiness(
+    config: &DryRunConfig,
+    store: &Arc<ChainlinkTwapStore>,
+    shutdown: &Arc<AtomicBool>,
+) {
+    let started = Instant::now();
+    let timeout_duration = Duration::from_secs(config.feed_ready_timeout_secs);
+    loop {
+        let now_ms = Utc::now().timestamp_millis();
+        let ready = config.symbols.iter().all(|symbol| {
+            store
+                .latest_observed_at_ms(symbol)
+                .is_some_and(|observed| now_ms.saturating_sub(observed) <= config.max_feed_age_ms)
+        });
+        if ready {
+            info!(target: LIVE_TARGET,
+                symbols = ?config.symbols,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "Chainlink TWAP feed ready for fair-value dry-run"
+            );
+            return;
+        }
+        if shutdown.load(Ordering::Relaxed) {
+            return;
+        }
+        if started.elapsed() >= timeout_duration {
+            warn!(target: LIVE_TARGET,
+                symbols = ?config.symbols,
+                timeout_secs = config.feed_ready_timeout_secs,
+                "Chainlink TWAP feed did not become ready before timeout; continuing fail-closed"
+            );
+            return;
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -606,23 +743,35 @@ fn scan_live_markets(
     monitor: &OrderBookMonitor,
     client: &reqwest::Client,
     journal: &EventJournal,
-    attempted: &mut std::collections::HashSet<String>,
+    attempted: &Arc<Mutex<std::collections::HashSet<String>>>,
+    stats: &Arc<Mutex<DryRunWindowStats>>,
+    rest_fallback_last_ms: &mut HashMap<String, i64>,
 ) {
     let now_ms = Utc::now().timestamp_millis();
     let remaining_ms = window_end_ms - now_ms;
     if remaining_ms <= 0 || remaining_ms > config.checkpoint_secs * 1_000 {
         return;
     }
+    if let Ok(mut guard) = stats.lock() {
+        guard.scan_ticks = guard.scan_ticks.saturating_add(1);
+    }
     for market in markets {
-        if attempted.contains(&market.slug) {
+        if attempted
+            .lock()
+            .map(|guard| guard.contains(&market.slug))
+            .unwrap_or(true)
+        {
             continue;
+        }
+        if let Ok(mut guard) = stats.lock() {
+            guard.market_evaluations = guard.market_evaluations.saturating_add(1);
         }
         let floor = config
             .min_volatility
             .get(&market.crypto_symbol)
             .copied()
             .unwrap_or(1.5);
-        let Some(state) = store.fair_value_snapshot(
+        let readiness = store.fair_value_snapshot_readiness(
             &market.crypto_symbol,
             window_start_ms,
             now_ms,
@@ -631,104 +780,396 @@ fn scan_live_markets(
             config.volatility_lookback_secs,
             config.min_observations,
             floor,
-        ) else {
-            continue;
+        );
+        let state = match readiness {
+            FairValueSnapshotReadiness::Ready(state) => state,
+            rejected => {
+                record_window_rejection(
+                    stats,
+                    &market.slug,
+                    rejected.reason().unwrap_or("model_not_ready"),
+                );
+                continue;
+            }
         };
-        let (Some(up), Some(down)) = (
-            monitor.winner_book_top(market.yes_token_id),
-            monitor.winner_book_top(market.no_token_id),
-        ) else {
-            continue;
-        };
-        if now_ms - up.received_at_ms > config.max_book_age_ms
-            || now_ms - down.received_at_ms > config.max_book_age_ms
-        {
+        let up = monitor.winner_book_top(market.yes_token_id);
+        let down = monitor.winner_book_top(market.no_token_id);
+        let ws_usable = up
+            .as_ref()
+            .is_some_and(|top| live_ws_top_usable(top, now_ms, config))
+            && down
+                .as_ref()
+                .is_some_and(|top| live_ws_top_usable(top, now_ms, config));
+        if !ws_usable {
+            let last = rest_fallback_last_ms
+                .get(&market.slug)
+                .copied()
+                .unwrap_or(i64::MIN);
+            if now_ms.saturating_sub(last) < config.rest_fallback_cooldown_ms {
+                continue;
+            }
+            rest_fallback_last_ms.insert(market.slug.clone(), now_ms);
+            if let Ok(mut guard) = stats.lock() {
+                guard.rest_fallback_attempts = guard.rest_fallback_attempts.saturating_add(1);
+            }
+            tokio::spawn(evaluate_rest_fallback(
+                config.clone(),
+                client.clone(),
+                journal.clone(),
+                stats.clone(),
+                attempted.clone(),
+                market.clone(),
+                state,
+                remaining_ms,
+                window_end_ms,
+            ));
             continue;
         }
+        let up = live_top_from_ws(up.expect("checked usable WebSocket UP book"));
+        let down = live_top_from_ws(down.expect("checked usable WebSocket DOWN book"));
         let probability_up = live_probability(state, remaining_ms as f64 / 1_000.0);
-        let up_ask = up.ask_price.and_then(|value| value.to_f64());
-        let down_ask = down.ask_price.and_then(|value| value.to_f64());
-        let up_bid = up.bid_price.and_then(|value| value.to_f64());
-        let down_bid = down.bid_price.and_then(|value| value.to_f64());
-        let up_edge = live_edge(
+        evaluate_live_tops(
             config,
+            market,
+            state,
             probability_up,
-            up_bid,
-            up_ask,
-            up.ask_size.and_then(|v| v.to_f64()),
-        );
-        let down_edge = live_edge(
-            config,
-            1.0 - probability_up,
-            down_bid,
-            down_ask,
-            down.ask_size.and_then(|v| v.to_f64()),
-        );
-        let choice = if up_edge >= down_edge && up_edge >= config.min_edge {
-            up_ask.map(|ask| (true, probability_up, ask, up_edge, market.yes_token_id))
-        } else if down_edge >= config.min_edge {
-            down_ask.map(|ask| {
-                (
-                    false,
-                    1.0 - probability_up,
-                    ask,
-                    down_edge,
-                    market.no_token_id,
-                )
-            })
-        } else {
-            None
-        };
-        let Some((buy_up, probability, ask, edge, token)) = choice else {
-            continue;
-        };
-        attempted.insert(market.slug.clone());
-        let evaluation_id = uuid::Uuid::new_v4().to_string();
-        let event = serde_json::json!({
-            "event":"opportunity",
-            "evaluation_id":evaluation_id,
-            "recorded_at":Utc::now(),
-            "asset":market.crypto_symbol,
-            "slug":market.slug,
-            "window_start_ms":window_start_ms,
-            "window_end_ms":window_end_ms,
-            "seconds_remaining":remaining_ms as f64 / 1000.0,
-            "buy_up":buy_up,
-            "opening_twap":state.opening,
-            "current_twap":state.current,
-            "twap_observed_at_ms":state.observed_at_ms,
-            "volatility_bps_per_sqrt_second":state.volatility_bps_per_sqrt_second,
-            "probability":probability,
-            "signal_ask":ask,
-            "net_edge_before_delay":edge,
-        });
-        if let Err(error) = journal.append(event) {
-            warn!(target: LIVE_TARGET, %error, "Could not persist opportunity");
-            continue;
-        }
-        info!(target: LIVE_TARGET,
-            asset = %market.crypto_symbol,
-            slug = %market.slug,
-            buy_up,
-            probability,
-            ask,
-            net_edge = edge,
-            seconds_remaining = remaining_ms as f64 / 1000.0,
-            "Fair-value opportunity"
-        );
-        tokio::spawn(execute_live_shadow(
-            config.clone(),
-            client.clone(),
-            journal.clone(),
-            evaluation_id,
-            market.slug.clone(),
-            market.crypto_symbol.clone(),
-            token.to_string(),
-            buy_up,
-            probability,
+            up,
+            down,
+            "websocket",
+            0,
+            remaining_ms,
+            window_start_ms,
             window_end_ms,
-        ));
+            client,
+            journal,
+            attempted,
+            stats,
+        );
     }
+}
+
+fn record_window_rejection(stats: &Arc<Mutex<DryRunWindowStats>>, slug: &str, reason: &str) {
+    if let Ok(mut guard) = stats.lock() {
+        guard.reject(slug, reason);
+    }
+}
+
+fn live_ws_top_usable(top: &WinnerBookTop, now_ms: i64, config: &DryRunConfig) -> bool {
+    now_ms.saturating_sub(top.received_at_ms) <= config.max_book_age_ms
+        && top.bid_price.is_some()
+        && top.ask_price.is_some()
+        && top.ask_size.is_some()
+}
+
+fn live_top_from_ws(top: WinnerBookTop) -> LiveBookTop {
+    LiveBookTop {
+        bid: top.bid_price.and_then(|value| value.to_f64()),
+        ask: top.ask_price.and_then(|value| value.to_f64()),
+        ask_size: top.ask_size.and_then(|value| value.to_f64()),
+    }
+}
+
+async fn evaluate_rest_fallback(
+    config: DryRunConfig,
+    client: reqwest::Client,
+    journal: EventJournal,
+    stats: Arc<Mutex<DryRunWindowStats>>,
+    attempted: Arc<Mutex<std::collections::HashSet<String>>>,
+    market: MarketInfo,
+    state: FairValueTwapSnapshot,
+    remaining_ms: i64,
+    window_end_ms: i64,
+) {
+    let up_token_id = market.yes_token_id.to_string();
+    let down_token_id = market.no_token_id.to_string();
+    let (up_result, down_result) = tokio::join!(
+        fetch_live_rest_top(&config, &client, &up_token_id),
+        fetch_live_rest_top(&config, &client, &down_token_id),
+    );
+    let (up, up_latency_ms) = match up_result {
+        Ok(value) => value,
+        Err(error) => {
+            record_window_rejection(&stats, &market.slug, "rest_up_book_failed");
+            warn!(target: LIVE_TARGET, slug = %market.slug, %error, "UP REST book fallback failed");
+            return;
+        }
+    };
+    let (down, down_latency_ms) = match down_result {
+        Ok(value) => value,
+        Err(error) => {
+            record_window_rejection(&stats, &market.slug, "rest_down_book_failed");
+            warn!(target: LIVE_TARGET, slug = %market.slug, %error, "DOWN REST book fallback failed");
+            return;
+        }
+    };
+    let rest_latency_ms = up_latency_ms.max(down_latency_ms);
+    if let Ok(mut guard) = stats.lock() {
+        guard.rest_fallback_successes = guard.rest_fallback_successes.saturating_add(1);
+        guard.record_rest_latency(up_latency_ms);
+        guard.record_rest_latency(down_latency_ms);
+    }
+    let now_ms = Utc::now().timestamp_millis();
+    let adjusted_remaining_ms = window_end_ms.saturating_sub(now_ms).min(remaining_ms);
+    if adjusted_remaining_ms <= 0 {
+        record_window_rejection(&stats, &market.slug, "rest_fallback_completed_after_window");
+        return;
+    }
+    let probability_up = live_probability(state, adjusted_remaining_ms as f64 / 1_000.0);
+    evaluate_live_tops(
+        &config,
+        &market,
+        state,
+        probability_up,
+        up,
+        down,
+        "rest_fallback",
+        rest_latency_ms,
+        adjusted_remaining_ms,
+        window_end_ms - 300_000,
+        window_end_ms,
+        &client,
+        &journal,
+        &attempted,
+        &stats,
+    );
+}
+
+async fn fetch_live_rest_top(
+    config: &DryRunConfig,
+    client: &reqwest::Client,
+    token_id: &str,
+) -> Result<(LiveBookTop, u64)> {
+    let started = Instant::now();
+    let response = timeout(
+        Duration::from_secs(6),
+        client
+            .get(format!("{}/book", config.clob_url.trim_end_matches('/')))
+            .query(&[("token_id", token_id)])
+            .send(),
+    )
+    .await
+    .context("REST book fallback timed out")??;
+    let status = response.status();
+    if !status.is_success() {
+        bail!("REST book fallback returned HTTP {status}");
+    }
+    let book = response.json::<LiveRestBook>().await?;
+    let best_bid = book
+        .bids
+        .iter()
+        .filter_map(|level| {
+            Some((
+                level.price.parse::<f64>().ok()?,
+                level.size.parse::<f64>().ok()?,
+            ))
+        })
+        .filter(|(_, size)| *size > 0.0)
+        .max_by(|a, b| a.0.total_cmp(&b.0));
+    let best_ask = book
+        .asks
+        .iter()
+        .filter_map(|level| {
+            Some((
+                level.price.parse::<f64>().ok()?,
+                level.size.parse::<f64>().ok()?,
+            ))
+        })
+        .filter(|(_, size)| *size > 0.0)
+        .min_by(|a, b| a.0.total_cmp(&b.0));
+    Ok((
+        LiveBookTop {
+            bid: best_bid.map(|level| level.0),
+            ask: best_ask.map(|level| level.0),
+            ask_size: best_ask.map(|level| level.1),
+        },
+        started.elapsed().as_millis() as u64,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_live_tops(
+    config: &DryRunConfig,
+    market: &MarketInfo,
+    state: FairValueTwapSnapshot,
+    probability_up: f64,
+    up: LiveBookTop,
+    down: LiveBookTop,
+    book_source: &'static str,
+    book_latency_ms: u64,
+    remaining_ms: i64,
+    window_start_ms: i64,
+    window_end_ms: i64,
+    client: &reqwest::Client,
+    journal: &EventJournal,
+    attempted: &Arc<Mutex<std::collections::HashSet<String>>>,
+    stats: &Arc<Mutex<DryRunWindowStats>>,
+) {
+    let up_evaluation = live_edge_evaluation(config, probability_up, up.bid, up.ask, up.ask_size);
+    let down_evaluation = live_edge_evaluation(
+        config,
+        1.0 - probability_up,
+        down.bid,
+        down.ask,
+        down.ask_size,
+    );
+    let up_edge = up_evaluation.unwrap_or(f64::NEG_INFINITY);
+    let down_edge = down_evaluation.unwrap_or(f64::NEG_INFINITY);
+    let choice = if up_edge >= down_edge && up_edge >= config.min_edge {
+        up.ask
+            .map(|ask| (true, probability_up, ask, up_edge, market.yes_token_id))
+    } else if down_edge >= config.min_edge {
+        down.ask.map(|ask| {
+            (
+                false,
+                1.0 - probability_up,
+                ask,
+                down_edge,
+                market.no_token_id,
+            )
+        })
+    } else {
+        None
+    };
+    let Some((buy_up, probability, ask, edge, token)) = choice else {
+        if let Ok(mut guard) = stats.lock() {
+            let terminal_reason = if up_edge.is_finite() || down_edge.is_finite() {
+                *guard
+                    .rejection_counts
+                    .entry("net_edge_below_threshold".to_string())
+                    .or_default() += 1;
+                "net_edge_below_threshold".to_string()
+            } else {
+                if let Err(reason) = up_evaluation {
+                    *guard
+                        .rejection_counts
+                        .entry(format!("up_{reason}"))
+                        .or_default() += 1;
+                }
+                if let Err(reason) = down_evaluation {
+                    *guard
+                        .rejection_counts
+                        .entry(format!("down_{reason}"))
+                        .or_default() += 1;
+                }
+                format!(
+                    "book_filters:up={},down={}",
+                    up_evaluation.err().unwrap_or("admissible"),
+                    down_evaluation.err().unwrap_or("admissible")
+                )
+            };
+            guard
+                .terminal_reason_by_market
+                .insert(market.slug.clone(), terminal_reason);
+        }
+        return;
+    };
+    let inserted = attempted
+        .lock()
+        .map(|mut guard| guard.insert(market.slug.clone()))
+        .unwrap_or(false);
+    if !inserted {
+        return;
+    }
+    let evaluation_id = uuid::Uuid::new_v4().to_string();
+    let event = serde_json::json!({
+        "event":"opportunity",
+        "evaluation_id":evaluation_id,
+        "recorded_at":Utc::now(),
+        "asset":market.crypto_symbol,
+        "slug":market.slug,
+        "window_start_ms":window_start_ms,
+        "window_end_ms":window_end_ms,
+        "seconds_remaining":remaining_ms as f64 / 1000.0,
+        "book_source":book_source,
+        "book_latency_ms":book_latency_ms,
+        "buy_up":buy_up,
+        "opening_twap":state.opening,
+        "current_twap":state.current,
+        "twap_observed_at_ms":state.observed_at_ms,
+        "volatility_bps_per_sqrt_second":state.volatility_bps_per_sqrt_second,
+        "probability":probability,
+        "signal_ask":ask,
+        "net_edge_before_delay":edge,
+    });
+    if let Err(error) = journal.append(event) {
+        warn!(target: LIVE_TARGET, %error, "Could not persist opportunity");
+        return;
+    }
+    if let Ok(mut guard) = stats.lock() {
+        guard.opportunities = guard.opportunities.saturating_add(1);
+        guard
+            .terminal_reason_by_market
+            .insert(market.slug.clone(), "opportunity".to_string());
+    }
+    info!(target: LIVE_TARGET,
+        asset = %market.crypto_symbol,
+        slug = %market.slug,
+        book_source,
+        book_latency_ms,
+        buy_up,
+        probability,
+        ask,
+        net_edge = edge,
+        seconds_remaining = remaining_ms as f64 / 1000.0,
+        "Fair-value opportunity"
+    );
+    tokio::spawn(execute_live_shadow(
+        config.clone(),
+        client.clone(),
+        journal.clone(),
+        stats.clone(),
+        evaluation_id,
+        market.slug.clone(),
+        market.crypto_symbol.clone(),
+        token.to_string(),
+        buy_up,
+        probability,
+        window_end_ms,
+    ));
+}
+
+async fn finalize_window_summary(
+    journal: EventJournal,
+    stats: Arc<Mutex<DryRunWindowStats>>,
+    window_start_ms: i64,
+    window_end_ms: i64,
+    markets: usize,
+    delay_ms: u64,
+) {
+    if delay_ms > 0 {
+        sleep(Duration::from_millis(delay_ms)).await;
+    }
+    let snapshot = stats.lock().map(|guard| guard.clone()).unwrap_or_default();
+    let average_rest_latency_ms = snapshot.average_rest_latency_ms();
+    let event = serde_json::json!({
+        "event":"window_summary",
+        "recorded_at":Utc::now(),
+        "window_start_ms":window_start_ms,
+        "window_end_ms":window_end_ms,
+        "markets":markets,
+        "average_rest_latency_ms":average_rest_latency_ms,
+        "stats":snapshot,
+    });
+    if let Err(error) = journal.append(event) {
+        warn!(target: LIVE_TARGET, %error, "Could not persist fair-value window summary");
+        return;
+    }
+    info!(target: LIVE_TARGET,
+        window_start_ms,
+        markets,
+        scan_ticks = snapshot.scan_ticks,
+        market_evaluations = snapshot.market_evaluations,
+        opportunities = snapshot.opportunities,
+        shadow_rejections = snapshot.shadow_rejections,
+        shadow_fills = snapshot.shadow_fills,
+        rest_fallback_attempts = snapshot.rest_fallback_attempts,
+        rest_fallback_successes = snapshot.rest_fallback_successes,
+        average_rest_latency_ms,
+        rest_latency_max_ms = snapshot.rest_latency_max_ms,
+        rejection_counts = ?snapshot.rejection_counts,
+        terminal_reason_by_market = ?snapshot.terminal_reason_by_market,
+        "Fair-value dry-run window summary"
+    );
 }
 
 fn live_probability(state: FairValueTwapSnapshot, remaining_secs: f64) -> f64 {
@@ -740,31 +1181,36 @@ fn live_probability(state: FairValueTwapSnapshot, remaining_secs: f64) -> f64 {
     )
 }
 
-fn live_edge(
+fn live_edge_evaluation(
     config: &DryRunConfig,
     probability: f64,
     bid: Option<f64>,
     ask: Option<f64>,
     ask_size: Option<f64>,
-) -> f64 {
+) -> std::result::Result<f64, &'static str> {
     let (Some(bid), Some(ask), Some(size)) = (bid, ask, ask_size) else {
-        return f64::NEG_INFINITY;
+        return Err("incomplete_book");
     };
-    if ask < config.min_price
-        || ask > config.max_price
-        || ask < bid
-        || ask - bid > config.max_spread
-        || ask * size < config.min_depth_usdc
-    {
-        return f64::NEG_INFINITY;
+    if ask < config.min_price || ask > config.max_price {
+        return Err("price_out_of_range");
     }
-    probability - ask - live_fee(config, ask)
+    if ask < bid {
+        return Err("crossed_book");
+    }
+    if ask - bid > config.max_spread {
+        return Err("spread_too_wide");
+    }
+    if ask * size < config.min_depth_usdc {
+        return Err("insufficient_depth");
+    }
+    Ok(probability - ask - live_fee(config, ask))
 }
 
 async fn execute_live_shadow(
     config: DryRunConfig,
     client: reqwest::Client,
     journal: EventJournal,
+    stats: Arc<Mutex<DryRunWindowStats>>,
     evaluation_id: String,
     slug: String,
     asset: String,
@@ -787,6 +1233,11 @@ async fn execute_live_shadow(
         _ => None,
     };
     let Some(book) = book else {
+        if let Ok(mut guard) = stats.lock() {
+            guard.shadow_rejections = guard.shadow_rejections.saturating_add(1);
+            guard.record_rest_latency(latency_ms);
+            guard.reject(&slug, "rest_book_failed_after_signal");
+        }
         let _ = journal.append(serde_json::json!({
             "event":"shadow_rejected","evaluation_id":evaluation_id,"recorded_at":Utc::now(),
             "slug":slug,"reason":"rest_book_failed","rest_latency_ms":latency_ms
@@ -807,6 +1258,11 @@ async fn execute_live_shadow(
     let signal_price = asks.first().map(|level| level.0).unwrap_or(1.0);
     let target = config.order_usdc / (signal_price + live_fee(&config, signal_price)).max(0.01);
     let Some(cost) = walk_ask_levels(&asks, target, config.liquidity_haircut) else {
+        if let Ok(mut guard) = stats.lock() {
+            guard.shadow_rejections = guard.shadow_rejections.saturating_add(1);
+            guard.record_rest_latency(latency_ms);
+            guard.reject(&slug, "delayed_depth_insufficient");
+        }
         let _ = journal.append(serde_json::json!({
             "event":"shadow_rejected","evaluation_id":evaluation_id,"recorded_at":Utc::now(),
             "slug":slug,"reason":"delayed_depth_insufficient","rest_latency_ms":latency_ms
@@ -817,6 +1273,11 @@ async fn execute_live_shadow(
     let fees = live_fee(&config, average) * target;
     let net_edge = probability - average - fees / target;
     if average < config.min_price || average > config.max_price || net_edge < config.min_edge {
+        if let Ok(mut guard) = stats.lock() {
+            guard.shadow_rejections = guard.shadow_rejections.saturating_add(1);
+            guard.record_rest_latency(latency_ms);
+            guard.reject(&slug, "delayed_net_edge_below_threshold");
+        }
         let _ = journal.append(serde_json::json!({
             "event":"shadow_rejected","evaluation_id":evaluation_id,"recorded_at":Utc::now(),
             "slug":slug,"reason":"delayed_net_edge_below_threshold","average_price":average,
@@ -825,6 +1286,13 @@ async fn execute_live_shadow(
         return;
     }
     let expected_pnl = probability * target - cost - fees;
+    if let Ok(mut guard) = stats.lock() {
+        guard.shadow_fills = guard.shadow_fills.saturating_add(1);
+        guard.record_rest_latency(latency_ms);
+        guard
+            .terminal_reason_by_market
+            .insert(slug.clone(), "shadow_fill".to_string());
+    }
     let _ = journal.append(serde_json::json!({
         "event":"shadow_fill","evaluation_id":evaluation_id,"recorded_at":Utc::now(),
         "asset":asset,"slug":slug,"buy_up":buy_up,"shares":target,"cost_usdc":cost,
@@ -1623,6 +2091,35 @@ fn env_decimal_list(name: &str, default: &[&str]) -> Result<Vec<Decimal>> {
 mod tests {
     use super::*;
 
+    fn dry_run_config() -> DryRunConfig {
+        DryRunConfig {
+            symbols: vec!["btc".to_string()],
+            checkpoint_secs: 10,
+            scan_interval_ms: 100,
+            feed_ready_timeout_secs: 15,
+            rest_fallback_cooldown_ms: 1_000,
+            execution_delay_ms: 1_000,
+            max_book_age_ms: 1_000,
+            max_feed_age_ms: 5_000,
+            opening_max_skew_ms: 5_000,
+            volatility_lookback_secs: 120,
+            min_observations: 20,
+            min_volatility: HashMap::new(),
+            min_edge: 0.03,
+            max_spread: 0.03,
+            min_depth_usdc: 10.0,
+            min_price: 0.05,
+            max_price: 0.95,
+            order_usdc: 5.0,
+            liquidity_haircut: 0.50,
+            fee_rate: 0.07,
+            fee_exponent: 1,
+            rtds_url: String::new(),
+            clob_url: String::new(),
+            results_file: PathBuf::new(),
+        }
+    }
+
     #[test]
     fn fair_probability_moves_with_moneyness_and_time() {
         let at_money = fair_up_probability(100.0, 100.0, 60.0, 1.0);
@@ -1646,5 +2143,29 @@ mod tests {
         let mut weak = MetricAccumulator::default();
         weak.record(0.6, true, Some(0.6));
         assert!(good.report().brier_score < weak.report().brier_score);
+    }
+
+    #[test]
+    fn live_book_filter_reports_specific_rejection_reasons() {
+        let config = dry_run_config();
+        assert_eq!(
+            live_edge_evaluation(&config, 0.9, None, Some(0.8), Some(20.0)),
+            Err("incomplete_book")
+        );
+        assert_eq!(
+            live_edge_evaluation(&config, 0.9, Some(0.80), Some(0.96), Some(20.0)),
+            Err("price_out_of_range")
+        );
+        assert_eq!(
+            live_edge_evaluation(&config, 0.9, Some(0.70), Some(0.80), Some(20.0)),
+            Err("spread_too_wide")
+        );
+        assert_eq!(
+            live_edge_evaluation(&config, 0.9, Some(0.79), Some(0.80), Some(5.0)),
+            Err("insufficient_depth")
+        );
+        assert!(
+            live_edge_evaluation(&config, 0.9, Some(0.79), Some(0.80), Some(20.0)).unwrap() > 0.0
+        );
     }
 }
