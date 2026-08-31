@@ -36,7 +36,8 @@ cargo build --release --bin polypulse
 
 ## 第一阶段：本地历史回放
 
-先更新数据，再回放：
+先更新数据，再回放。`BACKTEST_MARKET_TYPE` 是强制回放边界，Binary Complement 和
+Late-Resolution Winner Trading 只读取该周期的完整市场，避免把 5m 与 15m 混合成一份收益结论：
 
 ```bash
 ./target/release/polybacktest_downloader sync
@@ -48,11 +49,11 @@ cargo build --release --bin polypulse
 回放只以只读方式打开 SQLite，不初始化网络客户端、签名器或账户。两个策略每轮都使用独立目录：
 
 ```text
-results/backtests/binary-complement-arbitrage/run-YYYYMMDDTHHMMSSZ-<uuid>/
+results/backtests/binary-complement-arbitrage/<5m|15m>/run-YYYYMMDDTHHMMSSZ-<uuid>/
 ├── run.log
 ├── report.json
 └── analysis.zh-CN.md
-results/backtests/late-resolution-winner-trading/run-YYYYMMDDTHHMMSSZ-<uuid>/
+results/backtests/late-resolution-winner-trading/<5m|15m>/run-YYYYMMDDTHHMMSSZ-<uuid>/
 ├── run.log
 ├── report.json
 └── analysis.zh-CN.md
@@ -79,7 +80,7 @@ Brier Score、Log Loss，并与同一时点的市场隐含概率比较。成本�
 Binary Complement Arbitrage 回放规则：先要求价差和可信 ask 深度连续存在到场景确认时间，再经过场景化
 预检延迟用同一快照检查双腿及第二腿深度覆盖倍数，并先成交信号中较薄的一腿。第二腿按 FOK 语义在后续
 快照撮合；失败后按场景延迟读取第一腿 bid 并尝试完整紧急卖回，无法退出才按真实 winner 结算方向性风险。
-完整撮合还应用流动性折扣、信号限价、双腿最低 $1、fee buffer 和最小净利润。同一五分钟市场每个场景
+完整撮合还应用流动性折扣、信号限价、双腿最低 $1、fee buffer 和最小净利润。同一市场周期内每个市场、每个场景
 最多建立一个非重叠仓位。
 
 Late-Resolution Winner Trading 回放规则：只接纳 `coin_twap_source=chainlink_twap`，复用生产模型的开盘参考、
@@ -94,6 +95,7 @@ Late-Resolution Winner Trading 分别使用 BTC、ETH、SOL/其他资产的 `MIN
 `MODEL_RISK_BUFFER`：
 
 ```dotenv
+BACKTEST_MARKET_TYPE=5m
 BINARY_COMPLEMENT_ARBITRAGE_BACKTEST_ORDER_SIZES_USDC=2.5,5,10
 BINARY_COMPLEMENT_ARBITRAGE_BACKTEST_CONFIRMATION_MS=100,250,500,1000
 BINARY_COMPLEMENT_ARBITRAGE_BACKTEST_PREFLIGHT_DELAYS_MS=0,50,100,250
@@ -115,6 +117,28 @@ BACKTEST_PROGRESS_EVERY_MARKETS=100
 BACKTEST_MARKET_OFFSET=0
 BACKTEST_MAX_MARKETS=0
 ```
+
+### 独立验证 15 分钟市场
+
+不要把 15m 追加进现有 5m 回测文件后再依赖默认配置。推荐使用独立数据库：
+
+```bash
+POLYBACKTEST_MARKET_TYPE=15m \
+POLYBACKTEST_DATABASE_FILE=data/polybacktest/polybacktest-15m.sqlite3 \
+./target/release/polybacktest_downloader sync
+
+BACKTEST_MARKET_TYPE=15m \
+BACKTEST_DATABASE_FILE=data/polybacktest/polybacktest-15m.sqlite3 \
+./target/release/binary_complement_arbitrage backtest
+
+BACKTEST_MARKET_TYPE=15m \
+BACKTEST_DATABASE_FILE=data/polybacktest/polybacktest-15m.sqlite3 \
+./target/release/late_resolution_winner_trading backtest
+```
+
+回测报告中的 `market_type`、启动日志和输出目录会共同记录周期。若数据库没有该周期的
+完整市场，程序直接报错，不会回退到另一周期。15m 回测达到准入门槛后，再设置
+`MARKET_PERIOD_MINUTES=15` 运行对应独立 `dry-run`；5m 与 15m 不应在同一进程中同时验证。
 
 程序只读取每个市场快照一次，并同时评估所有场景。`report.json` 保存总体和分资产漏斗、成交、胜负、费用与 PnL；`analysis.zh-CN.md` 自动比较场景稳定性并列出主要拒绝原因；`run.log` 保存启动、进度、耗时和产物路径。可设置 `BACKTEST_MARKET_OFFSET` 和 `BACKTEST_MAX_MARKETS=100` 做指定区段的 smoke test，正式分析必须把两者恢复为 `0`。
 

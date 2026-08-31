@@ -793,7 +793,7 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
         let window_label = window_session.label().to_string();
 
         dashboard.with_mut(|d| {
-            d.set_window(&window_label, 300);
+            d.set_window(&window_label, window_session.remaining_seconds(Utc::now()));
             d.set_connected(true);
             d.push_event(format!(
                 "📡 Live — {} markets in {}",

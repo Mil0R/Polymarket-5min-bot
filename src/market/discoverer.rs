@@ -148,7 +148,7 @@ impl MarketDiscoverer {
             .collect()
     }
 
-    /// Fetch 5-minute markets for given timestamp
+    /// Fetch markets for the configured window period at the given timestamp.
     pub async fn get_markets_for_timestamp(&self, timestamp: i64) -> Result<Vec<MarketInfo>> {
         // Generate slugs for all crypto symbols
         let slugs = self.generate_market_slugs(timestamp);
@@ -243,6 +243,22 @@ mod tests {
     struct FakeGammaTransport {
         requested: Mutex<Vec<(Vec<String>, Option<bool>)>>,
         response: Mutex<Option<Vec<Market>>>,
+    }
+
+    #[test]
+    fn fifteen_minute_period_aligns_windows_and_slugs() {
+        let discoverer = MarketDiscoverer::new(vec!["btc".to_string(), "eth".to_string()], 15);
+        let now = DateTime::from_timestamp(1_800, 0).unwrap();
+
+        assert_eq!(discoverer.calculate_current_window_timestamp(now), 1_800);
+        assert_eq!(discoverer.calculate_next_window_timestamp(now), 2_700);
+        assert_eq!(
+            discoverer.generate_market_slugs(1_800),
+            vec![
+                "btc-updown-15m-1800".to_string(),
+                "eth-updown-15m-1800".to_string(),
+            ]
+        );
     }
 
     impl GammaTransport for FakeGammaTransport {

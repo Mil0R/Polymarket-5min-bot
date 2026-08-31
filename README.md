@@ -189,6 +189,11 @@ remain at least 1100ms between request starts, while Pro uses a conservative
 [`docs/POLYBACKTEST_DOWNLOADER.zh-CN.md`](docs/POLYBACKTEST_DOWNLOADER.zh-CN.md)
 for storage schema, recovery behavior, and operational guidance.
 
+Crypto strategy replays are explicitly scoped by `BACKTEST_MARKET_TYPE=5m` or
+`15m`; reports are written below a matching period directory, so the two periods
+cannot be silently mixed. Use a separate SQLite file for each period when
+downloading and comparing 5-minute and 15-minute markets.
+
 ## Disclaimer
 
 This software is for learning and research only — not investment advice. Crypto and prediction markets carry significant risk, including loss of funds. Assess your own risk and comply with Polymarket’s terms and applicable laws.

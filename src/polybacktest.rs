@@ -25,6 +25,7 @@ type BookCache = HashMap<(usize, bool, bool), Option<AskLevels>>;
 #[derive(Debug, Clone)]
 pub struct ReplayConfig {
     database_file: PathBuf,
+    market_type: String,
     output_dir: PathBuf,
     order_usdc: Decimal,
     execution_delay_ms: i64,
@@ -76,8 +77,14 @@ impl ReplayConfig {
         let fee_rate = env_decimal("BACKTEST_FEE_RATE", "0.25")?;
         let fee_exponent = env_parse("BACKTEST_FEE_EXPONENT", 2u64)?;
         let winner_fee = dynamic_fee_per_share(fee_rate, fee_exponent, dec!(0.97));
+        let market_type = std::env::var("BACKTEST_MARKET_TYPE")
+            .or_else(|_| std::env::var("POLYBACKTEST_MARKET_TYPE"))
+            .unwrap_or_else(|_| "5m".to_string())
+            .trim()
+            .to_ascii_lowercase();
         Ok(Self {
             database_file,
+            market_type,
             output_dir: std::env::var("BACKTEST_OUTPUT_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| PathBuf::from("results/backtests")),
@@ -228,6 +235,16 @@ impl ReplayConfig {
             bail!(
                 "PolyBacktest database not found: {}; run polybacktest_downloader sync first",
                 self.database_file.display()
+            );
+        }
+        if !matches!(self.market_type.as_str(), "5m" | "15m") {
+            bail!("BACKTEST_MARKET_TYPE must be 5m or 15m for these strategy replays");
+        }
+        let market_window_secs = if self.market_type == "5m" { 300 } else { 900 };
+        if self.winner_before_end_secs <= 0 || self.winner_before_end_secs > market_window_secs {
+            bail!(
+                "LATE_RESOLUTION_WINNER_TRADING_BEFORE_END_SECS must be in [1, {market_window_secs}] for BACKTEST_MARKET_TYPE={}",
+                self.market_type
             );
         }
         if self.order_usdc <= Decimal::ZERO {
@@ -496,6 +513,7 @@ struct WinnerReplayReport {
     strategy: &'static str,
     generated_at: String,
     database: String,
+    market_type: String,
     order_usdc: String,
     fee_rate: String,
     fee_exponent: u64,
@@ -528,6 +546,7 @@ struct SpreadReplayReport {
     strategy: &'static str,
     generated_at: String,
     database: String,
+    market_type: String,
     fee_rate: String,
     fee_exponent: u64,
     parameters: Value,
@@ -571,7 +590,14 @@ pub fn run_binary_complement_replay() -> Result<PathBuf> {
     let config = ReplayConfig::from_env()?;
     config.validate()?;
     let connection = open_database(&config)?;
-    let markets = load_markets(&connection)?;
+    let markets = load_markets(&connection, &config.market_type)?;
+    if markets.is_empty() {
+        bail!(
+            "no complete {} markets found in {}; download that period before backtesting",
+            config.market_type,
+            config.database_file.display()
+        );
+    }
     let mut markets = markets
         .into_iter()
         .skip(config.market_offset)
@@ -587,6 +613,7 @@ pub fn run_binary_complement_replay() -> Result<PathBuf> {
     let run_dir = config
         .output_dir
         .join("binary-complement-arbitrage")
+        .join(&config.market_type)
         .join(run_id);
     fs::create_dir_all(&run_dir)?;
     let report_path = run_dir.join("report.json");
@@ -603,7 +630,8 @@ pub fn run_binary_complement_replay() -> Result<PathBuf> {
         })
         .collect::<Vec<_>>();
     logger.line(format!(
-        "INFO strategy=binary-complement-arbitrage phase=started markets={} scenarios={} database={}",
+        "INFO strategy=binary-complement-arbitrage phase=started market_type={} markets={} scenarios={} database={}",
+        config.market_type,
         markets.len(),
         scenarios.len(),
         config.database_file.display()
@@ -681,6 +709,7 @@ pub fn run_binary_complement_replay() -> Result<PathBuf> {
         strategy: "binary-complement-arbitrage",
         generated_at: Utc::now().to_rfc3339(),
         database: config.database_file.display().to_string(),
+        market_type: config.market_type.clone(),
         fee_rate: config.fee_rate.to_string(),
         fee_exponent: config.fee_exponent,
         parameters: serde_json::json!({
@@ -741,7 +770,14 @@ pub fn run_late_resolution_winner_replay() -> Result<PathBuf> {
     let config = ReplayConfig::from_env()?;
     config.validate()?;
     let connection = open_database(&config)?;
-    let markets = load_markets(&connection)?;
+    let markets = load_markets(&connection, &config.market_type)?;
+    if markets.is_empty() {
+        bail!(
+            "no complete {} markets found in {}; download that period before backtesting",
+            config.market_type,
+            config.database_file.display()
+        );
+    }
     let mut markets = markets
         .into_iter()
         .skip(config.market_offset)
@@ -757,6 +793,7 @@ pub fn run_late_resolution_winner_replay() -> Result<PathBuf> {
     let run_dir = config
         .output_dir
         .join("late-resolution-winner-trading")
+        .join(&config.market_type)
         .join(run_id);
     fs::create_dir_all(&run_dir)?;
     let report_path = run_dir.join("report.json");
@@ -773,7 +810,8 @@ pub fn run_late_resolution_winner_replay() -> Result<PathBuf> {
         })
         .collect::<Vec<_>>();
     logger.line(format!(
-        "INFO strategy=late-resolution-winner-trading phase=started markets={} scenarios={} database={}",
+        "INFO strategy=late-resolution-winner-trading phase=started market_type={} markets={} scenarios={} database={}",
+        config.market_type,
         markets.len(),
         scenarios.len(),
         config.database_file.display()
@@ -834,6 +872,7 @@ pub fn run_late_resolution_winner_replay() -> Result<PathBuf> {
         strategy: "late-resolution-winner-trading",
         generated_at: Utc::now().to_rfc3339(),
         database: config.database_file.display().to_string(),
+        market_type: config.market_type.clone(),
         order_usdc: config.order_usdc.to_string(),
         fee_rate: config.fee_rate.to_string(),
         fee_exponent: config.fee_exponent,
@@ -917,14 +956,15 @@ fn open_database(config: &ReplayConfig) -> Result<Connection> {
     Ok(connection)
 }
 
-fn load_markets(connection: &Connection) -> Result<Vec<Market>> {
+fn load_markets(connection: &Connection, market_type: &str) -> Result<Vec<Market>> {
     let mut statement = connection.prepare(
         "SELECT market_id,coin,start_time,end_time,winner FROM markets
-         WHERE status='complete' AND start_time IS NOT NULL AND end_time IS NOT NULL
+         WHERE status='complete' AND market_type=?1
+           AND start_time IS NOT NULL AND end_time IS NOT NULL
          ORDER BY start_time,market_id",
     )?;
     let markets = statement
-        .query_map([], |row| {
+        .query_map([market_type], |row| {
             Ok(Market {
                 id: row.get(0)?,
                 coin: row.get(1)?,
@@ -1969,7 +2009,8 @@ fn write_spread_analysis(path: &Path, report: &SpreadReplayReport) -> Result<()>
          ## 总结\n\n",
     );
     markdown.push_str(&format!(
-        "准入判断：`{}`；正收益场景：`{}/{}`。\n\n",
+        "市场周期：`{}`；准入判断：`{}`；正收益场景：`{}/{}`。\n\n",
+        report.market_type,
         report.readiness,
         report.positive_scenarios,
         report.scenarios.len()
@@ -2071,7 +2112,8 @@ fn write_winner_analysis(path: &Path, report: &WinnerReplayReport) -> Result<()>
          ## 总结\n\n",
     );
     markdown.push_str(&format!(
-        "准入判断：`{}`；正收益场景：`{}/{}`。\n\n",
+        "市场周期：`{}`；准入判断：`{}`；正收益场景：`{}/{}`。\n\n",
+        report.market_type,
         report.readiness,
         report.positive_scenarios,
         report.scenarios.len()
@@ -2252,6 +2294,35 @@ fn env_decimal_list(name: &str, default: &[Decimal]) -> Result<Vec<Decimal>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn market_loader_isolates_five_and_fifteen_minute_periods() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE markets (
+                    market_id TEXT PRIMARY KEY,
+                    coin TEXT NOT NULL,
+                    market_type TEXT NOT NULL,
+                    start_time INTEGER,
+                    end_time INTEGER,
+                    winner TEXT,
+                    status TEXT NOT NULL
+                 );
+                 INSERT INTO markets VALUES
+                    ('five', 'btc', '5m', 1000, 301000, 'Up', 'complete'),
+                    ('fifteen', 'btc', '15m', 1000, 901000, 'Down', 'complete'),
+                    ('pending', 'eth', '15m', 1000, 901000, NULL, 'downloading');",
+            )
+            .unwrap();
+
+        let five = load_markets(&connection, "5m").unwrap();
+        let fifteen = load_markets(&connection, "15m").unwrap();
+        assert_eq!(five.len(), 1);
+        assert_eq!(five[0].id, "five");
+        assert_eq!(fifteen.len(), 1);
+        assert_eq!(fifteen[0].id, "fifteen");
+    }
 
     #[test]
     fn fee_and_time_normalization_are_deterministic() {

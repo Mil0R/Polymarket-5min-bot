@@ -23,7 +23,7 @@ Polymarket 私钥，也不会提交订单。
 cargo run --release --bin polybacktest_downloader -- sync
 ```
 
-Pro 31-day 配置会按 `POLYBACKTEST_COINS` 依次发现并下载 BTC/ETH/SOL 5m
+Pro 31-day 配置会按 `POLYBACKTEST_COINS` 依次发现并下载 BTC/ETH/SOL 的所选周期
 市场。Free Plan 只能访问其套餐允许的最近市场；Pro 才适合做全量 31 天回溯。
 下载器遇到已完成市场会跳过，只为待下载市场请求快照，因此可以中断后继续。
 
@@ -57,6 +57,17 @@ POLYBACKTEST_ZSTD_LEVEL=3
 POLYBACKTEST_INCLUDE_ORDERBOOK=true
 POLYBACKTEST_MAX_MARKETS_PER_SYNC=0
 ```
+
+比较 5m 与 15m 时应使用不同数据库文件，例如：
+
+```dotenv
+# 15m 下载任务
+POLYBACKTEST_MARKET_TYPE=15m
+POLYBACKTEST_DATABASE_FILE=data/polybacktest/polybacktest-15m.sqlite3
+```
+
+回测时再将 `BACKTEST_MARKET_TYPE=15m` 和 `BACKTEST_DATABASE_FILE` 指向同一文件。
+回测器会按 `market_type` 强制过滤，即使误用混合数据库也不会合并两个周期统计。
 
 - Free Plan 必须保持 `POLYBACKTEST_REQUEST_INTERVAL_MS>=1000`；Pro/Enterprise 最低
   100ms。Pro 使用 250ms 时低于 300 requests/minute 的持续限制。
@@ -152,7 +163,7 @@ coin_twap_source = 'chainlink_twap'
 ```
 
 正式回放会按 BTC、ETH、SOL/其他资产分别应用波动率下限和模型风险缓冲，并在一次数据库扫描中运行配置的延迟 × 流动性折扣网格。每轮在
-`results/backtests/late-resolution-winner-trading/run-*/` 保存 `run.log`、`report.json` 和 `analysis.zh-CN.md`，旧结果不会被覆盖。
+`results/backtests/late-resolution-winner-trading/<5m|15m>/run-*/` 保存 `run.log`、`report.json` 和 `analysis.zh-CN.md`，旧结果不会被覆盖。
 
 Binary Complement Arbitrage 应从信号快照之后选择首个满足
 `time >= signal_time + configured_delay` 的快照成交，逐档读取压缩完整盘口，

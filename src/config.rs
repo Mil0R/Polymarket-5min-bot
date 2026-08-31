@@ -596,6 +596,9 @@ impl Config {
     }
 
     fn validate(&self) -> Result<()> {
+        if !matches!(self.market_period_minutes, 5 | 15) {
+            bail!("MARKET_PERIOD_MINUTES must be 5 or 15");
+        }
         if self.private_key.is_empty() {
             bail!("POLYMARKET_PRIVATE_KEY cannot be empty");
         }
@@ -814,8 +817,18 @@ impl Config {
         {
             bail!("max(BINARY_COMPLEMENT_ARBITRAGE_EXECUTION_SPREAD, BINARY_COMPLEMENT_ARBITRAGE_MIN_PROFIT_THRESHOLD) + BINARY_COMPLEMENT_ARBITRAGE_FEE_BUFFER must be below 1");
         }
-        if self.market_refresh_advance_secs > 300 {
-            bail!("MARKET_REFRESH_ADVANCE_SECS cannot exceed the 300-second window");
+        let market_window_secs = self.market_period_minutes.saturating_mul(60);
+        if self.market_refresh_advance_secs > market_window_secs {
+            bail!(
+                "MARKET_REFRESH_ADVANCE_SECS cannot exceed the configured {market_window_secs}-second window"
+            );
+        }
+        if self.late_resolution_winner_trading_before_end_secs == 0
+            || u64::from(self.late_resolution_winner_trading_before_end_secs) > market_window_secs
+        {
+            bail!(
+                "LATE_RESOLUTION_WINNER_TRADING_BEFORE_END_SECS must be in [1, {market_window_secs}] for the configured market period"
+            );
         }
         if self.max_book_age_ms <= 0 || self.max_book_skew_ms < 0 {
             bail!("BINARY_COMPLEMENT_ARBITRAGE_MAX_BOOK_AGE_MS must be positive and BINARY_COMPLEMENT_ARBITRAGE_MAX_BOOK_SKEW_MS cannot be negative");
@@ -932,10 +945,13 @@ impl Config {
                 bail!("{name} must be finite and in [0, 1)");
             }
         }
-        if self.stop_arbitrage_before_end_minutes > 5
-            || self.wind_down_before_window_end_minutes > 5
+        if self.stop_arbitrage_before_end_minutes > self.market_period_minutes
+            || self.wind_down_before_window_end_minutes > self.market_period_minutes
         {
-            bail!("stop-arbitrage and wind-down minutes cannot exceed the 5-minute market window");
+            bail!(
+                "stop-arbitrage and wind-down minutes cannot exceed the configured {}-minute market window",
+                self.market_period_minutes
+            );
         }
         validate_strategy_compatibility(
             self.dry_run,
