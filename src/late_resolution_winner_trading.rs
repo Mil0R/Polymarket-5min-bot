@@ -108,6 +108,9 @@ pub struct WinnerSignal {
 /// A paper or live late-resolution-winner-trading position awaiting Polymarket settlement.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PendingLateResolutionWinnerTrading {
+    /// Runtime session that created the order attempt. Empty for legacy records.
+    #[serde(default)]
+    pub run_id: String,
     /// Stable idempotency key for persistence and settlement.
     pub position_id: String,
     /// Links the actual order lifecycle to its counterfactual model evaluation.
@@ -168,7 +171,13 @@ pub struct PendingLateResolutionWinnerTrading {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WinnerEvaluation {
+    /// Runtime session that produced this observation. Empty for legacy records.
+    #[serde(default)]
+    pub run_id: String,
     pub evaluation_id: String,
+    /// `production`, `hybrid_paper`, or `rejected_shadow`.
+    #[serde(default)]
+    pub candidate_stage: String,
     pub asset: String,
     pub slug: String,
     pub end_date: DateTime<Utc>,
@@ -194,6 +203,15 @@ pub struct WinnerEvaluation {
     pub probability_edge_before_risk: Decimal,
     #[serde(default)]
     pub required_probability: Decimal,
+    /// Raw market-implied probability (best ask), kept separate from fees/risk buffers.
+    #[serde(default)]
+    pub market_implied_probability: Decimal,
+    /// Independent model probability minus the market-implied probability.
+    #[serde(default)]
+    pub model_market_probability_gap: Decimal,
+    /// `model_below_market`, `model_at_market`, or `model_above_market`.
+    #[serde(default)]
+    pub probability_calibration_state: String,
     #[serde(default)]
     pub reversal_margin_ratio: f64,
     #[serde(default)]
@@ -219,6 +237,8 @@ pub struct WinnerEvaluation {
 /// order/position lifecycle entry.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WinnerShadowExecution {
+    #[serde(default)]
+    pub run_id: String,
     pub evaluation_id: String,
     pub slug: String,
     pub simulated_at: DateTime<Utc>,
@@ -248,6 +268,8 @@ fn default_shadow_candidate_stage() -> String {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WinnerConfirmationObservation {
+    #[serde(default)]
+    pub run_id: String,
     pub evaluation_id: String,
     pub slug: String,
     pub recorded_at: DateTime<Utc>,
@@ -263,6 +285,7 @@ pub struct WinnerConfirmationObservation {
 impl WinnerEvaluation {
     #[allow(clippy::too_many_arguments)]
     pub fn from_model(
+        run_id: String,
         evaluation_id: String,
         asset: String,
         slug: String,
@@ -280,7 +303,9 @@ impl WinnerEvaluation {
         model: &ModelEvaluation,
     ) -> Self {
         Self {
+            run_id,
             evaluation_id,
+            candidate_stage: String::new(),
             asset,
             slug,
             end_date,
@@ -306,6 +331,14 @@ impl WinnerEvaluation {
             effective_entry_price: model.effective_price,
             probability_edge_before_risk: model.probability_edge_before_risk,
             required_probability: model.required_probability,
+            market_implied_probability: ask_price,
+            model_market_probability_gap: model.probability - ask_price,
+            probability_calibration_state: match model.probability.cmp(&ask_price) {
+                std::cmp::Ordering::Less => "model_below_market",
+                std::cmp::Ordering::Equal => "model_at_market",
+                std::cmp::Ordering::Greater => "model_above_market",
+            }
+            .to_string(),
             reversal_margin_ratio: if model.reversal_boundary_bps > 0.0 {
                 model.directional_margin_bps / model.reversal_boundary_bps
             } else {
@@ -355,6 +388,16 @@ pub fn winner_research_cohorts(
     if direction_agrees {
         cohorts.push("chainlink_direction_agrees".to_string());
     }
+    cohorts.push(
+        if evaluation.model_market_probability_gap < Decimal::ZERO {
+            "model_probability_below_market"
+        } else if evaluation.model_market_probability_gap > Decimal::ZERO {
+            "model_probability_above_market"
+        } else {
+            "model_probability_at_market"
+        }
+        .to_string(),
+    );
     let positive_win_payoff =
         evaluation.effective_entry_price < dec!(1) && evaluation.fee_per_share >= dec!(0);
     if preferred_price
@@ -383,6 +426,13 @@ fn seconds_remaining_bucket(seconds: i64) -> &'static str {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 enum WinnerEvaluationEvent {
+    RunStarted {
+        version: u8,
+        run_id: String,
+        started_at: DateTime<Utc>,
+        mode: String,
+        hybrid_paper_enabled: bool,
+    },
     Evaluated {
         version: u8,
         evaluation: Box<WinnerEvaluation>,
@@ -463,6 +513,7 @@ impl WinnerEvaluationJournal {
                     }
                 };
                 match event {
+                    WinnerEvaluationEvent::RunStarted { version: 1, .. } => {}
                     WinnerEvaluationEvent::Evaluated {
                         version: 1,
                         evaluation,
@@ -495,6 +546,21 @@ impl WinnerEvaluationJournal {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn record_run_started(
+        &self,
+        run_id: &str,
+        mode: &str,
+        hybrid_paper_enabled: bool,
+    ) -> Result<()> {
+        self.append(&WinnerEvaluationEvent::RunStarted {
+            version: 1,
+            run_id: run_id.to_string(),
+            started_at: Utc::now(),
+            mode: mode.to_string(),
+            hybrid_paper_enabled,
+        })
     }
 
     pub fn record(&self, evaluation: WinnerEvaluation) -> Result<()> {
@@ -1413,6 +1479,7 @@ mod tests {
 
     fn pending_buy() -> PendingLateResolutionWinnerTrading {
         PendingLateResolutionWinnerTrading {
+            run_id: "run-1".into(),
             position_id: "winner-1".into(),
             evaluation_id: "evaluation-1".into(),
             candidate_stage: "production".into(),
@@ -1610,7 +1677,9 @@ mod tests {
         ));
         let now = Utc::now();
         let evaluation = WinnerEvaluation {
+            run_id: "run-1".into(),
             evaluation_id: "eval-1".into(),
+            candidate_stage: "rejected_shadow".into(),
             asset: "btc".into(),
             slug: "btc-updown-5m-1".into(),
             end_date: now - TimeDelta::seconds(1),
@@ -1632,6 +1701,9 @@ mod tests {
             effective_entry_price: dec!(0.953325),
             probability_edge_before_risk: dec!(-0.013325),
             required_probability: dec!(0.965325),
+            market_implied_probability: dec!(0.95),
+            model_market_probability_gap: dec!(-0.01),
+            probability_calibration_state: "model_below_market".into(),
             reversal_margin_ratio: 10.0,
             ask_price_bucket: "0.95".into(),
             seconds_remaining_bucket: "00-20s".into(),
@@ -1649,6 +1721,9 @@ mod tests {
         assert!(cohorts
             .iter()
             .any(|cohort| cohort == "chainlink_direction_agrees"));
+        assert!(cohorts
+            .iter()
+            .any(|cohort| cohort == "model_probability_below_market"));
         assert!(!cohorts.iter().any(|cohort| cohort == "price_096_098"));
         assert!(!cohorts.iter().any(|cohort| cohort == "production_model"));
         let mut production_evaluation = evaluation.clone();
@@ -1679,6 +1754,7 @@ mod tests {
             journal.record(evaluation).unwrap();
             journal
                 .record_confirmation_observation(WinnerConfirmationObservation {
+                    run_id: "run-1".into(),
                     evaluation_id: "eval-1".into(),
                     slug: "btc-updown-5m-1".into(),
                     recorded_at: now,
@@ -1691,6 +1767,7 @@ mod tests {
                 .unwrap();
             journal
                 .record_shadow_execution(WinnerShadowExecution {
+                    run_id: "run-1".into(),
                     evaluation_id: "eval-1".into(),
                     slug: "btc-updown-5m-1".into(),
                     simulated_at: now,

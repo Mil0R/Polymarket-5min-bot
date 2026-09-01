@@ -162,6 +162,10 @@ pub struct Config {
     /// PAPER-only research path: allow the evidence-backed Chainlink-direction
     /// veto cohort through the normal simulated order lifecycle.
     pub late_resolution_winner_trading_hybrid_paper_enabled: bool,
+    /// Smaller PAPER-only cash cap for each hybrid calibration order.
+    pub late_resolution_winner_trading_hybrid_paper_max_order_usdc: f64,
+    /// Independent per-window limit for hybrid PAPER calibration orders.
+    pub late_resolution_winner_trading_hybrid_paper_max_per_window: u32,
     /// Max notional (USDC) per late-resolution winner trading.
     pub late_resolution_winner_trading_max_order_usdc: f64,
     /// Max late-resolution winner tradings per window (0 = unlimited).
@@ -400,6 +404,14 @@ impl Config {
             late_resolution_winner_trading_hybrid_paper_enabled: env_bool(
                 "LATE_RESOLUTION_WINNER_TRADING_HYBRID_PAPER_ENABLED",
                 false,
+            )?,
+            late_resolution_winner_trading_hybrid_paper_max_order_usdc: env_parse(
+                "LATE_RESOLUTION_WINNER_TRADING_HYBRID_PAPER_MAX_ORDER_USDC",
+                "5.0",
+            )?,
+            late_resolution_winner_trading_hybrid_paper_max_per_window: env_parse(
+                "LATE_RESOLUTION_WINNER_TRADING_HYBRID_PAPER_MAX_PER_WINDOW",
+                "1",
             )?,
             late_resolution_winner_trading_max_order_usdc: env_parse(
                 "LATE_RESOLUTION_WINNER_TRADING_MAX_ORDER_USDC",
@@ -782,6 +794,20 @@ impl Config {
         }
         if self.late_resolution_winner_trading_hybrid_paper_enabled && !self.dry_run {
             bail!("LATE_RESOLUTION_WINNER_TRADING_HYBRID_PAPER_ENABLED can only be enabled with DRY_RUN=true");
+        }
+        if self.late_resolution_winner_trading_hybrid_paper_enabled {
+            if !self
+                .late_resolution_winner_trading_hybrid_paper_max_order_usdc
+                .is_finite()
+                || self.late_resolution_winner_trading_hybrid_paper_max_order_usdc <= 0.0
+                || self.late_resolution_winner_trading_hybrid_paper_max_order_usdc
+                    > self.late_resolution_winner_trading_max_order_usdc
+            {
+                bail!("LATE_RESOLUTION_WINNER_TRADING_HYBRID_PAPER_MAX_ORDER_USDC must be positive and cannot exceed LATE_RESOLUTION_WINNER_TRADING_MAX_ORDER_USDC");
+            }
+            if self.late_resolution_winner_trading_hybrid_paper_max_per_window == 0 {
+                bail!("LATE_RESOLUTION_WINNER_TRADING_HYBRID_PAPER_MAX_PER_WINDOW must be greater than 0");
+            }
         }
         if self.canary_max_pairs_per_window == 0
             || self.canary_max_pairs_per_window > 1

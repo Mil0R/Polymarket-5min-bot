@@ -92,7 +92,9 @@ cargo build --release --bin market_making
 - 最长 1800 秒 markout 连续负收益达到 `MARKET_MAKING_MAX_CONSECUTIVE_NEGATIVE_MARKOUTS` 后，市场进入冷却并触发重新筛选。
 - `report` 除总体结果外，还会按 run、市场分类、市场、价格区间、UTC 小时和报价距离实验组汇总。
 - `report` 会显示 5 分钟、30 分钟、最优买价退出 PnL、结算最坏/最好边界，以及独立 queue-aware 成交是否达到 `MARKET_MAKING_MIN_INDEPENDENT_FILL_SAMPLES=100`。
+- 延迟到达的历史成交代理现在按 YES/NO 逐腿执行 `MARKET_MAKING_MAX_INVENTORY_SHARES` 硬上限；发生截断时写入 `inventory_cap_applied`，该运行的数据完整性门禁保持失败，必须重新采集，不能把截断当作真实成交收益。
 - `MARKET_MAKING_REWARD_AUDIT_FILE` 保存逐小时快照。报告只比较日期和 `condition_id` 均重叠的数据，低于 `MARKET_MAKING_MIN_REWARD_CAPTURE_RATIO` 输出 `STOP`，达到 `MARKET_MAKING_TARGET_REWARD_CAPTURE_RATIO` 才通过奖励门槛。
+- `reward-watch` 对每次认证奖励请求设置 30 秒超时；请求失败会追加 `reward_snapshot_error` 事件到审计文件，避免 API 卡住时误认为没有运行审计。
 - 默认 canary 安全边界为最多 2 个市场、单次报价名义金额 `$5`、库存 `$10`、30 秒公平价跳变 1%。这些参数只作为未来真实 canary 的准入上限，当前二进制仍固定输出 `live_canary_status=BLOCKED`。
 - `MARKET_MAKING_NEWS_HALT_FILE` 是人工新闻熔断清单：每行可写 `condition_id`、slug、category 或 `*`；Shadow 每轮报价前重读，命中时撤销当前虚拟报价并记录 `manual_news_halt`。未来 canary 必须复用同一 fail-closed 检查。
 

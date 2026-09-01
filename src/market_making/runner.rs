@@ -197,6 +197,7 @@ pub fn run_report(path: &Path, config: &MarketMakingResearchConfig) -> Result<()
     let mut quote_horizons = HashMap::<String, HashSet<u64>>::new();
     let mut abandoned_pending_markouts = 0_u64;
     let mut inventory_limit_violations = 0_u64;
+    let mut inventory_cap_applied = 0_u64;
     let mut max_abs_net_inventory = Decimal::ZERO;
     for (line_number, line) in reader.lines().enumerate() {
         let line = line.with_context(|| format!("failed reading line {}", line_number + 1))?;
@@ -293,6 +294,9 @@ pub fn run_report(path: &Path, config: &MarketMakingResearchConfig) -> Result<()
                     max_abs_net_inventory = max_abs_net_inventory.max(absolute);
                     inventory_limit_violations += u64::from(absolute > config.max_inventory_shares);
                 }
+            }
+            Some("inventory_cap_applied") => {
+                inventory_cap_applied += 1;
             }
             Some("markout") => {
                 let markout: ShadowMarkout = serde_json::from_value(event["data"].clone())
@@ -404,13 +408,14 @@ pub fn run_report(path: &Path, config: &MarketMakingResearchConfig) -> Result<()
         schema_versions,
     );
     println!(
-        "data_integrity: final_horizon={}s matured_quotes={} not_due={} missing_due={} abandoned_pending={} inventory_limit_violations={} max_abs_net_inventory={}",
+        "data_integrity: final_horizon={}s matured_quotes={} not_due={} missing_due={} abandoned_pending={} inventory_limit_violations={} inventory_cap_applied={} max_abs_net_inventory={}",
         final_horizon,
         matured_quotes,
         not_due_quotes,
         missing_due_quotes,
         abandoned_pending_markouts,
         inventory_limit_violations,
+        inventory_cap_applied,
         max_abs_net_inventory.round_dp(4),
     );
     println!(
@@ -518,7 +523,8 @@ pub fn run_report(path: &Path, config: &MarketMakingResearchConfig) -> Result<()
     let has_long_horizons = horizons.contains_key(&300) && horizons.contains_key(&1_800);
     let data_integrity_pass = missing_due_quotes == 0
         && abandoned_pending_markouts == 0
-        && inventory_limit_violations == 0;
+        && inventory_limit_violations == 0
+        && inventory_cap_applied == 0;
     println!(
         "research_gate: analysis_horizon={}s independent_queue_aware_fills={}/{} long_horizons={} data_integrity={} sample_status={}",
         analysis_horizon.unwrap_or_default(),
@@ -1142,6 +1148,8 @@ fn observe_pending_markouts(
     let final_horizon = config.markout_horizons_secs.last().copied();
     let mut inventory_yes_delta = Decimal::ZERO;
     let mut inventory_no_delta = Decimal::ZERO;
+    let starting_yes_inventory = state.virtual_yes_inventory;
+    let starting_no_inventory = state.virtual_no_inventory;
     let mut negative_markout_updates = Vec::new();
     for pending in &mut state.pending {
         let age_secs = now
@@ -1163,12 +1171,36 @@ fn observe_pending_markouts(
                 now,
             ) {
                 Ok(markout) => {
-                    let yes_delta = (markout.yes_fill_proxy_shares
+                    let raw_yes_delta = (markout.yes_fill_proxy_shares
                         - pending.accounted_yes_fill_shares)
                         .max(Decimal::ZERO);
-                    let no_delta = (markout.no_fill_proxy_shares
+                    let raw_no_delta = (markout.no_fill_proxy_shares
                         - pending.accounted_no_fill_shares)
                         .max(Decimal::ZERO);
+                    let yes_headroom = (config.max_inventory_shares
+                        - starting_yes_inventory
+                        - inventory_yes_delta)
+                        .max(Decimal::ZERO);
+                    let no_headroom =
+                        (config.max_inventory_shares - starting_no_inventory - inventory_no_delta)
+                            .max(Decimal::ZERO);
+                    let yes_delta = raw_yes_delta.min(yes_headroom);
+                    let no_delta = raw_no_delta.min(no_headroom);
+                    if yes_delta < raw_yes_delta || no_delta < raw_no_delta {
+                        journal.record(
+                            "inventory_cap_applied",
+                            &json!({
+                                "condition_id": state.selection.market.condition_id,
+                                "quote_id": pending.quote.quote_id,
+                                "horizon_secs": horizon,
+                                "raw_yes_delta": raw_yes_delta,
+                                "raw_no_delta": raw_no_delta,
+                                "capped_yes_delta": yes_delta,
+                                "capped_no_delta": no_delta,
+                                "max_inventory_shares": config.max_inventory_shares,
+                            }),
+                        )?;
+                    }
                     pending.accounted_yes_fill_shares = pending
                         .accounted_yes_fill_shares
                         .max(markout.yes_fill_proxy_shares);

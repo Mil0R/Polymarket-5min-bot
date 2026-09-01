@@ -519,6 +519,11 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
         let journal = Arc::new(WinnerEvaluationJournal::open(
             &config.late_resolution_winner_trading_evaluation_journal_file,
         )?);
+        journal.record_run_started(
+            &run_id.to_string(),
+            execution_mode,
+            config.late_resolution_winner_trading_hybrid_paper_enabled,
+        )?;
         info!(target: "polypulse::strategy::late_resolution_winner_trading", path = %journal.path().display(), "Late-Resolution Winner Trading counterfactual journal ready");
         Some(journal)
     } else {
@@ -766,6 +771,8 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
 
         // Window-end late-resolution-winner-trading: attempt counter reset on each window rollover.
         let late_resolution_winner_trading_count = Arc::new(AtomicU32::new(0));
+        let late_resolution_winner_trading_production_count = Arc::new(AtomicU32::new(0));
+        let late_resolution_winner_trading_hybrid_count = Arc::new(AtomicU32::new(0));
         let mut winner_attempts_by_market: HashMap<String, u32> = HashMap::new();
         let mut winner_confirmations = WinnerConfirmationTracker::default();
         let mut winner_shadow_confirmations = WinnerConfirmationTracker::default();
@@ -776,6 +783,8 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                 min_price = config.late_resolution_winner_trading_min_price,
                 max_price = config.late_resolution_winner_trading_max_price,
                 hybrid_paper_enabled = config.late_resolution_winner_trading_hybrid_paper_enabled,
+                hybrid_paper_max_order_usdc = config.late_resolution_winner_trading_hybrid_paper_max_order_usdc,
+                hybrid_paper_max_per_window = config.late_resolution_winner_trading_hybrid_paper_max_per_window,
                 max_order_usdc = config.late_resolution_winner_trading_max_order_usdc,
                 max_book_age_ms = config.late_resolution_winner_trading_max_book_age_ms,
                 confirmation_observations = config.late_resolution_winner_trading_confirmation_observations,
@@ -1909,9 +1918,6 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                         }
                     }
                     if strategy_controls.late_resolution_winner_trading_enabled()
-                        && (config.late_resolution_winner_trading_max_per_window == 0
-                            || late_resolution_winner_trading_count.load(Ordering::Relaxed)
-                                < config.late_resolution_winner_trading_max_per_window)
                         && seconds_until_end > 0
                         && seconds_until_end <= config.late_resolution_winner_trading_before_end_secs
                         && matches!(
@@ -1928,6 +1934,10 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                             config.late_resolution_winner_trading_max_order_usdc,
                         )
                         .unwrap_or(dec!(50));
+                        let hybrid_max_order = rust_decimal::Decimal::try_from(
+                            config.late_resolution_winner_trading_hybrid_paper_max_order_usdc,
+                        )
+                        .unwrap_or(dec!(5));
                         for market in &markets {
                             runtime_metrics.record_late_resolution_winner_trading_scan();
                             runtime_metrics
@@ -1937,9 +1947,9 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                                 .copied()
                                 .unwrap_or(0);
                             if !attempt_allowed(
-                                late_resolution_winner_trading_count.load(Ordering::Relaxed),
+                                0,
                                 market_attempts,
-                                config.late_resolution_winner_trading_max_per_window,
+                                0,
                                 config.late_resolution_winner_trading_max_attempts_per_market,
                             ) {
                                 if config.late_resolution_winner_trading_max_per_window > 0
@@ -2220,6 +2230,7 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                             );
                             let evaluation_id = uuid::Uuid::new_v4().to_string();
                             let mut evaluation = WinnerEvaluation::from_model(
+                                run_id.to_string(),
                                 evaluation_id.clone(),
                                 market.crypto_symbol.clone(),
                                 market.slug.clone(),
@@ -2252,6 +2263,14 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                                 && research_cohorts
                                     .iter()
                                     .any(|cohort| cohort == "hybrid_chainlink_veto");
+                            evaluation.candidate_stage = if model.admitted() {
+                                "production"
+                            } else if hybrid_paper_admitted {
+                                "hybrid_paper"
+                            } else {
+                                "rejected_shadow"
+                            }
+                            .to_string();
                             if let Err(error) = winner_evaluation_journal
                                 .as_ref()
                                 .expect("Late-Resolution Winner Trading evaluation journal initialized")
@@ -2316,6 +2335,7 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                                         config.late_resolution_winner_trading_feed_max_age_ms.saturating_mul(3),
                                     );
                                     let confirmation_observation = WinnerConfirmationObservation {
+                                        run_id: run_id.to_string(),
                                         evaluation_id: evaluation_id.clone(),
                                         slug: market.slug.clone(),
                                         recorded_at: Utc::now(),
@@ -2349,7 +2369,7 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                                     let shadow_size = fee_inclusive_depth_capped_size(
                                         signal.price,
                                         fee_per_share,
-                                        max_order,
+                                        hybrid_max_order,
                                         ask_size,
                                     );
                                     if shadow_size > dec!(0) {
@@ -2371,6 +2391,7 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                                             shadow_size,
                                             fee_per_share,
                                             config.paper_late_resolution_winner_trading_delay_ms,
+                                            run_id.to_string(),
                                             evaluation_id.clone(),
                                             market.slug.clone(),
                                             market.crypto_symbol.clone(),
@@ -2397,6 +2418,29 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                             } else {
                                 "production"
                             };
+                            let (stage_count, stage_max_per_window) = if hybrid_paper_admitted {
+                                (
+                                    &late_resolution_winner_trading_hybrid_count,
+                                    config
+                                        .late_resolution_winner_trading_hybrid_paper_max_per_window,
+                                )
+                            } else {
+                                (
+                                    &late_resolution_winner_trading_production_count,
+                                    config.late_resolution_winner_trading_max_per_window,
+                                )
+                            };
+                            if stage_max_per_window > 0
+                                && stage_count.load(Ordering::Relaxed) >= stage_max_per_window
+                            {
+                                debug!(target: "polypulse::strategy::late_resolution_winner_trading",
+                                    market = %market.crypto_symbol,
+                                    stage = %candidate_stage,
+                                    stage_max_per_window,
+                                    "Late-Resolution Winner Trading stage-specific window limit reached"
+                                );
+                                continue;
+                            }
                             winner_shadow_confirmations.reject(&market.slug);
                             let observed_at_ms = model
                                 .observed_at_ms
@@ -2409,6 +2453,7 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                                 config.late_resolution_winner_trading_feed_max_age_ms.saturating_mul(3),
                             );
                             let confirmation_observation = WinnerConfirmationObservation {
+                                run_id: run_id.to_string(),
                                 evaluation_id: evaluation_id.clone(),
                                 slug: market.slug.clone(),
                                 recorded_at: Utc::now(),
@@ -2455,7 +2500,11 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                             let size = fee_inclusive_depth_capped_size(
                                 signal.price,
                                 fee_per_share,
-                                max_order,
+                                if hybrid_paper_admitted {
+                                    hybrid_max_order
+                                } else {
+                                    max_order
+                                },
                                 ask_size,
                             );
                             if size <= dec!(0) {
@@ -2508,6 +2557,7 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                                 continue;
                             }
                             let attempt = PendingLateResolutionWinnerTrading {
+                                run_id: run_id.to_string(),
                                 position_id,
                                 evaluation_id,
                                 candidate_stage: candidate_stage.to_string(),
@@ -2547,6 +2597,7 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                             match winner_journal.record_attempt(attempt.clone()) {
                                 Ok(true) => {
                                     late_resolution_winner_trading_count.fetch_add(1, Ordering::Relaxed);
+                                    stage_count.fetch_add(1, Ordering::Relaxed);
                                     *winner_attempts_by_market
                                         .entry(market.slug.clone())
                                         .or_default() += 1;
@@ -2779,6 +2830,7 @@ async fn record_winner_shadow(
     size: rust_decimal::Decimal,
     fee_per_share: rust_decimal::Decimal,
     delay_ms: u64,
+    run_id: String,
     evaluation_id: String,
     slug: String,
     asset: String,
@@ -2817,6 +2869,7 @@ async fn record_winner_shadow(
         }
     };
     let execution = WinnerShadowExecution {
+        run_id,
         evaluation_id: evaluation_id.clone(),
         slug,
         simulated_at: chrono::Utc::now(),

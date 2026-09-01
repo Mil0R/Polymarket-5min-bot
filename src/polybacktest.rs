@@ -32,6 +32,8 @@ pub struct ReplayConfig {
     liquidity_haircut: Decimal,
     fee_rate: Decimal,
     fee_exponent: u64,
+    spread_fee_rate: Decimal,
+    spread_fee_exponent: u64,
     spread_min_edge: Decimal,
     spread_min_net_profit: Decimal,
     spread_execution_spread: Decimal,
@@ -76,6 +78,12 @@ impl ReplayConfig {
             .unwrap_or_else(|| Path::new(&data_dir).join("polybacktest.sqlite3"));
         let fee_rate = env_decimal("BACKTEST_FEE_RATE", "0.25")?;
         let fee_exponent = env_parse("BACKTEST_FEE_EXPONENT", 2u64)?;
+        let spread_fee_rate =
+            env_optional_decimal("BINARY_COMPLEMENT_ARBITRAGE_BACKTEST_FEE_RATE", fee_rate)?;
+        let spread_fee_exponent = env_parse(
+            "BINARY_COMPLEMENT_ARBITRAGE_BACKTEST_FEE_EXPONENT",
+            fee_exponent,
+        )?;
         let winner_fee = dynamic_fee_per_share(fee_rate, fee_exponent, dec!(0.97));
         let market_type = std::env::var("BACKTEST_MARKET_TYPE")
             .or_else(|_| std::env::var("POLYBACKTEST_MARKET_TYPE"))
@@ -93,6 +101,8 @@ impl ReplayConfig {
             liquidity_haircut: env_decimal("BACKTEST_LIQUIDITY_HAIRCUT", "0.75")?,
             fee_rate,
             fee_exponent,
+            spread_fee_rate,
+            spread_fee_exponent,
             spread_min_edge: env_decimal("BINARY_COMPLEMENT_ARBITRAGE_BACKTEST_MIN_EDGE", "0.005")?,
             spread_min_net_profit: env_decimal(
                 "BINARY_COMPLEMENT_ARBITRAGE_BACKTEST_MIN_NET_PROFIT_USDC",
@@ -549,6 +559,7 @@ struct SpreadReplayReport {
     market_type: String,
     fee_rate: String,
     fee_exponent: u64,
+    coverage: ReplayCoverageReport,
     parameters: Value,
     scenarios: Vec<SpreadScenarioReport>,
     positive_scenarios: usize,
@@ -557,6 +568,21 @@ struct SpreadReplayReport {
     log_file: String,
     analysis_file: String,
     limitations: Vec<&'static str>,
+}
+
+#[derive(Debug, Serialize)]
+struct ReplayCoverageReport {
+    selected_markets: usize,
+    markets_with_snapshots: usize,
+    markets_without_snapshots: usize,
+    snapshots: usize,
+    snapshots_with_two_sided_quotes: usize,
+    snapshots_with_two_sided_books: usize,
+    assets: BTreeMap<String, usize>,
+    start_at: Option<String>,
+    end_at: Option<String>,
+    market_offset: usize,
+    max_markets: usize,
 }
 
 struct ReplayRunLog {
@@ -605,6 +631,36 @@ pub fn run_binary_complement_replay() -> Result<PathBuf> {
     if config.max_markets > 0 {
         markets.truncate(config.max_markets);
     }
+    if markets.is_empty() {
+        bail!(
+            "BACKTEST_MARKET_OFFSET={} and BACKTEST_MAX_MARKETS={} selected no markets from the complete {} dataset",
+            config.market_offset,
+            config.max_markets,
+            config.market_type
+        );
+    }
+    let mut coverage = ReplayCoverageReport {
+        selected_markets: markets.len(),
+        markets_with_snapshots: 0,
+        markets_without_snapshots: 0,
+        snapshots: 0,
+        snapshots_with_two_sided_quotes: 0,
+        snapshots_with_two_sided_books: 0,
+        assets: BTreeMap::new(),
+        start_at: markets
+            .first()
+            .and_then(|market| timestamp_rfc3339(market.start_ms)),
+        end_at: markets
+            .iter()
+            .map(|market| market.end_ms)
+            .max()
+            .and_then(timestamp_rfc3339),
+        market_offset: config.market_offset,
+        max_markets: config.max_markets,
+    };
+    for market in &markets {
+        *coverage.assets.entry(market.coin.clone()).or_default() += 1;
+    }
     let run_id = format!(
         "run-{}-{}",
         Utc::now().format("%Y%m%dT%H%M%SZ"),
@@ -639,6 +695,20 @@ pub fn run_binary_complement_replay() -> Result<PathBuf> {
     let started = Instant::now();
     for (index, market) in markets.iter().enumerate() {
         let snapshots = load_snapshots(&connection, &market.id)?;
+        coverage.snapshots += snapshots.len();
+        if snapshots.is_empty() {
+            coverage.markets_without_snapshots += 1;
+        } else {
+            coverage.markets_with_snapshots += 1;
+        }
+        coverage.snapshots_with_two_sided_quotes += snapshots
+            .iter()
+            .filter(|snapshot| snapshot.up_ask.is_some() && snapshot.down_ask.is_some())
+            .count();
+        coverage.snapshots_with_two_sided_books += snapshots
+            .iter()
+            .filter(|snapshot| snapshot.up_book.is_some() && snapshot.down_book.is_some())
+            .count();
         for totals in &mut scenario_totals {
             let asset = totals.assets.entry(market.coin.clone()).or_default();
             asset.markets += 1;
@@ -710,8 +780,9 @@ pub fn run_binary_complement_replay() -> Result<PathBuf> {
         generated_at: Utc::now().to_rfc3339(),
         database: config.database_file.display().to_string(),
         market_type: config.market_type.clone(),
-        fee_rate: config.fee_rate.to_string(),
-        fee_exponent: config.fee_exponent,
+        fee_rate: config.spread_fee_rate.to_string(),
+        fee_exponent: config.spread_fee_exponent,
+        coverage,
         parameters: serde_json::json!({
             "minimum_signal_edge_per_share": config.spread_min_edge,
             "minimum_net_profit_usdc": config.spread_min_net_profit,
@@ -1113,8 +1184,12 @@ fn replay_spread_market_grid(
                 continue;
             };
             let signal_fee_per_share =
-                dynamic_fee_per_share(config.fee_rate, config.fee_exponent, up_ask)
-                    + dynamic_fee_per_share(config.fee_rate, config.fee_exponent, down_ask);
+                dynamic_fee_per_share(config.spread_fee_rate, config.spread_fee_exponent, up_ask)
+                    + dynamic_fee_per_share(
+                        config.spread_fee_rate,
+                        config.spread_fee_exponent,
+                        down_ask,
+                    );
             let mut filled_shares =
                 (scenario.order_usdc / (signal_sum + signal_fee_per_share)).round_dp(6);
             if filled_shares <= Decimal::ZERO {
@@ -1163,10 +1238,15 @@ fn replay_spread_market_grid(
             }
             let mut up_average = up_cost / filled_shares;
             let mut down_average = down_cost / filled_shares;
-            let mut fees =
-                (dynamic_fee_per_share(config.fee_rate, config.fee_exponent, up_average)
-                    + dynamic_fee_per_share(config.fee_rate, config.fee_exponent, down_average))
-                    * filled_shares;
+            let mut fees = (dynamic_fee_per_share(
+                config.spread_fee_rate,
+                config.spread_fee_exponent,
+                up_average,
+            ) + dynamic_fee_per_share(
+                config.spread_fee_rate,
+                config.spread_fee_exponent,
+                down_average,
+            )) * filled_shares;
             if up_cost + down_cost + fees > scenario.order_usdc {
                 filled_shares = (filled_shares * scenario.order_usdc
                     / (up_cost + down_cost + fees)
@@ -1202,9 +1282,15 @@ fn replay_spread_market_grid(
                 down_cost = resized_down_cost;
                 up_average = up_cost / filled_shares;
                 down_average = down_cost / filled_shares;
-                fees = (dynamic_fee_per_share(config.fee_rate, config.fee_exponent, up_average)
-                    + dynamic_fee_per_share(config.fee_rate, config.fee_exponent, down_average))
-                    * filled_shares;
+                fees = (dynamic_fee_per_share(
+                    config.spread_fee_rate,
+                    config.spread_fee_exponent,
+                    up_average,
+                ) + dynamic_fee_per_share(
+                    config.spread_fee_rate,
+                    config.spread_fee_exponent,
+                    down_average,
+                )) * filled_shares;
             }
             if up_cost + down_cost + fees > scenario.order_usdc
                 || up_cost < dec!(1)
@@ -1233,9 +1319,11 @@ fn replay_spread_market_grid(
             }
             let first_cost = if up_first { up_cost } else { down_cost };
             let first_average = first_cost / filled_shares;
-            let first_fees =
-                dynamic_fee_per_share(config.fee_rate, config.fee_exponent, first_average)
-                    * filled_shares;
+            let first_fees = dynamic_fee_per_share(
+                config.spread_fee_rate,
+                config.spread_fee_exponent,
+                first_average,
+            ) * filled_shares;
             let second_target_ms = snapshots[preflight_index]
                 .time_ms
                 .saturating_add(scenario.second_leg_delay_ms);
@@ -1278,9 +1366,11 @@ fn replay_spread_market_grid(
                     .flatten();
                 if let Some(unwind_proceeds) = unwind_proceeds {
                     let unwind_average = unwind_proceeds / filled_shares;
-                    let unwind_fees =
-                        dynamic_fee_per_share(config.fee_rate, config.fee_exponent, unwind_average)
-                            * filled_shares;
+                    let unwind_fees = dynamic_fee_per_share(
+                        config.spread_fee_rate,
+                        config.spread_fee_exponent,
+                        unwind_average,
+                    ) * filled_shares;
                     let unwind_gross_pnl = unwind_proceeds - first_cost;
                     totals.emergency_unwinds += 1;
                     totals.gross_pnl += unwind_gross_pnl;
@@ -1310,9 +1400,11 @@ fn replay_spread_market_grid(
                 continue;
             };
             let second_average = second_cost / filled_shares;
-            let second_fees =
-                dynamic_fee_per_share(config.fee_rate, config.fee_exponent, second_average)
-                    * filled_shares;
+            let second_fees = dynamic_fee_per_share(
+                config.spread_fee_rate,
+                config.spread_fee_exponent,
+                second_average,
+            ) * filled_shares;
             let gross_pnl = filled_shares - first_cost - second_cost;
             totals.fills += 1;
             totals.wins += 1;
@@ -2015,6 +2107,24 @@ fn write_spread_analysis(path: &Path, report: &SpreadReplayReport) -> Result<()>
         report.positive_scenarios,
         report.scenarios.len()
     ));
+    markdown.push_str(&format!(
+        "数据覆盖：{} 个市场（有快照 {}，无快照 {}），{} 个快照；双边报价快照 {}，双边完整盘口快照 {}；时间范围 `{}` 至 `{}`；资产市场数：{}。\n\n",
+        report.coverage.selected_markets,
+        report.coverage.markets_with_snapshots,
+        report.coverage.markets_without_snapshots,
+        report.coverage.snapshots,
+        report.coverage.snapshots_with_two_sided_quotes,
+        report.coverage.snapshots_with_two_sided_books,
+        report.coverage.start_at.as_deref().unwrap_or("unknown"),
+        report.coverage.end_at.as_deref().unwrap_or("unknown"),
+        report
+            .coverage
+            .assets
+            .iter()
+            .map(|(asset, count)| format!("{asset}={count}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+    ));
     if total_fills == 0 {
         markdown.push_str(
             "全部订单金额、延迟与流动性场景均无模拟成交。应先检查候选、信号深度、动态手续费净边际和执行深度漏斗，不宜直接进入 dry-run。\n\n",
@@ -2204,6 +2314,10 @@ fn normalize_ms(value: i64) -> i64 {
     }
 }
 
+fn timestamp_rfc3339(timestamp_ms: i64) -> Option<String> {
+    chrono::DateTime::from_timestamp_millis(timestamp_ms).map(|timestamp| timestamp.to_rfc3339())
+}
+
 fn decimal_column(row: &Row<'_>, index: usize) -> rusqlite::Result<Option<Decimal>> {
     row.get::<_, Option<String>>(index)
         .map(|value| value.and_then(|value| Decimal::from_str(&value).ok()))
@@ -2220,6 +2334,14 @@ fn value_decimal(value: &Value) -> Option<Decimal> {
 fn env_decimal(name: &str, default: &str) -> Result<Decimal> {
     Decimal::from_str(&std::env::var(name).unwrap_or_else(|_| default.to_string()))
         .with_context(|| format!("{name} must be a decimal"))
+}
+
+fn env_optional_decimal(name: &str, fallback: Decimal) -> Result<Decimal> {
+    match std::env::var(name) {
+        Ok(value) => Decimal::from_str(&value).with_context(|| format!("{name} must be a decimal")),
+        Err(std::env::VarError::NotPresent) => Ok(fallback),
+        Err(error) => Err(error).with_context(|| format!("failed to read {name}")),
+    }
 }
 
 fn env_bool(name: &str, default: bool) -> Result<bool> {

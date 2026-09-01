@@ -116,6 +116,7 @@ Get these from Polymarket → Settings → Builder.
 | `LATE_RESOLUTION_WINNER_TRADING_MAX_SPREAD` / `LATE_RESOLUTION_WINNER_TRADING_MIN_DEPTH_USDC` | `0.03` / `10.0` | Selected outcome book-quality filters |
 | `LATE_RESOLUTION_WINNER_TRADING_MIN_NET_EV` | `0.002` | Minimum `p_model - effective_price - model_risk_buffer` |
 | `LATE_RESOLUTION_WINNER_TRADING_HYBRID_PAPER_ENABLED` | `false` | PAPER-only research path for price `0.96–0.98`, positive winner payoff, Chainlink-direction agreement, and normal spread/depth/confirmation gates; live mode rejects this setting |
+| `LATE_RESOLUTION_WINNER_TRADING_HYBRID_PAPER_MAX_ORDER_USDC` / `LATE_RESOLUTION_WINNER_TRADING_HYBRID_PAPER_MAX_PER_WINDOW` | `5.0` / `1` | Smaller PAPER-only order cap and independent per-window quota for the calibration track; it cannot consume the strict production track's quota |
 | `BINARY_COMPLEMENT_ARBITRAGE_ENABLED` / `LATE_RESOLUTION_WINNER_TRADING_ENABLED` | `true` / `false` | Initial strategy states; the TUI can pause/resume entries for the current process |
 | `LATE_RESOLUTION_WINNER_TRADING_PAPER_INITIAL_BALANCE_USDC` | `50.0` | Independent virtual cash budget for Dry-run |
 | `LATE_RESOLUTION_WINNER_TRADING_PAPER_LIQUIDITY_HAIRCUT` | `0.75` | Fraction of displayed depth treated as executable in paper fills |
@@ -125,7 +126,7 @@ Get these from Polymarket → Settings → Builder.
 | `BINARY_COMPLEMENT_ARBITRAGE_SIGNAL_COOLDOWN_MS` | `3000` | Cooldown for identical market/price signals |
 | `BINARY_COMPLEMENT_ARBITRAGE_STATE_JOURNAL_FILE` | `results/binary-complement-arbitrage/{paper|live}/orders.ndjson` | Binary Complement Arbitrage order-pair/recovery journal |
 | `LATE_RESOLUTION_WINNER_TRADING_STATE_JOURNAL_FILE` | `results/late-resolution-winner-trading/{paper|live}/orders.ndjson` | Late-Resolution Winner Trading order, fill, and settlement journal |
-| `LATE_RESOLUTION_WINNER_TRADING_EVALUATION_JOURNAL_FILE` | `results/late-resolution-winner-trading/{paper|live}/evaluations.ndjson` | Late-Resolution Winner Trading candidate and counterfactual evaluations |
+| `LATE_RESOLUTION_WINNER_TRADING_EVALUATION_JOURNAL_FILE` | `results/late-resolution-winner-trading/{paper|live}/evaluations.ndjson` | Candidate/counterfactual evaluations with `run_id`, strategy stage, and model-vs-market probability calibration fields |
 | `BINARY_COMPLEMENT_ARBITRAGE_SHADOW_LOG_FILE` | unset | Optional NDJSON research log for price-positive candidates rejected by depth; never changes admission |
 | `LOG_FILE` | `logs/system.log` in TUI mode | System log; strategy events move to their configured strategy file without duplication |
 | `BINARY_COMPLEMENT_ARBITRAGE_STRATEGY_LOG_FILE` / `LATE_RESOLUTION_WINNER_TRADING_STRATEGY_LOG_FILE` | unset | Optional mutually exclusive per-strategy text logs |
@@ -137,6 +138,10 @@ Get these from Polymarket → Settings → Builder.
 | `OBSERVABILITY_BIND` | unset | Optional `/livez`, `/readyz`, compatible `/healthz`, and Prometheus `/metrics` bind address |
 
 Other settings (CLOB URL, signature type, slippage, order type, position sync, etc.) have sensible defaults. See `.env.example` for the full list with bilingual comments.
+
+`late_resolution_winner_report <evaluations.ndjson>` reads the sibling `orders.ndjson` automatically. It reports `production`, `hybrid_paper`, and rejected-shadow cohorts separately, and keeps the strategy fail-closed until at least 100 fully settled `production` fills are available for review. Hybrid PAPER returns are research evidence only and are never merged into production ROI.
+
+For dual-track dry-run research, enable `LATE_RESOLUTION_WINNER_TRADING_HYBRID_PAPER_ENABLED=true`. Strict-model (`production`) candidates keep `LATE_RESOLUTION_WINNER_TRADING_MAX_ORDER_USDC` and `LATE_RESOLUTION_WINNER_TRADING_MAX_PER_WINDOW`; model-veto calibration (`hybrid_paper`) candidates use the smaller, independent `LATE_RESOLUTION_WINNER_TRADING_HYBRID_PAPER_MAX_ORDER_USDC` and `LATE_RESOLUTION_WINNER_TRADING_HYBRID_PAPER_MAX_PER_WINDOW`. Always give simultaneous 5-minute and 15-minute processes separate journals, log files, and `OBSERVABILITY_BIND` ports.
 
 Startup reconciles cumulative CLOB fills and Data API positions, then restores manageable recovery tasks. New journal records carry a version and SHA-256 checksum. A crash-damaged final line is isolated to a `.corrupt-*` file while the valid prefix is retained; corruption in the middle still blocks startup. Legacy records without enough context block live startup by default. `ALLOW_UNRESOLVED_STATE=true` only permits the reconciliation/recovery process to run; unresolved state still blocks new live entries.
 
@@ -196,6 +201,24 @@ Crypto strategy replays are explicitly scoped by `BACKTEST_MARKET_TYPE=5m` or
 `15m`; reports are written below a matching period directory, so the two periods
 cannot be silently mixed. Use a separate SQLite file for each period when
 downloading and comparing 5-minute and 15-minute markets.
+
+### PMData historical downloader
+
+`pmdata_downloader` is an independent, read-only downloader for PMData's
+historical Up/Down `l2` order-book and `trades` Parquet files. It keeps an
+SQLite manifest and atomic raw files, so a later `sync` resumes failed or
+missing files and refreshes only recently ended windows that may still receive
+PMData's hourly updates.
+
+```bash
+cargo run --release --bin pmdata_downloader -- sync
+cargo run --release --bin pmdata_downloader -- watch
+cargo run --release --bin pmdata_downloader -- status
+```
+
+Start with the small `PMDATA_MAX_MARKETS_PER_SYNC=20` Free Plan sample in
+`.env`; see [`docs/PMDATA_DOWNLOADER.zh-CN.md`](docs/PMDATA_DOWNLOADER.zh-CN.md)
+for storage, update, and quota-safe operation.
 
 ## Disclaimer
 

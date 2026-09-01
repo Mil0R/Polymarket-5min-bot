@@ -10,10 +10,13 @@ use std::str::FromStr;
 
 #[derive(Debug, Clone)]
 struct EvaluationMeta {
+    run_id: String,
+    candidate_stage: String,
     asset: String,
     ask_bucket: String,
     seconds_bucket: String,
     research_cohorts: Vec<String>,
+    probability_gap: Decimal,
 }
 
 #[derive(Debug, Clone)]
@@ -36,6 +39,41 @@ struct GroupStats {
     shadow_wins: u64,
     shadow_capital: Decimal,
     shadow_pnl: Decimal,
+}
+
+#[derive(Debug, Default)]
+struct CalibrationStats {
+    evaluations: u64,
+    model_below_market: u64,
+    probability_gap_sum: Decimal,
+}
+
+#[derive(Debug, Default)]
+struct OrderLifecycle {
+    stage: String,
+    attempted: bool,
+    filled: Decimal,
+    cost: Decimal,
+    settled: bool,
+    realized_pnl: Decimal,
+}
+
+#[derive(Debug, Default)]
+struct OrderStageStats {
+    attempts: u64,
+    fills: u64,
+    settled: u64,
+    wins: u64,
+    capital: Decimal,
+    realized_pnl: Decimal,
+}
+
+impl CalibrationStats {
+    fn record(&mut self, gap: Decimal) {
+        self.evaluations += 1;
+        self.model_below_market += u64::from(gap < Decimal::ZERO);
+        self.probability_gap_sum += gap;
+    }
 }
 
 impl GroupStats {
@@ -154,6 +192,60 @@ fn print_group(label: &str, stats: &GroupStats) {
     );
 }
 
+fn load_order_stage_stats(path: &PathBuf) -> Result<BTreeMap<String, OrderStageStats>> {
+    if !path.exists() {
+        return Ok(BTreeMap::new());
+    }
+    let reader = BufReader::new(
+        File::open(path).with_context(|| format!("cannot open {}", path.display()))?,
+    );
+    let mut positions = HashMap::<String, OrderLifecycle>::new();
+    for (index, line) in reader.lines().enumerate() {
+        let line = line.with_context(|| format!("cannot read {}:{}", path.display(), index + 1))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value: Value = serde_json::from_str(&line)
+            .with_context(|| format!("invalid JSON at {}:{}", path.display(), index + 1))?;
+        let position = &value["position"];
+        let Some(position_id) = position.get("position_id").and_then(Value::as_str) else {
+            continue;
+        };
+        let lifecycle = positions.entry(position_id.to_string()).or_default();
+        if lifecycle.stage.is_empty() {
+            lifecycle.stage = position
+                .get("candidate_stage")
+                .and_then(Value::as_str)
+                .filter(|stage| !stage.is_empty())
+                .unwrap_or("legacy")
+                .to_string();
+        }
+        match value.get("action").and_then(Value::as_str) {
+            Some("attempted") => lifecycle.attempted = true,
+            Some("pending") => {
+                lifecycle.filled = decimal(position.get("filled"));
+                lifecycle.cost = lifecycle.filled * decimal(position.get("price"));
+            }
+            Some("settled") => {
+                lifecycle.settled = true;
+                lifecycle.realized_pnl = decimal(value.get("realized_pnl"));
+            }
+            _ => {}
+        }
+    }
+    let mut by_stage = BTreeMap::<String, OrderStageStats>::new();
+    for lifecycle in positions.values() {
+        let stats = by_stage.entry(lifecycle.stage.clone()).or_default();
+        stats.attempts += u64::from(lifecycle.attempted);
+        stats.fills += u64::from(lifecycle.filled > Decimal::ZERO);
+        stats.settled += u64::from(lifecycle.settled);
+        stats.wins += u64::from(lifecycle.settled && lifecycle.realized_pnl > Decimal::ZERO);
+        stats.capital += lifecycle.cost;
+        stats.realized_pnl += lifecycle.realized_pnl;
+    }
+    Ok(by_stage)
+}
+
 fn main() -> Result<()> {
     let path = std::env::args_os()
         .nth(1)
@@ -169,6 +261,7 @@ fn main() -> Result<()> {
         File::open(&path).with_context(|| format!("cannot open {}", path.display()))?,
     );
     let mut evaluations = HashMap::new();
+    let mut runs = BTreeMap::<String, (String, String, bool)>::new();
     let mut shadows = HashMap::new();
     let mut latest_shadow_by_slug = HashMap::<String, ShadowFill>::new();
     let mut resolved_by_evaluation = HashMap::<String, bool>::new();
@@ -181,6 +274,32 @@ fn main() -> Result<()> {
         let value: Value = serde_json::from_str(&line)
             .with_context(|| format!("invalid JSON at {}:{}", path.display(), index + 1))?;
         match value.get("action").and_then(Value::as_str) {
+            Some("run_started") => {
+                let run_id = value
+                    .get("run_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("legacy")
+                    .to_string();
+                runs.insert(
+                    run_id,
+                    (
+                        value
+                            .get("started_at")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        value
+                            .get("mode")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown")
+                            .to_string(),
+                        value
+                            .get("hybrid_paper_enabled")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                    ),
+                );
+            }
             Some("evaluated") => {
                 let evaluation = &value["evaluation"];
                 if let Some(id) = evaluation.get("evaluation_id").and_then(Value::as_str) {
@@ -197,10 +316,28 @@ fn main() -> Result<()> {
                     evaluations.insert(
                         id.to_string(),
                         EvaluationMeta {
+                            run_id: evaluation
+                                .get("run_id")
+                                .and_then(Value::as_str)
+                                .unwrap_or("legacy")
+                                .to_string(),
+                            candidate_stage: evaluation
+                                .get("candidate_stage")
+                                .and_then(Value::as_str)
+                                .filter(|stage| !stage.is_empty())
+                                .unwrap_or("legacy")
+                                .to_string(),
                             asset,
                             ask_bucket,
                             seconds_bucket: time_bucket(evaluation),
                             research_cohorts,
+                            probability_gap: evaluation
+                                .get("model_market_probability_gap")
+                                .map(|value| decimal(Some(value)))
+                                .unwrap_or_else(|| {
+                                    decimal(evaluation.get("model_probability"))
+                                        - decimal(evaluation.get("ask_price"))
+                                }),
                         },
                     );
                 }
@@ -250,6 +387,20 @@ fn main() -> Result<()> {
                     }
                 }
             }
+            Some("confirmation_observed") => {
+                let observation = &value["observation"];
+                if let (Some(id), Some(stage)) = (
+                    observation.get("evaluation_id").and_then(Value::as_str),
+                    observation
+                        .get("candidate_stage")
+                        .and_then(Value::as_str)
+                        .filter(|stage| !stage.is_empty()),
+                ) {
+                    if let Some(meta) = evaluations.get_mut(id) {
+                        meta.candidate_stage = stage.to_string();
+                    }
+                }
+            }
             Some("resolved") => {
                 if let (Some(id), Some(won)) = (
                     value.get("evaluation_id").and_then(Value::as_str),
@@ -264,6 +415,7 @@ fn main() -> Result<()> {
     }
 
     let mut overall = GroupStats::default();
+    let mut by_stage = BTreeMap::<String, GroupStats>::new();
     let mut by_asset_price = BTreeMap::<String, GroupStats>::new();
     let mut by_time = BTreeMap::<String, GroupStats>::new();
     let mut missing_evaluations = 0_u64;
@@ -285,6 +437,10 @@ fn main() -> Result<()> {
         let pnl = decimal(resolution.get("counterfactual_pnl_per_share"));
         let shadow = shadows.get(id);
         overall.record(won, pnl, shadow);
+        by_stage
+            .entry(meta.candidate_stage.clone())
+            .or_default()
+            .record(won, pnl, shadow);
         by_asset_price
             .entry(format!("{} @{}", meta.asset, meta.ask_bucket))
             .or_default()
@@ -299,7 +455,17 @@ fn main() -> Result<()> {
         "Late-Resolution Winner Trading market-level report: {}",
         path.display()
     );
-    print_group("overall", &overall);
+    println!("Runs recorded: {}", runs.len());
+    for (run_id, (started_at, mode, hybrid_enabled)) in &runs {
+        println!(
+            "  run_id={run_id} started_at={started_at} mode={mode} hybrid_paper_enabled={hybrid_enabled}"
+        );
+    }
+    println!("\nCounterfactual outcomes (never interpret the mixed total as strategy ROI):");
+    print_group("all_stages", &overall);
+    for (stage, stats) in &by_stage {
+        print_group(stage, stats);
+    }
     println!("\nBy asset and ask price:");
     for (label, stats) in &by_asset_price {
         print_group(label, stats);
@@ -328,6 +494,71 @@ fn main() -> Result<()> {
     for (label, stats) in &by_cohort {
         print_group(label, stats);
     }
+    let mut calibration_by_stage = BTreeMap::<String, CalibrationStats>::new();
+    let mut evaluations_by_run = BTreeMap::<String, u64>::new();
+    for meta in evaluations.values() {
+        calibration_by_stage
+            .entry(meta.candidate_stage.clone())
+            .or_default()
+            .record(meta.probability_gap);
+        *evaluations_by_run.entry(meta.run_id.clone()).or_default() += 1;
+    }
+    println!("\nModel-vs-market probability calibration:");
+    for (stage, stats) in &calibration_by_stage {
+        let average_gap = if stats.evaluations > 0 {
+            stats.probability_gap_sum / Decimal::from(stats.evaluations)
+        } else {
+            Decimal::ZERO
+        };
+        println!(
+            "{stage:<18} evaluations={:<4} model_below_market={:<4} avg_model_minus_market={average_gap}",
+            stats.evaluations, stats.model_below_market
+        );
+    }
+    println!("\nEvaluations by run:");
+    for (run_id, count) in &evaluations_by_run {
+        println!("  run_id={run_id} evaluations={count}");
+    }
+    let order_path = path
+        .parent()
+        .map(|parent| parent.join("orders.ndjson"))
+        .unwrap_or_else(|| PathBuf::from("orders.ndjson"));
+    let order_stages = load_order_stage_stats(&order_path)?;
+    println!(
+        "\nActual/paper order lifecycle by stage: {}",
+        order_path.display()
+    );
+    if order_stages.is_empty() {
+        println!("  no order journal found or no lifecycle records");
+    }
+    for (stage, stats) in &order_stages {
+        let roi = if stats.capital > Decimal::ZERO {
+            stats.realized_pnl / stats.capital * Decimal::from(100_u64)
+        } else {
+            Decimal::ZERO
+        };
+        println!(
+            "{stage:<18} attempts={:<4} fills={:<4} settled={:<4} wins={:<4} capital={:>10} realized_pnl={:>10} roi={roi}%",
+            stats.attempts,
+            stats.fills,
+            stats.settled,
+            stats.wins,
+            stats.capital,
+            stats.realized_pnl,
+        );
+    }
+    let strict_settled = order_stages
+        .get("production")
+        .map(|stats| stats.settled)
+        .unwrap_or_default();
+    println!(
+        "\nStrict-model execution readiness: {strict_settled}/100 fully settled production fills ({})",
+        if strict_settled >= 100 {
+            "minimum reached; review confidence intervals and tail losses before live mode"
+        } else {
+            "insufficient; keep dry-run fail-closed"
+        }
+    );
     if missing_evaluations > 0 {
         eprintln!("warning: {missing_evaluations} market records lack their selected evaluation");
     }

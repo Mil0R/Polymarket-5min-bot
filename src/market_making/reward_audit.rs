@@ -8,7 +8,7 @@ use serde_json::json;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::str::FromStr;
-use tokio::time::{interval, Duration, MissedTickBehavior};
+use tokio::time::{interval, timeout, Duration, MissedTickBehavior};
 
 use crate::{create_authenticated_clob_client, parse_signature_type};
 
@@ -122,8 +122,18 @@ pub async fn watch_reward_snapshots(config: MarketMakingResearchConfig) -> Resul
     loop {
         tokio::select! {
             _ = ticker.tick() => {
-                if let Err(error) = record_reward_snapshot(&config, Utc::now().date_naive()).await {
+                let result = timeout(
+                    Duration::from_secs(30),
+                    record_reward_snapshot(&config, Utc::now().date_naive()),
+                )
+                .await
+                .map_err(|_| anyhow::anyhow!("maker reward audit timed out after 30s"))
+                .and_then(std::convert::identity);
+                if let Err(error) = result {
                     tracing::error!(%error, "Maker reward audit failed");
+                    if let Err(write_error) = append_reward_audit_error(&config, &error.to_string()) {
+                        tracing::error!(%write_error, "Could not persist maker reward audit failure");
+                    }
                 }
             }
             result = &mut shutdown => {
@@ -132,4 +142,34 @@ pub async fn watch_reward_snapshots(config: MarketMakingResearchConfig) -> Resul
             }
         }
     }
+}
+
+fn append_reward_audit_error(config: &MarketMakingResearchConfig, error: &str) -> Result<()> {
+    if let Some(parent) = config
+        .reward_audit_file
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let event = json!({
+        "action": "reward_snapshot_error",
+        "version": 1,
+        "timestamp": Utc::now(),
+        "data": { "error": error },
+    });
+    let mut writer = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&config.reward_audit_file)
+        .with_context(|| {
+            format!(
+                "failed to open reward audit file {}",
+                config.reward_audit_file.display()
+            )
+        })?;
+    serde_json::to_writer(&mut writer, &event)?;
+    writer.write_all(b"\n")?;
+    writer.flush()?;
+    Ok(())
 }
