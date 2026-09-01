@@ -501,6 +501,8 @@ struct DryRunWindowStats {
     rest_latency_total_ms: u64,
     rest_latency_max_ms: u64,
     #[serde(default)]
+    websocket_stream_errors: u64,
+    #[serde(default)]
     rejection_counts: BTreeMap<String, u64>,
     #[serde(default)]
     terminal_reason_by_market: BTreeMap<String, String>,
@@ -531,10 +533,11 @@ impl DryRunWindowStats {
 #[derive(Clone)]
 struct EventJournal {
     file: Arc<Mutex<File>>,
+    run_id: String,
 }
 
 impl EventJournal {
-    fn open(path: &Path) -> Result<Self> {
+    fn open(path: &Path, run_id: String) -> Result<Self> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -542,10 +545,16 @@ impl EventJournal {
             file: Arc::new(Mutex::new(
                 OpenOptions::new().create(true).append(true).open(path)?,
             )),
+            run_id,
         })
     }
 
-    fn append(&self, value: Value) -> Result<()> {
+    fn append(&self, mut value: Value) -> Result<()> {
+        if let Some(object) = value.as_object_mut() {
+            object
+                .entry("run_id".to_string())
+                .or_insert_with(|| Value::String(self.run_id.clone()));
+        }
         let mut file = self
             .file
             .lock()
@@ -563,6 +572,7 @@ impl EventJournal {
 pub async fn run_dry_run() -> Result<()> {
     let config = DryRunConfig::from_env()?;
     let run_started_ms = Utc::now().timestamp_millis();
+    let run_id = uuid::Uuid::new_v4().to_string();
     std::env::set_var("DRY_RUN", "true");
     std::env::set_var(
         "LOG_FILE",
@@ -576,7 +586,23 @@ pub async fn run_dry_run() -> Result<()> {
         .install_default()
         .ok();
     crate::utils::logger::init_logger(false)?;
-    let journal = EventJournal::open(&config.results_file)?;
+    let journal = EventJournal::open(&config.results_file, run_id.clone())?;
+    journal.append(serde_json::json!({
+        "event": "run_started",
+        "recorded_at": Utc::now(),
+        "strategy": "short-duration-digital-fair-value",
+        "config": {
+            "symbols": config.symbols.clone(),
+            "checkpoint_secs": config.checkpoint_secs,
+            "scan_interval_ms": config.scan_interval_ms,
+            "execution_delay_ms": config.execution_delay_ms,
+            "liquidity_haircut": config.liquidity_haircut,
+            "min_edge": config.min_edge,
+            "order_usdc": config.order_usdc,
+            "max_book_age_ms": config.max_book_age_ms,
+            "max_feed_age_ms": config.max_feed_age_ms
+        }
+    }))?;
     let shutdown = Arc::new(AtomicBool::new(false));
     let signal_shutdown = shutdown.clone();
     tokio::spawn(async move {
@@ -594,6 +620,7 @@ pub async fn run_dry_run() -> Result<()> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()?;
+    let run_result = async {
     info!(target: LIVE_TARGET,
         symbols = ?config.symbols,
         checkpoint_secs = config.checkpoint_secs,
@@ -618,6 +645,7 @@ pub async fn run_dry_run() -> Result<()> {
             monitor.subscribe_market(market)?;
         }
         let mut stream = monitor.create_orderbook_stream()?;
+        let mut stream_reconnect_attempt = 0u32;
         let attempted = Arc::new(Mutex::new(std::collections::HashSet::new()));
         let stats = Arc::new(Mutex::new(DryRunWindowStats::default()));
         let mut rest_fallback_last_ms = HashMap::new();
@@ -642,12 +670,54 @@ pub async fn run_dry_run() -> Result<()> {
             tokio::select! {
                 update = stream.next() => {
                     match update {
-                        Some(Ok(book)) => { monitor.handle_book_update(book); }
-                        Some(Err(error)) => {
-                            warn!(target: LIVE_TARGET, %error, "Order-book stream error; restarting window subscription");
-                            break;
+                        Some(Ok(book)) => {
+                            stream_reconnect_attempt = 0;
+                            monitor.handle_book_update(book);
                         }
-                        None => break,
+                        Some(Err(error)) => {
+                            if let Ok(mut guard) = stats.lock() {
+                                guard.websocket_stream_errors = guard.websocket_stream_errors.saturating_add(1);
+                            }
+                            stream_reconnect_attempt = stream_reconnect_attempt.saturating_add(1);
+                            let delay_ms = (250u64.saturating_mul(1u64 << stream_reconnect_attempt.min(5))).min(8_000);
+                            warn!(target: LIVE_TARGET, %error, attempt = stream_reconnect_attempt, delay_ms,
+                                "Order-book stream error; reconnecting within current window");
+                            monitor.invalidate_books();
+                            sleep(Duration::from_millis(delay_ms)).await;
+                            match monitor.create_orderbook_stream() {
+                                Ok(new_stream) => {
+                                    stream = new_stream;
+                                    continue;
+                                }
+                                Err(reconnect_error) => {
+                                    warn!(target: LIVE_TARGET, %reconnect_error,
+                                        "Order-book stream reconnect failed; ending current window");
+                                    break;
+                                }
+                            }
+                        }
+                        None => {
+                            if let Ok(mut guard) = stats.lock() {
+                                guard.websocket_stream_errors = guard.websocket_stream_errors.saturating_add(1);
+                            }
+                            stream_reconnect_attempt = stream_reconnect_attempt.saturating_add(1);
+                            let delay_ms = (250u64.saturating_mul(1u64 << stream_reconnect_attempt.min(5))).min(8_000);
+                            warn!(target: LIVE_TARGET, attempt = stream_reconnect_attempt, delay_ms,
+                                "Order-book stream ended; reconnecting within current window");
+                            monitor.invalidate_books();
+                            sleep(Duration::from_millis(delay_ms)).await;
+                            match monitor.create_orderbook_stream() {
+                                Ok(new_stream) => {
+                                    stream = new_stream;
+                                    continue;
+                                }
+                                Err(reconnect_error) => {
+                                    warn!(target: LIVE_TARGET, %reconnect_error,
+                                        "Order-book stream reconnect failed; ending current window");
+                                    break;
+                                }
+                            }
+                        }
                     }
                 }
                 _ = ticker.tick() => {
@@ -692,8 +762,18 @@ pub async fn run_dry_run() -> Result<()> {
             sleep(Duration::from_millis(250)).await;
         }
     }
-    info!(target: LIVE_TARGET, "Short-Duration Digital Fair Value dry-run stopped");
-    Ok(())
+    Ok::<(), anyhow::Error>(())
+    }.await;
+    let stop_reason = run_result.as_ref().err().map(ToString::to_string);
+    let _ = journal.append(serde_json::json!({
+        "event": "run_stopped",
+        "recorded_at": Utc::now(),
+        "started_at_ms": run_started_ms,
+        "stop_reason": stop_reason,
+        "normal": run_result.is_ok()
+    }));
+    info!(target: LIVE_TARGET, normal = run_result.is_ok(), "Short-Duration Digital Fair Value dry-run stopped");
+    run_result
 }
 
 async fn wait_for_feed_readiness(
@@ -1124,6 +1204,11 @@ fn evaluate_live_tops(
         token.to_string(),
         buy_up,
         probability,
+        ask,
+        edge,
+        book_source,
+        book_latency_ms,
+        remaining_ms as f64 / 1_000.0,
         window_end_ms,
     ));
 }
@@ -1162,6 +1247,7 @@ async fn finalize_window_summary(
         opportunities = snapshot.opportunities,
         shadow_rejections = snapshot.shadow_rejections,
         shadow_fills = snapshot.shadow_fills,
+        websocket_stream_errors = snapshot.websocket_stream_errors,
         rest_fallback_attempts = snapshot.rest_fallback_attempts,
         rest_fallback_successes = snapshot.rest_fallback_successes,
         average_rest_latency_ms,
@@ -1217,6 +1303,11 @@ async fn execute_live_shadow(
     token_id: String,
     buy_up: bool,
     probability: f64,
+    signal_ask: f64,
+    signal_net_edge: f64,
+    signal_book_source: &'static str,
+    signal_book_latency_ms: u64,
+    signal_seconds_remaining: f64,
     window_end_ms: i64,
 ) {
     sleep(Duration::from_millis(config.execution_delay_ms)).await;
@@ -1240,7 +1331,10 @@ async fn execute_live_shadow(
         }
         let _ = journal.append(serde_json::json!({
             "event":"shadow_rejected","evaluation_id":evaluation_id,"recorded_at":Utc::now(),
-            "slug":slug,"reason":"rest_book_failed","rest_latency_ms":latency_ms
+            "slug":slug,"reason":"rest_book_failed","rest_latency_ms":latency_ms,
+            "signal_ask":signal_ask,"signal_net_edge":signal_net_edge,
+            "signal_book_source":signal_book_source,"signal_book_latency_ms":signal_book_latency_ms,
+            "signal_seconds_remaining":signal_seconds_remaining,"delay_ms":config.execution_delay_ms
         }));
         return;
     };
@@ -1265,7 +1359,11 @@ async fn execute_live_shadow(
         }
         let _ = journal.append(serde_json::json!({
             "event":"shadow_rejected","evaluation_id":evaluation_id,"recorded_at":Utc::now(),
-            "slug":slug,"reason":"delayed_depth_insufficient","rest_latency_ms":latency_ms
+            "slug":slug,"reason":"delayed_depth_insufficient","rest_latency_ms":latency_ms,
+            "signal_ask":signal_ask,"signal_net_edge":signal_net_edge,
+            "signal_book_source":signal_book_source,"signal_book_latency_ms":signal_book_latency_ms,
+            "signal_seconds_remaining":signal_seconds_remaining,"delay_ms":config.execution_delay_ms,
+            "delayed_ask":signal_price
         }));
         return;
     };
@@ -1281,7 +1379,11 @@ async fn execute_live_shadow(
         let _ = journal.append(serde_json::json!({
             "event":"shadow_rejected","evaluation_id":evaluation_id,"recorded_at":Utc::now(),
             "slug":slug,"reason":"delayed_net_edge_below_threshold","average_price":average,
-            "net_edge":net_edge,"rest_latency_ms":latency_ms
+            "net_edge":net_edge,"rest_latency_ms":latency_ms,
+            "signal_ask":signal_ask,"signal_net_edge":signal_net_edge,
+            "signal_book_source":signal_book_source,"signal_book_latency_ms":signal_book_latency_ms,
+            "signal_seconds_remaining":signal_seconds_remaining,"delay_ms":config.execution_delay_ms,
+            "delayed_ask":signal_price
         }));
         return;
     }
@@ -1297,7 +1399,11 @@ async fn execute_live_shadow(
         "event":"shadow_fill","evaluation_id":evaluation_id,"recorded_at":Utc::now(),
         "asset":asset,"slug":slug,"buy_up":buy_up,"shares":target,"cost_usdc":cost,
         "average_price":average,"fees_usdc":fees,"expected_pnl_usdc":expected_pnl,
-        "net_edge":net_edge,"rest_latency_ms":latency_ms,"window_end_ms":window_end_ms
+        "net_edge":net_edge,"rest_latency_ms":latency_ms,"window_end_ms":window_end_ms,
+        "signal_ask":signal_ask,"signal_net_edge":signal_net_edge,
+        "signal_book_source":signal_book_source,"signal_book_latency_ms":signal_book_latency_ms,
+        "signal_seconds_remaining":signal_seconds_remaining,"delay_ms":config.execution_delay_ms,
+        "delayed_ask":signal_price
     }));
     info!(target: LIVE_TARGET, %asset, %slug, buy_up, shares = target, average_price = average,
         fees_usdc = fees, expected_pnl_usdc = expected_pnl, rest_latency_ms = latency_ms,
