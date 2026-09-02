@@ -13,6 +13,7 @@
 | Wallet-Copy Trading | `wallet_copy_trading` | 不支持：数据没有钱包逐笔交易、持仓与跟随时延 | 支持 | 当前仍禁用，等待账户级共享资金/订单归属账本 |
 | Market Making | `market_making` | 不支持：数据没有历史奖励参数、队列位置及可靠逐笔成交 | `scan` / `shadow` | 当前为只读研究策略，没有真实下单器 |
 | Cross-Market Probability Arbitrage | `cross_market_probability_arbitrage` | 不支持：BTC 5m 数据没有父子市场关系图和同步跨市场盘口 | `scan` / `shadow` | 当前为只读研究策略，没有真实下单器 |
+| Bayesian Consistency Arbitrage | `bayesian_consistency_arbitrage` | 不支持：本地 5m 数据不包含人工审核的父子分区关系及同步跨市场盘口 | `validate` / `scan` / `shadow` / `report` | v1 仅接受人工批准的互斥完备分区，强制只读 |
 
 “不支持第一阶段”不代表策略无效，只表示用当前 PolyBacktest 数据回放会产生错误的
 精确感。这些策略直接从第二阶段开始，以真实公开行情做无账户写入的 shadow/PAPER 验证。
