@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::Mutex;
 use std::time::Duration;
 use tokio::time::{interval, MissedTickBehavior};
@@ -240,12 +241,14 @@ pub async fn run_shadow(client: CrossMarketProbabilityResearchClient) -> Result<
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut last_logged = HashMap::<String, (String, DateTime<Utc>)>::new();
     let mut last_maker_taker_logged = HashMap::<String, (String, DateTime<Utc>)>::new();
+    let mut opportunity_episodes = HashMap::<String, (String, DateTime<Utc>)>::new();
     let mut near_miss_relationships = HashSet::<String>::new();
     let mut last_book_signatures = HashMap::<String, String>::new();
     let mut cycles = 0_u64;
     let mut evaluations_seen = 0_u64;
     let mut evaluations_logged = 0_u64;
     let mut opportunities_logged = 0_u64;
+    let mut pricing_opportunities_rejected_by_sync = 0_u64;
     let mut maker_taker_evaluations_logged = 0_u64;
     let mut maker_taker_candidates_logged = 0_u64;
     let mut complete_evaluations = 0_u64;
@@ -359,6 +362,17 @@ pub async fn run_shadow(client: CrossMarketProbabilityResearchClient) -> Result<
             }
         }
         for evaluation in cycle.evaluations {
+            let pricing_opportunity =
+                evaluation
+                    .rejection_reason
+                    .as_deref()
+                    .is_some_and(|reason| {
+                        reason == "book_age_exceeds_limit"
+                            || reason == "book_age_unavailable"
+                            || reason == "observed_at_skew_exceeds_limit"
+                            || reason == "exchange_timestamp_skew_exceeds_limit"
+                            || reason == "exchange_timestamp_unavailable"
+                    });
             let signature = evaluation_signature(&evaluation);
             let is_near_miss = !evaluation.qualifies
                 && evaluation
@@ -404,9 +418,45 @@ pub async fn run_shadow(client: CrossMarketProbabilityResearchClient) -> Result<
             }
             journal.record("relationship_evaluation", &evaluation)?;
             evaluations_logged += 1;
+            if pricing_opportunity {
+                journal.record("pricing_opportunity_rejected_by_sync", &evaluation)?;
+                pricing_opportunities_rejected_by_sync += 1;
+            }
             if evaluation.qualifies {
                 journal.record("shadow_opportunity", &evaluation)?;
                 opportunities_logged += 1;
+                let new_episode = opportunity_episodes
+                    .get(&evaluation.relationship_id)
+                    .is_none_or(|(_, last_seen)| {
+                        now.signed_duration_since(*last_seen).num_seconds()
+                            > i64::try_from(config.opportunity_episode_gap_seconds)
+                                .unwrap_or(i64::MAX)
+                    });
+                let episode_id = if new_episode {
+                    uuid::Uuid::new_v4().to_string()
+                } else {
+                    opportunity_episodes
+                        .get(&evaluation.relationship_id)
+                        .map(|(id, _)| id.clone())
+                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+                };
+                opportunity_episodes.insert(
+                    evaluation.relationship_id.clone(),
+                    (episode_id.clone(), now),
+                );
+                if new_episode {
+                    journal.record(
+                        "opportunity_episode_started",
+                        &json!({"episode_id": episode_id, "evaluation": &evaluation}),
+                    )?;
+                    if let Some(relationship) = relationships
+                        .iter()
+                        .find(|item| item.relationship_id == evaluation.relationship_id)
+                    {
+                        record_delayed_rechecks(&client, relationship, &episode_id, &journal)
+                            .await?;
+                    }
+                }
                 tracing::info!(
                     relationship = %evaluation.relationship_id,
                     event = %evaluation.event_slug,
@@ -466,6 +516,8 @@ pub async fn run_shadow(client: CrossMarketProbabilityResearchClient) -> Result<
                     "evaluations_seen": evaluations_seen,
                     "evaluations_logged": evaluations_logged,
                     "opportunities_logged": opportunities_logged,
+                    "pricing_opportunities_rejected_by_sync": pricing_opportunities_rejected_by_sync,
+                    "opportunity_episodes": opportunity_episodes.len(),
                     "conditional_maker_taker_evaluations_logged": maker_taker_evaluations_logged,
                     "conditional_maker_taker_candidates_logged": maker_taker_candidates_logged,
                     "complete_evaluations": complete_evaluations,
@@ -492,6 +544,8 @@ pub async fn run_shadow(client: CrossMarketProbabilityResearchClient) -> Result<
                     "evaluations_seen": evaluations_seen,
                     "evaluations_logged": evaluations_logged,
                     "opportunities_logged": opportunities_logged,
+                    "pricing_opportunities_rejected_by_sync": pricing_opportunities_rejected_by_sync,
+                    "opportunity_episodes": opportunity_episodes.len(),
                     "conditional_maker_taker_evaluations_logged": maker_taker_evaluations_logged,
                     "conditional_maker_taker_candidates_logged": maker_taker_candidates_logged,
                     "complete_evaluations": complete_evaluations,
@@ -519,6 +573,8 @@ pub async fn run_shadow(client: CrossMarketProbabilityResearchClient) -> Result<
         "evaluations_seen": evaluations_seen,
         "evaluations_logged": evaluations_logged,
         "opportunities_logged": opportunities_logged,
+        "pricing_opportunities_rejected_by_sync": pricing_opportunities_rejected_by_sync,
+        "opportunity_episodes": opportunity_episodes.len(),
         "conditional_maker_taker_evaluations_logged": maker_taker_evaluations_logged,
         "conditional_maker_taker_candidates_logged": maker_taker_candidates_logged,
         "active_near_misses": near_miss_relationships.len(),
@@ -629,7 +685,7 @@ fn evaluate_maker_taker_relationships<'a>(
     let now = Utc::now();
     relationships
         .filter_map(|relationship| {
-            evaluate_maker_taker_relationship(
+            let mut evaluation = evaluate_maker_taker_relationship(
                 relationship,
                 books,
                 &config.size_ladder_shares,
@@ -637,7 +693,22 @@ fn evaluate_maker_taker_relationships<'a>(
                 config.maker_taker_min_net_edge,
                 config.maker_taker_execution_buffer_pct,
                 now,
-            )
+            )?;
+            if evaluation.max_book_age_ms.is_none()
+                || evaluation
+                    .max_book_age_ms
+                    .is_some_and(|value| value > config.max_book_age_ms)
+                || evaluation.max_exchange_timestamp_skew_ms.is_none()
+                || evaluation
+                    .max_observed_at_skew_ms
+                    .is_some_and(|value| value > config.max_observed_at_skew_ms)
+                || evaluation
+                    .max_exchange_timestamp_skew_ms
+                    .is_some_and(|value| value > config.max_exchange_timestamp_skew_ms)
+            {
+                evaluation.research_candidate = false;
+            }
+            Some(evaluation)
         })
         .collect()
 }
@@ -657,7 +728,7 @@ fn evaluate_relationships<'a>(
     let now = Utc::now();
     relationships
         .map(|relationship| {
-            evaluate_relationship_with_buffers(
+            let mut evaluation = evaluate_relationship_with_buffers(
                 relationship,
                 books,
                 &config.size_ladder_shares,
@@ -666,9 +737,180 @@ fn evaluate_relationships<'a>(
                 config.execution_buffer_pct,
                 &config.execution_buffer_curve_pct,
                 now,
-            )
+            );
+            apply_sync_gate(&mut evaluation, config);
+            evaluation
         })
         .collect()
+}
+
+fn apply_sync_gate(
+    evaluation: &mut RelationshipEvaluation,
+    config: &CrossMarketProbabilityArbitrageConfig,
+) {
+    if !evaluation.qualifies {
+        return;
+    }
+    let rejection = sync_rejection(
+        evaluation,
+        config.max_book_age_ms,
+        config.max_observed_at_skew_ms,
+        config.max_exchange_timestamp_skew_ms,
+    );
+    if let Some(rejection) = rejection {
+        evaluation.qualifies = false;
+        evaluation.rejection_reason = Some(rejection.into());
+        for point in &mut evaluation.size_evaluations {
+            if point.qualifies {
+                point.qualifies = false;
+                point.rejection_reason = Some(rejection.into());
+            }
+        }
+    }
+}
+
+fn sync_rejection(
+    evaluation: &RelationshipEvaluation,
+    max_book_age_ms: i64,
+    max_observed_at_skew_ms: i64,
+    max_exchange_timestamp_skew_ms: i64,
+) -> Option<&'static str> {
+    if evaluation.max_book_age_ms.is_none() {
+        Some("book_age_unavailable")
+    } else if evaluation
+        .max_book_age_ms
+        .is_some_and(|value| value > max_book_age_ms)
+    {
+        Some("book_age_exceeds_limit")
+    } else if evaluation
+        .max_observed_at_skew_ms
+        .is_some_and(|value| value > max_observed_at_skew_ms)
+    {
+        Some("observed_at_skew_exceeds_limit")
+    } else if evaluation.max_exchange_timestamp_skew_ms.is_none() {
+        Some("exchange_timestamp_unavailable")
+    } else if evaluation
+        .max_exchange_timestamp_skew_ms
+        .is_some_and(|value| value > max_exchange_timestamp_skew_ms)
+    {
+        Some("exchange_timestamp_skew_exceeds_limit")
+    } else {
+        None
+    }
+}
+
+async fn record_delayed_rechecks(
+    client: &CrossMarketProbabilityResearchClient,
+    relationship: &MarketRelationship,
+    episode_id: &str,
+    journal: &ResearchJournal,
+) -> Result<()> {
+    let config = client.config();
+    let mut elapsed_ms = 0_u64;
+    for delay_ms in &config.delayed_recheck_ms {
+        tokio::time::sleep(Duration::from_millis(delay_ms.saturating_sub(elapsed_ms))).await;
+        elapsed_ms = *delay_ms;
+        let batch = client
+            .fetch_books_with_diagnostics(std::slice::from_ref(relationship))
+            .await;
+        let mut evaluation = evaluate_relationship_with_buffers(
+            relationship,
+            &batch.books,
+            &config.size_ladder_shares,
+            config.min_bundle_notional_usdc,
+            config.min_net_edge,
+            config.execution_buffer_pct,
+            &config.execution_buffer_curve_pct,
+            Utc::now(),
+        );
+        apply_sync_gate(&mut evaluation, config);
+        let stress = execution_stress(&evaluation, &batch.books, config);
+        journal.record(
+            "delayed_execution_recheck",
+            &json!({
+                "episode_id": episode_id,
+                "delay_ms": delay_ms,
+                "still_executable": evaluation.qualifies,
+                "deployment_eligible": evaluation.qualifies && evaluation.live_eligible,
+                "evaluation": evaluation,
+                "book_fetch": batch.diagnostics,
+                "stress": stress,
+            }),
+        )?;
+    }
+    Ok(())
+}
+
+fn execution_stress(
+    evaluation: &RelationshipEvaluation,
+    books: &HashMap<String, super::model::BookSnapshot>,
+    config: &CrossMarketProbabilityArbitrageConfig,
+) -> serde_json::Value {
+    let ratio = config.partial_fill_ratio;
+    let haircut = config.emergency_exit_haircut_pct;
+    let mut full_cost = Decimal::ZERO;
+    let mut partial_cost = Decimal::ZERO;
+    let mut partial_exit = Decimal::ZERO;
+    let mut worst_one_leg_pnl = None::<Decimal>;
+    for (index, leg) in evaluation.legs.iter().enumerate() {
+        let filled_shares = if index + 1 == evaluation.legs.len() {
+            leg.shares * ratio
+        } else {
+            leg.shares
+        };
+        let cost = (leg.raw_cost_usdc + leg.taker_fee_usdc)
+            * if index + 1 == evaluation.legs.len() {
+                ratio
+            } else {
+                Decimal::ONE
+            };
+        full_cost += leg.raw_cost_usdc + leg.taker_fee_usdc;
+        partial_cost += cost;
+        let partial_leg_exit = books
+            .get(&leg.token_id)
+            .and_then(|book| walk_bids(&book.bids, filled_shares))
+            .map(|proceeds| proceeds * (Decimal::ONE - haircut));
+        if let Some(exit) = partial_leg_exit {
+            partial_exit += exit;
+        }
+        let one_leg_exit = books
+            .get(&leg.token_id)
+            .and_then(|book| walk_bids(&book.bids, leg.shares))
+            .map(|proceeds| proceeds * (Decimal::ONE - haircut));
+        if let Some(exit) = one_leg_exit {
+            let one_leg_cost = leg.raw_cost_usdc + leg.taker_fee_usdc;
+            let pnl = exit - one_leg_cost;
+            worst_one_leg_pnl = Some(worst_one_leg_pnl.map_or(pnl, |current| current.min(pnl)));
+        } else {
+            let one_leg_cost = leg.raw_cost_usdc + leg.taker_fee_usdc;
+            worst_one_leg_pnl =
+                Some(worst_one_leg_pnl.map_or(-one_leg_cost, |current| current.min(-one_leg_cost)));
+        }
+    }
+    json!({
+        "partial_fill_ratio": ratio,
+        "partial_fill_emergency_exit_pnl_usdc": partial_exit - partial_cost,
+        "worst_single_leg_emergency_exit_pnl_usdc": worst_one_leg_pnl,
+        "full_bundle_cost_usdc": full_cost,
+        "emergency_exit_haircut_pct": haircut,
+        "assumption": "all filled exposure is immediately sold into visible bids; missing bid depth is valued at zero",
+    })
+}
+
+fn walk_bids(levels: &[super::model::BookLevel], shares: Decimal) -> Option<Decimal> {
+    let mut remaining = shares;
+    let mut proceeds = Decimal::ZERO;
+    let mut levels = levels.iter().collect::<Vec<_>>();
+    levels.sort_by_key(|level| std::cmp::Reverse(level.price));
+    for level in levels {
+        let filled = remaining.min(level.size);
+        proceeds += filled * level.price;
+        remaining -= filled;
+        if remaining <= Decimal::ZERO {
+            return Some(proceeds);
+        }
+    }
+    None
 }
 
 fn book_signature(book: &super::model::BookSnapshot) -> String {
@@ -794,6 +1036,7 @@ fn config_summary(config: &CrossMarketProbabilityArbitrageConfig) -> serde_json:
     json!({
         "results_file": config.results_file,
         "summary_file": config.summary_file,
+        "report_file": config.report_file,
         "semantic_review_file": config.semantic_review_file,
         "event_pages": config.event_pages,
         "events_per_page": config.events_per_page,
@@ -817,6 +1060,13 @@ fn config_summary(config: &CrossMarketProbabilityArbitrageConfig) -> serde_json:
         "ordinary_log_seconds": config.ordinary_log_seconds,
         "websocket_books": config.websocket_books,
         "websocket_book_max_age_ms": config.websocket_book_max_age_ms,
+        "max_book_age_ms": config.max_book_age_ms,
+        "max_observed_at_skew_ms": config.max_observed_at_skew_ms,
+        "max_exchange_timestamp_skew_ms": config.max_exchange_timestamp_skew_ms,
+        "opportunity_episode_gap_seconds": config.opportunity_episode_gap_seconds,
+        "delayed_recheck_ms": config.delayed_recheck_ms,
+        "partial_fill_ratio": config.partial_fill_ratio,
+        "emergency_exit_haircut_pct": config.emergency_exit_haircut_pct,
         "semantic_allowlist": config.semantic_allowlist,
         "maker_taker_shadow": config.maker_taker_shadow,
         "maker_taker_min_net_edge": config.maker_taker_min_net_edge,
@@ -914,7 +1164,7 @@ struct ReportEvent {
     data: serde_json::Value,
 }
 
-pub fn run_report(path: &Path) -> Result<()> {
+pub fn run_report(path: &Path, config: &CrossMarketProbabilityArbitrageConfig) -> Result<()> {
     let report_paths = report_input_paths(path);
     if report_paths.is_empty() {
         bail!(
@@ -1422,8 +1672,203 @@ pub fn run_report(path: &Path) -> Result<()> {
             }
         }
     }
-    println!("Note: opportunity counts are executable-book snapshots, not atomic multi-market fills or realized PnL.");
+    write_execution_report(&events, &selected_run_id, path, config)?;
+    println!("machine_report: {}", config.report_file.display());
+    println!("Note: opportunity counts are synchronized executable-book snapshots, not atomic multi-market fills or realized PnL.");
     Ok(())
+}
+
+fn write_execution_report(
+    events: &[ReportEvent],
+    selected_run_id: &str,
+    source_path: &Path,
+    config: &CrossMarketProbabilityArbitrageConfig,
+) -> Result<()> {
+    let selected = events
+        .iter()
+        .filter(|event| event.run_id == selected_run_id)
+        .collect::<Vec<_>>();
+    let explicit_pricing_rejected_by_sync = selected
+        .iter()
+        .filter(|event| event.action == "pricing_opportunity_rejected_by_sync")
+        .count();
+    let mut synchronized_snapshots = 0_usize;
+    let mut raw_pricing_snapshots = explicit_pricing_rejected_by_sync;
+    let mut strict_opportunity_relationships = HashSet::<String>::new();
+    let mut fallback_episodes = 0_usize;
+    let mut last_strict_opportunity = HashMap::<String, DateTime<Utc>>::new();
+    let mut episode_relationships = HashMap::<String, String>::new();
+    let mut delayed_by_episode = HashMap::<String, Vec<(u64, bool, bool)>>::new();
+    let mut delayed_by_ms = BTreeMap::<u64, (u64, u64, u64)>::new();
+    let mut worst_single_leg_pnl = None::<Decimal>;
+    let mut worst_partial_fill_pnl = None::<Decimal>;
+    for event in selected {
+        if event.action == "shadow_opportunity" {
+            raw_pricing_snapshots += 1;
+            if let Ok(evaluation) =
+                serde_json::from_value::<RelationshipEvaluation>(event.data.clone())
+            {
+                if sync_rejection(
+                    &evaluation,
+                    config.max_book_age_ms,
+                    config.max_observed_at_skew_ms,
+                    config.max_exchange_timestamp_skew_ms,
+                )
+                .is_none()
+                {
+                    synchronized_snapshots += 1;
+                    strict_opportunity_relationships.insert(evaluation.relationship_id.clone());
+                    let is_new = last_strict_opportunity
+                        .get(&evaluation.relationship_id)
+                        .is_none_or(|last_seen| {
+                            event
+                                .timestamp
+                                .signed_duration_since(*last_seen)
+                                .num_seconds()
+                                > i64::try_from(config.opportunity_episode_gap_seconds)
+                                    .unwrap_or(i64::MAX)
+                        });
+                    fallback_episodes += usize::from(is_new);
+                    last_strict_opportunity
+                        .insert(evaluation.relationship_id.clone(), event.timestamp);
+                }
+            }
+        } else if event.action == "opportunity_episode_started" {
+            if let (Some(episode_id), Some(relationship_id)) = (
+                event
+                    .data
+                    .get("episode_id")
+                    .and_then(serde_json::Value::as_str),
+                event
+                    .data
+                    .pointer("/evaluation/relationship_id")
+                    .and_then(serde_json::Value::as_str),
+            ) {
+                episode_relationships.insert(episode_id.to_string(), relationship_id.to_string());
+            }
+        } else if event.action == "delayed_execution_recheck" {
+            let Some(episode_id) = event
+                .data
+                .get("episode_id")
+                .and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
+            let delay_ms = event
+                .data
+                .get("delay_ms")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default();
+            let executable = event
+                .data
+                .get("still_executable")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let deployment_eligible = event
+                .data
+                .get("deployment_eligible")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            delayed_by_episode
+                .entry(episode_id.to_string())
+                .or_default()
+                .push((delay_ms, executable, deployment_eligible));
+            let checkpoint = delayed_by_ms.entry(delay_ms).or_default();
+            checkpoint.0 += 1;
+            checkpoint.1 += u64::from(executable);
+            checkpoint.2 += u64::from(deployment_eligible);
+            update_min_decimal_from_json(
+                &mut worst_single_leg_pnl,
+                event
+                    .data
+                    .pointer("/stress/worst_single_leg_emergency_exit_pnl_usdc"),
+            );
+            update_min_decimal_from_json(
+                &mut worst_partial_fill_pnl,
+                event
+                    .data
+                    .pointer("/stress/partial_fill_emergency_exit_pnl_usdc"),
+            );
+        }
+    }
+    let episodes_all_rechecks_positive = delayed_by_episode
+        .values()
+        .filter(|checks| !checks.is_empty() && checks.iter().all(|(_, executable, _)| *executable))
+        .count();
+    let episodes_deployment_eligible_at_all_rechecks = delayed_by_episode
+        .values()
+        .filter(|checks| {
+            !checks.is_empty()
+                && checks
+                    .iter()
+                    .all(|(_, _, deployment_eligible)| *deployment_eligible)
+        })
+        .count();
+    let unique_opportunity_relationships = strict_opportunity_relationships.len();
+    let independent_episodes = if episode_relationships.is_empty() {
+        fallback_episodes
+    } else {
+        episode_relationships.len()
+    };
+    let delayed_checkpoints = delayed_by_ms
+        .into_iter()
+        .map(|(delay_ms, (observations, executable, deployment_eligible))| {
+            json!({
+                "delay_ms": delay_ms,
+                "observations": observations,
+                "executable": executable,
+                "deployment_eligible": deployment_eligible,
+                "survival_rate": if observations > 0 { Some(executable as f64 / observations as f64) } else { None },
+            })
+        })
+        .collect::<Vec<_>>();
+    let report = json!({
+        "generated_at": Utc::now(),
+        "source": source_path,
+        "selected_run_id": selected_run_id,
+        "raw_pricing_opportunity_snapshots": raw_pricing_snapshots,
+        "pricing_opportunities_rejected_by_sync": raw_pricing_snapshots.saturating_sub(synchronized_snapshots),
+        "explicit_sync_rejection_events": explicit_pricing_rejected_by_sync,
+        "synchronized_opportunity_snapshots": synchronized_snapshots,
+        "unique_opportunity_relationships": unique_opportunity_relationships,
+        "independent_opportunity_episodes": independent_episodes,
+        "episodes_with_delayed_rechecks": delayed_by_episode.len(),
+        "episodes_executable_at_all_delayed_checkpoints": episodes_all_rechecks_positive,
+        "episodes_deployment_eligible_at_all_delayed_checkpoints": episodes_deployment_eligible_at_all_rechecks,
+        "delayed_checkpoints": delayed_checkpoints,
+        "worst_single_leg_emergency_exit_pnl_usdc": worst_single_leg_pnl,
+        "worst_partial_fill_emergency_exit_pnl_usdc": worst_partial_fill_pnl,
+        "interpretation": "Shadow observations only. Delayed survival and emergency-exit stress are not realized fills or realized PnL.",
+    });
+    if let Some(parent) = config
+        .report_file
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&config.report_file, serde_json::to_vec_pretty(&report)?)
+        .with_context(|| format!("failed to write {}", config.report_file.display()))?;
+    println!(
+        "execution_validation: synchronized_snapshots={} unique_relationships={} episodes={} all_delays_positive={} sync_rejected={}",
+        synchronized_snapshots,
+        unique_opportunity_relationships,
+        independent_episodes,
+        episodes_all_rechecks_positive,
+        raw_pricing_snapshots.saturating_sub(synchronized_snapshots),
+    );
+    Ok(())
+}
+
+fn update_min_decimal_from_json(target: &mut Option<Decimal>, value: Option<&serde_json::Value>) {
+    let parsed = value.and_then(|value| match value {
+        serde_json::Value::String(value) => Decimal::from_str(value).ok(),
+        serde_json::Value::Number(value) => Decimal::from_str(&value.to_string()).ok(),
+        _ => None,
+    });
+    if let Some(parsed) = parsed {
+        *target = Some(target.map_or(parsed, |current| current.min(parsed)));
+    }
 }
 
 fn report_input_paths(path: &Path) -> Vec<std::path::PathBuf> {
@@ -1504,6 +1949,21 @@ mod tests {
             evaluation_signature(&base),
             evaluation_signature(&changed_time)
         );
+        changed_time.max_book_age_ms = Some(100);
+        changed_time.max_observed_at_skew_ms = Some(1_001);
+        changed_time.max_exchange_timestamp_skew_ms = Some(100);
+        assert_eq!(
+            sync_rejection(&changed_time, 2_000, 1_000, 2_000),
+            Some("observed_at_skew_exceeds_limit")
+        );
+        changed_time.max_observed_at_skew_ms = Some(100);
+        changed_time.max_exchange_timestamp_skew_ms = Some(2_001);
+        assert_eq!(
+            sync_rejection(&changed_time, 2_000, 1_000, 2_000),
+            Some("exchange_timestamp_skew_exceeds_limit")
+        );
+        changed_time.max_exchange_timestamp_skew_ms = Some(2_000);
+        assert_eq!(sync_rejection(&changed_time, 2_000, 1_000, 2_000), None);
     }
 
     #[test]

@@ -2074,6 +2074,23 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                                     rest_started.elapsed().as_millis(),
                                 )
                                 .unwrap_or(u64::MAX);
+                                // A REST response can carry a freshly received
+                                // timestamp even when the request itself spent
+                                // tens of seconds blocked.  For a near-expiry
+                                // strategy that is not actionable data, so fail
+                                // closed on request latency before considering the
+                                // returned book.
+                                let rest_too_slow = rest_latency_ms
+                                    > config.late_resolution_winner_trading_max_rest_latency_ms;
+                                if rest_too_slow {
+                                    runtime_metrics.record_late_resolution_winner_trading_stale_book();
+                                    warn!(
+                                        target: "polypulse::strategy::late_resolution_winner_trading",
+                                        latency_ms = rest_latency_ms,
+                                        limit_ms = config.late_resolution_winner_trading_max_rest_latency_ms,
+                                        "Late-Resolution Winner Trading REST fallback exceeded latency limit"
+                                    );
+                                }
                                 if yes_requested {
                                     if let Ok(top) = &yes_rest {
                                         runtime_metrics.record_late_resolution_winner_trading_rest_result(
@@ -2106,6 +2123,10 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                                         None
                                     }
                                 };
+                                if rest_too_slow {
+                                    yes_top = None;
+                                    no_top = None;
+                                }
                             }
                             let rest_checked_at_ms = Utc::now().timestamp_millis();
                             if yes_top.as_ref().is_some_and(|top| {
@@ -2260,6 +2281,10 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                             let hybrid_paper_admitted = !model.admitted()
                                 && config.late_resolution_winner_trading_hybrid_paper_enabled
                                 && config.dry_run
+                                // Hybrid PAPER is calibration only; it must
+                                // never turn a negative-EV model output into
+                                // an order lifecycle entry.
+                                && model.net_ev >= rust_decimal::Decimal::ZERO
                                 && research_cohorts
                                     .iter()
                                     .any(|cohort| cohort == "hybrid_chainlink_veto");

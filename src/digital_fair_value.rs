@@ -13,7 +13,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufWriter, Write};
+use std::hash::{Hash, Hasher};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -338,6 +339,10 @@ struct DryRunConfig {
     feed_ready_timeout_secs: u64,
     rest_fallback_cooldown_ms: i64,
     execution_delay_ms: u64,
+    max_rest_latency_ms: u64,
+    min_partial_fill_ratio: f64,
+    slippage_bps: f64,
+    simulated_order_failure_rate: f64,
     max_book_age_ms: i64,
     max_feed_age_ms: i64,
     opening_max_skew_ms: i64,
@@ -412,6 +417,22 @@ impl DryRunConfig {
                 "SHORT_DURATION_DIGITAL_FAIR_VALUE_DRY_RUN_EXECUTION_DELAY_MS",
                 1_000,
             )?,
+            max_rest_latency_ms: env_parse(
+                "SHORT_DURATION_DIGITAL_FAIR_VALUE_DRY_RUN_MAX_REST_LATENCY_MS",
+                2_000,
+            )?,
+            min_partial_fill_ratio: env_parse(
+                "SHORT_DURATION_DIGITAL_FAIR_VALUE_DRY_RUN_MIN_PARTIAL_FILL_RATIO",
+                0.25,
+            )?,
+            slippage_bps: env_parse(
+                "SHORT_DURATION_DIGITAL_FAIR_VALUE_DRY_RUN_SLIPPAGE_BPS",
+                10.0,
+            )?,
+            simulated_order_failure_rate: env_parse(
+                "SHORT_DURATION_DIGITAL_FAIR_VALUE_DRY_RUN_ORDER_FAILURE_RATE",
+                0.02,
+            )?,
             max_book_age_ms: env_parse("SHORT_DURATION_DIGITAL_FAIR_VALUE_MAX_BOOK_AGE_MS", 1_000)?,
             max_feed_age_ms: env_parse("SHORT_DURATION_DIGITAL_FAIR_VALUE_FEED_MAX_AGE_MS", 5_000)?,
             opening_max_skew_ms: env_parse(
@@ -454,6 +475,14 @@ impl DryRunConfig {
             || config.rest_fallback_cooldown_ms < 250
             || config.rest_fallback_cooldown_ms > 10_000
             || config.execution_delay_ms > 30_000
+            || config.max_rest_latency_ms == 0
+            || config.max_rest_latency_ms > 30_000
+            || !(0.0..=1.0).contains(&config.min_partial_fill_ratio)
+            || config.min_partial_fill_ratio == 0.0
+            || !config.slippage_bps.is_finite()
+            || !(0.0..=500.0).contains(&config.slippage_bps)
+            || !config.simulated_order_failure_rate.is_finite()
+            || !(0.0..=1.0).contains(&config.simulated_order_failure_rate)
             || config.max_book_age_ms <= 0
             || config.max_feed_age_ms <= 0
             || config.opening_max_skew_ms < 0
@@ -596,6 +625,10 @@ pub async fn run_dry_run() -> Result<()> {
             "checkpoint_secs": config.checkpoint_secs,
             "scan_interval_ms": config.scan_interval_ms,
             "execution_delay_ms": config.execution_delay_ms,
+            "max_rest_latency_ms": config.max_rest_latency_ms,
+            "min_partial_fill_ratio": config.min_partial_fill_ratio,
+            "slippage_bps": config.slippage_bps,
+            "simulated_order_failure_rate": config.simulated_order_failure_rate,
             "liquidity_haircut": config.liquidity_haircut,
             "min_edge": config.min_edge,
             "order_usdc": config.order_usdc,
@@ -774,6 +807,208 @@ pub async fn run_dry_run() -> Result<()> {
     }));
     info!(target: LIVE_TARGET, normal = run_result.is_ok(), "Short-Duration Digital Fair Value dry-run stopped");
     run_result
+}
+
+/// Build an auditable calibration/readiness report from the append-only
+/// dry-run journal.  This never contacts Polymarket and never submits orders.
+pub fn run_dry_run_report() -> Result<PathBuf> {
+    let _ = dotenvy::dotenv();
+    let input = PathBuf::from(
+        std::env::var("SHORT_DURATION_DIGITAL_FAIR_VALUE_RESULTS_FILE").unwrap_or_else(|_| {
+            "results/short-duration-digital-fair-value/paper/events.ndjson".to_string()
+        }),
+    );
+    let output = std::env::var("SHORT_DURATION_DIGITAL_FAIR_VALUE_DRY_RUN_REPORT_FILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            input
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join("dry-run-report.json")
+        });
+    let min_asset_samples: usize = env_parse(
+        "SHORT_DURATION_DIGITAL_FAIR_VALUE_CANARY_MIN_ASSET_SAMPLES",
+        50,
+    )?;
+    let max_brier: f64 = env_parse(
+        "SHORT_DURATION_DIGITAL_FAIR_VALUE_CANARY_MAX_BRIER_SCORE",
+        0.10,
+    )?;
+    let enabled_assets = std::env::var("SHORT_DURATION_DIGITAL_FAIR_VALUE_SYMBOLS")
+        .unwrap_or_else(|_| "btc,eth,sol".to_string())
+        .split(',')
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    let file =
+        File::open(&input).with_context(|| format!("open dry-run journal {}", input.display()))?;
+    let mut events = Vec::new();
+    for (line_no, line) in BufReader::new(file).lines().enumerate() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        events.push(
+            serde_json::from_str::<Value>(&line)
+                .with_context(|| format!("parse {} line {}", input.display(), line_no + 1))?,
+        );
+    }
+    let mut opportunities = HashMap::<String, (String, f64)>::new();
+    let mut fills = HashMap::<String, (String, f64, u64)>::new();
+    let mut rejected_latency = 0usize;
+    for event in &events {
+        let id = event
+            .get("evaluation_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        match event.get("event").and_then(Value::as_str) {
+            Some("opportunity") => {
+                opportunities.insert(
+                    id.to_string(),
+                    (
+                        event
+                            .get("asset")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown")
+                            .to_ascii_lowercase(),
+                        event
+                            .get("probability")
+                            .and_then(Value::as_f64)
+                            .unwrap_or(0.5),
+                    ),
+                );
+            }
+            Some("shadow_fill") => {
+                let fallback = opportunities
+                    .get(id)
+                    .cloned()
+                    .unwrap_or_else(|| ("unknown".to_string(), 0.5));
+                fills.insert(
+                    id.to_string(),
+                    (
+                        event
+                            .get("asset")
+                            .and_then(Value::as_str)
+                            .map(str::to_ascii_lowercase)
+                            .unwrap_or(fallback.0),
+                        event
+                            .get("probability")
+                            .and_then(Value::as_f64)
+                            .unwrap_or(fallback.1),
+                        event
+                            .get("rest_latency_ms")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0),
+                    ),
+                );
+            }
+            Some("shadow_rejected" | "signal_rejected")
+                if event
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .is_some_and(|reason| reason.starts_with("rest_latency_exceeded")) =>
+            {
+                rejected_latency += 1;
+            }
+            _ => {}
+        }
+    }
+    #[derive(Default)]
+    struct Bucket {
+        samples: usize,
+        wins: usize,
+        probability_sum: f64,
+        brier_sum: f64,
+        pnl: f64,
+    }
+    let mut overall = Bucket::default();
+    let mut by_asset = BTreeMap::<String, Bucket>::new();
+    let mut by_probability = BTreeMap::<String, Bucket>::new();
+    let mut by_latency = BTreeMap::<String, Bucket>::new();
+    for event in &events {
+        if event.get("event").and_then(Value::as_str) != Some("resolution") {
+            continue;
+        }
+        let id = event
+            .get("evaluation_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let fallback = opportunities
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| ("unknown".to_string(), 0.5));
+        let (asset, probability, latency) = fills
+            .get(id)
+            .cloned()
+            .unwrap_or((fallback.0, fallback.1, 0));
+        let won = event.get("won").and_then(Value::as_bool).unwrap_or(false);
+        let pnl = event
+            .get("realized_pnl_usdc")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        let probability_key = match probability {
+            p if p >= 0.99 => "0.99-1.00",
+            p if p >= 0.90 => "0.90-0.99",
+            p if p >= 0.80 => "0.80-0.90",
+            p if p >= 0.70 => "0.70-0.80",
+            _ => "below-0.70",
+        };
+        for bucket in [
+            &mut overall,
+            by_asset.entry(asset).or_default(),
+            by_probability
+                .entry(probability_key.to_string())
+                .or_default(),
+            by_latency
+                .entry(latency_bucket(latency).to_string())
+                .or_default(),
+        ] {
+            bucket.samples += 1;
+            bucket.wins += usize::from(won);
+            bucket.probability_sum += probability;
+            bucket.brier_sum += (probability - if won { 1.0 } else { 0.0 }).powi(2);
+            bucket.pnl += pnl;
+        }
+    }
+    let bucket_json = |bucket: &Bucket| {
+        let n = bucket.samples.max(1) as f64;
+        serde_json::json!({
+            "samples":bucket.samples,"wins":bucket.wins,
+            "observed_win_rate":bucket.wins as f64 / n,
+            "average_probability":bucket.probability_sum / n,
+            "brier_score":bucket.brier_sum / n,"realized_pnl_usdc":bucket.pnl
+        })
+    };
+    let all_assets_ready = enabled_assets.iter().all(|asset| {
+        by_asset
+            .get(asset)
+            .is_some_and(|bucket| bucket.samples >= min_asset_samples && bucket.pnl > 0.0)
+    });
+    let brier_score = overall.brier_sum / overall.samples.max(1) as f64;
+    let canary_ready =
+        overall.samples > 0 && overall.pnl > 0.0 && brier_score <= max_brier && all_assets_ready;
+    let report = serde_json::json!({
+        "strategy":"short-duration-digital-fair-value",
+        "generated_at":Utc::now(),"source":input,
+        "overall":bucket_json(&overall),
+        "by_asset":by_asset.iter().map(|(k,v)|(k.clone(),bucket_json(v))).collect::<BTreeMap<_,_>>(),
+        "by_probability":by_probability.iter().map(|(k,v)|(k.clone(),bucket_json(v))).collect::<BTreeMap<_,_>>(),
+        "by_rest_latency":by_latency.iter().map(|(k,v)|(k.clone(),bucket_json(v))).collect::<BTreeMap<_,_>>(),
+        "latency_rejections":rejected_latency,
+        "canary_gate":{
+            "ready":canary_ready,"enabled_assets":enabled_assets,
+            "min_samples_per_asset":min_asset_samples,"max_brier_score":max_brier,
+            "all_assets_ready":all_assets_ready,"positive_total_pnl":overall.pnl > 0.0
+        }
+    });
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = File::create(&output)?;
+    serde_json::to_writer_pretty(&mut file, &report)?;
+    writeln!(file)?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(output)
 }
 
 async fn wait_for_feed_readiness(
@@ -988,6 +1223,16 @@ async fn evaluate_rest_fallback(
         guard.record_rest_latency(up_latency_ms);
         guard.record_rest_latency(down_latency_ms);
     }
+    if rest_latency_ms > config.max_rest_latency_ms {
+        record_window_rejection(&stats, &market.slug, "rest_latency_exceeded_before_signal");
+        let _ = journal.append(serde_json::json!({
+            "event":"signal_rejected","recorded_at":Utc::now(),"asset":market.crypto_symbol,
+            "slug":market.slug,"reason":"rest_latency_exceeded_before_signal",
+            "rest_latency_ms":rest_latency_ms,"max_rest_latency_ms":config.max_rest_latency_ms,
+            "seconds_remaining":remaining_ms as f64 / 1_000.0
+        }));
+        return;
+    }
     let now_ms = Utc::now().timestamp_millis();
     let adjusted_remaining_ms = window_end_ms.saturating_sub(now_ms).min(remaining_ms);
     if adjusted_remaining_ms <= 0 {
@@ -1095,14 +1340,25 @@ fn evaluate_live_tops(
     let up_edge = up_evaluation.unwrap_or(f64::NEG_INFINITY);
     let down_edge = down_evaluation.unwrap_or(f64::NEG_INFINITY);
     let choice = if up_edge >= down_edge && up_edge >= config.min_edge {
-        up.ask
-            .map(|ask| (true, probability_up, ask, up_edge, market.yes_token_id))
+        up.ask.map(|ask| {
+            (
+                true,
+                probability_up,
+                up.bid.unwrap_or(0.0),
+                ask,
+                up.ask_size.unwrap_or(0.0),
+                up_edge,
+                market.yes_token_id,
+            )
+        })
     } else if down_edge >= config.min_edge {
         down.ask.map(|ask| {
             (
                 false,
                 1.0 - probability_up,
+                down.bid.unwrap_or(0.0),
                 ask,
+                down.ask_size.unwrap_or(0.0),
                 down_edge,
                 market.no_token_id,
             )
@@ -1110,7 +1366,7 @@ fn evaluate_live_tops(
     } else {
         None
     };
-    let Some((buy_up, probability, ask, edge, token)) = choice else {
+    let Some((buy_up, probability, bid, ask, ask_size, edge, token)) = choice else {
         if let Ok(mut guard) = stats.lock() {
             let terminal_reason = if up_edge.is_finite() || down_edge.is_finite() {
                 *guard
@@ -1168,7 +1424,10 @@ fn evaluate_live_tops(
         "twap_observed_at_ms":state.observed_at_ms,
         "volatility_bps_per_sqrt_second":state.volatility_bps_per_sqrt_second,
         "probability":probability,
+        "signal_bid":bid,
         "signal_ask":ask,
+        "signal_ask_size":ask_size,
+        "signal_depth_usdc":ask * ask_size,
         "net_edge_before_delay":edge,
     });
     if let Err(error) = journal.append(event) {
@@ -1188,7 +1447,9 @@ fn evaluate_live_tops(
         book_latency_ms,
         buy_up,
         probability,
+        bid,
         ask,
+        ask_size,
         net_edge = edge,
         seconds_remaining = remaining_ms as f64 / 1000.0,
         "Fair-value opportunity"
@@ -1204,7 +1465,9 @@ fn evaluate_live_tops(
         token.to_string(),
         buy_up,
         probability,
+        bid,
         ask,
+        ask_size,
         edge,
         book_source,
         book_latency_ms,
@@ -1303,7 +1566,9 @@ async fn execute_live_shadow(
     token_id: String,
     buy_up: bool,
     probability: f64,
+    signal_bid: f64,
     signal_ask: f64,
+    signal_ask_size: f64,
     signal_net_edge: f64,
     signal_book_source: &'static str,
     signal_book_latency_ms: u64,
@@ -1317,6 +1582,24 @@ async fn execute_live_shadow(
         .query(&[("token_id", token_id.as_str())]);
     let response = timeout(Duration::from_secs(6), request.send()).await;
     let latency_ms = started.elapsed().as_millis() as u64;
+    if latency_ms > config.max_rest_latency_ms {
+        if let Ok(mut guard) = stats.lock() {
+            guard.shadow_rejections = guard.shadow_rejections.saturating_add(1);
+            guard.record_rest_latency(latency_ms);
+            guard.reject(&slug, "rest_latency_exceeded");
+        }
+        let _ = journal.append(serde_json::json!({
+            "event":"shadow_rejected","evaluation_id":evaluation_id,"recorded_at":Utc::now(),
+            "slug":slug,"reason":"rest_latency_exceeded","rest_latency_ms":latency_ms,
+            "max_rest_latency_ms":config.max_rest_latency_ms,
+            "signal_ask":signal_ask,"signal_net_edge":signal_net_edge,
+            "signal_book_source":signal_book_source,"signal_book_latency_ms":signal_book_latency_ms,
+            "signal_seconds_remaining":signal_seconds_remaining,"delay_ms":config.execution_delay_ms
+        }));
+        warn!(target: LIVE_TARGET, %asset, %slug, latency_ms, max_latency_ms = config.max_rest_latency_ms,
+            "Fair-value shadow rejected: REST latency exceeded limit");
+        return;
+    }
     let book = match response {
         Ok(Ok(response)) if response.status().is_success() => {
             response.json::<LiveRestBook>().await.ok()
@@ -1338,6 +1621,11 @@ async fn execute_live_shadow(
         }));
         return;
     };
+    let delayed_bid = book
+        .bids
+        .iter()
+        .filter_map(|level| Some(level.price.parse::<f64>().ok()?))
+        .max_by(|a, b| a.total_cmp(b));
     let mut asks = book
         .asks
         .iter()
@@ -1349,9 +1637,12 @@ async fn execute_live_shadow(
         })
         .collect::<Vec<_>>();
     asks.sort_by(|a, b| a.0.total_cmp(&b.0));
-    let signal_price = asks.first().map(|level| level.0).unwrap_or(1.0);
-    let target = config.order_usdc / (signal_price + live_fee(&config, signal_price)).max(0.01);
-    let Some(cost) = walk_ask_levels(&asks, target, config.liquidity_haircut) else {
+    let delayed_ask = asks.first().map(|level| level.0).unwrap_or(1.0);
+    let delayed_ask_size = asks.first().map(|level| level.1).unwrap_or(0.0);
+    let target = config.order_usdc / (delayed_ask + live_fee(&config, delayed_ask)).max(0.01);
+    let fill = walk_ask_levels_partial(&asks, target, config.liquidity_haircut);
+    let fill_ratio = fill.shares / target.max(1e-9);
+    if fill_ratio < config.min_partial_fill_ratio {
         if let Ok(mut guard) = stats.lock() {
             guard.shadow_rejections = guard.shadow_rejections.saturating_add(1);
             guard.record_rest_latency(latency_ms);
@@ -1363,13 +1654,33 @@ async fn execute_live_shadow(
             "signal_ask":signal_ask,"signal_net_edge":signal_net_edge,
             "signal_book_source":signal_book_source,"signal_book_latency_ms":signal_book_latency_ms,
             "signal_seconds_remaining":signal_seconds_remaining,"delay_ms":config.execution_delay_ms,
-            "delayed_ask":signal_price
+            "signal_bid":signal_bid,"signal_ask_size":signal_ask_size,
+            "delayed_bid":delayed_bid,"delayed_ask":delayed_ask,"delayed_ask_size":delayed_ask_size,
+            "requested_shares":target,"filled_shares":fill.shares,"fill_ratio":fill_ratio,
+            "min_partial_fill_ratio":config.min_partial_fill_ratio
         }));
         return;
-    };
-    let average = cost / target;
-    let fees = live_fee(&config, average) * target;
-    let net_edge = probability - average - fees / target;
+    }
+    if deterministic_failure(&evaluation_id, config.simulated_order_failure_rate) {
+        if let Ok(mut guard) = stats.lock() {
+            guard.shadow_rejections = guard.shadow_rejections.saturating_add(1);
+            guard.record_rest_latency(latency_ms);
+            guard.reject(&slug, "simulated_order_failure");
+        }
+        let _ = journal.append(serde_json::json!({
+            "event":"shadow_rejected","evaluation_id":evaluation_id,"recorded_at":Utc::now(),
+            "asset":asset,"slug":slug,"reason":"simulated_order_failure",
+            "simulated_order_failure_rate":config.simulated_order_failure_rate,
+            "rest_latency_ms":latency_ms,"requested_shares":target,"fillable_shares":fill.shares
+        }));
+        return;
+    }
+    let raw_average = fill.cost / fill.shares;
+    let average = (raw_average * (1.0 + config.slippage_bps / 10_000.0)).min(1.0);
+    let slippage_cost = (average - raw_average) * fill.shares;
+    let cost = average * fill.shares;
+    let fees = live_fee(&config, average) * fill.shares;
+    let net_edge = probability - average - fees / fill.shares;
     if average < config.min_price || average > config.max_price || net_edge < config.min_edge {
         if let Ok(mut guard) = stats.lock() {
             guard.shadow_rejections = guard.shadow_rejections.saturating_add(1);
@@ -1383,11 +1694,15 @@ async fn execute_live_shadow(
             "signal_ask":signal_ask,"signal_net_edge":signal_net_edge,
             "signal_book_source":signal_book_source,"signal_book_latency_ms":signal_book_latency_ms,
             "signal_seconds_remaining":signal_seconds_remaining,"delay_ms":config.execution_delay_ms,
-            "delayed_ask":signal_price
+            "signal_bid":signal_bid,"signal_ask_size":signal_ask_size,
+            "delayed_bid":delayed_bid,"delayed_ask":delayed_ask,"delayed_ask_size":delayed_ask_size,
+            "requested_shares":target,"filled_shares":fill.shares,"fill_ratio":fill_ratio,
+            "raw_average_price":raw_average,"slippage_bps":config.slippage_bps,
+            "slippage_cost_usdc":slippage_cost
         }));
         return;
     }
-    let expected_pnl = probability * target - cost - fees;
+    let expected_pnl = probability * fill.shares - cost - fees;
     if let Ok(mut guard) = stats.lock() {
         guard.shadow_fills = guard.shadow_fills.saturating_add(1);
         guard.record_rest_latency(latency_ms);
@@ -1397,13 +1712,17 @@ async fn execute_live_shadow(
     }
     let _ = journal.append(serde_json::json!({
         "event":"shadow_fill","evaluation_id":evaluation_id,"recorded_at":Utc::now(),
-        "asset":asset,"slug":slug,"buy_up":buy_up,"shares":target,"cost_usdc":cost,
+        "asset":asset,"slug":slug,"buy_up":buy_up,"probability":probability,
+        "shares":fill.shares,"requested_shares":target,"fill_ratio":fill_ratio,"cost_usdc":cost,
         "average_price":average,"fees_usdc":fees,"expected_pnl_usdc":expected_pnl,
         "net_edge":net_edge,"rest_latency_ms":latency_ms,"window_end_ms":window_end_ms,
         "signal_ask":signal_ask,"signal_net_edge":signal_net_edge,
         "signal_book_source":signal_book_source,"signal_book_latency_ms":signal_book_latency_ms,
         "signal_seconds_remaining":signal_seconds_remaining,"delay_ms":config.execution_delay_ms,
-        "delayed_ask":signal_price
+        "signal_bid":signal_bid,"signal_ask_size":signal_ask_size,
+        "delayed_bid":delayed_bid,"delayed_ask":delayed_ask,"delayed_ask_size":delayed_ask_size,
+        "raw_average_price":raw_average,"slippage_bps":config.slippage_bps,
+        "slippage_cost_usdc":slippage_cost,"latency_bucket":latency_bucket(latency_ms)
     }));
     info!(target: LIVE_TARGET, %asset, %slug, buy_up, shares = target, average_price = average,
         fees_usdc = fees, expected_pnl_usdc = expected_pnl, rest_latency_ms = latency_ms,
@@ -1413,7 +1732,9 @@ async fn execute_live_shadow(
         evaluation_id,
         slug,
         buy_up,
-        target,
+        asset,
+        probability,
+        fill.shares,
         cost,
         fees,
         window_end_ms,
@@ -1425,6 +1746,8 @@ async fn resolve_shadow_fill(
     evaluation_id: String,
     slug: String,
     buy_up: bool,
+    asset: String,
+    probability: f64,
     shares: f64,
     cost: f64,
     fees: f64,
@@ -1448,7 +1771,9 @@ async fn resolve_shadow_fill(
                 let realized_pnl = if won { shares } else { 0.0 } - cost - fees;
                 let _ = journal.append(serde_json::json!({
                     "event":"resolution","evaluation_id":evaluation_id,"recorded_at":Utc::now(),
-                    "slug":slug,"winner_up":winner_up,"won":won,"realized_pnl_usdc":realized_pnl
+                    "asset":asset,"slug":slug,"buy_up":buy_up,"probability":probability,
+                    "winner_up":winner_up,"won":won,"shares":shares,"cost_usdc":cost,
+                    "fees_usdc":fees,"realized_pnl_usdc":realized_pnl
                 }));
                 info!(target: LIVE_TARGET, %slug, won, realized_pnl_usdc = realized_pnl,
                     "Fair-value shadow position resolved");
@@ -1957,7 +2282,13 @@ fn decode_asks(book_zstd: Option<&[u8]>) -> Result<Option<Vec<(f64, f64)>>> {
     Ok(Some(asks))
 }
 
-fn walk_ask_levels(asks: &[(f64, f64)], target: f64, haircut: f64) -> Option<f64> {
+#[derive(Debug, Clone, Copy)]
+struct PartialWalk {
+    shares: f64,
+    cost: f64,
+}
+
+fn walk_ask_levels_partial(asks: &[(f64, f64)], target: f64, haircut: f64) -> PartialWalk {
     let mut remaining = target;
     let mut cost = 0.0;
     for (price, size) in asks {
@@ -1965,10 +2296,35 @@ fn walk_ask_levels(asks: &[(f64, f64)], target: f64, haircut: f64) -> Option<f64
         remaining -= filled;
         cost += filled * *price;
         if remaining <= 1e-9 {
-            return Some(cost);
+            break;
         }
     }
-    None
+    PartialWalk {
+        shares: (target - remaining).max(0.0),
+        cost,
+    }
+}
+
+fn walk_ask_levels(asks: &[(f64, f64)], target: f64, haircut: f64) -> Option<f64> {
+    let fill = walk_ask_levels_partial(asks, target, haircut);
+    (fill.shares + 1e-9 >= target).then_some(fill.cost)
+}
+
+fn deterministic_failure(key: &str, rate: f64) -> bool {
+    if rate <= 0.0 {
+        return false;
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut hasher);
+    hasher.finish() as f64 / (u64::MAX as f64) < rate
+}
+
+fn latency_bucket(latency_ms: u64) -> &'static str {
+    match latency_ms {
+        0..=1_000 => "le_1000ms",
+        1_001..=2_000 => "1001_2000ms",
+        _ => "gt_2000ms",
+    }
 }
 
 fn load_markets(connection: &Connection) -> Result<Vec<Market>> {
@@ -2205,6 +2561,10 @@ mod tests {
             feed_ready_timeout_secs: 15,
             rest_fallback_cooldown_ms: 1_000,
             execution_delay_ms: 1_000,
+            max_rest_latency_ms: 2_000,
+            min_partial_fill_ratio: 0.25,
+            slippage_bps: 10.0,
+            simulated_order_failure_rate: 0.02,
             max_book_age_ms: 1_000,
             max_feed_age_ms: 5_000,
             opening_max_skew_ms: 5_000,
@@ -2273,5 +2633,20 @@ mod tests {
         assert!(
             live_edge_evaluation(&config, 0.9, Some(0.79), Some(0.80), Some(20.0)).unwrap() > 0.0
         );
+    }
+
+    #[test]
+    fn partial_book_walk_preserves_fill_ratio_and_cost() {
+        let fill = walk_ask_levels_partial(&[(0.50, 4.0), (0.55, 4.0)], 10.0, 0.50);
+        assert!((fill.shares - 4.0).abs() < 1e-9);
+        assert!((fill.cost - 2.10).abs() < 1e-9);
+        assert!(walk_ask_levels(&[(0.50, 4.0)], 10.0, 0.50).is_none());
+    }
+
+    #[test]
+    fn latency_buckets_are_stable() {
+        assert_eq!(latency_bucket(1_000), "le_1000ms");
+        assert_eq!(latency_bucket(1_001), "1001_2000ms");
+        assert_eq!(latency_bucket(2_001), "gt_2000ms");
     }
 }

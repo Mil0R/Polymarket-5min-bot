@@ -11,6 +11,7 @@ pub struct CrossMarketProbabilityArbitrageConfig {
     pub clob_url: String,
     pub results_file: PathBuf,
     pub summary_file: PathBuf,
+    pub report_file: PathBuf,
     pub semantic_review_file: PathBuf,
     pub event_pages: usize,
     pub events_per_page: usize,
@@ -35,6 +36,13 @@ pub struct CrossMarketProbabilityArbitrageConfig {
     pub ordinary_log_seconds: u64,
     pub websocket_books: bool,
     pub websocket_book_max_age_ms: i64,
+    pub max_book_age_ms: i64,
+    pub max_observed_at_skew_ms: i64,
+    pub max_exchange_timestamp_skew_ms: i64,
+    pub opportunity_episode_gap_seconds: u64,
+    pub delayed_recheck_ms: Vec<u64>,
+    pub partial_fill_ratio: Decimal,
+    pub emergency_exit_haircut_pct: Decimal,
     pub semantic_allowlist: Vec<String>,
     pub maker_taker_shadow: bool,
     pub maker_taker_min_net_edge: Decimal,
@@ -51,13 +59,18 @@ impl CrossMarketProbabilityArbitrageConfig {
                 .unwrap_or_else(|_| "https://clob.polymarket.com".into()),
             results_file: PathBuf::from(
                 env::var("CROSS_MARKET_PROBABILITY_ARBITRAGE_RESULTS_FILE").unwrap_or_else(|_| {
-                    "results/cross-market-probability-arbitrage/shadow-run-003/events.ndjson".into()
+                    "results/cross-market-probability-arbitrage/shadow-run-004/events.ndjson".into()
                 }),
             ),
             summary_file: PathBuf::from(
                 env::var("CROSS_MARKET_PROBABILITY_ARBITRAGE_SUMMARY_FILE").unwrap_or_else(|_| {
-                    "results/cross-market-probability-arbitrage/shadow-run-003/summary.ndjson"
+                    "results/cross-market-probability-arbitrage/shadow-run-004/summary.ndjson"
                         .into()
+                }),
+            ),
+            report_file: PathBuf::from(
+                env::var("CROSS_MARKET_PROBABILITY_ARBITRAGE_REPORT_FILE").unwrap_or_else(|_| {
+                    "results/cross-market-probability-arbitrage/shadow-run-004/report.json".into()
                 }),
             ),
             semantic_review_file: PathBuf::from(
@@ -138,6 +151,31 @@ impl CrossMarketProbabilityArbitrageConfig {
             websocket_book_max_age_ms: parse(
                 "CROSS_MARKET_PROBABILITY_ARBITRAGE_WEBSOCKET_BOOK_MAX_AGE_MS",
                 "15000",
+            )?,
+            max_book_age_ms: parse("CROSS_MARKET_PROBABILITY_ARBITRAGE_MAX_BOOK_AGE_MS", "2000")?,
+            max_observed_at_skew_ms: parse(
+                "CROSS_MARKET_PROBABILITY_ARBITRAGE_MAX_OBSERVED_AT_SKEW_MS",
+                "1000",
+            )?,
+            max_exchange_timestamp_skew_ms: parse(
+                "CROSS_MARKET_PROBABILITY_ARBITRAGE_MAX_EXCHANGE_TIMESTAMP_SKEW_MS",
+                "2000",
+            )?,
+            opportunity_episode_gap_seconds: parse(
+                "CROSS_MARKET_PROBABILITY_ARBITRAGE_OPPORTUNITY_EPISODE_GAP_SECONDS",
+                "300",
+            )?,
+            delayed_recheck_ms: parse_u64_list(
+                "CROSS_MARKET_PROBABILITY_ARBITRAGE_DELAYED_RECHECK_MS",
+                "250,500,1000",
+            )?,
+            partial_fill_ratio: decimal_env(
+                "CROSS_MARKET_PROBABILITY_ARBITRAGE_PARTIAL_FILL_RATIO",
+                dec!(0.75),
+            )?,
+            emergency_exit_haircut_pct: decimal_env(
+                "CROSS_MARKET_PROBABILITY_ARBITRAGE_EMERGENCY_EXIT_HAIRCUT_PCT",
+                dec!(0.05),
             )?,
             semantic_allowlist: parse_string_list(
                 "CROSS_MARKET_PROBABILITY_ARBITRAGE_SEMANTIC_ALLOWLIST",
@@ -248,6 +286,41 @@ impl CrossMarketProbabilityArbitrageConfig {
         if self.websocket_book_max_age_ms <= 0 || self.websocket_book_max_age_ms > 300_000 {
             bail!("CROSS_MARKET_PROBABILITY_ARBITRAGE_WEBSOCKET_BOOK_MAX_AGE_MS must be in [1, 300000]");
         }
+        if self.max_book_age_ms <= 0 || self.max_book_age_ms > 60_000 {
+            bail!("CROSS_MARKET_PROBABILITY_ARBITRAGE_MAX_BOOK_AGE_MS must be in [1, 60000]");
+        }
+        if self.max_observed_at_skew_ms <= 0 || self.max_observed_at_skew_ms > 60_000 {
+            bail!(
+                "CROSS_MARKET_PROBABILITY_ARBITRAGE_MAX_OBSERVED_AT_SKEW_MS must be in [1, 60000]"
+            );
+        }
+        if self.max_exchange_timestamp_skew_ms <= 0 || self.max_exchange_timestamp_skew_ms > 60_000
+        {
+            bail!("CROSS_MARKET_PROBABILITY_ARBITRAGE_MAX_EXCHANGE_TIMESTAMP_SKEW_MS must be in [1, 60000]");
+        }
+        if self.opportunity_episode_gap_seconds < self.poll_seconds
+            || self.opportunity_episode_gap_seconds > 86_400
+        {
+            bail!("CROSS_MARKET_PROBABILITY_ARBITRAGE_OPPORTUNITY_EPISODE_GAP_SECONDS must be >= poll interval and <= 86400");
+        }
+        if self.delayed_recheck_ms.is_empty()
+            || self
+                .delayed_recheck_ms
+                .iter()
+                .any(|value| *value == 0 || *value > 60_000)
+        {
+            bail!("CROSS_MARKET_PROBABILITY_ARBITRAGE_DELAYED_RECHECK_MS must contain values in [1, 60000]");
+        }
+        if self.partial_fill_ratio <= Decimal::ZERO || self.partial_fill_ratio > Decimal::ONE {
+            bail!("CROSS_MARKET_PROBABILITY_ARBITRAGE_PARTIAL_FILL_RATIO must be in (0, 1]");
+        }
+        if self.emergency_exit_haircut_pct < Decimal::ZERO
+            || self.emergency_exit_haircut_pct >= Decimal::ONE
+        {
+            bail!(
+                "CROSS_MARKET_PROBABILITY_ARBITRAGE_EMERGENCY_EXIT_HAIRCUT_PCT must be in [0, 1)"
+            );
+        }
         if self.maker_taker_min_net_edge < Decimal::ZERO || self.maker_taker_min_net_edge >= dec!(1)
         {
             bail!("CROSS_MARKET_PROBABILITY_ARBITRAGE_MAKER_TAKER_MIN_NET_EDGE must be in [0, 1)");
@@ -316,6 +389,22 @@ fn parse_decimal_list_allow_zero(name: &str, default: &str) -> Result<Vec<Decima
         .map(|value| Decimal::from_str(value.trim()).with_context(|| format!("{name} is invalid")))
         .collect::<Result<Vec<_>>>()?;
     values.sort();
+    values.dedup();
+    Ok(values)
+}
+
+fn parse_u64_list(name: &str, default: &str) -> Result<Vec<u64>> {
+    let mut values = env::var(name)
+        .unwrap_or_else(|_| default.to_string())
+        .split(',')
+        .map(|value| {
+            value
+                .trim()
+                .parse::<u64>()
+                .with_context(|| format!("{name} is invalid"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    values.sort_unstable();
     values.dedup();
     Ok(values)
 }

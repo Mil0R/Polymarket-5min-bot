@@ -183,6 +183,9 @@ pub struct Config {
     /// Late-Resolution Winner Trading WS snapshot age limit. Kept separate from the much stricter
     /// two-leg arbitrage synchronization threshold.
     pub late_resolution_winner_trading_max_book_age_ms: i64,
+    /// Maximum elapsed latency of a REST fallback book request before the
+    /// candidate is discarded as too stale for near-expiry trading.
+    pub late_resolution_winner_trading_max_rest_latency_ms: u64,
     pub late_resolution_winner_trading_feed_max_age_ms: i64,
     pub late_resolution_winner_trading_opening_max_skew_ms: i64,
     pub late_resolution_winner_trading_volatility_lookback_secs: u64,
@@ -444,6 +447,10 @@ impl Config {
             late_resolution_winner_trading_max_book_age_ms: env_parse(
                 "LATE_RESOLUTION_WINNER_TRADING_MAX_BOOK_AGE_MS",
                 "1000",
+            )?,
+            late_resolution_winner_trading_max_rest_latency_ms: env_parse(
+                "LATE_RESOLUTION_WINNER_TRADING_MAX_REST_LATENCY_MS",
+                "3000",
             )?,
             late_resolution_winner_trading_feed_max_age_ms: env_parse(
                 "LATE_RESOLUTION_WINNER_TRADING_FEED_MAX_AGE_MS",
@@ -906,6 +913,8 @@ impl Config {
         }
         if self.late_resolution_winner_trading_max_book_age_ms <= 0
             || self.late_resolution_winner_trading_max_book_age_ms > 30_000
+            || self.late_resolution_winner_trading_max_rest_latency_ms == 0
+            || self.late_resolution_winner_trading_max_rest_latency_ms > 30_000
             || self.late_resolution_winner_trading_feed_max_age_ms <= 0
             || self.late_resolution_winner_trading_opening_max_skew_ms < 0
             || self.late_resolution_winner_trading_volatility_lookback_secs == 0

@@ -32,8 +32,8 @@ async fn main() -> Result<()> {
             let path = std::env::args()
                 .nth(2)
                 .map(std::path::PathBuf::from)
-                .unwrap_or(config.results_file);
-            run_report(&path)?;
+                .unwrap_or_else(|| config.results_file.clone());
+            run_report(&path, &config)?;
         }
         _ => bail!("unknown cross_market_probability_arbitrage command '{command}'; use scan, shadow, or report"),
     }
@@ -46,7 +46,7 @@ fn print_help() {
          Usage:\n  cross_market_probability_arbitrage scan\n  cross_market_probability_arbitrage shadow\n  cross_market_probability_arbitrage report [events.ndjson]\n\n\
          scan    Discover relationships and evaluate one live order-book snapshot.\n\
          shadow  Continuously evaluate and journal materially changed snapshots.\n\
-         report  Summarize executable edges, depth failures, and fee-adjusted profit.\n\n\
+         report  Summarize synchronized edges, independent episodes, delayed survival, and failure stress; also writes REPORT_FILE.\n\n\
          Safety: this binary has no signer and never submits, cancels, splits, merges, or converts positions."
     );
 }
