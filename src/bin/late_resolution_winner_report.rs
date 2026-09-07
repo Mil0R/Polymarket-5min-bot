@@ -17,6 +17,7 @@ struct EvaluationMeta {
     seconds_bucket: String,
     research_cohorts: Vec<String>,
     probability_gap: Decimal,
+    model_probability: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -180,13 +181,14 @@ fn print_group(label: &str, stats: &GroupStats) {
         0.0
     };
     println!(
-        "{label:<18} markets={:<4} wins={:<4} win_rate={:>7.2}% lower95={:>7.2}% cf_pnl/share={:>10} shadow={:<4} shadow_pnl={:>10} shadow_return={:>7.3}%",
+        "{label:<18} markets={:<4} wins={:<4} win_rate={:>7.2}% lower95={:>7.2}% cf_pnl/share={:>10} shadow={:<4} shadow_wins={:<4} shadow_pnl={:>10} shadow_return={:>7.3}%",
         stats.markets,
         stats.wins,
         win_rate * 100.0,
         wilson_lower_bound(stats.wins, stats.markets) * 100.0,
         stats.counterfactual_pnl_per_share,
         stats.shadow_fills,
+        stats.shadow_wins,
         stats.shadow_pnl,
         shadow_return * 100.0,
     );
@@ -266,6 +268,10 @@ fn main() -> Result<()> {
     let mut latest_shadow_by_slug = HashMap::<String, ShadowFill>::new();
     let mut resolved_by_evaluation = HashMap::<String, bool>::new();
     let mut resolutions = Vec::new();
+    let mut failed_checks = BTreeMap::<String, u64>::new();
+    let mut audit_samples = 0_u64;
+    let mut floor_active = 0_u64;
+    let mut max_opening_skew_ms = 0_u64;
     for (index, line) in reader.lines().enumerate() {
         let line = line.with_context(|| format!("cannot read line {}", index + 1))?;
         if line.trim().is_empty() {
@@ -302,6 +308,20 @@ fn main() -> Result<()> {
             }
             Some("evaluated") => {
                 let evaluation = &value["evaluation"];
+                for reason in string_list(evaluation.get("failed_checks")) {
+                    *failed_checks.entry(reason).or_default() += 1;
+                }
+                if let Some(audit) = evaluation.get("model_audit").filter(|v| v.is_object()) {
+                    audit_samples += 1;
+                    floor_active +=
+                        u64::from(audit["volatility_floor_active"].as_bool().unwrap_or(false));
+                    max_opening_skew_ms = max_opening_skew_ms.max(
+                        audit["opening_skew_ms"]
+                            .as_i64()
+                            .unwrap_or(0)
+                            .unsigned_abs(),
+                    );
+                }
                 if let Some(id) = evaluation.get("evaluation_id").and_then(Value::as_str) {
                     let asset = evaluation
                         .get("asset")
@@ -316,6 +336,12 @@ fn main() -> Result<()> {
                     evaluations.insert(
                         id.to_string(),
                         EvaluationMeta {
+                            model_probability: evaluation
+                                .get("opening_twap")
+                                .filter(|v| !v.is_null())
+                                .and_then(|_| {
+                                    decimal(evaluation.get("model_probability")).to_f64()
+                                }),
                             run_id: evaluation
                                 .get("run_id")
                                 .and_then(Value::as_str)
@@ -419,6 +445,7 @@ fn main() -> Result<()> {
     let mut by_asset_price = BTreeMap::<String, GroupStats>::new();
     let mut by_time = BTreeMap::<String, GroupStats>::new();
     let mut missing_evaluations = 0_u64;
+    let mut outcome_calibration = BTreeMap::<String, (u64, u64, f64, f64)>::new();
     for resolution in &resolutions {
         let Some(id) = resolution
             .get("selected_evaluation_id")
@@ -435,6 +462,20 @@ fn main() -> Result<()> {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         let pnl = decimal(resolution.get("counterfactual_pnl_per_share"));
+        if let Some(probability) = meta.model_probability {
+            let bucket = if probability >= 0.9 {
+                "0.90+"
+            } else {
+                "below_0.90"
+            };
+            let stats = outcome_calibration
+                .entry(format!("{} model={bucket}", meta.asset))
+                .or_default();
+            stats.0 += 1;
+            stats.1 += u64::from(won);
+            stats.2 += probability;
+            stats.3 += (probability - if won { 1.0 } else { 0.0 }).powi(2);
+        }
         let shadow = shadows.get(id);
         overall.record(won, pnl, shadow);
         by_stage
@@ -461,19 +502,6 @@ fn main() -> Result<()> {
             "  run_id={run_id} started_at={started_at} mode={mode} hybrid_paper_enabled={hybrid_enabled}"
         );
     }
-    println!("\nCounterfactual outcomes (never interpret the mixed total as strategy ROI):");
-    print_group("all_stages", &overall);
-    for (stage, stats) in &by_stage {
-        print_group(stage, stats);
-    }
-    println!("\nBy asset and ask price:");
-    for (label, stats) in &by_asset_price {
-        print_group(label, stats);
-    }
-    println!("\nBy seconds remaining:");
-    for (label, stats) in &by_time {
-        print_group(label, stats);
-    }
     let mut by_cohort = BTreeMap::<String, GroupStats>::new();
     let mut unresolved_shadows = 0_u64;
     for shadow in latest_shadow_by_slug.values() {
@@ -490,20 +518,59 @@ fn main() -> Result<()> {
                 .record(won, Decimal::ZERO, Some(shadow));
         }
     }
-    println!("\nConfirmation-consistent shadow cohorts (latest attempt per market):");
+    println!("\nPRIMARY RESEARCH RESULT: confirmation-consistent shadow cohorts (latest attempt per market; simulated, NOT account PnL):");
+    println!("Wins/win_rate describe all resolved attempts, including no-fill; shadow counts and PnL describe fills only. Cohorts overlap; do not sum them.");
     for (label, stats) in &by_cohort {
         print_group(label, stats);
     }
+    println!("\nSECONDARY counterfactual outcomes: linked shadow is a selected-evaluation SUBSET, NOT the complete shadow result or strategy ROI:");
+    print_group("all_stages", &overall);
+    for (stage, stats) in &by_stage {
+        print_group(stage, stats);
+    }
+    println!("\nCounterfactual by asset and ask price:");
+    for (label, stats) in &by_asset_price {
+        print_group(label, stats);
+    }
+    println!("\nCounterfactual by seconds remaining:");
+    for (label, stats) in &by_time {
+        print_group(label, stats);
+    }
+    println!("\nAll failed checks (overlapping; primary rejection counters omit later failures):");
+    for (reason, count) in &failed_checks {
+        println!("  {reason}: {count}");
+    }
+    println!("\nModel audit: samples={audit_samples} volatility_floor_active={floor_active} max_abs_opening_skew_ms={max_opening_skew_ms}");
+    if audit_samples == 0 {
+        println!(
+            "  Legacy data: volatility floor/reference diagnostics unavailable; collect a new run."
+        );
+    }
+    println!("\nResolved selected-market probability calibration (selection-biased research sample, not out-of-sample validation):");
+    for (label, (n, wins, probability_sum, squared_error)) in outcome_calibration {
+        println!(
+            "  {label} markets={n} mean_probability={:.4} observed_win_rate={:.4} brier={:.4}",
+            probability_sum / n as f64,
+            wins as f64 / n as f64,
+            squared_error / n as f64
+        );
+    }
     let mut calibration_by_stage = BTreeMap::<String, CalibrationStats>::new();
     let mut evaluations_by_run = BTreeMap::<String, u64>::new();
+    let mut unpriced_evaluations = 0_u64;
     for meta in evaluations.values() {
-        calibration_by_stage
-            .entry(meta.candidate_stage.clone())
-            .or_default()
-            .record(meta.probability_gap);
+        if meta.model_probability.is_some() {
+            calibration_by_stage
+                .entry(meta.candidate_stage.clone())
+                .or_default()
+                .record(meta.probability_gap);
+        } else {
+            unpriced_evaluations += 1;
+        }
         *evaluations_by_run.entry(meta.run_id.clone()).or_default() += 1;
     }
     println!("\nModel-vs-market probability calibration:");
+    println!("  missing_model_inputs_excluded={unpriced_evaluations} (placeholder zero is not a probability forecast)");
     for (stage, stats) in &calibration_by_stage {
         let average_gap = if stats.evaluations > 0 {
             stats.probability_gap_sum / Decimal::from(stats.evaluations)
@@ -571,6 +638,33 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_fill_outcome_does_not_change_filled_cohort_pnl() {
+        let mut stats = GroupStats::default();
+        let fill = ShadowFill {
+            evaluation_id: "filled".into(),
+            simulated_at: String::new(),
+            candidate_stage: "rejected_confirmed".into(),
+            research_cohorts: vec![],
+            outcome: "filled".into(),
+            filled: Decimal::from(5),
+            cost: Decimal::from_str("4.9").unwrap(),
+        };
+        stats.record(true, Decimal::ZERO, Some(&fill));
+        let no_fill = ShadowFill {
+            outcome: "no_fill".into(),
+            ..fill.clone()
+        };
+        stats.record(false, Decimal::ZERO, Some(&no_fill));
+        assert_eq!(stats.markets, 2);
+        assert_eq!(stats.wins, 1);
+        assert_eq!(stats.shadow_fills, 1);
+        assert_eq!(stats.shadow_wins, 1);
+        assert_eq!(stats.shadow_pnl, Decimal::from_str("0.1").unwrap());
+        stats.record(false, Decimal::ZERO, Some(&fill));
+        assert_eq!(stats.shadow_pnl, Decimal::from_str("-4.8").unwrap());
+    }
 
     #[test]
     fn wilson_bound_penalizes_small_perfect_samples() {

@@ -171,6 +171,8 @@ pub struct PendingLateResolutionWinnerTrading {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WinnerEvaluation {
+    #[serde(default)]
+    pub model_audit: Option<crate::late_resolution_winner_model::WinnerModelAudit>,
     /// Runtime session that produced this observation. Empty for legacy records.
     #[serde(default)]
     pub run_id: String,
@@ -209,7 +211,7 @@ pub struct WinnerEvaluation {
     /// Independent model probability minus the market-implied probability.
     #[serde(default)]
     pub model_market_probability_gap: Decimal,
-    /// `model_below_market`, `model_at_market`, or `model_above_market`.
+    /// `model_unavailable`, `model_below_market`, `model_at_market`, or `model_above_market`.
     #[serde(default)]
     pub probability_calibration_state: String,
     #[serde(default)]
@@ -333,10 +335,14 @@ impl WinnerEvaluation {
             required_probability: model.required_probability,
             market_implied_probability: ask_price,
             model_market_probability_gap: model.probability - ask_price,
-            probability_calibration_state: match model.probability.cmp(&ask_price) {
-                std::cmp::Ordering::Less => "model_below_market",
-                std::cmp::Ordering::Equal => "model_at_market",
-                std::cmp::Ordering::Greater => "model_above_market",
+            probability_calibration_state: if model.opening_twap.is_none() {
+                "model_unavailable"
+            } else {
+                match model.probability.cmp(&ask_price) {
+                    std::cmp::Ordering::Less => "model_below_market",
+                    std::cmp::Ordering::Equal => "model_at_market",
+                    std::cmp::Ordering::Greater => "model_above_market",
+                }
             }
             .to_string(),
             reversal_margin_ratio: if model.reversal_boundary_bps > 0.0 {
@@ -351,6 +357,7 @@ impl WinnerEvaluation {
             research_cohorts: Vec::new(),
             directional_margin_bps: model.directional_margin_bps,
             reversal_boundary_bps: model.reversal_boundary_bps,
+            model_audit: model.audit.clone(),
             volatility_bps_per_sqrt_second: model.volatility_bps_per_sqrt_second,
             spread: model.spread,
             depth_usdc: model.depth_notional,
@@ -389,7 +396,9 @@ pub fn winner_research_cohorts(
         cohorts.push("chainlink_direction_agrees".to_string());
     }
     cohorts.push(
-        if evaluation.model_market_probability_gap < Decimal::ZERO {
+        if !has_chainlink_model {
+            "model_probability_unavailable"
+        } else if evaluation.model_market_probability_gap < Decimal::ZERO {
             "model_probability_below_market"
         } else if evaluation.model_market_probability_gap > Decimal::ZERO {
             "model_probability_above_market"
@@ -1712,6 +1721,7 @@ mod tests {
             research_cohorts: vec![],
             directional_margin_bps: 100.0,
             reversal_boundary_bps: 10.0,
+            model_audit: None,
             volatility_bps_per_sqrt_second: 1.0,
             spread: dec!(0.01),
             depth_usdc: dec!(9.5),

@@ -7,7 +7,7 @@ use futures::{future::join_all, StreamExt};
 use rust_decimal_macros::dec;
 use std::collections::{HashMap, HashSet};
 use std::io::{stdout, IsTerminal};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
@@ -547,17 +547,55 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
     if let Some(journal) = late_resolution_winner_trading_journal.as_ref() {
         runtime_metrics.set_late_resolution_winner_trading_pending(journal.pending().len());
     }
+    let winner_loop_heartbeat = Arc::new(AtomicU64::new(0));
     if config.dry_run {
         if let Some(summary_journal) = late_resolution_winner_trading_journal.clone() {
             let summary_metrics = runtime_metrics.clone();
             let summary_shutdown = shutdown.clone();
             let summary_interval_secs =
                 config.late_resolution_winner_trading_paper_summary_interval_secs;
-            tokio::spawn(async move {
+            let summary_heartbeat = Arc::new(AtomicU64::new(0));
+            let watchdog_summary = summary_heartbeat.clone();
+            let watchdog_loop = winner_loop_heartbeat.clone();
+            let watchdog_shutdown = shutdown.clone();
+            // Independent of Tokio: a blocked runtime must not silence its own watchdog.
+            std::thread::Builder::new().name("winner-watchdog".into()).spawn(move || {
+                let mut last_summary = 0;
+                let mut last_loop = 0;
+                let mut summary_progress = Instant::now();
+                let mut loop_progress = Instant::now();
+                let mut last_check = Instant::now();
+                let mut unhealthy = false;
+                while !watchdog_shutdown.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_secs(1));
+                    let summary = watchdog_summary.load(Ordering::Relaxed);
+                    let event_loop = watchdog_loop.load(Ordering::Relaxed);
+                    if summary != last_summary { summary_progress = Instant::now(); last_summary = summary; }
+                    if event_loop != last_loop { loop_progress = Instant::now(); last_loop = event_loop; }
+                    if last_check.elapsed() < Duration::from_secs(60) { continue; }
+                    last_check = Instant::now();
+                    let summary_stale = summary_progress.elapsed().as_secs() > summary_interval_secs.saturating_mul(3).max(180);
+                    // Market discovery may normally wait for a 15-minute window.
+                    let loop_stale = loop_progress.elapsed().as_secs() > 1800;
+                    if summary_stale || loop_stale {
+                        error!(target: "polypulse::console::late_resolution_winner_trading",
+                            summary_stale, loop_stale,
+                            summary_silence_secs = summary_progress.elapsed().as_secs(),
+                            loop_silence_secs = loop_progress.elapsed().as_secs(),
+                            "Winner runtime heartbeat stalled; feed connectivity does not imply strategy health; investigate before counting runtime");
+                    } else if unhealthy {
+                        info!(target: "polypulse::console::late_resolution_winner_trading", "Winner runtime heartbeat recovered");
+                    }
+                    unhealthy = summary_stale || loop_stale;
+                }
+                info!(target: "polypulse::console::late_resolution_winner_trading", "Winner watchdog stopped: shutdown requested");
+            })?;
+            let summary_task = tokio::spawn(async move {
                 let interval = Duration::from_secs(summary_interval_secs);
                 loop {
                     sleep(interval).await;
                     if summary_shutdown.load(Ordering::Relaxed) {
+                        info!(target: "polypulse::console::late_resolution_winner_trading", "Winner summary stopped: shutdown requested");
                         break;
                     }
                     log_late_resolution_winner_paper_summary(
@@ -565,6 +603,12 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                         &summary_journal,
                         summary_interval_secs,
                     );
+                    summary_heartbeat.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+            tokio::spawn(async move {
+                if let Err(error) = summary_task.await {
+                    error!(target: "polypulse::console::late_resolution_winner_trading", %error, "Winner summary task terminated unexpectedly");
                 }
             });
         }
@@ -683,6 +727,7 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
     );
     #[allow(unreachable_code)]
     loop {
+        winner_loop_heartbeat.fetch_add(1, Ordering::Relaxed);
         if shutdown.load(Ordering::Relaxed) {
             tracing::info!("Shutdown requested from dashboard");
             return Ok(());
@@ -870,6 +915,7 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
         let mut event_loop_state = WindowEventLoopState::default();
         // Monitor orderbook updates
         loop {
+            winner_loop_heartbeat.fetch_add(1, Ordering::Relaxed);
             // Wind-down check: run once when <= N minutes to window end (stay in loop until natural switch by new-window detection)
             // Use second precision; num_minutes() truncation may miss in 5min windows
             if window_session

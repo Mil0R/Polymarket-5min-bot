@@ -5,6 +5,7 @@ use futures::{SinkExt, StreamExt};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
@@ -262,12 +263,29 @@ impl ChainlinkTwapStore {
         let reversal_boundary_bps =
             policy.min_margin_bps + policy.reversal_sigma_multiplier * remaining_sigma_bps;
         let z = directional_margin_bps / remaining_sigma_bps.max(0.000_001);
-        let probability = Decimal::try_from(normal_cdf(z).clamp(0.5, 0.9999)).unwrap_or(dec!(0.5));
+        // An outcome moving against the reference must be allowed below 50%.
+        let probability =
+            Decimal::try_from(normal_cdf(z).clamp(0.0001, 0.9999)).unwrap_or(dec!(0.5));
         let effective_price = (input.ask_price + policy.fee_buffer).min(dec!(1));
         let probability_edge_before_risk = probability - effective_price;
         let required_probability = effective_price + policy.model_risk_buffer + policy.min_net_ev;
         let net_ev = probability - effective_price - policy.model_risk_buffer;
         let mut evaluation = ModelEvaluation {
+            audit: Some(WinnerModelAudit {
+                version: 1,
+                opening_observed_at_ms: open.observed_at_ms,
+                opening_skew_ms: open.observed_at_ms - input.window_start_ms,
+                current_age_ms: (input.now_ms - current.observed_at_ms).max(0),
+                observation_count: history.len(),
+                observed_volatility_bps: observed_volatility,
+                minimum_volatility_bps: policy.min_volatility_bps_per_sqrt_second,
+                volatility_floor_active: observed_volatility
+                    < policy.min_volatility_bps_per_sqrt_second,
+                probability_without_volatility_floor: normal_cdf(
+                    directional_margin_bps
+                        / (observed_volatility * remaining.sqrt()).max(0.000_001),
+                ),
+            }),
             rejection: failed_checks.first().copied(),
             failed_checks,
             opening_twap: Some(open.value),
@@ -338,8 +356,23 @@ pub enum ModelRejection {
     NetEvTooLow,
 }
 
+/// Diagnostics only: the unfloored probability is never used for admission.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WinnerModelAudit {
+    pub version: u32,
+    pub opening_observed_at_ms: i64,
+    pub opening_skew_ms: i64,
+    pub current_age_ms: i64,
+    pub observation_count: usize,
+    pub observed_volatility_bps: f64,
+    pub minimum_volatility_bps: f64,
+    pub volatility_floor_active: bool,
+    pub probability_without_volatility_floor: f64,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelEvaluation {
+    pub audit: Option<WinnerModelAudit>,
     pub rejection: Option<ModelRejection>,
     /// All failed checks in policy order. `rejection` remains the primary
     /// reason for backwards-compatible admission and aggregate counters.
@@ -362,6 +395,7 @@ pub struct ModelEvaluation {
 impl ModelEvaluation {
     fn rejected(rejection: ModelRejection) -> Self {
         Self {
+            audit: None,
             rejection: Some(rejection),
             failed_checks: vec![rejection],
             opening_twap: None,
@@ -736,6 +770,57 @@ mod tests {
         );
         assert_eq!(evaluation.required_probability, dec!(0.968));
         assert!(evaluation.net_ev > dec!(0));
+    }
+
+    #[test]
+    fn adverse_direction_is_below_half_and_records_audit() {
+        let evaluation = seeded_store(dec!(99.9)).evaluate(
+            WinnerModelInput {
+                asset: "btc",
+                window_start_ms: 0,
+                now_ms: 10_500,
+                seconds_remaining: 30,
+                buy_yes: true,
+                bid_price: dec!(0.95),
+                ask_price: dec!(0.96),
+                ask_size: dec!(20),
+            },
+            policy(),
+        );
+        assert!(evaluation.probability < dec!(0.5));
+        assert!(!evaluation.admitted());
+        let audit = evaluation.audit.unwrap();
+        // The store rejects timestamp zero; the nearest valid sample is at 1s.
+        assert_eq!(audit.opening_skew_ms, 1_000);
+        assert_eq!(audit.current_age_ms, 500);
+        assert_eq!(audit.observation_count, 10);
+        assert!(audit.probability_without_volatility_floor < 0.5);
+    }
+
+    #[test]
+    fn volatility_floor_audit_does_not_bypass_admission() {
+        let mut conservative = policy();
+        conservative.min_volatility_bps_per_sqrt_second = 100.0;
+        let evaluation = seeded_store(dec!(100.1)).evaluate(
+            WinnerModelInput {
+                asset: "btc",
+                window_start_ms: 0,
+                now_ms: 10_500,
+                seconds_remaining: 30,
+                buy_yes: true,
+                bid_price: dec!(0.95),
+                ask_price: dec!(0.96),
+                ask_size: dec!(20),
+            },
+            conservative,
+        );
+        let audit = evaluation.audit.as_ref().unwrap();
+        assert!(audit.volatility_floor_active);
+        assert_eq!(evaluation.volatility_bps_per_sqrt_second, 100.0);
+        assert!(
+            audit.probability_without_volatility_floor > evaluation.probability.to_f64().unwrap()
+        );
+        assert!(!evaluation.admitted());
     }
 
     #[test]
