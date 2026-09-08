@@ -2,7 +2,7 @@ use polypulse::ui::control::{StrategyControls, StrategyKind};
 use polypulse::ui::{decimal_to_f64, spawn_dashboard_thread, symbol_short, DashboardHandle};
 use polypulse::wallet_copy_trading::WalletCopyTradingRuntime;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use futures::{future::join_all, StreamExt};
 use rust_decimal_macros::dec;
 use std::collections::{HashMap, HashSet};
@@ -103,6 +103,11 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
 
     // Load config
     let config = Config::from_env()?;
+    let winner_sensitivity_enabled = config.dry_run
+        && std::env::var("LATE_RESOLUTION_WINNER_TRADING_SENSITIVITY_ENABLED")
+            .unwrap_or_else(|_| "false".into())
+            .parse::<bool>()
+            .context("invalid LATE_RESOLUTION_WINNER_TRADING_SENSITIVITY_ENABLED")?;
     if !config.dry_run && !use_tui {
         anyhow::bail!(
             "live/canary execution is restricted to the interactive polypulse TUI; standalone and headless execution must use DRY_RUN=true"
@@ -822,6 +827,10 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
         let mut winner_confirmations = WinnerConfirmationTracker::default();
         let mut winner_shadow_confirmations = WinnerConfirmationTracker::default();
         let mut winner_shadow_executed = HashSet::new();
+        let mut winner_sensitivity_confirmations: Vec<_> = (0..8)
+            .map(|_| WinnerConfirmationTracker::default())
+            .collect();
+        let mut winner_sensitivity_executed = HashSet::new();
         if late_resolution_winner_trading_available {
             info!(target: "polypulse::strategy::late_resolution_winner_trading",
                 before_end_secs = config.late_resolution_winner_trading_before_end_secs,
@@ -1576,6 +1585,7 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                     if !strategy_controls.late_resolution_winner_trading_enabled() {
                         winner_confirmations.clear();
                         winner_shadow_confirmations.clear();
+                        for tracker in &mut winner_sensitivity_confirmations { tracker.clear(); }
                     }
 
                     // Window-end late-resolution-winner-trading (strategy B): when the window is
@@ -2083,6 +2093,7 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                                 ) {
                                     winner_confirmations.reject(&market.slug);
                                     winner_shadow_confirmations.reject(&market.slug);
+                                    for tracker in &mut winner_sensitivity_confirmations { tracker.reject(&market.slug); }
                                     runtime_metrics.record_late_resolution_winner_trading_no_signal();
                                     runtime_metrics.record_late_resolution_winner_trading_asset_no_signal(
                                         &market.crypto_symbol,
@@ -2210,6 +2221,7 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                             if yes_ask.is_none() && no_ask.is_none() {
                                 winner_confirmations.reject(&market.slug);
                                 winner_shadow_confirmations.reject(&market.slug);
+                                for tracker in &mut winner_sensitivity_confirmations { tracker.reject(&market.slug); }
                                 runtime_metrics.record_late_resolution_winner_trading_no_book();
                                 runtime_metrics
                                     .record_late_resolution_winner_trading_asset_no_book(&market.crypto_symbol);
@@ -2224,6 +2236,7 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                             else {
                                 winner_confirmations.reject(&market.slug);
                                 winner_shadow_confirmations.reject(&market.slug);
+                                for tracker in &mut winner_sensitivity_confirmations { tracker.reject(&market.slug); }
                                 runtime_metrics.record_late_resolution_winner_trading_no_signal();
                                 runtime_metrics
                                     .record_late_resolution_winner_trading_asset_no_signal(&market.crypto_symbol);
@@ -2248,6 +2261,7 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                             let Some(selected_top) = selected_top else {
                                 winner_confirmations.reject(&market.slug);
                                 winner_shadow_confirmations.reject(&market.slug);
+                                for tracker in &mut winner_sensitivity_confirmations { tracker.reject(&market.slug); }
                                 continue;
                             };
                             let book_source = if selected_from_rest { "rest" } else { "ws" };
@@ -2261,6 +2275,7 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                             ) else {
                                 winner_confirmations.reject(&market.slug);
                                 winner_shadow_confirmations.reject(&market.slug);
+                                for tracker in &mut winner_sensitivity_confirmations { tracker.reject(&market.slug); }
                                 runtime_metrics.record_late_resolution_winner_trading_incomplete_book();
                                 debug!(
                                     market = %market.crypto_symbol,
@@ -2275,6 +2290,7 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                             else {
                                 winner_confirmations.reject(&market.slug);
                                 winner_shadow_confirmations.reject(&market.slug);
+                                for tracker in &mut winner_sensitivity_confirmations { tracker.reject(&market.slug); }
                                 continue;
                             };
                             let fee_per_share = fee_policy.fee_per_share(signal.price);
@@ -2345,7 +2361,7 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                             if let Err(error) = winner_evaluation_journal
                                 .as_ref()
                                 .expect("Late-Resolution Winner Trading evaluation journal initialized")
-                                .record(evaluation)
+                                .record(evaluation.clone())
                             {
                                 error!(target: "polypulse::strategy::late_resolution_winner_trading",
                                     %error,
@@ -2353,6 +2369,50 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                                     "Late-Resolution Winner Trading evaluation persistence failed"
                                 );
                                 continue;
+                            }
+                            if winner_sensitivity_enabled {
+                                let journal = winner_evaluation_journal.as_ref().expect("initialized journal");
+                                let policy = late_resolution_winner_model_policy(&config, &market.crypto_symbol, fee_per_share);
+                                let mut groups = Vec::new();
+                                let mut decisions = Vec::new();
+                                for (index, (floor, risk)) in [1.0, 0.5, 0.25, 0.1].into_iter()
+                                    .flat_map(|f| [1.0, 0.5].into_iter().map(move |r| (f, r))).enumerate() {
+                                    let group = format!("sensitivity_f{floor}_r{risk}");
+                                    let key = format!("{}:{group}", market.slug);
+                                    let (admitted, probability, net_ev) = crate::late_resolution_winner_model::sensitivity_decision(
+                                        &model, policy, i64::from(seconds_until_end), floor, risk);
+                                    let tracker = &mut winner_sensitivity_confirmations[index];
+                                    let confirmed = if admitted {
+                                        model.observed_at_ms.is_some_and(|t| tracker.observe(&market.slug, signal.buy_yes, t,
+                                            config.late_resolution_winner_trading_confirmation_observations,
+                                            config.late_resolution_winner_trading_feed_max_age_ms.saturating_mul(3)).confirmed)
+                                    } else { tracker.reject(&market.slug); false };
+                                    let attempted = winner_sensitivity_executed.contains(&key);
+                                    decisions.push(serde_json::json!({"group":group,"floor_scale":floor,"risk_scale":risk,
+                                        "probability":probability,"net_ev":net_ev,"admitted":admitted,
+                                        "confirmed":confirmed,"already_attempted":attempted}));
+                                    if confirmed && !attempted { groups.push(group); }
+                                }
+                                let persisted = journal.record_sensitivity(serde_json::json!({"run_id":run_id,
+                                    "evaluation_id":evaluation_id,"slug":market.slug,"recorded_at":Utc::now(),
+                                    "reference_verified":false,"groups":decisions}));
+                                if let Err(error) = persisted {
+                                    warn!(%error, "Winner sensitivity decision persistence failed");
+                                } else if !groups.is_empty() {
+                                    let size = fee_inclusive_depth_capped_size(signal.price, fee_per_share, hybrid_max_order, ask_size);
+                                    if size > dec!(0) {
+                                        info!(target: "polypulse::console::late_resolution_winner_trading",
+                                            market = %market.crypto_symbol, %evaluation_id, groups = ?groups,
+                                            price = %signal.price, %size, "Winner sensitivity Shadow opportunity confirmed");
+                                        for group in &groups { winner_sensitivity_executed.insert(format!("{}:{group}", market.slug)); }
+                                        // All groups confirmed now share one delayed snapshot and execution result.
+                                        window_session.spawn_trade(record_winner_shadow(executor.clone(), journal.clone(),
+                                            runtime_metrics.clone(), token, signal.price, size, fee_per_share,
+                                            config.paper_late_resolution_winner_trading_delay_ms, run_id.to_string(),
+                                            evaluation_id.clone(), market.slug.clone(), market.crypto_symbol.clone(),
+                                            "sensitivity_confirmed".into(), groups));
+                                    }
+                                }
                             }
                             runtime_metrics.record_late_resolution_winner_trading_evaluation();
                             runtime_metrics
@@ -2584,6 +2644,7 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                             if !strategy_controls.late_resolution_winner_trading_enabled() {
                                 winner_confirmations.clear();
                                 winner_shadow_confirmations.clear();
+                                for tracker in &mut winner_sensitivity_confirmations { tracker.clear(); }
                                 debug!(target: "polypulse::strategy::late_resolution_winner_trading", market = %market.crypto_symbol, "Late-Resolution Winner Trading paused before submission");
                                 continue;
                             }
@@ -2911,9 +2972,13 @@ async fn record_winner_shadow(
     let result = executor
         .shadow_buy_winner(token, limit_price, size, fee_per_share)
         .await;
+    let request_latency_ms = result.as_ref().ok().map(|r| r.request_latency_ms);
+    let total_latency_ms = result.as_ref().ok().map(|r| r.total_latency_ms);
     let (outcome, filled, cost, average_price, estimated_fee, error) = match result {
         Ok(execution) if execution.filled > dec!(0) => {
-            metrics.record_late_resolution_winner_trading_shadow_execution_fill();
+            if candidate_stage != "sensitivity_confirmed" {
+                metrics.record_late_resolution_winner_trading_shadow_execution_fill();
+            }
             (
                 "filled",
                 execution.filled,
@@ -2924,11 +2989,15 @@ async fn record_winner_shadow(
             )
         }
         Ok(_) => {
-            metrics.record_late_resolution_winner_trading_shadow_execution_no_fill();
+            if candidate_stage != "sensitivity_confirmed" {
+                metrics.record_late_resolution_winner_trading_shadow_execution_no_fill();
+            }
             ("no_fill", dec!(0), dec!(0), dec!(0), dec!(0), None)
         }
         Err(error) => {
-            metrics.record_late_resolution_winner_trading_shadow_execution_failure();
+            if candidate_stage != "sensitivity_confirmed" {
+                metrics.record_late_resolution_winner_trading_shadow_execution_failure();
+            }
             (
                 "error",
                 dec!(0),
@@ -2940,6 +3009,8 @@ async fn record_winner_shadow(
         }
     };
     let execution = WinnerShadowExecution {
+        request_latency_ms,
+        total_latency_ms,
         run_id,
         evaluation_id: evaluation_id.clone(),
         slug,
@@ -2965,6 +3036,11 @@ async fn record_winner_shadow(
             "Late-Resolution Winner Trading shadow persistence failed"
         );
         return;
+    }
+    if candidate_stage == "sensitivity_confirmed" {
+        info!(target: "polypulse::console::late_resolution_winner_trading", %evaluation_id,
+            market = %asset, %outcome, %filled, %cost, ?request_latency_ms, ?total_latency_ms,
+            "Winner sensitivity Shadow result; settlement PnL available in report");
     }
     debug!(target: "polypulse::strategy::late_resolution_winner_trading",
         %evaluation_id,

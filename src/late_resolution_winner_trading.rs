@@ -240,6 +240,10 @@ pub struct WinnerEvaluation {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WinnerShadowExecution {
     #[serde(default)]
+    pub request_latency_ms: Option<u64>,
+    #[serde(default)]
+    pub total_latency_ms: Option<u64>,
+    #[serde(default)]
     pub run_id: String,
     pub evaluation_id: String,
     pub slug: String,
@@ -435,6 +439,10 @@ fn seconds_remaining_bucket(seconds: i64) -> &'static str {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 enum WinnerEvaluationEvent {
+    SensitivityObserved {
+        version: u8,
+        decision: serde_json::Value,
+    },
     RunStarted {
         version: u8,
         run_id: String,
@@ -539,6 +547,7 @@ impl WinnerEvaluationJournal {
                     WinnerEvaluationEvent::MarketResolved { version: 1, .. } => {}
                     WinnerEvaluationEvent::ShadowExecuted { version: 1, .. } => {}
                     WinnerEvaluationEvent::ConfirmationObserved { version: 1, .. } => {}
+                    WinnerEvaluationEvent::SensitivityObserved { version: 1, .. } => {}
                     _ => anyhow::bail!(
                         "unsupported Late-Resolution Winner Trading evaluation journal version"
                     ),
@@ -588,6 +597,13 @@ impl WinnerEvaluationJournal {
         self.append(&WinnerEvaluationEvent::ShadowExecuted {
             version: 1,
             execution: Box::new(execution),
+        })
+    }
+
+    pub fn record_sensitivity(&self, decision: serde_json::Value) -> Result<()> {
+        self.append(&WinnerEvaluationEvent::SensitivityObserved {
+            version: 1,
+            decision,
         })
     }
 
@@ -1777,6 +1793,8 @@ mod tests {
                 .unwrap();
             journal
                 .record_shadow_execution(WinnerShadowExecution {
+                    request_latency_ms: Some(20),
+                    total_latency_ms: Some(270),
                     run_id: "run-1".into(),
                     evaluation_id: "eval-1".into(),
                     slug: "btc-updown-5m-1".into(),

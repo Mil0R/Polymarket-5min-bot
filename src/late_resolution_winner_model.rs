@@ -293,6 +293,11 @@ impl ChainlinkTwapStore {
                     directional_margin_bps
                         / (observed_volatility * remaining.sqrt()).max(0.000_001),
                 ),
+                reference_topic: "crypto_prices_twap_sixty".into(),
+                horizon_volatility: [10, 20, 40, 60]
+                    .into_iter()
+                    .map(|seconds| horizon_volatility(&history, seconds))
+                    .collect(),
             }),
             rejection: failed_checks.first().copied(),
             failed_checks,
@@ -376,6 +381,80 @@ pub struct WinnerModelAudit {
     pub minimum_volatility_bps: f64,
     pub volatility_floor_active: bool,
     pub probability_without_volatility_floor: f64,
+    #[serde(default)]
+    pub reference_topic: String,
+    /// Historical non-overlapping increments; diagnostics, not calibrated settlement variance.
+    #[serde(default)]
+    pub horizon_volatility: Vec<HorizonVolatility>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HorizonVolatility {
+    pub seconds: u64,
+    pub pairs: usize,
+    pub bps_per_sqrt_second: Option<f64>,
+}
+
+fn horizon_volatility(samples: &[TwapSample], seconds: u64) -> HorizonVolatility {
+    let mut sum = 0.0;
+    let mut pairs = 0;
+    let mut start = samples.first();
+    for sample in samples.iter().skip(1) {
+        let Some(previous) = start else { break };
+        let dt = (sample.observed_at_ms - previous.observed_at_ms) as f64 / 1000.0;
+        if dt < seconds as f64 {
+            continue;
+        }
+        if dt <= seconds as f64 + 3.0 {
+            if let (Some(a), Some(b)) = (previous.value.to_f64(), sample.value.to_f64()) {
+                if a > 0.0 && b > 0.0 {
+                    sum += ((b / a - 1.0) * 10000.0).powi(2) / dt;
+                    pairs += 1;
+                }
+            }
+        }
+        start = Some(sample);
+    }
+    HorizonVolatility {
+        seconds,
+        pairs,
+        bps_per_sqrt_second: (pairs > 0).then(|| (sum / pairs as f64).sqrt()),
+    }
+}
+
+/// Reprice a recorded observation without re-reading the feed. Research only.
+pub fn sensitivity_decision(
+    model: &ModelEvaluation,
+    policy: WinnerModelPolicy,
+    seconds: i64,
+    floor_scale: f64,
+    risk_scale: f64,
+) -> (bool, f64, f64) {
+    let Some(audit) = &model.audit else {
+        return (false, 0.0, 0.0);
+    };
+    let volatility = audit
+        .observed_volatility_bps
+        .max(audit.minimum_volatility_bps * floor_scale);
+    let sigma = volatility * (seconds.max(1) as f64).sqrt();
+    let probability =
+        normal_cdf(model.directional_margin_bps / sigma.max(0.000001)).clamp(0.0001, 0.9999);
+    let risk = policy.model_risk_buffer.to_f64().unwrap_or(1.0) * risk_scale;
+    let ev = probability - model.effective_price.to_f64().unwrap_or(1.0) - risk;
+    let market_ok = model.failed_checks.iter().all(|r| {
+        matches!(
+            r,
+            ModelRejection::ReversalBoundary | ModelRejection::NetEvTooLow
+        )
+    });
+    (
+        market_ok
+            && model.directional_margin_bps
+                > policy.min_margin_bps + policy.reversal_sigma_multiplier * sigma
+            && ev >= policy.min_net_ev.to_f64().unwrap_or(1.0),
+        probability,
+        ev,
+    )
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -803,6 +882,56 @@ mod tests {
         assert_eq!(audit.current_age_ms, 500);
         assert_eq!(audit.observation_count, 10);
         assert!(audit.probability_without_volatility_floor < 0.5);
+    }
+
+    #[test]
+    fn sensitivity_baseline_matches_model_and_keeps_market_rejections() {
+        for price in [dec!(99.9), dec!(100.1), dec!(101)] {
+            let model = seeded_store(price).evaluate(
+                WinnerModelInput {
+                    asset: "btc",
+                    window_start_ms: 0,
+                    now_ms: 10_500,
+                    seconds_remaining: 30,
+                    buy_yes: true,
+                    bid_price: dec!(0.95),
+                    ask_price: dec!(0.96),
+                    ask_size: dec!(20),
+                },
+                policy(),
+            );
+            let (admitted, probability, _) = sensitivity_decision(&model, policy(), 30, 1.0, 1.0);
+            assert_eq!(admitted, model.admitted());
+            assert!((probability - model.probability.to_f64().unwrap()).abs() < 1e-12);
+            let mut thin = model.clone();
+            thin.failed_checks.push(ModelRejection::InsufficientDepth);
+            assert!(!sensitivity_decision(&thin, policy(), 30, 0.1, 0.5).0);
+        }
+        assert!(
+            !sensitivity_decision(
+                &ModelEvaluation::rejected(ModelRejection::StalePrice),
+                policy(),
+                30,
+                0.1,
+                0.5
+            )
+            .0
+        );
+    }
+
+    #[test]
+    fn horizon_estimate_rejects_gaps_and_does_not_overlap() {
+        let samples = (0..=60)
+            .map(|i| TwapSample {
+                observed_at_ms: 1000 + i * 1000,
+                value: dec!(100) + Decimal::from(i) * dec!(0.01),
+            })
+            .collect::<Vec<_>>();
+        let ten = horizon_volatility(&samples, 10);
+        assert_eq!(ten.pairs, 6);
+        assert!(ten.bps_per_sqrt_second.unwrap() > volatility_bps_per_sqrt_second(&samples));
+        assert_eq!(horizon_volatility(&[samples[0], samples[60]], 10).pairs, 0);
+        assert_eq!(horizon_volatility(&[], 10).bps_per_sqrt_second, None);
     }
 
     #[test]

@@ -39,6 +39,7 @@ struct GroupStats {
     shadow_fills: u64,
     shadow_wins: u64,
     shadow_capital: Decimal,
+    shadow_shares: Decimal,
     shadow_pnl: Decimal,
 }
 
@@ -86,6 +87,7 @@ impl GroupStats {
             self.shadow_fills += 1;
             self.shadow_wins += u64::from(won);
             self.shadow_capital += shadow.cost;
+            self.shadow_shares += shadow.filled;
             self.shadow_pnl += if won {
                 shadow.filled - shadow.cost
             } else {
@@ -192,6 +194,15 @@ fn print_group(label: &str, stats: &GroupStats) {
         stats.shadow_pnl,
         shadow_return * 100.0,
     );
+    let break_even = if stats.shadow_shares > Decimal::ZERO {
+        (stats.shadow_capital / stats.shadow_shares)
+            .to_f64()
+            .unwrap_or_default()
+    } else {
+        0.0
+    };
+    println!("  filled_win_lower95={:.2}% approximate_break_even={:.2}% (cost/share; assumes comparable win probabilities)",
+        wilson_lower_bound(stats.shadow_wins, stats.shadow_fills) * 100.0, break_even * 100.0);
 }
 
 fn load_order_stage_stats(path: &PathBuf) -> Result<BTreeMap<String, OrderStageStats>> {
@@ -248,7 +259,118 @@ fn load_order_stage_stats(path: &PathBuf) -> Result<BTreeMap<String, OrderStageS
     Ok(by_stage)
 }
 
+fn reference_audit(path: &std::path::Path, evaluations: &HashMap<String, Value>) -> Result<()> {
+    let cache_path = path.with_file_name("reference-audit.json");
+    let mut cache: BTreeMap<String, Value> = if cache_path.exists() {
+        serde_json::from_reader(File::open(&cache_path)?)?
+    } else {
+        BTreeMap::new()
+    };
+    if std::env::args().any(|arg| arg == "--reference-audit") {
+        let slugs = evaluations
+            .values()
+            .filter_map(|e| e["slug"].as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        tokio::runtime::Runtime::new()?.block_on(async {
+            let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(15)).build()?;
+            for slug in slugs {
+                if cache.get(slug).is_some_and(|v| v["closed"] == true && number(&v["eventMetadata"]["finalPrice"]).is_some()) { continue; }
+                let result = async {
+                    let events: Value = client.get("https://gamma-api.polymarket.com/events")
+                        .query(&[("slug", slug)]).send().await?.error_for_status()?.json().await?;
+                    let event = events.as_array().and_then(|a| a.iter().find(|v| v["slug"] == slug))
+                        .context("Gamma returned no matching slug")?;
+                    Ok::<_, anyhow::Error>(serde_json::json!({"slug":slug,"closed":event["closed"],
+                        "description":event["description"],"eventMetadata":event["eventMetadata"],"fetched_at":chrono::Utc::now()}))
+                }.await;
+                match result { Ok(event) => { cache.insert(slug.into(), event); }, Err(error) => eprintln!("reference audit {slug}: {error}") }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            Ok::<_, anyhow::Error>(())
+        })?;
+        let tmp = cache_path.with_extension("json.tmp");
+        serde_json::to_writer_pretty(File::create(&tmp)?, &cache)?;
+        std::fs::rename(tmp, &cache_path)?;
+    }
+    println!("REFERENCE AUDIT: cached Gamma priceToBeat/finalPrice; refresh missing values with --reference-audit");
+    let mut selected = BTreeMap::<(String, String, String), &Value>::new();
+    for e in evaluations.values() {
+        let key = (
+            e["run_id"].as_str().unwrap_or("legacy").into(),
+            e["slug"].as_str().unwrap_or("unknown").into(),
+            time_bucket(e),
+        );
+        if selected
+            .get(&key)
+            .is_none_or(|old| e["evaluated_at"].as_str() < old["evaluated_at"].as_str())
+        {
+            selected.insert(key, e);
+        }
+    }
+    let mut groups = BTreeMap::<String, (u64, f64, f64, f64)>::new();
+    let mut missing = 0;
+    let mut source_unknown = 0;
+    for ((_, slug, bucket), e) in selected {
+        let Some(reference) = cache.get(&slug).filter(|r| r["closed"] == true) else {
+            missing += 1;
+            continue;
+        };
+        let description = reference["description"].as_str().unwrap_or("");
+        if !description.contains("twap-60s") {
+            source_unknown += 1;
+        }
+        let (Some(final_price), Some(strike), Some(open), Some(current), Some(volatility)) = (
+            number(&reference["eventMetadata"]["finalPrice"]),
+            number(&reference["eventMetadata"]["priceToBeat"]),
+            number(&e["opening_twap"]),
+            number(&e["current_twap"]),
+            number(&e["volatility_bps_per_sqrt_second"]),
+        ) else {
+            missing += 1;
+            continue;
+        };
+        if strike <= 0.0 || current <= 0.0 || volatility <= 0.0 {
+            missing += 1;
+            continue;
+        }
+        let seconds = e["seconds_remaining"].as_i64().unwrap_or(0);
+        if seconds <= 0 {
+            missing += 1;
+            continue;
+        }
+        let residual = (final_price / current - 1.0) * 10000.0;
+        let normalized = residual / (volatility * (seconds as f64).sqrt());
+        let stats = groups
+            .entry(format!(
+                "{} {bucket}",
+                e["asset"].as_str().unwrap_or("unknown")
+            ))
+            .or_default();
+        stats.0 += 1;
+        stats.1 += residual * residual;
+        stats.2 += normalized * normalized;
+        stats.3 = stats.3.max(((open / strike - 1.0) * 10000.0).abs());
+    }
+    for (group, (n, sum, normalized, opening)) in groups {
+        println!("  {group}: markets={n} terminal_error_rms_bps={:.5} normalized_error_rms={:.5} max_open_vs_official_strike_bps={opening:.5}",
+            (sum / n as f64).sqrt(), (normalized / n as f64).sqrt());
+    }
+    println!("  missing_or_unusable={missing} source_not_explicit_60s={source_unknown}; candidate-selected samples, cross-horizon groups overlap; no automatic calibration");
+    Ok(())
+}
+
+fn number(v: &Value) -> Option<f64> {
+    v.as_f64()
+        .or_else(|| v.as_str()?.parse().ok())
+        .filter(|v| v.is_finite())
+}
+
+fn counterfactual_entry(evaluation: &Value) -> Decimal {
+    decimal(evaluation.get("ask_price")) + decimal(evaluation.get("fee_per_share"))
+}
+
 fn main() -> Result<()> {
+    dotenvy::dotenv().ok();
     let path = std::env::args_os()
         .nth(1)
         .map(PathBuf::from)
@@ -266,12 +388,20 @@ fn main() -> Result<()> {
     let mut runs = BTreeMap::<String, (String, String, bool)>::new();
     let mut shadows = HashMap::new();
     let mut latest_shadow_by_slug = HashMap::<String, ShadowFill>::new();
+    let mut sensitivity_shadows = HashMap::<(String, String, String), ShadowFill>::new();
+    let mut sensitivity_counts = BTreeMap::<String, (u64, u64, u64)>::new();
+    let mut raw_evaluations = HashMap::<String, Value>::new();
+    let mut first_candidates = BTreeMap::<(String, String), String>::new();
+    let mut last_candidates = BTreeMap::<(String, String), String>::new();
+    let mut first_confirmed = BTreeMap::<(String, String), String>::new();
+    let mut directions = BTreeMap::<(String, String), std::collections::HashSet<bool>>::new();
     let mut resolved_by_evaluation = HashMap::<String, bool>::new();
     let mut resolutions = Vec::new();
     let mut failed_checks = BTreeMap::<String, u64>::new();
     let mut audit_samples = 0_u64;
     let mut floor_active = 0_u64;
     let mut max_opening_skew_ms = 0_u64;
+    let mut horizon_stats = BTreeMap::<String, (u64, f64)>::new();
     for (index, line) in reader.lines().enumerate() {
         let line = line.with_context(|| format!("cannot read line {}", index + 1))?;
         if line.trim().is_empty() {
@@ -280,6 +410,18 @@ fn main() -> Result<()> {
         let value: Value = serde_json::from_str(&line)
             .with_context(|| format!("invalid JSON at {}:{}", path.display(), index + 1))?;
         match value.get("action").and_then(Value::as_str) {
+            Some("sensitivity_observed") => {
+                if let Some(groups) = value["decision"]["groups"].as_array() {
+                    for group in groups {
+                        let stats = sensitivity_counts
+                            .entry(group["group"].as_str().unwrap_or("unknown").into())
+                            .or_default();
+                        stats.0 += 1;
+                        stats.1 += u64::from(group["admitted"] == true);
+                        stats.2 += u64::from(group["confirmed"] == true);
+                    }
+                }
+            }
             Some("run_started") => {
                 let run_id = value
                     .get("run_id")
@@ -308,10 +450,42 @@ fn main() -> Result<()> {
             }
             Some("evaluated") => {
                 let evaluation = &value["evaluation"];
+                if let Some(id) = evaluation["evaluation_id"].as_str() {
+                    let key = (
+                        evaluation["run_id"]
+                            .as_str()
+                            .unwrap_or("legacy")
+                            .to_string(),
+                        evaluation["slug"].as_str().unwrap_or("unknown").to_string(),
+                    );
+                    first_candidates
+                        .entry(key.clone())
+                        .or_insert_with(|| id.to_string());
+                    last_candidates.insert(key.clone(), id.to_string());
+                    if let Some(direction) = evaluation["buy_yes"].as_bool() {
+                        directions.entry(key).or_default().insert(direction);
+                    }
+                    raw_evaluations.insert(id.to_string(), evaluation.clone());
+                }
                 for reason in string_list(evaluation.get("failed_checks")) {
                     *failed_checks.entry(reason).or_default() += 1;
                 }
                 if let Some(audit) = evaluation.get("model_audit").filter(|v| v.is_object()) {
+                    if let Some(horizons) = audit["horizon_volatility"].as_array() {
+                        for h in horizons {
+                            if let Some(v) = number(&h["bps_per_sqrt_second"]) {
+                                let stats = horizon_stats
+                                    .entry(format!(
+                                        "{} {}s",
+                                        evaluation["asset"].as_str().unwrap_or("unknown"),
+                                        h["seconds"]
+                                    ))
+                                    .or_default();
+                                stats.0 += 1;
+                                stats.1 += v;
+                            }
+                        }
+                    }
                     audit_samples += 1;
                     floor_active +=
                         u64::from(audit["volatility_floor_active"].as_bool().unwrap_or(false));
@@ -404,6 +578,19 @@ fn main() -> Result<()> {
                         filled: decimal(execution.get("filled")),
                         cost: decimal(execution.get("cost")),
                     };
+                    if shadow.candidate_stage == "sensitivity_confirmed" {
+                        for group in &shadow.research_cohorts {
+                            let key = (
+                                execution["run_id"].as_str().unwrap_or("legacy").to_string(),
+                                slug.clone(),
+                                group.clone(),
+                            );
+                            sensitivity_shadows
+                                .entry(key)
+                                .or_insert_with(|| shadow.clone());
+                        }
+                        continue;
+                    }
                     shadows.insert(id.to_string(), shadow.clone());
                     let replace = latest_shadow_by_slug
                         .get(&slug)
@@ -415,6 +602,21 @@ fn main() -> Result<()> {
             }
             Some("confirmation_observed") => {
                 let observation = &value["observation"];
+                if observation["confirmed"] == true {
+                    if let Some(id) = observation["evaluation_id"].as_str() {
+                        let key = (
+                            observation["run_id"]
+                                .as_str()
+                                .unwrap_or("legacy")
+                                .to_string(),
+                            observation["slug"]
+                                .as_str()
+                                .unwrap_or("unknown")
+                                .to_string(),
+                        );
+                        first_confirmed.entry(key).or_insert_with(|| id.into());
+                    }
+                }
                 if let (Some(id), Some(stage)) = (
                     observation.get("evaluation_id").and_then(Value::as_str),
                     observation
@@ -440,6 +642,69 @@ fn main() -> Result<()> {
         }
     }
 
+    reference_audit(&path, &raw_evaluations)?;
+    println!("HISTORICAL TWAP HORIZONS (correlated candidate observations; not settlement-calibrated volatility):");
+    for (label, (n, sum)) in horizon_stats {
+        println!(
+            "  {label} observations={n} mean_bps_per_sqrt_second={:.6}",
+            sum / n as f64
+        );
+    }
+    println!("ENTRY SELECTION AUDIT (one record per run/market; no retrospective direction replacement):");
+    println!(
+        "direction_flip_markets={}",
+        directions.values().filter(|d| d.len() > 1).count()
+    );
+    for (label, selection) in [
+        ("first_candidate", &first_candidates),
+        ("first_confirmed", &first_confirmed),
+        ("last_candidate", &last_candidates),
+    ] {
+        let mut stats = GroupStats::default();
+        let mut pending = 0;
+        for id in selection.values() {
+            if let Some(won) = resolved_by_evaluation.get(id) {
+                // Model-unavailable records contain a zero placeholder in effective_entry_price.
+                let raw = &raw_evaluations[id];
+                let entry = counterfactual_entry(raw);
+                stats.record(*won, if *won { Decimal::ONE - entry } else { -entry }, None);
+            } else {
+                pending += 1;
+            }
+        }
+        print_group(label, &stats);
+        println!("  pending={pending}; counterfactual only, no execution assumption");
+    }
+    println!(
+        "\nSENSITIVITY SHADOW (first attempt per run/market/group; groups overlap; never sum PnL):"
+    );
+    let mut sensitivity_stats = BTreeMap::<String, GroupStats>::new();
+    let mut sensitivity_pending = BTreeMap::<String, usize>::new();
+    for ((_, _, group), shadow) in &sensitivity_shadows {
+        if let Some(won) = resolved_by_evaluation.get(&shadow.evaluation_id) {
+            sensitivity_stats.entry(group.clone()).or_default().record(
+                *won,
+                Decimal::ZERO,
+                Some(shadow),
+            );
+        } else {
+            *sensitivity_pending.entry(group.clone()).or_default() += 1;
+        }
+    }
+    for (group, (evaluations, admitted, confirmed)) in &sensitivity_counts {
+        println!("{group} evaluations={evaluations} admitted_evaluations={admitted} confirmed_evaluations={confirmed} pending_attempts={}", sensitivity_pending.get(group).unwrap_or(&0));
+        print_group(
+            group,
+            sensitivity_stats
+                .get(group)
+                .unwrap_or(&GroupStats::default()),
+        );
+    }
+    for (group, stats) in &sensitivity_stats {
+        if !sensitivity_counts.contains_key(group) {
+            print_group(group, stats);
+        }
+    }
     let mut overall = GroupStats::default();
     let mut by_stage = BTreeMap::<String, GroupStats>::new();
     let mut by_asset_price = BTreeMap::<String, GroupStats>::new();
@@ -677,5 +942,14 @@ mod tests {
         let evaluation = serde_json::json!({"ask_price":"0.980", "seconds_remaining":32});
         assert_eq!(price_bucket(&evaluation), "0.98");
         assert_eq!(time_bucket(&evaluation), "21-40s");
+    }
+
+    #[test]
+    fn missing_model_does_not_create_free_counterfactual_entry() {
+        let evaluation = serde_json::json!({"ask_price":"0.98", "fee_per_share":"0.001372", "effective_entry_price":"0"});
+        assert_eq!(
+            counterfactual_entry(&evaluation),
+            Decimal::from_str("0.981372").unwrap()
+        );
     }
 }
