@@ -175,6 +175,14 @@ auditable rejection/fill summary:
 cargo run --release --bin short_duration_digital_fair_value -- backtest
 cargo run --release --bin short_duration_digital_fair_value -- dry-run
 ```
+NegRisk Conversion Arbitrage provides a separate read-only stage-1 scanner,
+delayed exit shadow scenarios, and reports, reusing the Cross-Market Probability
+Arbitrage data client. See the [stage-1 guide](docs/NEG_RISK_CONVERSION_ARBITRAGE_STAGE1.zh-CN.md).
+
+```bash
+cargo run --release --bin neg_risk_conversion_arbitrage -- shadow
+cargo run --release --bin neg_risk_conversion_arbitrage -- report
+```
 The canonical strategy names, legacy aliases, Rust modules, executables, and
 result directories are recorded in
 [the strategy naming guide](docs/STRATEGY_NAMING.zh-CN.md).

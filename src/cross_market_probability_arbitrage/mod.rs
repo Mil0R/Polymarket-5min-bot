@@ -1,5 +1,6 @@
 mod client;
 mod config;
+pub mod conversion;
 mod model;
 mod runner;
 

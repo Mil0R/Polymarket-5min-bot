@@ -158,6 +158,8 @@ struct GammaFeeSchedule {
 #[derive(Debug, Deserialize)]
 struct ClobBookResponse {
     #[serde(default)]
+    asset_id: Option<String>,
+    #[serde(default)]
     bids: Vec<ClobLevel>,
     #[serde(default)]
     asks: Vec<ClobLevel>,
@@ -212,6 +214,89 @@ impl CrossMarketProbabilityResearchClient {
 
     pub fn config(&self) -> &CrossMarketProbabilityArbitrageConfig {
         &self.config
+    }
+
+    /// Separate discovery policy for conversion research. Gamma membership is
+    /// only a hypothesis: this deliberately grants no on-chain execution authority.
+    pub async fn discover_conversion_routes(
+        &self,
+    ) -> Result<(Vec<super::conversion::Route>, BTreeMap<String, usize>)> {
+        let events = self.fetch_events().await?;
+        let mut routes = Vec::new();
+        let mut diagnostics = BTreeMap::new();
+        diagnostics.insert("events_scanned".into(), events.len());
+        for event in events {
+            if !(event.neg_risk || event.enable_neg_risk) {
+                continue;
+            }
+            *diagnostics.entry("neg_risk_events".into()).or_default() += 1;
+            let markets = event
+                .markets
+                .iter()
+                .filter_map(tradable_market)
+                .collect::<Vec<_>>();
+            let complete = event.markets.iter().all(|m| {
+                let outcomes = string_array(&m.outcomes).unwrap_or_default();
+                outcomes.len() == 2
+                    && outcomes.iter().any(|o| o.eq_ignore_ascii_case("yes"))
+                    && outcomes.iter().any(|o| o.eq_ignore_ascii_case("no"))
+                    && (!m.fees_enabled || m.fee_schedule.is_some())
+            });
+            if !complete
+                || markets.len() != event.markets.len()
+                || !(2..=self.config.max_partition_legs).contains(&markets.len())
+            {
+                *diagnostics
+                    .entry("incomplete_untradable_unknown_fee_or_leg_limit".into())
+                    .or_default() += 1;
+                continue;
+            }
+            let mut tokens = HashSet::new();
+            if !markets.iter().all(|m| {
+                tokens.insert(m.yes_token_id.clone()) && tokens.insert(m.no_token_id.clone())
+            }) {
+                continue;
+            }
+            for input in &markets {
+                routes.push(super::conversion::Route {
+                    id: format!("conversion:{}:{}", event.id, input.condition_id),
+                    event_id: event.id.clone(),
+                    slug: event.slug.clone(),
+                    input: relation_leg(input, Outcome::No),
+                    outputs: markets
+                        .iter()
+                        .filter(|m| m.condition_id != input.condition_id)
+                        .map(|m| relation_leg(m, Outcome::Yes))
+                        .collect(),
+                    protocol_verified: false,
+                });
+            }
+        }
+        diagnostics.insert("routes_before_limit".into(), routes.len());
+        routes.truncate(self.config.max_relationships);
+        diagnostics.insert("routes_emitted".into(), routes.len());
+        Ok((routes, diagnostics))
+    }
+
+    pub async fn fetch_conversion_books(
+        &self,
+        routes: &[super::conversion::Route],
+    ) -> HashMap<String, BookSnapshot> {
+        let tokens = routes
+            .iter()
+            .flat_map(|r| std::iter::once(&r.input).chain(r.outputs.iter()))
+            .map(|l| l.token_id.clone())
+            .collect::<HashSet<_>>();
+        stream::iter(tokens.into_iter().map(|token| async move {
+            self.fetch_book_checked(&token, true)
+                .await
+                .ok()
+                .map(|book| (token, book))
+        }))
+        .buffer_unordered(self.config.request_concurrency)
+        .filter_map(|v| async move { v })
+        .collect()
+        .await
     }
 
     pub async fn discover_relationships(&self) -> Result<Vec<MarketRelationship>> {
@@ -426,6 +511,10 @@ impl CrossMarketProbabilityResearchClient {
     }
 
     async fn fetch_book(&self, token_id: &str) -> Result<BookSnapshot> {
+        self.fetch_book_checked(token_id, false).await
+    }
+
+    async fn fetch_book_checked(&self, token_id: &str, strict_token: bool) -> Result<BookSnapshot> {
         if let Some(book) = self.book_cache.get(token_id) {
             let age_ms = Utc::now()
                 .signed_duration_since(book.observed_at)
@@ -448,6 +537,9 @@ impl CrossMarketProbabilityResearchClient {
             .await
             .context("Cross-market probability CLOB book response is invalid")?;
         let request_latency_ms = request_started.elapsed().as_millis() as u64;
+        if strict_token && response.asset_id.as_deref() != Some(token_id) {
+            anyhow::bail!("missing or mismatched CLOB asset_id");
+        }
         let mut bids = response
             .bids
             .into_iter()
