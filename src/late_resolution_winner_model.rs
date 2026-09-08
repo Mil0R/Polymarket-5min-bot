@@ -48,6 +48,10 @@ pub struct ChainlinkTwapStore {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FairValueTwapSnapshot {
+    pub opening_observed_at_ms: i64,
+    pub observed_volatility_bps: f64,
+    pub minimum_volatility_bps: f64,
+    pub observation_count: usize,
     pub opening: Decimal,
     pub current: Decimal,
     pub observed_at_ms: i64,
@@ -180,6 +184,10 @@ impl ChainlinkTwapStore {
             return FairValueSnapshotReadiness::InsufficientObservations;
         }
         FairValueSnapshotReadiness::Ready(FairValueTwapSnapshot {
+            opening_observed_at_ms: opening.observed_at_ms,
+            observed_volatility_bps: volatility_bps_per_sqrt_second(&history),
+            minimum_volatility_bps: min_volatility_bps_per_sqrt_second,
+            observation_count: history.len(),
             opening: opening.value,
             current: current.value,
             observed_at_ms: current.observed_at_ms,

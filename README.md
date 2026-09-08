@@ -163,8 +163,10 @@ See [the Chinese stage guide](docs/STRATEGY_DEVELOPMENT_STAGES.zh-CN.md) for the
 strategy/data compatibility matrix, commands, result paths, and promotion gates.
 
 Short-Duration Digital Fair Value supports an offline probability/Taker-cost
-replay and an independent public-data-only dry run. The live runner is locked to
-the 10-second checkpoint selected by validation and out-of-sample replay. Its
+replay and an independent public-data-only dry run. The dry-run runner defaults to
+the last 10 seconds and supports separate 30/60-second research groups. See the
+[v4 research guide](docs/SHORT_DURATION_DIGITAL_FAIR_VALUE_RESEARCH_V4_2026-09-08.zh-CN.md)
+for isolated group paths, model diagnostics and report commands. Its
 standalone log is isolated from the TUI system log, stale/incomplete WebSocket
 books use a rate-limited public REST fallback, and each window writes an
 auditable rejection/fill summary:

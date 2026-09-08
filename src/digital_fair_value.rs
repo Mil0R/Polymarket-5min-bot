@@ -468,7 +468,7 @@ impl DryRunConfig {
                 }),
         };
         if config.symbols.is_empty()
-            || config.checkpoint_secs != 10
+            || !matches!(config.checkpoint_secs, 10 | 30 | 60)
             || config.scan_interval_ms < 25
             || config.feed_ready_timeout_secs == 0
             || config.feed_ready_timeout_secs > 120
@@ -490,7 +490,7 @@ impl DryRunConfig {
             || config.liquidity_haircut == 0.0
             || config.order_usdc < 1.0
         {
-            bail!("invalid dry-run configuration; only the backtest-approved 10-second checkpoint is enabled");
+            bail!("invalid dry-run configuration; supported research checkpoints are 10, 30 and 60 seconds");
         }
         Ok(config)
     }
@@ -525,6 +525,8 @@ struct LiveBookTop {
 
 #[derive(Debug, Clone, Default, Serialize)]
 struct DryRunWindowStats {
+    #[serde(skip)]
+    audited_markets: std::collections::HashSet<String>,
     scan_ticks: u64,
     market_evaluations: u64,
     opportunities: u64,
@@ -626,7 +628,7 @@ pub async fn run_dry_run() -> Result<()> {
         "event": "run_started",
         "recorded_at": Utc::now(),
         "strategy": "short-duration-digital-fair-value",
-        "execution_version": 3,
+        "execution_version": 4,
         "config": {
             "symbols": config.symbols.clone(),
             "checkpoint_secs": config.checkpoint_secs,
@@ -818,6 +820,57 @@ pub async fn run_dry_run() -> Result<()> {
 
 /// Build an auditable calibration/readiness report from the append-only
 /// dry-run journal.  This never contacts Polymarket and never submits orders.
+fn dry_run_research_summary(events: &[Value]) -> Value {
+    let mut event_counts = BTreeMap::<String, u64>::new();
+    let mut rejections = BTreeMap::<String, u64>::new();
+    let mut terminals = BTreeMap::<String, u64>::new();
+    let mut model_by_asset = BTreeMap::<String, (u64, u64, i64)>::new();
+    let mut rest_samples = 0_u64;
+    let mut rest_total = 0_u64;
+    let mut rest_max = 0_u64;
+    let mut evaluations = 0_u64;
+    for event in events {
+        *event_counts
+            .entry(event["event"].as_str().unwrap_or("unknown").into())
+            .or_default() += 1;
+        if event["event"] == "window_summary" {
+            let stats = &event["stats"];
+            evaluations += stats["market_evaluations"].as_u64().unwrap_or(0);
+            rest_samples += stats["rest_latency_samples"].as_u64().unwrap_or(0);
+            rest_total += stats["rest_latency_total_ms"].as_u64().unwrap_or(0);
+            rest_max = rest_max.max(stats["rest_latency_max_ms"].as_u64().unwrap_or(0));
+            if let Some(counts) = stats["rejection_counts"].as_object() {
+                for (reason, count) in counts {
+                    *rejections.entry(reason.clone()).or_default() += count.as_u64().unwrap_or(0);
+                }
+            }
+            if let Some(counts) = stats["terminal_reason_by_market"].as_object() {
+                for reason in counts.values() {
+                    *terminals
+                        .entry(reason.as_str().unwrap_or("unknown").into())
+                        .or_default() += 1;
+                }
+            }
+        }
+        if event["event"] == "model_observation" {
+            let a = &event["model_audit"];
+            let stats = model_by_asset
+                .entry(event["asset"].as_str().unwrap_or("unknown").into())
+                .or_default();
+            stats.0 += 1;
+            stats.1 += u64::from(a["volatility_floor_active"].as_bool().unwrap_or(false));
+            stats.2 = stats
+                .2
+                .max(a["opening_skew_ms"].as_i64().unwrap_or(0).saturating_abs());
+        }
+    }
+    serde_json::json!({"event_counts":event_counts,"market_evaluations":evaluations,
+        "window_rejection_counts":rejections,"terminal_market_window_counts":terminals,
+        "rest_samples":rest_samples,"rest_average_ms":if rest_samples>0 {Some(rest_total as f64/rest_samples as f64)}else{None},"rest_max_ms":rest_max,
+        "model_observation_by_asset":model_by_asset.iter().map(|(asset,(n,floor,skew))|(asset.clone(),serde_json::json!({"samples":n,"floor_active":floor,"max_abs_opening_skew_ms":skew}))).collect::<BTreeMap<_,_>>(),
+        "notes":["Absent model observations in legacy data mean unknown, not zero floor usage.","Terminal counts describe the last recorded state, not every scan.","Research checkpoints are overlapping opportunity windows; compare separate runs without pooling correlated fills."]})
+}
+
 pub fn run_dry_run_report() -> Result<PathBuf> {
     let _ = dotenvy::dotenv();
     let input = PathBuf::from(
@@ -927,6 +980,7 @@ pub fn run_dry_run_report() -> Result<PathBuf> {
         probability_sum: f64,
         brier_sum: f64,
         pnl: f64,
+        capital: f64,
     }
     let mut overall = Bucket::default();
     let mut by_asset = BTreeMap::<String, Bucket>::new();
@@ -935,6 +989,10 @@ pub fn run_dry_run_report() -> Result<PathBuf> {
     let mut by_run = BTreeMap::<String, Bucket>::new();
     let mut by_source = BTreeMap::<String, Bucket>::new();
     let mut by_version = BTreeMap::<String, Bucket>::new();
+    let mut by_entry_price = BTreeMap::<String, Bucket>::new();
+    let mut by_direction = BTreeMap::<String, Bucket>::new();
+    let mut by_checkpoint = BTreeMap::<String, Bucket>::new();
+    let mut by_total_latency = BTreeMap::<String, Bucket>::new();
     let fill_events = events
         .iter()
         .filter(|e| e["event"] == "shadow_fill")
@@ -991,8 +1049,43 @@ pub fn run_dry_run_report() -> Result<PathBuf> {
             p if p >= 0.70 => "0.70-0.80",
             _ => "below-0.70",
         };
+        let entry = fill_event["average_price"].as_f64();
+        let price_key = match entry {
+            Some(p) if p < 0.30 => "below_0.30",
+            Some(p) if p < 0.70 => "0.30-0.70",
+            Some(_) => "0.70+",
+            None => "unknown",
+        };
+        let direction_key = fill_event["execution_audit"]["model_audit"]["directional_margin_bps"]
+            .as_f64()
+            .map(|m| {
+                if m > 0.0 {
+                    "agrees"
+                } else if m < 0.0 {
+                    "opposes"
+                } else {
+                    "at_reference"
+                }
+            })
+            .unwrap_or("unknown");
+        let checkpoint = fill_event["checkpoint_secs"]
+            .as_i64()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "unknown".into());
+        let total_latency = fill_event["execution_audit"]["total_latency_ms"]
+            .as_u64()
+            .map(|ms| latency_bucket(ms).to_string())
+            .unwrap_or_else(|| "unknown".into());
         for bucket in [
             &mut overall,
+            by_entry_price
+                .entry(format!("{asset}/{price_key}"))
+                .or_default(),
+            by_direction
+                .entry(format!("{asset}/{direction_key}"))
+                .or_default(),
+            by_checkpoint.entry(checkpoint).or_default(),
+            by_total_latency.entry(total_latency).or_default(),
             by_run
                 .entry(event["run_id"].as_str().unwrap_or("unknown").to_string())
                 .or_default(),
@@ -1018,6 +1111,8 @@ pub fn run_dry_run_report() -> Result<PathBuf> {
             bucket.probability_sum += probability;
             bucket.brier_sum += (probability - if won { 1.0 } else { 0.0 }).powi(2);
             bucket.pnl += pnl;
+            bucket.capital += fill_event["cost_usdc"].as_f64().unwrap_or(0.0)
+                + fill_event["fees_usdc"].as_f64().unwrap_or(0.0);
         }
     }
     let bucket_json = |bucket: &Bucket| {
@@ -1026,7 +1121,8 @@ pub fn run_dry_run_report() -> Result<PathBuf> {
             "samples":bucket.samples,"wins":bucket.wins,
             "observed_win_rate":bucket.wins as f64 / n,
             "average_probability":bucket.probability_sum / n,
-            "brier_score":bucket.brier_sum / n,"realized_pnl_usdc":bucket.pnl
+            "brier_score":bucket.brier_sum / n,"realized_pnl_usdc":bucket.pnl,
+            "capital_usdc":bucket.capital,"return_on_settled_capital":if bucket.capital>0.0 {Some(bucket.pnl/bucket.capital)} else {None}
         })
     };
     let all_assets_ready = enabled_assets.iter().all(|asset| {
@@ -1061,6 +1157,11 @@ pub fn run_dry_run_report() -> Result<PathBuf> {
         "strategy":"short-duration-digital-fair-value",
         "generated_at":Utc::now(),"source":input,
         "overall":bucket_json(&overall),
+        "research_audit":dry_run_research_summary(&events),
+        "by_entry_price":by_entry_price.iter().map(|(k,v)|(k.clone(),bucket_json(v))).collect::<BTreeMap<_,_>>(),
+        "by_reference_direction":by_direction.iter().map(|(k,v)|(k.clone(),bucket_json(v))).collect::<BTreeMap<_,_>>(),
+        "by_checkpoint":by_checkpoint.iter().map(|(k,v)|(k.clone(),bucket_json(v))).collect::<BTreeMap<_,_>>(),
+        "by_total_execution_latency":by_total_latency.iter().map(|(k,v)|(k.clone(),bucket_json(v))).collect::<BTreeMap<_,_>>(),
         "by_run":by_run.iter().map(|(k,v)|(k.clone(),bucket_json(v))).collect::<BTreeMap<_,_>>(),
         "by_source":by_source.iter().map(|(k,v)|(k.clone(),bucket_json(v))).collect::<BTreeMap<_,_>>(),
         "by_execution_version":by_version.iter().map(|(k,v)|(k.clone(),bucket_json(v))).collect::<BTreeMap<_,_>>(),
@@ -1183,6 +1284,18 @@ fn scan_live_markets(
                 continue;
             }
         };
+        let audit_first = stats
+            .lock()
+            .map(|mut s| s.audited_markets.insert(market.slug.clone()))
+            .unwrap_or(false);
+        if audit_first {
+            let _ = journal.append(serde_json::json!({
+                "event":"model_observation", "recorded_at":Utc::now(),
+                "slug":market.slug,"asset":market.crypto_symbol,
+                "checkpoint_secs":config.checkpoint_secs,
+                "model_audit":live_model_audit(state, window_start_ms, now_ms, remaining_ms as f64 / 1000.0, true)
+            }));
+        }
         let up = monitor.winner_book_top(market.yes_token_id);
         let down = monitor.winner_book_top(market.no_token_id);
         let ws_usable = up
@@ -1512,6 +1625,8 @@ fn evaluate_live_tops(
     let evaluation_id = uuid::Uuid::new_v4().to_string();
     let event = serde_json::json!({
         "event":"opportunity",
+        "checkpoint_secs":config.checkpoint_secs,
+        "model_audit":live_model_audit(state, window_start_ms, Utc::now().timestamp_millis(), remaining_ms as f64 / 1000.0, buy_up),
         "evaluation_id":evaluation_id,
         "recorded_at":Utc::now(),
         "asset":market.crypto_symbol,
@@ -1666,6 +1781,35 @@ fn executable_asks(
         .collect()
 }
 
+fn delayed_book_rejection(
+    config: &DryRunConfig,
+    probability: f64,
+    bid: Option<f64>,
+    raw: &[(f64, f64)],
+    executable: &[(f64, f64)],
+) -> Option<&'static str> {
+    let ask = raw.first().map(|x| x.0);
+    let depth: f64 = raw
+        .iter()
+        .map(|(p, s)| p * s * config.liquidity_haircut)
+        .sum();
+    if let Err(reason) = live_edge_evaluation(config, probability, bid, ask, ask.map(|p| depth / p))
+    {
+        return Some(reason);
+    }
+    if executable.is_empty() {
+        return Some("no_executable_asks_after_costs");
+    }
+    let depth: f64 = executable
+        .iter()
+        .map(|(p, s)| p * s * config.liquidity_haircut)
+        .sum();
+    if depth < config.min_depth_usdc {
+        return Some("executable_depth_insufficient");
+    }
+    None
+}
+
 fn budgeted_live_fill(config: &DryRunConfig, asks: &[(f64, f64)], target: f64) -> PartialWalk {
     let mut low = 0.0;
     let mut high = target;
@@ -1704,6 +1848,33 @@ fn live_probability(state: FairValueTwapSnapshot, remaining_secs: f64) -> f64 {
         remaining_secs,
         state.volatility_bps_per_sqrt_second,
     )
+}
+
+fn live_model_audit(
+    state: FairValueTwapSnapshot,
+    window_start_ms: i64,
+    now_ms: i64,
+    remaining_secs: f64,
+    buy_up: bool,
+) -> Value {
+    let raw_up = fair_up_probability(
+        state.opening.to_f64().unwrap_or(0.0),
+        state.current.to_f64().unwrap_or(0.0),
+        remaining_secs,
+        state.observed_volatility_bps.max(0.000001),
+    );
+    let margin = (state.current / state.opening - Decimal::ONE)
+        .to_f64()
+        .unwrap_or(0.0)
+        * 10000.0;
+    serde_json::json!({"version":1,"opening_observed_at_ms":state.opening_observed_at_ms,
+        "opening_skew_ms":state.opening_observed_at_ms-window_start_ms,
+        "feed_age_ms":now_ms-state.observed_at_ms,"observations":state.observation_count,
+        "observed_volatility_bps":state.observed_volatility_bps,
+        "minimum_volatility_bps":state.minimum_volatility_bps,
+        "volatility_floor_active":state.observed_volatility_bps < state.minimum_volatility_bps,
+        "probability_without_floor":if buy_up {raw_up} else {1.0-raw_up},
+        "directional_margin_bps":if buy_up {margin} else {-margin}})
 }
 
 fn live_edge_evaluation(
@@ -1858,25 +2029,25 @@ async fn execute_live_shadow(
     let delayed_ask = asks.first().map(|level| level.0).unwrap_or(1.0);
     let delayed_ask_size = asks.first().map(|level| level.1).unwrap_or(0.0);
     // Bound every consumed level, not only the final average price.
-    let asks = executable_asks(&config, &asks, probability);
+    let raw_asks = asks;
+    let asks = executable_asks(&config, &raw_asks, probability);
     let cumulative_depth = asks
         .iter()
         .map(|(price, size)| price * size * config.liquidity_haircut)
         .sum::<f64>();
-    if let Err(reason) = live_edge_evaluation(
-        &config,
-        probability,
-        delayed_bid,
-        asks.first().map(|x| x.0),
-        asks.first().map(|x| cumulative_depth / x.0),
-    ) {
+    if let Some(reason) =
+        delayed_book_rejection(&config, probability, delayed_bid, &raw_asks, &asks)
+    {
         if let Ok(mut guard) = stats.lock() {
             guard.shadow_rejections += 1;
             guard.reject(&slug, &format!("delayed_{reason}"));
         }
         let _ = journal.append(serde_json::json!({"event":"shadow_rejected","evaluation_id":evaluation_id,
             "recorded_at":Utc::now(),"slug":slug,"reason":format!("delayed_{reason}"),
-            "signal_probability":signal_probability,"probability":probability,"delayed_bid":delayed_bid,"delayed_ask":delayed_ask}));
+            "signal_probability":signal_probability,"probability":probability,"delayed_bid":delayed_bid,"delayed_ask":delayed_ask,
+            "raw_ask_levels":raw_asks.len(),"executable_ask_levels":asks.len(),
+            "executable_best_ask":asks.first().map(|x|x.0),"executable_depth_usdc":cumulative_depth,
+            "model_audit":live_model_audit(state,window_end_ms-300_000,now_ms,(window_end_ms-now_ms) as f64/1000.0,buy_up)}));
         return;
     }
     let target = config.order_usdc / (delayed_ask + live_fee(&config, delayed_ask)).max(0.01);
@@ -1943,6 +2114,7 @@ async fn execute_live_shadow(
         return;
     }
     let execution_audit = serde_json::json!({
+        "model_audit":live_model_audit(state, window_end_ms-300_000, now_ms, (window_end_ms-now_ms) as f64/1000.0, buy_up),
         "opening_twap":state.opening,"current_twap":state.current,
         "volatility":state.volatility_bps_per_sqrt_second,
         "seconds_remaining":(window_end_ms-now_ms) as f64/1000.0,
@@ -1962,7 +2134,7 @@ async fn execute_live_shadow(
         "event":"shadow_fill","evaluation_id":evaluation_id,"recorded_at":Utc::now(),
         "asset":asset,"slug":slug,"buy_up":buy_up,"probability":probability,
         "signal_probability":signal_probability,"execution_model_observed_at_ms":state.observed_at_ms,
-        "execution_version":3,"budget_usdc":config.order_usdc,
+        "execution_version":4,"checkpoint_secs":config.checkpoint_secs,"budget_usdc":config.order_usdc,
         "execution_audit":execution_audit,
         "shares":fill.shares,"requested_shares":target,"fill_ratio":fill_ratio,"cost_usdc":cost,
         "average_price":average,"fees_usdc":fees,"expected_pnl_usdc":expected_pnl,
@@ -2972,6 +3144,77 @@ mod tests {
         assert!(
             live_edge_evaluation(&config, 0.9, Some(0.79), Some(0.80), Some(20.0)).unwrap() > 0.0
         );
+    }
+
+    #[test]
+    fn delayed_rejections_preserve_raw_book_and_cost_reasons() {
+        let config = dry_run_config();
+        let raw = [(0.84, 100.0)];
+        assert_eq!(
+            delayed_book_rejection(&config, 0.72, Some(0.83), &raw, &[]),
+            Some("no_executable_asks_after_costs")
+        );
+        assert_eq!(
+            delayed_book_rejection(&config, 0.72, Some(0.78), &raw, &[]),
+            Some("spread_too_wide")
+        );
+        assert_eq!(
+            delayed_book_rejection(&config, 0.72, Some(0.83), &[], &[]),
+            Some("incomplete_book")
+        );
+        // Do not silently skip the cheapest out-of-range ask and buy higher levels.
+        assert_eq!(
+            delayed_book_rejection(
+                &config,
+                0.72,
+                Some(0.03),
+                &[(0.04, 1000.0), (0.08, 1000.0)],
+                &[(0.08, 1000.0)]
+            ),
+            Some("price_out_of_range")
+        );
+    }
+
+    #[test]
+    fn model_audit_exposes_floor_and_reference_skew() {
+        let state = FairValueTwapSnapshot {
+            opening: Decimal::from(100),
+            current: Decimal::from_str("100.01").unwrap(),
+            observed_at_ms: 295_000,
+            opening_observed_at_ms: 2_000,
+            observed_volatility_bps: 0.01,
+            minimum_volatility_bps: 0.8,
+            volatility_bps_per_sqrt_second: 0.8,
+            observation_count: 30,
+        };
+        let audit = live_model_audit(state, 0, 296_000, 4.0, true);
+        assert_eq!(audit["opening_skew_ms"], 2000);
+        assert_eq!(audit["feed_age_ms"], 1000);
+        assert_eq!(audit["volatility_floor_active"], true);
+        assert!(
+            audit["probability_without_floor"].as_f64().unwrap() > live_probability(state, 4.0)
+        );
+        assert!(
+            live_model_audit(state, 0, 296_000, 4.0, false)["directional_margin_bps"]
+                .as_f64()
+                .unwrap()
+                < 0.0
+        );
+    }
+
+    #[test]
+    fn research_summary_handles_legacy_and_multiple_rejections() {
+        let events = vec![
+            serde_json::json!({"event":"window_summary","stats":{"market_evaluations":4,"rest_latency_samples":2,"rest_latency_total_ms":60,"rest_latency_max_ms":40,"rejection_counts":{"up_incomplete_book":2,"down_incomplete_book":2},"terminal_reason_by_market":{"btc":"incomplete"}}}),
+        ];
+        let summary = dry_run_research_summary(&events);
+        assert_eq!(summary["market_evaluations"], 4);
+        assert_eq!(summary["rest_average_ms"], 30.0);
+        assert_eq!(summary["window_rejection_counts"]["up_incomplete_book"], 2);
+        assert!(summary["model_observation_by_asset"]
+            .as_object()
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
