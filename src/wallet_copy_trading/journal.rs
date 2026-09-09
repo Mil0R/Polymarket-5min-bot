@@ -168,7 +168,8 @@ pub fn init_wallet_copy_trading_logging(default_log_file: &str) -> Result<()> {
         );
     }
 
-    let log_path = std::env::var("WALLET_COPY_TRADING_LOG_FILE")
+    let log_path = std::env::var("WALLET_COPY_TRADING_SYSTEM_LOG_FILE")
+        .or_else(|_| std::env::var("WALLET_COPY_TRADING_LOG_FILE"))
         .or_else(|_| std::env::var("LOG_FILE"))
         .unwrap_or_else(|_| default_log_file.to_string());
     let file_writer = RotatingFileWriter::new(&log_path)?;

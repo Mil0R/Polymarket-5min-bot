@@ -14,6 +14,10 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     let config = BayesianConsistencyConfig::from_env()?;
+    polypulse::init_research_system_logger(
+        "BAYESIAN_CONSISTENCY_ARBITRAGE",
+        "logs/bayesian-consistency-arbitrage/system.log",
+    )?;
     match command.as_str() {
         "discover" => {
             run_discover(config).await?;

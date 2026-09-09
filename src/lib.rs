@@ -26,6 +26,7 @@ mod strategy_gate;
 mod strategy_service;
 mod trading;
 mod utils;
+pub use utils::logger::init_research_system_logger;
 #[path = "bin/wallet_copy_trading.rs"]
 mod wallet_copy_trading_embedded;
 mod wallet_kind;

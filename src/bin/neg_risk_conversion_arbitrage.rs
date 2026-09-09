@@ -6,5 +6,9 @@ async fn main() -> Result<()> {
         println!("Usage: neg_risk_conversion_arbitrage [scan|shadow|report]\nStage-1 read-only economics research. No signer, orders or on-chain conversions.");
         return Ok(());
     }
+    polypulse::init_research_system_logger(
+        "NEG_RISK_CONVERSION_ARBITRAGE",
+        "logs/neg-risk-conversion-arbitrage/system.log",
+    )?;
     polypulse::cross_market_probability_arbitrage::conversion::run(&command).await
 }

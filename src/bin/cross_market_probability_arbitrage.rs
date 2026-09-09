@@ -3,7 +3,6 @@ use polypulse::cross_market_probability_arbitrage::{
     run_report, run_scan, run_shadow, CrossMarketProbabilityArbitrageConfig,
     CrossMarketProbabilityResearchClient,
 };
-use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -11,12 +10,10 @@ async fn main() -> Result<()> {
         .install_default()
         .expect("failed to install rustls crypto provider");
     let _ = dotenvy::dotenv();
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .with_target(false)
-        .init();
+    polypulse::init_research_system_logger(
+        "CROSS_MARKET_PROBABILITY_ARBITRAGE",
+        "logs/cross-market-probability-arbitrage/system.log",
+    )?;
     let command = std::env::args().nth(1).unwrap_or_else(|| "scan".into());
     if matches!(command.as_str(), "help" | "--help" | "-h") {
         print_help();

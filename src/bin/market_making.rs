@@ -3,7 +3,6 @@ use polypulse::market_making::{
     record_reward_snapshot, run_market_scan, run_report, run_shadow_maker, watch_reward_snapshots,
     MarketMakingResearchClient, MarketMakingResearchConfig,
 };
-use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -11,12 +10,7 @@ async fn main() -> Result<()> {
         .install_default()
         .expect("failed to install rustls crypto provider");
     let _ = dotenvy::dotenv();
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .with_target(false)
-        .init();
+    polypulse::init_research_system_logger("MARKET_MAKING", "logs/market-making/system.log")?;
     let command = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "shadow".to_string());

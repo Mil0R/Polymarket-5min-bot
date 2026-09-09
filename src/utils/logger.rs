@@ -18,7 +18,48 @@ pub const LATE_RESOLUTION_WINNER_TRADING_CONSOLE_TARGET: &str =
     "polypulse::console::late_resolution_winner_trading";
 type LogLayer = Box<dyn Layer<tracing_subscriber::Registry> + Send + Sync>;
 
+fn system_log_path(configured: Option<String>, fallback: &str) -> String {
+    configured
+        .filter(|p| !p.trim().is_empty())
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+/// Standalone runners select their own system log, independently of shared LOG_FILE.
+pub fn select_strategy_system_log(prefix: &str, fallback: &str) {
+    dotenvy::dotenv().ok();
+    let path = system_log_path(
+        std::env::var(format!("{prefix}_SYSTEM_LOG_FILE")).ok(),
+        fallback,
+    );
+    std::env::set_var("LOG_FILE", path);
+}
+
+/// Research binaries keep full console tracing and a rotating system log.
+pub fn init_research_system_logger(prefix: &str, fallback: &str) -> Result<()> {
+    select_strategy_system_log(prefix, fallback);
+    let writer = Mutex::new(open_log_writer(std::env::var("LOG_FILE")?)?);
+    tracing_subscriber::registry()
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with(tracing_subscriber::fmt::layer().with_target(false))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(writer),
+        )
+        .try_init()?;
+    Ok(())
+}
+
 pub fn init_logger(quiet_stdout: bool) -> Result<()> {
+    init_logger_for_strategies(quiet_stdout, true, true, true)
+}
+
+pub fn init_logger_for_strategies(
+    quiet_stdout: bool,
+    binary: bool,
+    winner: bool,
+    copy: bool,
+) -> Result<()> {
     // Logger setup happens before Config::from_env(), so load .env here as well.
     dotenvy::dotenv().ok();
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -86,23 +127,29 @@ pub fn init_logger(quiet_stdout: bool) -> Result<()> {
                 .boxed(),
         );
     }
-    if let Some(layer) = strategy_log_layer(
-        "BINARY_COMPLEMENT_ARBITRAGE_STRATEGY_LOG_FILE",
-        is_binary_complement_arbitrage_metadata,
-    )? {
-        log_layers.push(layer);
+    if binary {
+        if let Some(layer) = strategy_log_layer(
+            "BINARY_COMPLEMENT_ARBITRAGE_STRATEGY_LOG_FILE",
+            is_binary_complement_arbitrage_metadata,
+        )? {
+            log_layers.push(layer);
+        }
     }
-    if let Some(layer) = strategy_log_layer(
-        "LATE_RESOLUTION_WINNER_TRADING_STRATEGY_LOG_FILE",
-        is_late_resolution_winner_trading_metadata,
-    )? {
-        log_layers.push(layer);
+    if winner {
+        if let Some(layer) = strategy_log_layer(
+            "LATE_RESOLUTION_WINNER_TRADING_STRATEGY_LOG_FILE",
+            is_late_resolution_winner_trading_metadata,
+        )? {
+            log_layers.push(layer);
+        }
     }
-    if let Some(layer) = strategy_log_layer(
-        "WALLET_COPY_TRADING_LOG_FILE",
-        is_wallet_copy_trading_metadata,
-    )? {
-        log_layers.push(layer);
+    if copy {
+        if let Some(layer) = strategy_log_layer(
+            "WALLET_COPY_TRADING_LOG_FILE",
+            is_wallet_copy_trading_metadata,
+        )? {
+            log_layers.push(layer);
+        }
     }
 
     tracing_subscriber::registry()
@@ -293,6 +340,18 @@ pub fn tui_enabled_from_env() -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn standalone_system_path_uses_nonempty_override_or_own_default() {
+        assert_eq!(
+            super::system_log_path(Some("logs/run-004/system.log".into()), "own.log"),
+            "logs/run-004/system.log"
+        );
+        assert_eq!(super::system_log_path(None, "own.log"), "own.log");
+        assert_eq!(
+            super::system_log_path(Some("  ".into()), "own.log"),
+            "own.log"
+        );
+    }
     use super::*;
     use std::io::Write;
 

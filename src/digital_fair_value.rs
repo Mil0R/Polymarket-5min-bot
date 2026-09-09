@@ -611,9 +611,9 @@ pub async fn run_dry_run() -> Result<()> {
     let run_started_ms = Utc::now().timestamp_millis();
     let run_id = uuid::Uuid::new_v4().to_string();
     std::env::set_var("DRY_RUN", "true");
-    std::env::set_var(
-        "LOG_FILE",
-        std::env::var("SHORT_DURATION_DIGITAL_FAIR_VALUE_LOG_FILE")
+    crate::utils::logger::select_strategy_system_log(
+        "SHORT_DURATION_DIGITAL_FAIR_VALUE",
+        &std::env::var("SHORT_DURATION_DIGITAL_FAIR_VALUE_LOG_FILE")
             .unwrap_or_else(|_| "logs/short-duration-digital-fair-value.log".to_string()),
     );
     if std::env::var_os("LOG_STDOUT_TEE").is_none() {
@@ -622,7 +622,7 @@ pub async fn run_dry_run() -> Result<()> {
     rustls::crypto::ring::default_provider()
         .install_default()
         .ok();
-    crate::utils::logger::init_logger(false)?;
+    crate::utils::logger::init_logger_for_strategies(false, false, false, false)?;
     let journal = EventJournal::open(&config.results_file, run_id.clone())?;
     journal.append(serde_json::json!({
         "event": "run_started",

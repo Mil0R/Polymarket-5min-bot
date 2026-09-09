@@ -1,5 +1,7 @@
 # NegRisk Conversion Arbitrage：第一阶段运行说明
 
+2026-09-09 已增加轮换发现、HTTP/hash 证据和独立诊断组；当前部署路径及新增配置见[诊断优化说明](NEG_RISK_CONVERSION_ARBITRAGE_DIAGNOSTICS_2026-09-09.zh-CN.md)。下文保留第一版参数说明供旧批次对照。
+
 ## 范围
 
 这是 Cross-Market Probability Arbitrage 的独立研究扩展，复用 Gamma 发现与 CLOB 盘口客户端。原有 scan/shadow/report 入口和篮子筛选规则保持不变。新程序不读取交易签名密钥、不提交订单、不发起链上转换，且没有 live 命令。

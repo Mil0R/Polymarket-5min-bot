@@ -89,6 +89,29 @@ impl WindowSessionRunner {
         }
     }
 
+    pub fn process_pair_if_enabled(
+        &self,
+        enabled: bool,
+        pair: &OrderBookPair,
+        now_ms: i64,
+        trading_paused: bool,
+        connection_healthy: bool,
+        unresolved_state: bool,
+    ) -> anyhow::Result<Option<MarketTick>> {
+        if !enabled {
+            self.invalidate_transient_state();
+            return Ok(None);
+        }
+        self.process_pair(
+            pair,
+            now_ms,
+            trading_paused,
+            connection_healthy,
+            unresolved_state,
+        )
+        .map(Some)
+    }
+
     pub fn process_pair(
         &self,
         pair: &OrderBookPair,
@@ -372,6 +395,35 @@ mod tests {
         assert_eq!(direction(Decimal::ONE, Decimal::ZERO), "↑");
         assert_eq!(direction(Decimal::ZERO, Decimal::ONE), "↓");
         assert_eq!(direction(Decimal::ONE, Decimal::ONE), "−");
+    }
+
+    #[test]
+    fn disabled_strategy_produces_no_tick_or_research_metrics() {
+        let market_id = B256::repeat_byte(7);
+        let metrics = Arc::new(RuntimeMetrics::default());
+        let runner = runner(market_id, metrics.clone());
+        let now_ms = Utc::now().timestamp_millis();
+        let pair = OrderBookPair {
+            yes_book: book(1, market_id, now_ms, dec!(0.45)),
+            no_book: book(2, market_id, now_ms, dec!(0.50)),
+            market_id,
+        };
+        assert!(runner
+            .process_pair_if_enabled(false, &pair, now_ms, false, true, false)
+            .unwrap()
+            .is_none());
+        assert_eq!(metrics.snapshot().orderbook_pairs, 0);
+        assert!(runner
+            .process_pair_if_enabled(true, &pair, now_ms, false, true, false)
+            .unwrap()
+            .unwrap()
+            .opportunity
+            .is_some());
+        assert!(runner
+            .process_pair_if_enabled(false, &pair, now_ms, false, true, false)
+            .unwrap()
+            .is_none());
+        assert_eq!(metrics.snapshot().orderbook_pairs, 1);
     }
 
     #[test]

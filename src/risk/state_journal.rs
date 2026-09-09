@@ -85,11 +85,19 @@ struct JournalEnvelope {
 
 pub struct StateJournal {
     path: PathBuf,
-    writer: Mutex<File>,
+    writer: Mutex<Option<File>>,
     latest: Mutex<HashMap<String, JournalEvent>>,
 }
 
 impl StateJournal {
+    /// Isolated research state: never opens or changes a strategy's disk journal.
+    pub fn in_memory() -> Self {
+        Self {
+            path: PathBuf::new(),
+            writer: Mutex::new(None),
+            latest: Mutex::new(HashMap::new()),
+        }
+    }
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path
@@ -112,17 +120,23 @@ impl StateJournal {
             .with_context(|| format!("failed to open state journal {}", path.display()))?;
         Ok(Self {
             path,
-            writer: Mutex::new(writer),
+            writer: Mutex::new(Some(writer)),
             latest: Mutex::new(latest),
         })
     }
 
     pub fn probe_writable(&self) -> Result<()> {
-        self.writer
+        if let Some(writer) = self
+            .writer
             .lock()
             .expect("state journal lock poisoned")
-            .sync_data()
-            .context("state journal sync probe failed")
+            .as_ref()
+        {
+            writer
+                .sync_data()
+                .context("state journal sync probe failed")?;
+        }
+        Ok(())
     }
 
     pub fn path(&self) -> &Path {
@@ -137,9 +151,11 @@ impl StateJournal {
             event: event.clone(),
         })?;
         let mut writer = self.writer.lock().expect("state journal lock poisoned");
-        writeln!(writer, "{encoded}")?;
-        writer.flush()?;
-        writer.sync_data()?;
+        if let Some(writer) = writer.as_mut() {
+            writeln!(writer, "{encoded}")?;
+            writer.flush()?;
+            writer.sync_data()?;
+        }
         self.latest
             .lock()
             .expect("state journal cache lock poisoned")
@@ -280,6 +296,22 @@ mod tests {
             pair: None,
             recovery: None,
         }
+    }
+
+    #[test]
+    fn isolated_memory_journal_tracks_state_without_a_file() {
+        let journal = StateJournal::in_memory();
+        assert!(journal.path().as_os_str().is_empty());
+        journal.probe_writable().unwrap();
+        journal
+            .append(&event("paper", JournalState::OneSided))
+            .unwrap();
+        assert!(journal.has_unresolved());
+        journal
+            .append(&event("paper", JournalState::Recovered))
+            .unwrap();
+        assert!(!journal.has_unresolved());
+        assert!(journal.writer.lock().unwrap().is_none());
     }
 
     #[test]

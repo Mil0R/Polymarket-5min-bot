@@ -25,6 +25,7 @@ pub struct CrossMarketProbabilityResearchClient {
     config: CrossMarketProbabilityArbitrageConfig,
     book_cache: Arc<DashMap<String, BookSnapshot>>,
     websocket_subscribed_tokens: Arc<DashSet<String>>,
+    conversion_audit: Arc<DashMap<String, Value>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -158,6 +159,8 @@ struct GammaFeeSchedule {
 #[derive(Debug, Deserialize)]
 struct ClobBookResponse {
     #[serde(default)]
+    hash: Option<String>,
+    #[serde(default)]
     asset_id: Option<String>,
     #[serde(default)]
     bids: Vec<ClobLevel>,
@@ -209,6 +212,7 @@ impl CrossMarketProbabilityResearchClient {
             config,
             book_cache: Arc::new(DashMap::new()),
             websocket_subscribed_tokens: Arc::new(DashSet::new()),
+            conversion_audit: Arc::new(DashMap::new()),
         })
     }
 
@@ -221,10 +225,18 @@ impl CrossMarketProbabilityResearchClient {
     pub async fn discover_conversion_routes(
         &self,
     ) -> Result<(Vec<super::conversion::Route>, BTreeMap<String, usize>)> {
-        let events = self.fetch_events().await?;
+        self.discover_conversion_routes_at(0).await
+    }
+
+    pub async fn discover_conversion_routes_at(
+        &self,
+        page_offset: usize,
+    ) -> Result<(Vec<super::conversion::Route>, BTreeMap<String, usize>)> {
+        let events = self.fetch_events_at(page_offset).await?;
         let mut routes = Vec::new();
         let mut diagnostics = BTreeMap::new();
         diagnostics.insert("events_scanned".into(), events.len());
+        diagnostics.insert("page_offset".into(), page_offset);
         for event in events {
             if !(event.neg_risk || event.enable_neg_risk) {
                 continue;
@@ -242,6 +254,36 @@ impl CrossMarketProbabilityResearchClient {
                     && outcomes.iter().any(|o| o.eq_ignore_ascii_case("no"))
                     && (!m.fees_enabled || m.fee_schedule.is_some())
             });
+            if markets.len() != event.markets.len() {
+                *diagnostics
+                    .entry("untradable_or_incomplete_tokens".into())
+                    .or_default() += 1;
+            }
+            if event.markets.len() < 2 {
+                *diagnostics.entry("too_few_outcomes".into()).or_default() += 1;
+            }
+            if event.markets.len() > self.config.max_partition_legs {
+                *diagnostics.entry("too_many_outcomes".into()).or_default() += 1;
+            }
+            if event
+                .markets
+                .iter()
+                .any(|m| m.fees_enabled && m.fee_schedule.is_none())
+            {
+                *diagnostics
+                    .entry("missing_enabled_fee_schedule".into())
+                    .or_default() += 1;
+            }
+            if event.markets.iter().any(|m| {
+                let o = string_array(&m.outcomes).unwrap_or_default();
+                o.len() != 2
+                    || !o.iter().any(|v| v.eq_ignore_ascii_case("yes"))
+                    || !o.iter().any(|v| v.eq_ignore_ascii_case("no"))
+            }) {
+                *diagnostics
+                    .entry("invalid_outcome_labels".into())
+                    .or_default() += 1;
+            }
             if !complete
                 || markets.len() != event.markets.len()
                 || !(2..=self.config.max_partition_legs).contains(&markets.len())
@@ -255,6 +297,7 @@ impl CrossMarketProbabilityResearchClient {
             if !markets.iter().all(|m| {
                 tokens.insert(m.yes_token_id.clone()) && tokens.insert(m.no_token_id.clone())
             }) {
+                *diagnostics.entry("duplicate_tokens".into()).or_default() += 1;
                 continue;
             }
             for input in &markets {
@@ -282,21 +325,35 @@ impl CrossMarketProbabilityResearchClient {
         &self,
         routes: &[super::conversion::Route],
     ) -> HashMap<String, BookSnapshot> {
+        self.conversion_audit.clear();
         let tokens = routes
             .iter()
             .flat_map(|r| std::iter::once(&r.input).chain(r.outputs.iter()))
             .map(|l| l.token_id.clone())
             .collect::<HashSet<_>>();
         stream::iter(tokens.into_iter().map(|token| async move {
-            self.fetch_book_checked(&token, true)
-                .await
-                .ok()
-                .map(|book| (token, book))
+            match self.fetch_book_checked(&token, true).await {
+                Ok(book) => Some((token, book)),
+                Err(error) => {
+                    self.conversion_audit.insert(
+                        token,
+                        serde_json::json!({"error":format!("{error:#}"),"received_at":Utc::now()}),
+                    );
+                    None
+                }
+            }
         }))
         .buffer_unordered(self.config.request_concurrency)
         .filter_map(|v| async move { v })
         .collect()
         .await
+    }
+
+    pub fn conversion_book_audit(&self) -> BTreeMap<String, Value> {
+        self.conversion_audit
+            .iter()
+            .map(|e| (e.key().clone(), e.value().clone()))
+            .collect()
     }
 
     pub async fn discover_relationships(&self) -> Result<Vec<MarketRelationship>> {
@@ -476,10 +533,14 @@ impl CrossMarketProbabilityResearchClient {
     }
 
     async fn fetch_events(&self) -> Result<Vec<GammaEvent>> {
+        self.fetch_events_at(0).await
+    }
+
+    async fn fetch_events_at(&self, page_offset: usize) -> Result<Vec<GammaEvent>> {
         let mut all = Vec::new();
         let mut seen = HashSet::new();
         for page in 0..self.config.event_pages {
-            let offset = page * self.config.events_per_page;
+            let offset = (page_offset + page) * self.config.events_per_page;
             let events: Vec<GammaEvent> = self
                 .http
                 .get(format!("{}/events", self.config.gamma_url))
@@ -515,7 +576,7 @@ impl CrossMarketProbabilityResearchClient {
     }
 
     async fn fetch_book_checked(&self, token_id: &str, strict_token: bool) -> Result<BookSnapshot> {
-        if let Some(book) = self.book_cache.get(token_id) {
+        if let Some(book) = self.book_cache.get(token_id).filter(|_| !strict_token) {
             let age_ms = Utc::now()
                 .signed_duration_since(book.observed_at)
                 .num_milliseconds();
@@ -524,7 +585,8 @@ impl CrossMarketProbabilityResearchClient {
             }
         }
         let request_started = Instant::now();
-        let response: ClobBookResponse = self
+        let request_started_at = Utc::now();
+        let response = self
             .http
             .get(format!("{}/book", self.config.clob_url))
             .query(&[("token_id", token_id)])
@@ -532,13 +594,29 @@ impl CrossMarketProbabilityResearchClient {
             .await
             .context("Cross-market probability CLOB book request failed")?
             .error_for_status()
-            .context("Cross-market probability CLOB book returned non-success")?
+            .context("Cross-market probability CLOB book returned non-success")?;
+        let headers = ["date", "age", "cache-control", "cf-cache-status", "x-cache"]
+            .into_iter()
+            .filter_map(|k| {
+                response
+                    .headers()
+                    .get(k)
+                    .and_then(|v| v.to_str().ok())
+                    .map(|v| (k.to_string(), v.to_string()))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let response: ClobBookResponse = response
             .json()
             .await
             .context("Cross-market probability CLOB book response is invalid")?;
         let request_latency_ms = request_started.elapsed().as_millis() as u64;
         if strict_token && response.asset_id.as_deref() != Some(token_id) {
             anyhow::bail!("missing or mismatched CLOB asset_id");
+        }
+        if strict_token {
+            self.conversion_audit.insert(token_id.to_string(), serde_json::json!({"request_started_at":request_started_at,
+                "received_at":Utc::now(),"request_latency_ms":request_latency_ms,"headers":headers,
+                "exchange_timestamp_ms":response.timestamp.as_ref().and_then(value_i64),"hash":response.hash}));
         }
         let mut bids = response
             .bids

@@ -44,6 +44,12 @@ pub struct Config {
     pub max_skew_ms: i64,
     pub max_future_skew_ms: i64,
     pub cooldown_secs: u64,
+    pub discovery_windows: usize,
+    pub diagnostic_enabled: bool,
+    pub diagnostic_max_exchange_age_ms: i64,
+    pub diagnostic_max_rest_ms: u64,
+    pub evidence_interval_secs: u64,
+    pub evidence_routes: usize,
 }
 fn env<T: std::str::FromStr>(key: &str, default: &str) -> Result<T> {
     std::env::var(format!("NEG_RISK_CONVERSION_ARBITRAGE_{key}"))
@@ -73,6 +79,12 @@ impl Config {
             max_skew_ms: env("MAX_SNAPSHOT_SKEW_MS", "2000")?,
             max_future_skew_ms: env("MAX_FUTURE_SKEW_MS", "10000")?,
             cooldown_secs: env("EPISODE_COOLDOWN_SECS", "300")?,
+            discovery_windows: env("DISCOVERY_WINDOWS", "3")?,
+            diagnostic_enabled: env("DIAGNOSTIC_ENABLED", "false")?,
+            diagnostic_max_exchange_age_ms: env("DIAGNOSTIC_MAX_EXCHANGE_AGE_MS", "600000")?,
+            diagnostic_max_rest_ms: env("DIAGNOSTIC_MAX_REST_MS", "1000")?,
+            evidence_interval_secs: env("EVIDENCE_INTERVAL_SECS", "60")?,
+            evidence_routes: env("EVIDENCE_ROUTES", "5")?,
         };
         if c.poll_secs == 0
             || c.refresh_secs == 0
@@ -80,6 +92,11 @@ impl Config {
             || c.max_skew_ms <= 0
             || !(0..=30000).contains(&c.max_future_skew_ms)
             || c.cooldown_secs == 0
+            || !(1..=20).contains(&c.discovery_windows)
+            || !(1..=600000).contains(&c.diagnostic_max_exchange_age_ms)
+            || !(1..=5000).contains(&c.diagnostic_max_rest_ms)
+            || c.evidence_interval_secs == 0
+            || !(1..=20).contains(&c.evidence_routes)
             || ![
                 c.budget,
                 c.minimum_profit,
@@ -242,6 +259,87 @@ fn evaluate(
         net_profit: exit_proceeds - input_cost - c.chain_cost,
     })
 }
+
+/// Diagnostic cohort only. Keep receipt freshness, depth, cost and clock checks;
+/// allow bounded old exchange timestamps and compare repeat REST snapshots later.
+fn evaluate_diagnostic(
+    route: &Route,
+    books: &HashMap<String, BookSnapshot>,
+    q: f64,
+    c: &Config,
+    fixed_input: Option<f64>,
+) -> Result<Quote> {
+    let now = Utc::now().timestamp_millis();
+    let mut observed = HashMap::new();
+    for leg in std::iter::once(&route.input)
+        .filter(|_| fixed_input.is_none())
+        .chain(route.outputs.iter())
+    {
+        let book = books.get(&leg.token_id).context("missing_book")?;
+        let ts = book
+            .exchange_timestamp_ms
+            .context("missing_exchange_timestamp")?;
+        if now - ts > c.diagnostic_max_exchange_age_ms {
+            bail!("diagnostic_exchange_too_old");
+        }
+        if ts - now > c.max_future_skew_ms {
+            bail!("exchange_clock_ahead");
+        }
+        if book
+            .request_latency_ms
+            .is_none_or(|ms| ms > c.diagnostic_max_rest_ms)
+        {
+            bail!("diagnostic_rest_latency");
+        }
+        let mut copy = book.clone();
+        copy.exchange_timestamp_ms = None;
+        observed.insert(leg.token_id.clone(), copy);
+    }
+    evaluate(route, &observed, q, c, fixed_input)
+}
+
+fn evidence(
+    route: &Route,
+    books: &HashMap<String, BookSnapshot>,
+    audit: &BTreeMap<String, Value>,
+    c: &Config,
+) -> Value {
+    let now = Utc::now().timestamp_millis();
+    json!({"route_id":route.id,"event_slug":route.slug,"legs":std::iter::once(&route.input).chain(route.outputs.iter()).map(|leg| {
+        let b = books.get(&leg.token_id);
+        json!({"token_id":leg.token_id,"is_input":leg.token_id==route.input.token_id,
+            "freshness_error":fresh(books,leg,now,c).err().map(|e|e.to_string()),
+            "observed_at":b.map(|b|b.observed_at),"exchange_age_ms":b.and_then(|b|b.exchange_timestamp_ms).map(|ts|now-ts),
+            "request":audit.get(&leg.token_id),"bids":b.map(|b|b.bids.iter().take(5).collect::<Vec<_>>()),
+            "asks":b.map(|b|b.asks.iter().take(5).collect::<Vec<_>>())})
+    }).collect::<Vec<_>>()})
+}
+
+fn raw_spread(
+    route: &Route,
+    books: &HashMap<String, BookSnapshot>,
+    shares: f64,
+    c: &Config,
+) -> Option<f64> {
+    let mut raw = c.clone();
+    raw.slippage_bps = 0.;
+    let mut input = route.input.clone();
+    input.fee.enabled = false;
+    let cost = walk(books.get(&input.token_id)?, &input, shares, true, &raw)?;
+    let mut proceeds = 0.;
+    for output in &route.outputs {
+        let mut leg = output.clone();
+        leg.fee.enabled = false;
+        proceeds += walk(
+            books.get(&leg.token_id)?,
+            &leg,
+            shares * (1. - c.conversion_fee_bps / 10000.),
+            false,
+            &raw,
+        )?;
+    }
+    Some(proceeds - cost)
+}
 struct Journal {
     file: File,
     log: File,
@@ -305,22 +403,29 @@ pub async fn run(command: &str) -> Result<()> {
     }
     let client = CrossMarketProbabilityResearchClient::new(base)?;
     let mut journal = Journal::open(&c)?;
-    journal.event(json!({"event":"run_started","config":c,"mode":"read_only_shadow","protocol_verified":false,"stage":"economics_only"}))?;
+    journal.event(json!({"event":"run_started","config":c,"mode":"read_only_shadow","protocol_verified":false,"stage":"economics_only",
+        "discovery_parameters":{"event_pages":client.config().event_pages,"events_per_page":client.config().events_per_page,
+            "max_routes":client.config().max_relationships,"max_outcomes":client.config().max_partition_legs,"request_concurrency":client.config().request_concurrency}}))?;
     let started = Instant::now();
     let mut refresh = Instant::now();
     let mut routes = Vec::new();
     let mut initialized = false;
     let mut last_episode = HashMap::<String, Instant>::new();
     let mut last_log = Instant::now();
+    let mut discovery_cycle = 0;
+    let mut last_evidence: Option<Instant> = None;
+    let mut evidence_cursor = 0;
     let work = async {
         loop {
             if c.duration_secs > 0 && started.elapsed().as_secs() >= c.duration_secs {
                 break;
             }
             if !initialized || refresh.elapsed().as_secs() >= c.refresh_secs {
-                match client.discover_conversion_routes().await {
+                let offset = (discovery_cycle % c.discovery_windows) * client.config().event_pages;
+                match client.discover_conversion_routes_at(offset).await {
                     Ok((new, diagnostics)) => {
                         routes = new;
+                        discovery_cycle += 1;
                         initialized = true;
                         refresh = Instant::now();
                         journal.event(
@@ -345,14 +450,38 @@ pub async fn run(command: &str) -> Result<()> {
                 }
             }
             let books = client.fetch_conversion_books(&routes).await;
+            let book_audit = client.conversion_book_audit();
+            if last_evidence.is_none_or(|t| t.elapsed().as_secs() >= c.evidence_interval_secs) {
+                let sampled = (0..c.evidence_routes.min(routes.len()))
+                    .map(|i| &routes[(evidence_cursor + i) % routes.len()])
+                    .collect::<Vec<_>>();
+                journal.event(json!({"event":"book_evidence","sampled_routes":sampled.iter().map(|r|evidence(r,&books,&book_audit,&c)).collect::<Vec<_>>(),"truncated_levels":5}))?;
+                evidence_cursor = evidence_cursor.wrapping_add(c.evidence_routes);
+                last_evidence = Some(Instant::now());
+            }
             let mut rejects = BTreeMap::<String, usize>::new();
+            let mut diagnostic_rejects = BTreeMap::<String, usize>::new();
+            let mut by_event = BTreeMap::<String, BTreeMap<String, usize>>::new();
+            let mut leg_time_failures = BTreeMap::<String, usize>::new();
             let mut candidates = Vec::new();
             let mut closest: Option<(&Route, Quote)> = None;
+            let mut diagnostic_closest: Option<(&Route, Quote)> = None;
             for route in &routes {
+                for leg in std::iter::once(&route.input).chain(route.outputs.iter()) {
+                    if let Err(error) = fresh(&books, leg, Utc::now().timestamp_millis(), &c) {
+                        *leg_time_failures.entry(error.to_string()).or_default() += 1;
+                    }
+                }
                 let mut best: Option<Quote> = None;
+                let mut diagnostic_best: Option<Quote> = None;
                 for &q in &c.sizes {
                     match evaluate(route, &books, q, &c, None) {
                         Ok(quote) if quote.net_profit >= c.minimum_profit => {
+                            *by_event
+                                .entry(route.slug.clone())
+                                .or_default()
+                                .entry("strict_profitable".into())
+                                .or_default() += 1;
                             if best
                                 .as_ref()
                                 .is_none_or(|b| quote.net_profit > b.net_profit)
@@ -361,6 +490,11 @@ pub async fn run(command: &str) -> Result<()> {
                             }
                         }
                         Ok(quote) => {
+                            *by_event
+                                .entry(route.slug.clone())
+                                .or_default()
+                                .entry("below_net_profit".into())
+                                .or_default() += 1;
                             if closest
                                 .as_ref()
                                 .is_none_or(|(_, q)| quote.net_profit > q.net_profit)
@@ -370,8 +504,58 @@ pub async fn run(command: &str) -> Result<()> {
                             *rejects.entry("below_net_profit".into()).or_default() += 1;
                         }
                         Err(e) => {
+                            *by_event
+                                .entry(route.slug.clone())
+                                .or_default()
+                                .entry(e.to_string())
+                                .or_default() += 1;
                             *rejects.entry(e.to_string()).or_default() += 1;
                         }
+                    }
+                    if c.diagnostic_enabled {
+                        match evaluate_diagnostic(route, &books, q, &c, None) {
+                            Ok(quote) => {
+                                *by_event
+                                    .entry(route.slug.clone())
+                                    .or_default()
+                                    .entry("diagnostic_priced".into())
+                                    .or_default() += 1;
+                                if diagnostic_closest
+                                    .as_ref()
+                                    .is_none_or(|(_, v)| quote.net_profit > v.net_profit)
+                                {
+                                    diagnostic_closest = Some((route, quote.clone()));
+                                }
+                                if quote.net_profit >= c.minimum_profit
+                                    && diagnostic_best
+                                        .as_ref()
+                                        .is_none_or(|v| quote.net_profit > v.net_profit)
+                                {
+                                    diagnostic_best = Some(quote);
+                                } else if quote.net_profit < c.minimum_profit {
+                                    *diagnostic_rejects
+                                        .entry("below_net_profit".into())
+                                        .or_default() += 1;
+                                }
+                            }
+                            Err(e) => {
+                                *diagnostic_rejects.entry(e.to_string()).or_default() += 1;
+                            }
+                        }
+                    }
+                }
+                if let Some(quote) = diagnostic_best {
+                    let key = format!("diagnostic:{}", route.id);
+                    if last_episode
+                        .get(&key)
+                        .is_none_or(|t| t.elapsed().as_secs() >= c.cooldown_secs)
+                    {
+                        last_episode.insert(key, Instant::now());
+                        let id = uuid::Uuid::new_v4().to_string();
+                        journal.event(json!({"event":"diagnostic_candidate","episode_id":id,"route":route,"quote":quote,
+                            "raw_spread_before_trading_costs":raw_spread(route,&books,quote.shares,&c),"evidence":evidence(route,&books,&book_audit,&c),
+                            "books":std::iter::once(&route.input).chain(route.outputs.iter()).filter_map(|l|books.get(&l.token_id)).collect::<Vec<_>>(),"execution_verified":false}))?;
+                        candidates.push((id, route.clone(), quote, true));
                     }
                 }
                 if let Some(quote) = best {
@@ -383,8 +567,10 @@ pub async fn run(command: &str) -> Result<()> {
                     }
                     last_episode.insert(route.id.clone(), Instant::now());
                     let id = uuid::Uuid::new_v4().to_string();
-                    journal.event(json!({"event":"candidate","episode_id":id,"route":route,"quote":quote,"books":std::iter::once(&route.input).chain(route.outputs.iter()).filter_map(|l|books.get(&l.token_id)).collect::<Vec<_>>()}))?;
-                    candidates.push((id, route.clone(), quote));
+                    journal.event(json!({"event":"candidate","episode_id":id,"route":route,"quote":quote,
+                        "raw_spread_before_trading_costs":raw_spread(route,&books,quote.shares,&c),"evidence":evidence(route,&books,&book_audit,&c),
+                        "books":std::iter::once(&route.input).chain(route.outputs.iter()).filter_map(|l|books.get(&l.token_id)).collect::<Vec<_>>()}))?;
+                    candidates.push((id, route.clone(), quote, false));
                 }
             }
             let now_ms = Utc::now().timestamp_millis();
@@ -392,15 +578,18 @@ pub async fn run(command: &str) -> Result<()> {
                 .values()
                 .filter_map(|b| b.exchange_timestamp_ms.map(|t| now_ms - t))
                 .collect::<Vec<_>>();
-            journal.event(json!({"event":"scan_summary","routes":routes.len(),"books":books.len(),"candidates":candidates.len(),"size_rejections":rejects,
-                "best_non_candidate":closest.map(|(r,q)|json!({"route_id":r.id,"event_slug":r.slug,"quote":q})),
+            journal.event(json!({"event":"scan_summary","routes":routes.len(),"books":books.len(),"candidates":candidates.iter().filter(|(_,_,_,d)|!*d).count(),"size_rejections":rejects,
+                "by_event":by_event,"overlapping_leg_time_failures":leg_time_failures,"diagnostic_rejections":diagnostic_rejects,"diagnostic_candidates":candidates.iter().filter(|(_,_,_,d)|*d).count(),
+                "diagnostic_best":diagnostic_closest.map(|(r,q)|json!({"route_id":r.id,"event_slug":r.slug,"raw_spread_before_trading_costs":raw_spread(r,&books,q.shares,&c),"quote":q})),
+                "best_non_candidate":closest.map(|(r,q)|json!({"route_id":r.id,"event_slug":r.slug,"raw_spread_before_trading_costs":raw_spread(r,&books,q.shares,&c),"quote":q})),
                 "book_health":{"minimum_exchange_age_ms":exchange_ages.iter().min(),"maximum_exchange_age_ms":exchange_ages.iter().max(),"missing_exchange_timestamp":books.len()-exchange_ages.len(),"max_rest_latency_ms":books.values().filter_map(|b|b.request_latency_ms).max()}}))?;
             if last_log.elapsed().as_secs() >= 60 || !candidates.is_empty() || command == "scan" {
                 journal.log(&format!(
-                    "routes={} books={} candidates={} elapsed_secs={}",
+                    "routes={} books={} strict_candidates={} diagnostic_candidates={} elapsed_secs={}",
                     routes.len(),
                     books.len(),
-                    candidates.len(),
+                    candidates.iter().filter(|(_,_,_,d)| !*d).count(),
+                    candidates.iter().filter(|(_,_,_,d)| *d).count(),
                     started.elapsed().as_secs()
                 ))?;
                 last_log = Instant::now();
@@ -409,7 +598,7 @@ pub async fn run(command: &str) -> Result<()> {
                 let delay_start = Instant::now();
                 let selected = candidates
                     .iter()
-                    .map(|(_, r, _)| r.clone())
+                    .map(|(_, r, _, _)| r.clone())
                     .collect::<Vec<_>>();
                 for &delay in &c.delays_ms {
                     tokio::time::sleep(
@@ -417,10 +606,34 @@ pub async fn run(command: &str) -> Result<()> {
                     )
                     .await;
                     let delayed = client.fetch_conversion_books(&selected).await;
-                    for (id, route, initial) in &candidates {
-                        match evaluate(route,&delayed,initial.shares,&c,Some(initial.input_cost)) {
-                            Ok(quote)=>journal.event(json!({"event":"delayed_exit","episode_id":id,"event_id":route.event_id,"delay_ms":delay,"actual_delay_ms":delay_start.elapsed().as_millis(),"quote":quote,"full_exit":true,"books":route.outputs.iter().filter_map(|l|delayed.get(&l.token_id)).collect::<Vec<_>>()}))?,
-                            Err(e)=>journal.event(json!({"event":"delayed_exit","episode_id":id,"event_id":route.event_id,"delay_ms":delay,"actual_delay_ms":delay_start.elapsed().as_millis(),"full_exit":false,"reason":e.to_string(),"conservative_pnl":-initial.input_cost-c.chain_cost,"residual_inventory_unpriced":true}))?,
+                    let delayed_audit = client.conversion_book_audit();
+                    for (id, route, initial, diagnostic) in &candidates {
+                        let kind = if *diagnostic {
+                            "diagnostic_delayed_exit"
+                        } else {
+                            "delayed_exit"
+                        };
+                        let result = if *diagnostic {
+                            evaluate_diagnostic(
+                                route,
+                                &delayed,
+                                initial.shares,
+                                &c,
+                                Some(initial.input_cost),
+                            )
+                        } else {
+                            evaluate(
+                                route,
+                                &delayed,
+                                initial.shares,
+                                &c,
+                                Some(initial.input_cost),
+                            )
+                        };
+                        let repeated = evidence(route, &delayed, &delayed_audit, &c);
+                        match result {
+                            Ok(quote)=>journal.event(json!({"event":kind,"episode_id":id,"event_id":route.event_id,"delay_ms":delay,"actual_delay_ms":delay_start.elapsed().as_millis(),"quote":quote,"full_exit":true,"repeat_evidence":repeated,"books":route.outputs.iter().filter_map(|l|delayed.get(&l.token_id)).collect::<Vec<_>>()}))?,
+                            Err(e)=>journal.event(json!({"event":kind,"episode_id":id,"event_id":route.event_id,"delay_ms":delay,"actual_delay_ms":delay_start.elapsed().as_millis(),"full_exit":false,"reason":e.to_string(),"repeat_evidence":repeated,"conservative_pnl":-initial.input_cost-c.chain_cost,"residual_inventory_unpriced":true}))?,
                         }
                     }
                 }
@@ -442,6 +655,20 @@ pub async fn run(command: &str) -> Result<()> {
 
 fn report(c: &Config) -> Result<()> {
     let mut episodes = HashMap::<String, (String, Vec<f64>, usize)>::new();
+    let mut diagnostic_episodes = HashMap::<String, (String, Vec<f64>, usize)>::new();
+    let mut unique_events = BTreeMap::<String, String>::new();
+    let mut unique_routes = std::collections::BTreeSet::new();
+    let mut discovery_totals = BTreeMap::<String, u64>::new();
+    let mut diagnostic_rejections = BTreeMap::<String, u64>::new();
+    let mut by_event = BTreeMap::<String, BTreeMap<String, u64>>::new();
+    let mut leg_failures = BTreeMap::<String, u64>::new();
+    let mut diagnostic_best: Option<Value> = None;
+    let mut health = BTreeMap::<String, Vec<i64>>::new();
+    let mut priced_scans = 0u64;
+    let mut estimated_evaluations = 0u64;
+    let mut strict_profitable_evaluations = 0u64;
+    let mut initial_hashes = HashMap::<String, BTreeMap<String, String>>::new();
+    let mut repeat_hash_checks = BTreeMap::<String, u64>::new();
     let mut counts = BTreeMap::<String, usize>::new();
     let mut malformed = 0;
     let mut first: Option<chrono::DateTime<Utc>> = None;
@@ -458,6 +685,52 @@ fn report(c: &Config) -> Result<()> {
             }
         };
         let kind = e["event"].as_str().unwrap_or("unknown");
+        if kind == "diagnostic_candidate" {
+            let hashes = e["evidence"]["legs"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|leg| {
+                    Some((
+                        leg["token_id"].as_str()?.to_string(),
+                        leg["request"]["hash"].as_str()?.to_string(),
+                    ))
+                })
+                .collect();
+            initial_hashes.insert(e["episode_id"].as_str().unwrap_or_default().into(), hashes);
+        }
+        if kind == "diagnostic_delayed_exit" {
+            for leg in e["repeat_evidence"]["legs"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                let key = match (
+                    initial_hashes
+                        .get(e["episode_id"].as_str().unwrap_or_default())
+                        .and_then(|h| h.get(leg["token_id"].as_str().unwrap_or_default())),
+                    leg["request"]["hash"].as_str(),
+                ) {
+                    (Some(a), Some(b)) if a == b => "same_hash",
+                    (Some(_), Some(_)) => "changed_hash",
+                    _ => "missing_hash_or_response",
+                };
+                *repeat_hash_checks.entry(key.into()).or_default() += 1;
+            }
+        }
+        if kind == "discovery" {
+            if let Some(routes) = e["routes"].as_array() {
+                for r in routes {
+                    if let (Some(id), Some(slug), Some(route_id)) =
+                        (r["event_id"].as_str(), r["slug"].as_str(), r["id"].as_str())
+                    {
+                        unique_events.insert(id.into(), slug.into());
+                        unique_routes.insert(route_id.to_string());
+                    }
+                }
+            }
+            merge_counts(&mut discovery_totals, &e["diagnostics"]);
+        }
         if let Some(t) = e["recorded_at"]
             .as_str()
             .and_then(|s| s.parse::<chrono::DateTime<Utc>>().ok())
@@ -466,6 +739,35 @@ fn report(c: &Config) -> Result<()> {
             last = Some(last.map_or(t, |v| v.max(t)));
         }
         if kind == "scan_summary" {
+            estimated_evaluations += e["routes"].as_u64().unwrap_or(0) * c.sizes.len() as u64;
+            priced_scans += u64::from(
+                e["best_non_candidate"].is_object() || e["candidates"].as_u64().unwrap_or(0) > 0,
+            );
+            merge_counts(&mut diagnostic_rejections, &e["diagnostic_rejections"]);
+            merge_counts(&mut leg_failures, &e["overlapping_leg_time_failures"]);
+            if let Some(events) = e["by_event"].as_object() {
+                for (slug, counts) in events {
+                    strict_profitable_evaluations +=
+                        counts["strict_profitable"].as_u64().unwrap_or(0);
+                    merge_counts(by_event.entry(slug.clone()).or_default(), counts);
+                }
+            }
+            if let Some(values) = e["book_health"].as_object() {
+                for (k, v) in values {
+                    if let Some(v) = v.as_i64() {
+                        health.entry(k.clone()).or_default().push(v);
+                    }
+                }
+            }
+            if let Some(p) = e["diagnostic_best"]["quote"]["net_profit"].as_f64() {
+                if diagnostic_best.as_ref().is_none_or(|v| {
+                    p > v["quote"]["net_profit"]
+                        .as_f64()
+                        .unwrap_or(f64::NEG_INFINITY)
+                }) {
+                    diagnostic_best = Some(e["diagnostic_best"].clone());
+                }
+            }
             if let Some(p) = e["best_non_candidate"]["quote"]["net_profit"].as_f64() {
                 if best_non_candidate.as_ref().is_none_or(|v| {
                     p > v["quote"]["net_profit"]
@@ -482,8 +784,13 @@ fn report(c: &Config) -> Result<()> {
             }
         }
         *counts.entry(kind.into()).or_default() += 1;
-        if kind == "candidate" {
-            episodes.insert(
+        if matches!(kind, "candidate" | "diagnostic_candidate") {
+            let destination = if kind == "candidate" {
+                &mut episodes
+            } else {
+                &mut diagnostic_episodes
+            };
+            destination.insert(
                 e["episode_id"].as_str().unwrap_or_default().into(),
                 (
                     e["route"]["event_id"].as_str().unwrap_or_default().into(),
@@ -492,8 +799,13 @@ fn report(c: &Config) -> Result<()> {
                 ),
             );
         }
-        if kind == "delayed_exit" {
-            if let Some(item) = episodes.get_mut(e["episode_id"].as_str().unwrap_or_default()) {
+        if matches!(kind, "delayed_exit" | "diagnostic_delayed_exit") {
+            let destination = if kind == "delayed_exit" {
+                &mut episodes
+            } else {
+                &mut diagnostic_episodes
+            };
+            if let Some(item) = destination.get_mut(e["episode_id"].as_str().unwrap_or_default()) {
                 item.1.push(if e["full_exit"] == true {
                     e["quote"]["net_profit"]
                         .as_f64()
@@ -509,6 +821,18 @@ fn report(c: &Config) -> Result<()> {
         .values()
         .filter(|(_, p, _)| p.len() == c.delays_ms.len())
         .collect::<Vec<_>>();
+    let diagnostic_complete = diagnostic_episodes
+        .values()
+        .filter(|(_, p, _)| p.len() == c.delays_ms.len())
+        .collect::<Vec<_>>();
+    let diagnostic_robust = diagnostic_complete
+        .iter()
+        .filter(|(_, p, f)| *f == c.delays_ms.len() && p.iter().all(|p| *p >= c.minimum_profit))
+        .count();
+    let health_summary=health.into_iter().map(|(k,mut values)|{
+        values.sort_unstable(); let n=values.len();
+        (k,json!({"samples":n,"min":values[0],"median":values[n/2],"p95":values[((n-1) as f64*0.95).ceil() as usize],"max":values[n-1]}))
+    }).collect::<BTreeMap<_,_>>();
     let robust = complete
         .iter()
         .filter(|(_, p, f)| *f == c.delays_ms.len() && p.iter().all(|p| *p >= c.minimum_profit))
@@ -520,6 +844,15 @@ fn report(c: &Config) -> Result<()> {
         .collect::<std::collections::HashSet<_>>()
         .len();
     let report = json!({"generated_at":Utc::now(),"mode":"economics_only","protocol_verified":false,"live_ready":false,
+        "coverage":{"unique_events":unique_events.len(),"unique_routes":unique_routes.len(),"events":unique_events,
+            "scans_with_strict_priced_route":priced_scans,"estimated_size_evaluations":estimated_evaluations,
+            "strict_priced_evaluations":scan_rejections.get("below_net_profit").copied().unwrap_or(0)+strict_profitable_evaluations},
+        "discovery_totals_repeated_observations":discovery_totals,"by_event_size_checks":by_event,"overlapping_leg_time_failures":leg_failures,
+        "book_health_per_scan_distribution":health_summary,
+        "diagnostic_only":{"episodes":diagnostic_episodes.len(),"completed_episodes":diagnostic_complete.len(),"pending_episodes":diagnostic_episodes.len()-diagnostic_complete.len(),
+            "all_delay_positive_episodes":diagnostic_robust,"best_observed_quote":diagnostic_best,"size_rejections":diagnostic_rejections,
+            "worst_delay_pnl_sum":diagnostic_complete.iter().map(|(_,p,_)|p.iter().copied().fold(f64::INFINITY,f64::min)).sum::<f64>(),
+            "repeat_leg_hash_checks":repeat_hash_checks,"counts_toward_promotion":false,"execution_verified":false},
         "first_recorded_at":first,"last_recorded_at":last,"size_rejections":scan_rejections,"best_non_candidate":best_non_candidate,
         "event_counts":counts,"episodes":episodes.len(),"completed_episodes":complete.len(),"pending_episodes":episodes.len()-complete.len(),
         "robust_episodes":robust,"robust_distinct_events":events,"malformed_lines":malformed,
@@ -529,6 +862,16 @@ fn report(c: &Config) -> Result<()> {
     serde_json::to_writer_pretty(File::create(c.root.join("report.json"))?, &report)?;
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
+}
+
+fn merge_counts(destination: &mut BTreeMap<String, u64>, source: &Value) {
+    if let Some(values) = source.as_object() {
+        for (key, value) in values {
+            if let Some(value) = value.as_u64() {
+                *destination.entry(key.clone()).or_default() += value;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -554,6 +897,12 @@ mod tests {
             max_skew_ms: 2000,
             max_future_skew_ms: 10000,
             cooldown_secs: 1,
+            discovery_windows: 1,
+            diagnostic_enabled: true,
+            diagnostic_max_exchange_age_ms: 600000,
+            diagnostic_max_rest_ms: 1000,
+            evidence_interval_secs: 60,
+            evidence_routes: 5,
         };
         let leg = |token: &str| RelationLeg {
             condition_id: token.into(),
@@ -619,6 +968,26 @@ mod tests {
         );
         delayed.get_mut("b").unwrap().observed_at = Utc::now() - chrono::Duration::seconds(30);
         assert!(evaluate(&route, &delayed, 10., &c, Some(5.7)).is_err());
+        for book in books.values_mut() {
+            book.exchange_timestamp_ms = Some(Utc::now().timestamp_millis() - 60000);
+            book.request_latency_ms = Some(30);
+        }
+        assert!(evaluate(&route, &books, 10., &c, None).is_err());
+        assert!(
+            evaluate_diagnostic(&route, &books, 10., &c, None)
+                .unwrap()
+                .net_profit
+                > 0.
+        );
+        books.get_mut("b").unwrap().request_latency_ms = Some(2000);
+        assert!(evaluate_diagnostic(&route, &books, 10., &c, None).is_err());
+        books.get_mut("b").unwrap().request_latency_ms = Some(30);
+        books.get_mut("b").unwrap().observed_at = Utc::now() - chrono::Duration::seconds(30);
+        assert!(evaluate_diagnostic(&route, &books, 10., &c, None).is_err());
+        books.get_mut("b").unwrap().observed_at = Utc::now();
+        books.get_mut("b").unwrap().exchange_timestamp_ms =
+            Some(Utc::now().timestamp_millis() - 700000);
+        assert!(evaluate_diagnostic(&route, &books, 10., &c, None).is_err());
         books.remove("c");
         assert!(evaluate(&route, &books, 10., &c, None).is_err());
     }
@@ -637,5 +1006,30 @@ mod tests {
             exponent: 1,
         };
         assert!((fee(&policy, 0.5, 10.).unwrap() - 0.1).abs() < 1e-8);
+    }
+
+    #[test]
+    fn diagnostic_profit_never_promotes_strict_research() {
+        let mut c = Config::load().unwrap();
+        c.root = std::env::temp_dir().join(format!("conversion-report-{}", uuid::Uuid::new_v4()));
+        c.minimum_profit = 0.05;
+        let mut journal = Journal::open(&c).unwrap();
+        for id in 0..21 {
+            journal.event(json!({"event":"diagnostic_candidate","episode_id":id.to_string(),"route":{"event_id":(id%3).to_string()}})).unwrap();
+            for delay in &c.delays_ms {
+                journal.event(json!({"event":"diagnostic_delayed_exit","episode_id":id.to_string(),"delay_ms":delay,"full_exit":true,"quote":{"net_profit":0.1}})).unwrap();
+            }
+        }
+        report(&c).unwrap();
+        let result: Value =
+            serde_json::from_reader(File::open(c.root.join("report.json")).unwrap()).unwrap();
+        assert_eq!(result["diagnostic_only"]["all_delay_positive_episodes"], 21);
+        assert_eq!(result["episodes"], 0);
+        assert_eq!(result["next_step"], "INSUFFICIENT_EVIDENCE");
+        drop(journal);
+        std::fs::remove_file(c.root.join("events.ndjson")).unwrap();
+        std::fs::remove_file(c.root.join("runtime.log")).unwrap();
+        std::fs::remove_file(c.root.join("report.json")).unwrap();
+        std::fs::remove_dir(c.root).unwrap();
     }
 }

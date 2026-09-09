@@ -84,6 +84,21 @@ fn apply_runtime_profile(profile: RuntimeProfile) {
 
 pub async fn run(profile: RuntimeProfile) -> Result<()> {
     apply_runtime_profile(profile);
+    match profile {
+        RuntimeProfile::BinaryComplementArbitrageDryRun => {
+            utils::logger::select_strategy_system_log(
+                "BINARY_COMPLEMENT_ARBITRAGE",
+                "logs/binary-complement-arbitrage/system.log",
+            )
+        }
+        RuntimeProfile::LateResolutionWinnerTradingDryRun => {
+            utils::logger::select_strategy_system_log(
+                "LATE_RESOLUTION_WINNER_TRADING",
+                "logs/late-resolution-winner-trading/system.log",
+            )
+        }
+        RuntimeProfile::Integrated => {}
+    }
     // Must set rustls default crypto provider first, otherwise reqwest/alloy etc. will panic when using TLS
 
     rustls::crypto::ring::default_provider()
@@ -91,7 +106,12 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
         .expect("Failed to install rustls crypto provider");
 
     let use_tui = utils::logger::tui_enabled_from_env() && stdout().is_terminal();
-    utils::logger::init_logger(use_tui)?;
+    utils::logger::init_logger_for_strategies(
+        use_tui,
+        profile != RuntimeProfile::LateResolutionWinnerTradingDryRun,
+        profile != RuntimeProfile::BinaryComplementArbitrageDryRun,
+        profile == RuntimeProfile::Integrated,
+    )?;
 
     let shutdown = Arc::new(AtomicBool::new(false));
 
@@ -149,25 +169,27 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
         wallet_copy_trading_budget_usdc = config.wallet_copy_trading_budget_usdc,
         "Per-strategy capital budgets loaded"
     );
-    info!(
-        target: "polypulse::strategy::binary_complement_arbitrage",
-        %run_id,
-        mode = execution_mode,
-        state_file = %config.state_journal_file,
-        opportunity_file = ?config.arbitrage_log_file,
-        shadow_file = ?config.arbitrage_shadow_log_file,
-        max_book_age_ms = config.max_book_age_ms,
-        max_book_skew_ms = config.max_book_skew_ms,
-        signal_confirmation_ms = config.arbitrage_signal_confirmation_ms,
-        dynamic_fee_gate_paper = config.arbitrage_dynamic_fee_gate_paper,
-        fixed_gross_edge = config.arbitrage_execution_spread,
-        fee_buffer = config.arbitrage_fee_buffer,
-        max_order_size_usdc = config.max_order_size_usdc,
-        rest_shadow_delays_ms = ?config.arbitrage_rest_shadow_delays_ms,
-        rest_shadow_notionals_usdc = ?config.arbitrage_rest_shadow_notionals_usdc,
-        enabled = config.arbitrage_enabled,
-        "Binary Complement Arbitrage run started"
-    );
+    if profile != RuntimeProfile::LateResolutionWinnerTradingDryRun {
+        info!(
+            target: "polypulse::strategy::binary_complement_arbitrage",
+            %run_id,
+            mode = execution_mode,
+            state_file = %config.state_journal_file,
+            opportunity_file = ?config.arbitrage_log_file,
+            shadow_file = ?config.arbitrage_shadow_log_file,
+            max_book_age_ms = config.max_book_age_ms,
+            max_book_skew_ms = config.max_book_skew_ms,
+            signal_confirmation_ms = config.arbitrage_signal_confirmation_ms,
+            dynamic_fee_gate_paper = config.arbitrage_dynamic_fee_gate_paper,
+            fixed_gross_edge = config.arbitrage_execution_spread,
+            fee_buffer = config.arbitrage_fee_buffer,
+            max_order_size_usdc = config.max_order_size_usdc,
+            rest_shadow_delays_ms = ?config.arbitrage_rest_shadow_delays_ms,
+            rest_shadow_notionals_usdc = ?config.arbitrage_rest_shadow_notionals_usdc,
+            enabled = config.arbitrage_enabled,
+            "Binary Complement Arbitrage run started"
+        );
+    }
     if late_resolution_winner_trading_available {
         info!(
             target: "polypulse::strategy::late_resolution_winner_trading",
@@ -352,7 +374,13 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
         },
     ));
 
-    let _risk_manager = Arc::new(RiskManager::new(&config)?);
+    let _risk_manager = Arc::new(
+        if profile == RuntimeProfile::LateResolutionWinnerTradingDryRun {
+            RiskManager::new_isolated_paper(&config)?
+        } else {
+            RiskManager::new(&config)?
+        },
+    );
     let winner_position_tracker = Arc::new(PositionTracker::new(rust_decimal::Decimal::try_from(
         config.late_resolution_winner_trading_budget_usdc,
     )?));
@@ -987,14 +1015,18 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                             }
                             // Process orderbook update (book will be moved)
                             if let Some(pair) = monitor.handle_book_update(book) {
-                                let tick = match session_runner.process_pair(
+                                // Shared book ingestion and recovery stay active. Disabled Binary
+                                // must not evaluate, log candidates, or schedule REST research.
+                                let tick = match session_runner.process_pair_if_enabled(
+                                    strategy_controls.binary_complement_arbitrage_enabled(),
                                     &pair,
                                     Utc::now().timestamp_millis(),
                                     window_scope.trading_paused() || live_safety.is_tripped(),
                                     connection_supervisor.is_healthy(),
                                     _risk_manager.has_unresolved_state(),
                                 ) {
-                                    Ok(tick) => tick,
+                                    Ok(Some(tick)) => tick,
+                                    Ok(None) => continue,
                                     Err(error) => {
                                         debug!(target: "polypulse::strategy::binary_complement_arbitrage", %error, market_id = %pair.market_id, "Rejected unsafe orderbook pair");
                                         continue;
@@ -2940,7 +2972,9 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
         match serde_json::to_string(&runtime_metrics.snapshot()) {
             Ok(snapshot) => {
                 info!(metrics = %snapshot, "Runtime metrics snapshot");
-                info!(target: "polypulse::strategy::binary_complement_arbitrage", metrics = %snapshot, "Binary Complement Arbitrage metrics snapshot");
+                if profile != RuntimeProfile::LateResolutionWinnerTradingDryRun {
+                    info!(target: "polypulse::strategy::binary_complement_arbitrage", metrics = %snapshot, "Binary Complement Arbitrage metrics snapshot");
+                }
                 if late_resolution_winner_trading_available {
                     info!(target: "polypulse::strategy::late_resolution_winner_trading", metrics = %snapshot, "Late-Resolution Winner Trading metrics snapshot");
                 }

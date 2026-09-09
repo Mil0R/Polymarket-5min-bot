@@ -52,6 +52,18 @@ pub struct RiskManager {
 impl RiskManager {
     pub fn new(config: &BotConfig) -> Result<Self> {
         let journal = std::sync::Arc::new(StateJournal::open(&config.state_journal_file)?);
+        Self::with_journal(config, journal)
+    }
+
+    pub fn new_isolated_paper(config: &BotConfig) -> Result<Self> {
+        anyhow::ensure!(
+            config.dry_run,
+            "isolated in-memory risk state requires dry-run"
+        );
+        Self::with_journal(config, std::sync::Arc::new(StateJournal::in_memory()))
+    }
+
+    fn with_journal(config: &BotConfig, journal: std::sync::Arc<StateJournal>) -> Result<Self> {
         let unresolved = journal.unresolved()?;
         if !unresolved.is_empty() {
             warn!(
