@@ -413,6 +413,8 @@ pub async fn run(command: &str) -> Result<()> {
     let mut last_episode = HashMap::<String, Instant>::new();
     let mut last_log = Instant::now();
     let mut discovery_cycle = 0;
+    let mut next_discovery = Instant::now();
+    let mut discovery_failures = 0u32;
     let mut last_evidence: Option<Instant> = None;
     let mut evidence_cursor = 0;
     let work = async {
@@ -420,7 +422,7 @@ pub async fn run(command: &str) -> Result<()> {
             if c.duration_secs > 0 && started.elapsed().as_secs() >= c.duration_secs {
                 break;
             }
-            if !initialized || refresh.elapsed().as_secs() >= c.refresh_secs {
+            if Instant::now() >= next_discovery {
                 let offset = (discovery_cycle % c.discovery_windows) * client.config().event_pages;
                 match client.discover_conversion_routes_at(offset).await {
                     Ok((new, diagnostics)) => {
@@ -428,6 +430,8 @@ pub async fn run(command: &str) -> Result<()> {
                         discovery_cycle += 1;
                         initialized = true;
                         refresh = Instant::now();
+                        next_discovery = refresh + Duration::from_secs(c.refresh_secs);
+                        discovery_failures = 0;
                         journal.event(
                             json!({"event":"discovery","diagnostics":diagnostics,"routes":routes}),
                         )?;
@@ -437,17 +441,32 @@ pub async fn run(command: &str) -> Result<()> {
                         ))?;
                     }
                     Err(e) => {
+                        discovery_failures = discovery_failures.saturating_add(1);
+                        let retry_secs = discovery_retry_secs(discovery_failures);
+                        next_discovery = Instant::now() + Duration::from_secs(retry_secs);
                         journal.event(
-                            json!({"event":"error","phase":"discovery","message":e.to_string()}),
+                            json!({"event":"error","phase":"discovery","message":format!("{e:#}"),
+                                "retry_secs":retry_secs,"consecutive_failures":discovery_failures,
+                                "window_page":offset,"retained_routes":routes.len(),
+                                "route_age_secs":initialized.then(||refresh.elapsed().as_secs())}),
                         )?;
-                        journal.log(&format!("discovery failed: {e}"))?;
+                        journal.log(&format!(
+                            "discovery failed: {e:#}; retry in {retry_secs}s; retained_routes={}",
+                            routes.len()
+                        ))?;
                         if command == "scan" {
                             return Err(e);
                         }
-                        tokio::time::sleep(Duration::from_secs(c.poll_secs)).await;
-                        continue;
                     }
                 }
+            }
+            // Reuse discovery metadata for at most two refresh intervals. Every
+            // iteration still fetches current books and applies strict freshness gates.
+            if !initialized || refresh.elapsed().as_secs() >= c.refresh_secs.saturating_mul(2) {
+                journal.event(json!({"event":"sampling_unavailable","reason":"discovery_unavailable_or_expired",
+                    "interval_secs":c.poll_secs}))?;
+                tokio::time::sleep(Duration::from_secs(c.poll_secs)).await;
+                continue;
             }
             let books = client.fetch_conversion_books(&routes).await;
             let book_audit = client.conversion_book_audit();
@@ -874,8 +893,21 @@ fn merge_counts(destination: &mut BTreeMap<String, u64>, source: &Value) {
     }
 }
 
+fn discovery_retry_secs(failures: u32) -> u64 {
+    30u64
+        .saturating_mul(1u64 << failures.saturating_sub(1).min(4))
+        .min(300)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn discovery_retry_backs_off_and_caps() {
+        assert_eq!(
+            [1, 2, 3, 4, 5, 100].map(super::discovery_retry_secs),
+            [30, 60, 120, 240, 300, 300]
+        );
+    }
     use super::*;
     use rust_decimal::Decimal;
     #[test]

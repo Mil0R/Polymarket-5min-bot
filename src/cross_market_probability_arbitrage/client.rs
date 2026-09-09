@@ -14,6 +14,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::config::CrossMarketProbabilityArbitrageConfig;
+#[derive(Debug, Deserialize)]
+struct GammaEventPage {
+    events: Vec<GammaEvent>,
+    #[serde(default)]
+    next_cursor: Option<String>,
+}
+
 use super::model::{
     BookLevel, BookSnapshot, BookSource, FeePolicy, MarketRelationship, Outcome, RelationLeg,
     RelationshipKind,
@@ -539,34 +546,55 @@ impl CrossMarketProbabilityResearchClient {
     async fn fetch_events_at(&self, page_offset: usize) -> Result<Vec<GammaEvent>> {
         let mut all = Vec::new();
         let mut seen = HashSet::new();
-        for page in 0..self.config.event_pages {
-            let offset = (page_offset + page) * self.config.events_per_page;
-            let events: Vec<GammaEvent> = self
+        let mut cursor: Option<String> = None;
+        let mut cursors = HashSet::new();
+        // Walk cursors to the requested disjoint window; never synthesize an offset.
+        for page in 0..page_offset.saturating_add(self.config.event_pages) {
+            let mut request = self
                 .http
-                .get(format!("{}/events", self.config.gamma_url))
+                .get(format!("{}/events/keyset", self.config.gamma_url))
                 .query(&[
                     ("active", "true"),
                     ("closed", "false"),
                     ("limit", &self.config.events_per_page.to_string()),
-                    ("offset", &offset.to_string()),
-                ])
+                ]);
+            if let Some(cursor) = &cursor {
+                request = request.query(&[("after_cursor", cursor)]);
+            }
+            let response = request
                 .send()
                 .await
-                .context("Cross-market probability Gamma events request failed")?
-                .error_for_status()
-                .context("Cross-market probability Gamma events returned non-success")?
+                .with_context(|| format!("Gamma events/keyset request failed at page {page}"))?;
+            let status = response.status();
+            if !status.is_success() {
+                let retry_after = response
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("unspecified")
+                    .to_string();
+                let body = response.text().await.unwrap_or_default();
+                anyhow::bail!("Gamma events/keyset HTTP {status} at page {page}, window_page={page_offset}, retry-after={retry_after}: {}", body.chars().take(512).collect::<String>());
+            }
+            let batch: GammaEventPage = response
                 .json()
                 .await
-                .context("Cross-market probability Gamma events response is invalid")?;
-            let count = events.len();
-            for event in events {
-                if seen.insert(event.id.clone()) {
-                    all.push(event);
+                .with_context(|| format!("Gamma events/keyset invalid response at page {page}"))?;
+            if page >= page_offset {
+                for event in batch.events {
+                    if seen.insert(event.id.clone()) {
+                        all.push(event);
+                    }
                 }
             }
-            if count < self.config.events_per_page {
+            cursor = batch.next_cursor.filter(|s| !s.is_empty());
+            let Some(next) = &cursor else {
                 break;
-            }
+            };
+            anyhow::ensure!(
+                cursors.insert(next.clone()),
+                "Gamma repeated pagination cursor at page {page}"
+            );
         }
         Ok(all)
     }
@@ -1098,6 +1126,21 @@ fn value_i64(value: &Value) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keyset_envelope_requires_events_and_accepts_terminal_cursor() {
+        let page: GammaEventPage =
+            serde_json::from_value(serde_json::json!({"events":[],"next_cursor":"opaque"}))
+                .unwrap();
+        assert_eq!(page.next_cursor.as_deref(), Some("opaque"));
+        let last: GammaEventPage =
+            serde_json::from_value(serde_json::json!({"events":[],"next_cursor":null})).unwrap();
+        assert!(last.next_cursor.is_none());
+        assert!(serde_json::from_value::<GammaEventPage>(
+            serde_json::json!({"error":"bad request"})
+        )
+        .is_err());
+    }
 
     fn gamma_market(condition: &str, rank: i64, other: bool) -> GammaMarket {
         GammaMarket {
