@@ -9,7 +9,7 @@ use rust_decimal::prelude::ToPrimitive;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     fs::{self, File, OpenOptions},
     io::{BufRead, BufReader, Write},
     path::PathBuf,
@@ -24,6 +24,18 @@ pub struct Route {
     pub input: RelationLeg,
     pub outputs: Vec<RelationLeg>,
     pub protocol_verified: bool,
+    #[serde(default)]
+    pub event_title: String,
+    #[serde(default)]
+    pub market_count: usize,
+    #[serde(default)]
+    pub fee_enabled_legs: usize,
+    #[serde(default)]
+    pub neg_risk_other_markets: usize,
+    #[serde(default)]
+    pub earliest_deadline_at: Option<chrono::DateTime<Utc>>,
+    #[serde(default)]
+    pub latest_deadline_at: Option<chrono::DateTime<Utc>>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -50,6 +62,10 @@ pub struct Config {
     pub diagnostic_max_rest_ms: u64,
     pub evidence_interval_secs: u64,
     pub evidence_routes: usize,
+    pub focus_enabled: bool,
+    pub focus_net_profit_floor: f64,
+    pub focus_delay_ms: u64,
+    pub focus_routes: usize,
 }
 fn env<T: std::str::FromStr>(key: &str, default: &str) -> Result<T> {
     std::env::var(format!("NEG_RISK_CONVERSION_ARBITRAGE_{key}"))
@@ -85,6 +101,10 @@ impl Config {
             diagnostic_max_rest_ms: env("DIAGNOSTIC_MAX_REST_MS", "1000")?,
             evidence_interval_secs: env("EVIDENCE_INTERVAL_SECS", "60")?,
             evidence_routes: env("EVIDENCE_ROUTES", "5")?,
+            focus_enabled: env("FOCUS_ENABLED", "true")?,
+            focus_net_profit_floor: env("FOCUS_NET_PROFIT_FLOOR_USDC", "-0.10")?,
+            focus_delay_ms: env("FOCUS_DELAY_MS", "2000")?,
+            focus_routes: env("FOCUS_ROUTES", "5")?,
         };
         if c.poll_secs == 0
             || c.refresh_secs == 0
@@ -97,6 +117,8 @@ impl Config {
             || !(1..=5000).contains(&c.diagnostic_max_rest_ms)
             || c.evidence_interval_secs == 0
             || !(1..=20).contains(&c.evidence_routes)
+            || !(250..=30000).contains(&c.focus_delay_ms)
+            || !(1..=20).contains(&c.focus_routes)
             || ![
                 c.budget,
                 c.minimum_profit,
@@ -104,6 +126,7 @@ impl Config {
                 c.slippage_bps,
                 c.conversion_fee_bps,
                 c.chain_cost,
+                c.focus_net_profit_floor,
             ]
             .iter()
             .all(|v| v.is_finite())
@@ -127,6 +150,88 @@ struct Quote {
     output_shares: f64,
     exit_proceeds: f64,
     net_profit: f64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct RouteResearchPriority {
+    route_id: String,
+    event_slug: String,
+    required_legs: usize,
+    books_present: usize,
+    strict_fresh_legs: usize,
+    top_levels_present: usize,
+    minimum_top_depth_shares: Option<f64>,
+    raw_top_spread_per_share: Option<f64>,
+    fee_enabled_legs: usize,
+    score: f64,
+}
+
+fn route_research_priority(
+    route: &Route,
+    books: &HashMap<String, BookSnapshot>,
+    c: &Config,
+) -> RouteResearchPriority {
+    let now = Utc::now().timestamp_millis();
+    let legs = std::iter::once(&route.input)
+        .chain(route.outputs.iter())
+        .collect::<Vec<_>>();
+    let books_present = legs
+        .iter()
+        .filter(|leg| books.contains_key(&leg.token_id))
+        .count();
+    let strict_fresh_legs = legs
+        .iter()
+        .filter(|leg| fresh(books, leg, now, c).is_ok())
+        .count();
+    let input_top = books.get(&route.input.token_id).and_then(|book| {
+        book.asks
+            .iter()
+            .filter_map(|level| Some((level.price.to_f64()?, level.size.to_f64()?)))
+            .filter(|(price, size)| (0.0..1.0).contains(price) && *size > 0.)
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+    });
+    let output_tops = route
+        .outputs
+        .iter()
+        .filter_map(|leg| {
+            books
+                .get(&leg.token_id)?
+                .bids
+                .iter()
+                .filter_map(|level| Some((level.price.to_f64()?, level.size.to_f64()?)))
+                .filter(|(price, size)| (0.0..1.0).contains(price) && *size > 0.)
+                .max_by(|a, b| a.0.total_cmp(&b.0))
+        })
+        .collect::<Vec<_>>();
+    let top_levels_present = usize::from(input_top.is_some()) + output_tops.len();
+    let complete_tops = input_top.is_some() && output_tops.len() == route.outputs.len();
+    let minimum_top_depth_shares = complete_tops.then(|| {
+        std::iter::once(input_top.unwrap().1)
+            .chain(output_tops.iter().map(|(_, size)| *size))
+            .fold(f64::INFINITY, f64::min)
+            * c.haircut
+    });
+    let raw_top_spread_per_share = complete_tops
+        .then(|| output_tops.iter().map(|(price, _)| *price).sum::<f64>() - input_top.unwrap().0);
+    let required_legs = legs.len();
+    let score = (books_present == required_legs) as u8 as f64 * 1_000_000.
+        + strict_fresh_legs as f64 * 10_000.
+        + complete_tops as u8 as f64 * 1_000.
+        + minimum_top_depth_shares.unwrap_or(0.).min(1_000.)
+        + raw_top_spread_per_share.unwrap_or(-1.) * 100.
+        - route.fee_enabled_legs as f64;
+    RouteResearchPriority {
+        route_id: route.id.clone(),
+        event_slug: route.slug.clone(),
+        required_legs,
+        books_present,
+        strict_fresh_legs,
+        top_levels_present,
+        minimum_top_depth_shares,
+        raw_top_spread_per_share,
+        fee_enabled_legs: route.fee_enabled_legs,
+        score,
+    }
 }
 
 fn fee(policy: &FeePolicy, p: f64, q: f64) -> Option<f64> {
@@ -340,6 +445,113 @@ fn raw_spread(
     }
     Some(proceeds - cost)
 }
+
+fn sensitivity_quote(
+    route: &Route,
+    books: &HashMap<String, BookSnapshot>,
+    shares: f64,
+    c: &Config,
+    diagnostic: bool,
+    fees: bool,
+    slippage_bps: f64,
+    conversion_fee_bps: f64,
+    chain_cost: f64,
+) -> Option<Quote> {
+    let mut route = route.clone();
+    if !fees {
+        route.input.fee.enabled = false;
+        for output in &mut route.outputs {
+            output.fee.enabled = false;
+        }
+    }
+    let mut scenario = c.clone();
+    scenario.slippage_bps = slippage_bps;
+    scenario.conversion_fee_bps = conversion_fee_bps;
+    scenario.chain_cost = chain_cost;
+    let result = if diagnostic {
+        evaluate_diagnostic(&route, books, shares, &scenario, None)
+    } else {
+        evaluate(&route, books, shares, &scenario, None)
+    };
+    result.ok()
+}
+
+/// Attribute the observed spread loss in a fixed order. Components are
+/// incremental scenario differences, so they sum back to configured PnL.
+fn cost_sensitivity(
+    route: &Route,
+    books: &HashMap<String, BookSnapshot>,
+    shares: f64,
+    c: &Config,
+    diagnostic: bool,
+) -> Value {
+    let no_cost = sensitivity_quote(route, books, shares, c, diagnostic, false, 0., 0., 0.);
+    let fees_only = sensitivity_quote(route, books, shares, c, diagnostic, true, 0., 0., 0.);
+    let fees_slippage = sensitivity_quote(
+        route,
+        books,
+        shares,
+        c,
+        diagnostic,
+        true,
+        c.slippage_bps,
+        0.,
+        0.,
+    );
+    let zero_chain = sensitivity_quote(
+        route,
+        books,
+        shares,
+        c,
+        diagnostic,
+        true,
+        c.slippage_bps,
+        c.conversion_fee_bps,
+        0.,
+    );
+    let configured = sensitivity_quote(
+        route,
+        books,
+        shares,
+        c,
+        diagnostic,
+        true,
+        c.slippage_bps,
+        c.conversion_fee_bps,
+        c.chain_cost,
+    );
+    let double_slippage = sensitivity_quote(
+        route,
+        books,
+        shares,
+        c,
+        diagnostic,
+        true,
+        c.slippage_bps * 2.,
+        c.conversion_fee_bps,
+        c.chain_cost,
+    );
+    let pnl = |quote: &Option<Quote>| quote.as_ref().map(|value| value.net_profit);
+    json!({
+        "shares": shares,
+        "scenario_net_pnl_usdc": {
+            "no_fees_slippage_conversion_or_chain": pnl(&no_cost),
+            "fees_only": pnl(&fees_only),
+            "fees_and_slippage": pnl(&fees_slippage),
+            "configured_without_chain": pnl(&zero_chain),
+            "configured": pnl(&configured),
+            "double_slippage": pnl(&double_slippage)
+        },
+        "incremental_cost_usdc": {
+            "market_fees": pnl(&no_cost).zip(pnl(&fees_only)).map(|(a,b)|a-b),
+            "slippage": pnl(&fees_only).zip(pnl(&fees_slippage)).map(|(a,b)|a-b),
+            "conversion_fee": pnl(&fees_slippage).zip(pnl(&zero_chain)).map(|(a,b)|a-b),
+            "chain": pnl(&zero_chain).zip(pnl(&configured)).map(|(a,b)|a-b),
+            "extra_slippage_stress": pnl(&configured).zip(pnl(&double_slippage)).map(|(a,b)|a-b)
+        },
+        "assumptions": {"slippage_bps":c.slippage_bps,"conversion_fee_bps":c.conversion_fee_bps,"chain_cost_usdc":c.chain_cost}
+    })
+}
 struct Journal {
     file: File,
     log: File,
@@ -370,7 +582,7 @@ impl Journal {
     }
     fn log(&mut self, message: &str) -> Result<()> {
         let line = format!("{} {message}", Utc::now());
-        println!("{line}");
+        tracing::info!(target: "polypulse::strategy::neg_risk_conversion_arbitrage", "{message}");
         writeln!(self.log, "{line}")?;
         self.log.flush()?;
         Ok(())
@@ -404,6 +616,7 @@ pub async fn run(command: &str) -> Result<()> {
     let client = CrossMarketProbabilityResearchClient::new(base)?;
     let mut journal = Journal::open(&c)?;
     journal.event(json!({"event":"run_started","config":c,"mode":"read_only_shadow","protocol_verified":false,"stage":"economics_only",
+        "build":{"package_version":env!("CARGO_PKG_VERSION"),"git_commit":option_env!("POLYPULSE_GIT_COMMIT"),"research_schema_version":2},
         "discovery_parameters":{"event_pages":client.config().event_pages,"events_per_page":client.config().events_per_page,
             "max_routes":client.config().max_relationships,"max_outcomes":client.config().max_partition_legs,"request_concurrency":client.config().request_concurrency}}))?;
     let started = Instant::now();
@@ -415,6 +628,8 @@ pub async fn run(command: &str) -> Result<()> {
     let mut discovery_cycle = 0;
     let mut next_discovery = Instant::now();
     let mut discovery_failures = 0u32;
+    let mut route_cursors = HashMap::<usize, usize>::new();
+    let mut discovery_routes_seen = HashSet::<String>::new();
     let mut last_evidence: Option<Instant> = None;
     let mut evidence_cursor = 0;
     let work = async {
@@ -424,8 +639,33 @@ pub async fn run(command: &str) -> Result<()> {
             }
             if Instant::now() >= next_discovery {
                 let offset = (discovery_cycle % c.discovery_windows) * client.config().event_pages;
-                match client.discover_conversion_routes_at(offset).await {
-                    Ok((new, diagnostics)) => {
+                let route_offset = route_cursors.get(&offset).copied().unwrap_or(0);
+                match client
+                    .discover_conversion_routes_at_with_route_offset(offset, route_offset)
+                    .await
+                {
+                    Ok((new, mut diagnostics)) => {
+                        let routes_before = diagnostics
+                            .get("routes_before_limit")
+                            .copied()
+                            .unwrap_or(new.len());
+                        let emitted = new.len();
+                        let next_route_offset = if routes_before > emitted && routes_before > 0 {
+                            (route_offset + emitted) % routes_before
+                        } else {
+                            0
+                        };
+                        route_cursors.insert(offset, next_route_offset);
+                        let newly_seen = new
+                            .iter()
+                            .filter(|route| discovery_routes_seen.insert(route.id.clone()))
+                            .count();
+                        diagnostics.insert("routes_new_to_run".into(), newly_seen);
+                        diagnostics.insert(
+                            "routes_unique_seen_in_run".into(),
+                            discovery_routes_seen.len(),
+                        );
+                        diagnostics.insert("next_route_selection_offset".into(), next_route_offset);
                         routes = new;
                         discovery_cycle += 1;
                         initialized = true;
@@ -433,7 +673,8 @@ pub async fn run(command: &str) -> Result<()> {
                         next_discovery = refresh + Duration::from_secs(c.refresh_secs);
                         discovery_failures = 0;
                         journal.event(
-                            json!({"event":"discovery","diagnostics":diagnostics,"routes":routes}),
+                            json!({"event":"discovery","diagnostics":diagnostics,"routes":routes,
+                                "selection_policy":"rotating_within_page_window","page_offset":offset}),
                         )?;
                         journal.log(&format!(
                             "discovered {} conversion routes; protocol mapping remains unverified",
@@ -470,11 +711,35 @@ pub async fn run(command: &str) -> Result<()> {
             }
             let books = client.fetch_conversion_books(&routes).await;
             let book_audit = client.conversion_book_audit();
+            let mut route_ranking = routes
+                .iter()
+                .map(|route| (route_research_priority(route, &books, &c), route))
+                .collect::<Vec<_>>();
+            route_ranking.sort_by(|(a, _), (b, _)| b.score.total_cmp(&a.score));
             if last_evidence.is_none_or(|t| t.elapsed().as_secs() >= c.evidence_interval_secs) {
-                let sampled = (0..c.evidence_routes.min(routes.len()))
-                    .map(|i| &routes[(evidence_cursor + i) % routes.len()])
+                let target = c.evidence_routes.min(routes.len());
+                let priority_count = target.div_ceil(2);
+                let mut sampled = route_ranking
+                    .iter()
+                    .take(priority_count)
+                    .map(|(_, route)| *route)
                     .collect::<Vec<_>>();
-                journal.event(json!({"event":"book_evidence","sampled_routes":sampled.iter().map(|r|evidence(r,&books,&book_audit,&c)).collect::<Vec<_>>(),"truncated_levels":5}))?;
+                let mut sampled_ids = sampled
+                    .iter()
+                    .map(|route| route.id.clone())
+                    .collect::<HashSet<_>>();
+                for i in 0..routes.len() {
+                    if sampled.len() >= target {
+                        break;
+                    }
+                    let route = &routes[(evidence_cursor + i) % routes.len()];
+                    if sampled_ids.insert(route.id.clone()) {
+                        sampled.push(route);
+                    }
+                }
+                journal.event(json!({"event":"book_evidence","selection_policy":"half_priority_half_rotation",
+                    "route_ranking":route_ranking.iter().take(10).map(|(priority,_)|priority).collect::<Vec<_>>(),
+                    "sampled_routes":sampled.iter().map(|r|evidence(r,&books,&book_audit,&c)).collect::<Vec<_>>(),"truncated_levels":5}))?;
                 evidence_cursor = evidence_cursor.wrapping_add(c.evidence_routes);
                 last_evidence = Some(Instant::now());
             }
@@ -485,6 +750,7 @@ pub async fn run(command: &str) -> Result<()> {
             let mut candidates = Vec::new();
             let mut closest: Option<(&Route, Quote)> = None;
             let mut diagnostic_closest: Option<(&Route, Quote)> = None;
+            let mut focused_routes = Vec::<(Route, Quote)>::new();
             for route in &routes {
                 for leg in std::iter::once(&route.input).chain(route.outputs.iter()) {
                     if let Err(error) = fresh(&books, leg, Utc::now().timestamp_millis(), &c) {
@@ -493,6 +759,7 @@ pub async fn run(command: &str) -> Result<()> {
                 }
                 let mut best: Option<Quote> = None;
                 let mut diagnostic_best: Option<Quote> = None;
+                let mut route_diagnostic_closest: Option<Quote> = None;
                 for &q in &c.sizes {
                     match evaluate(route, &books, q, &c, None) {
                         Ok(quote) if quote.net_profit >= c.minimum_profit => {
@@ -545,6 +812,12 @@ pub async fn run(command: &str) -> Result<()> {
                                 {
                                     diagnostic_closest = Some((route, quote.clone()));
                                 }
+                                if route_diagnostic_closest
+                                    .as_ref()
+                                    .is_none_or(|v| quote.net_profit > v.net_profit)
+                                {
+                                    route_diagnostic_closest = Some(quote.clone());
+                                }
                                 if quote.net_profit >= c.minimum_profit
                                     && diagnostic_best
                                         .as_ref()
@@ -563,6 +836,13 @@ pub async fn run(command: &str) -> Result<()> {
                         }
                     }
                 }
+                if c.focus_enabled {
+                    if let Some(quote) = route_diagnostic_closest
+                        .filter(|q| q.net_profit >= c.focus_net_profit_floor)
+                    {
+                        focused_routes.push((route.clone(), quote));
+                    }
+                }
                 if let Some(quote) = diagnostic_best {
                     let key = format!("diagnostic:{}", route.id);
                     if last_episode
@@ -573,6 +853,7 @@ pub async fn run(command: &str) -> Result<()> {
                         let id = uuid::Uuid::new_v4().to_string();
                         journal.event(json!({"event":"diagnostic_candidate","episode_id":id,"route":route,"quote":quote,
                             "raw_spread_before_trading_costs":raw_spread(route,&books,quote.shares,&c),"evidence":evidence(route,&books,&book_audit,&c),
+                            "cost_sensitivity":cost_sensitivity(route,&books,quote.shares,&c,true),
                             "books":std::iter::once(&route.input).chain(route.outputs.iter()).filter_map(|l|books.get(&l.token_id)).collect::<Vec<_>>(),"execution_verified":false}))?;
                         candidates.push((id, route.clone(), quote, true));
                     }
@@ -588,6 +869,7 @@ pub async fn run(command: &str) -> Result<()> {
                     let id = uuid::Uuid::new_v4().to_string();
                     journal.event(json!({"event":"candidate","episode_id":id,"route":route,"quote":quote,
                         "raw_spread_before_trading_costs":raw_spread(route,&books,quote.shares,&c),"evidence":evidence(route,&books,&book_audit,&c),
+                        "cost_sensitivity":cost_sensitivity(route,&books,quote.shares,&c,false),
                         "books":std::iter::once(&route.input).chain(route.outputs.iter()).filter_map(|l|books.get(&l.token_id)).collect::<Vec<_>>()}))?;
                     candidates.push((id, route.clone(), quote, false));
                 }
@@ -598,10 +880,56 @@ pub async fn run(command: &str) -> Result<()> {
                 .filter_map(|b| b.exchange_timestamp_ms.map(|t| now_ms - t))
                 .collect::<Vec<_>>();
             journal.event(json!({"event":"scan_summary","routes":routes.len(),"books":books.len(),"candidates":candidates.iter().filter(|(_,_,_,d)|!*d).count(),"size_rejections":rejects,
+                "route_research_ranking":route_ranking.iter().take(10).map(|(priority,_)|priority).collect::<Vec<_>>(),
                 "by_event":by_event,"overlapping_leg_time_failures":leg_time_failures,"diagnostic_rejections":diagnostic_rejects,"diagnostic_candidates":candidates.iter().filter(|(_,_,_,d)|*d).count(),
-                "diagnostic_best":diagnostic_closest.map(|(r,q)|json!({"route_id":r.id,"event_slug":r.slug,"raw_spread_before_trading_costs":raw_spread(r,&books,q.shares,&c),"quote":q})),
-                "best_non_candidate":closest.map(|(r,q)|json!({"route_id":r.id,"event_slug":r.slug,"raw_spread_before_trading_costs":raw_spread(r,&books,q.shares,&c),"quote":q})),
+                "diagnostic_best":diagnostic_closest.map(|(r,q)|json!({"route_id":r.id,"event_slug":r.slug,"route_metadata":{"event_title":r.event_title,"market_count":r.market_count,"fee_enabled_legs":r.fee_enabled_legs,"neg_risk_other_markets":r.neg_risk_other_markets,"earliest_deadline_at":r.earliest_deadline_at,"latest_deadline_at":r.latest_deadline_at},"raw_spread_before_trading_costs":raw_spread(r,&books,q.shares,&c),"cost_sensitivity":cost_sensitivity(r,&books,q.shares,&c,true),"quote":q})),
+                "best_non_candidate":closest.map(|(r,q)|json!({"route_id":r.id,"event_slug":r.slug,"route_metadata":{"event_title":r.event_title,"market_count":r.market_count,"fee_enabled_legs":r.fee_enabled_legs,"neg_risk_other_markets":r.neg_risk_other_markets,"earliest_deadline_at":r.earliest_deadline_at,"latest_deadline_at":r.latest_deadline_at},"raw_spread_before_trading_costs":raw_spread(r,&books,q.shares,&c),"cost_sensitivity":cost_sensitivity(r,&books,q.shares,&c,false),"quote":q})),
                 "book_health":{"minimum_exchange_age_ms":exchange_ages.iter().min(),"maximum_exchange_age_ms":exchange_ages.iter().max(),"missing_exchange_timestamp":books.len()-exchange_ages.len(),"max_rest_latency_ms":books.values().filter_map(|b|b.request_latency_ms).max()}}))?;
+            focused_routes.sort_by(|a, b| {
+                b.1.net_profit
+                    .total_cmp(&a.1.net_profit)
+                    .then_with(|| a.0.id.cmp(&b.0.id))
+            });
+            focused_routes.truncate(c.focus_routes);
+            if !focused_routes.is_empty() && candidates.is_empty() && command != "scan" {
+                tokio::time::sleep(Duration::from_millis(c.focus_delay_ms)).await;
+                let selected = focused_routes
+                    .iter()
+                    .map(|(route, _)| route.clone())
+                    .collect::<Vec<_>>();
+                let focused_books = client.fetch_conversion_books(&selected).await;
+                let focused_audit = client.conversion_book_audit();
+                let mut observations = Vec::new();
+                for (route, initial) in &focused_routes {
+                    let repeated =
+                        evaluate_diagnostic(route, &focused_books, initial.shares, &c, None);
+                    observations.push(match repeated {
+                        Ok(quote) => json!({
+                            "route_id": route.id,
+                            "event_slug": route.slug,
+                            "initial_quote": initial,
+                            "repeated_quote": quote,
+                            "became_profitable": quote.net_profit >= c.minimum_profit,
+                            "cost_sensitivity": cost_sensitivity(route, &focused_books, quote.shares, &c, true),
+                            "evidence": evidence(route, &focused_books, &focused_audit, &c),
+                        }),
+                        Err(error) => json!({
+                            "route_id": route.id,
+                            "event_slug": route.slug,
+                            "initial_quote": initial,
+                            "repeat_error": error.to_string(),
+                            "evidence": evidence(route, &focused_books, &focused_audit, &c),
+                        }),
+                    });
+                }
+                journal.event(json!({
+                    "event":"focused_observation",
+                    "selection":"diagnostic_net_profit_floor",
+                    "net_profit_floor_usdc":c.focus_net_profit_floor,
+                    "requested_delay_ms":c.focus_delay_ms,
+                    "routes":observations,
+                }))?;
+            }
             if last_log.elapsed().as_secs() >= 60 || !candidates.is_empty() || command == "scan" {
                 journal.log(&format!(
                     "routes={} books={} strict_candidates={} diagnostic_candidates={} elapsed_secs={}",
@@ -673,11 +1001,79 @@ pub async fn run(command: &str) -> Result<()> {
 }
 
 fn report(c: &Config) -> Result<()> {
+    let path = c.root.join("events.ndjson");
+    let mut all_events = Vec::<Value>::new();
+    let mut malformed = 0usize;
+    let mut directory_event_counts = BTreeMap::<String, usize>::new();
+    let mut run_event_counts = BTreeMap::<String, BTreeMap<String, usize>>::new();
+    let mut run_first = BTreeMap::<String, chrono::DateTime<Utc>>::new();
+    let mut run_last = BTreeMap::<String, chrono::DateTime<Utc>>::new();
+    let mut selected: Option<(chrono::DateTime<Utc>, String)> = None;
+    for line in BufReader::new(File::open(&path)?).lines() {
+        let line = line?;
+        let event: Value = match serde_json::from_str(&line) {
+            Ok(value) => value,
+            Err(_) => {
+                malformed += 1;
+                continue;
+            }
+        };
+        let kind = event["event"].as_str().unwrap_or("unknown");
+        let run_id = event["run_id"].as_str().unwrap_or("legacy").to_string();
+        *directory_event_counts.entry(kind.into()).or_default() += 1;
+        *run_event_counts
+            .entry(run_id.clone())
+            .or_default()
+            .entry(kind.into())
+            .or_default() += 1;
+        if let Some(time) = event["recorded_at"]
+            .as_str()
+            .and_then(|value| value.parse::<chrono::DateTime<Utc>>().ok())
+        {
+            run_first
+                .entry(run_id.clone())
+                .and_modify(|current| *current = (*current).min(time))
+                .or_insert(time);
+            run_last
+                .entry(run_id.clone())
+                .and_modify(|current| *current = (*current).max(time))
+                .or_insert(time);
+            if kind == "run_started" && selected.as_ref().is_none_or(|(current, _)| time > *current)
+            {
+                selected = Some((time, run_id.clone()));
+            }
+        }
+        all_events.push(event);
+    }
+    let selected_run_id = selected
+        .map(|(_, run_id)| run_id)
+        .or_else(|| {
+            all_events
+                .last()
+                .and_then(|event| event["run_id"].as_str())
+                .map(str::to_string)
+        })
+        .context("event journal has no run_id")?;
+    let run_summaries = run_event_counts
+        .iter()
+        .map(|(run_id, counts)| {
+            (
+                run_id.clone(),
+                json!({"first_recorded_at":run_first.get(run_id),"last_recorded_at":run_last.get(run_id),
+                    "event_counts":counts,"selected":run_id==&selected_run_id}),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     let mut episodes = HashMap::<String, (String, Vec<f64>, usize)>::new();
     let mut diagnostic_episodes = HashMap::<String, (String, Vec<f64>, usize)>::new();
     let mut unique_events = BTreeMap::<String, String>::new();
     let mut unique_routes = std::collections::BTreeSet::new();
     let mut discovery_totals = BTreeMap::<String, u64>::new();
+    let mut discovery_peaks = BTreeMap::<String, u64>::new();
+    let mut page_discovery_scans = BTreeMap::<usize, u64>::new();
+    let mut page_max_routes = BTreeMap::<usize, u64>::new();
+    let mut page_truncated_scans = BTreeMap::<usize, u64>::new();
+    let mut page_unique_routes = BTreeMap::<usize, HashSet<String>>::new();
     let mut diagnostic_rejections = BTreeMap::<String, u64>::new();
     let mut by_event = BTreeMap::<String, BTreeMap<String, u64>>::new();
     let mut leg_failures = BTreeMap::<String, u64>::new();
@@ -689,20 +1085,20 @@ fn report(c: &Config) -> Result<()> {
     let mut initial_hashes = HashMap::<String, BTreeMap<String, String>>::new();
     let mut repeat_hash_checks = BTreeMap::<String, u64>::new();
     let mut counts = BTreeMap::<String, usize>::new();
-    let mut malformed = 0;
     let mut first: Option<chrono::DateTime<Utc>> = None;
     let mut last: Option<chrono::DateTime<Utc>> = None;
     let mut scan_rejections = BTreeMap::<String, u64>::new();
     let mut best_non_candidate: Option<Value> = None;
-    for line in BufReader::new(File::open(c.root.join("events.ndjson"))?).lines() {
-        let line = line?;
-        let e: Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(_) => {
-                malformed += 1;
-                continue;
-            }
-        };
+    let mut latest_route_research_ranking = Value::Null;
+    let mut focused_route_observations = 0u64;
+    let mut focused_became_profitable = 0u64;
+    let mut focused_best_initial = f64::NEG_INFINITY;
+    let mut focused_best_repeated = f64::NEG_INFINITY;
+    for e in all_events.iter().filter(|event| {
+        event["run_id"]
+            .as_str()
+            .is_some_and(|run_id| run_id == selected_run_id)
+    }) {
         let kind = e["event"].as_str().unwrap_or("unknown");
         if kind == "diagnostic_candidate" {
             let hashes = e["evidence"]["legs"]
@@ -738,6 +1134,17 @@ fn report(c: &Config) -> Result<()> {
             }
         }
         if kind == "discovery" {
+            let page_offset = e["diagnostics"]["page_offset"].as_u64().unwrap_or(0) as usize;
+            *page_discovery_scans.entry(page_offset).or_default() += 1;
+            let routes_before = e["diagnostics"]["routes_before_limit"]
+                .as_u64()
+                .unwrap_or(0);
+            page_max_routes
+                .entry(page_offset)
+                .and_modify(|current| *current = (*current).max(routes_before))
+                .or_insert(routes_before);
+            *page_truncated_scans.entry(page_offset).or_default() +=
+                u64::from(e["diagnostics"]["routes_truncated"].as_u64().unwrap_or(0) > 0);
             if let Some(routes) = e["routes"].as_array() {
                 for r in routes {
                     if let (Some(id), Some(slug), Some(route_id)) =
@@ -745,6 +1152,24 @@ fn report(c: &Config) -> Result<()> {
                     {
                         unique_events.insert(id.into(), slug.into());
                         unique_routes.insert(route_id.to_string());
+                        page_unique_routes
+                            .entry(page_offset)
+                            .or_default()
+                            .insert(route_id.to_string());
+                    }
+                }
+            }
+            if let Some(values) = e["diagnostics"].as_object() {
+                for key in [
+                    "routes_before_limit",
+                    "routes_truncated",
+                    "routes_unique_seen_in_run",
+                ] {
+                    if let Some(value) = values.get(key).and_then(Value::as_u64) {
+                        discovery_peaks
+                            .entry(key.into())
+                            .and_modify(|current| *current = (*current).max(value))
+                            .or_insert(value);
                     }
                 }
             }
@@ -758,6 +1183,9 @@ fn report(c: &Config) -> Result<()> {
             last = Some(last.map_or(t, |v| v.max(t)));
         }
         if kind == "scan_summary" {
+            if e["route_research_ranking"].is_array() {
+                latest_route_research_ranking = e["route_research_ranking"].clone();
+            }
             estimated_evaluations += e["routes"].as_u64().unwrap_or(0) * c.sizes.len() as u64;
             priced_scans += u64::from(
                 e["best_non_candidate"].is_object() || e["candidates"].as_u64().unwrap_or(0) > 0,
@@ -799,6 +1227,19 @@ fn report(c: &Config) -> Result<()> {
             if let Some(r) = e["size_rejections"].as_object() {
                 for (k, v) in r {
                     *scan_rejections.entry(k.clone()).or_default() += v.as_u64().unwrap_or(0);
+                }
+            }
+        }
+        if kind == "focused_observation" {
+            for observation in e["routes"].as_array().into_iter().flatten() {
+                focused_route_observations += 1;
+                focused_became_profitable +=
+                    u64::from(observation["became_profitable"].as_bool().unwrap_or(false));
+                if let Some(value) = observation["initial_quote"]["net_profit"].as_f64() {
+                    focused_best_initial = focused_best_initial.max(value);
+                }
+                if let Some(value) = observation["repeated_quote"]["net_profit"].as_f64() {
+                    focused_best_repeated = focused_best_repeated.max(value);
                 }
             }
         }
@@ -862,11 +1303,31 @@ fn report(c: &Config) -> Result<()> {
         .map(|(id, _, _)| id)
         .collect::<std::collections::HashSet<_>>()
         .len();
+    let page_coverage = page_discovery_scans
+        .iter()
+        .map(|(offset, scans)| {
+            (
+                offset.to_string(),
+                json!({"discovery_scans":scans,"maximum_routes_before_limit":page_max_routes.get(offset),
+                    "unique_routes_emitted":page_unique_routes.get(offset).map(HashSet::len).unwrap_or(0),
+                    "scans_with_truncation":page_truncated_scans.get(offset).copied().unwrap_or(0)}),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     let report = json!({"generated_at":Utc::now(),"mode":"economics_only","protocol_verified":false,"live_ready":false,
+        "selected_run_id":selected_run_id,"run_summaries":run_summaries,
+        "directory_event_counts":directory_event_counts,"directory_malformed_lines":malformed,
         "coverage":{"unique_events":unique_events.len(),"unique_routes":unique_routes.len(),"events":unique_events,
             "scans_with_strict_priced_route":priced_scans,"estimated_size_evaluations":estimated_evaluations,
             "strict_priced_evaluations":scan_rejections.get("below_net_profit").copied().unwrap_or(0)+strict_profitable_evaluations},
-        "discovery_totals_repeated_observations":discovery_totals,"by_event_size_checks":by_event,"overlapping_leg_time_failures":leg_failures,
+        "discovery_totals_repeated_observations":discovery_totals,"discovery_peaks":discovery_peaks,
+        "discovery_page_coverage":page_coverage,"latest_route_research_ranking":latest_route_research_ranking,
+        "focused_observations":{"events":counts.get("focused_observation").copied().unwrap_or(0),
+            "route_observations":focused_route_observations,"became_profitable":focused_became_profitable,
+            "best_initial_net_profit":focused_best_initial.is_finite().then_some(focused_best_initial),
+            "best_repeated_net_profit":focused_best_repeated.is_finite().then_some(focused_best_repeated),
+            "counts_toward_promotion":false},
+        "by_event_size_checks":by_event,"overlapping_leg_time_failures":leg_failures,
         "book_health_per_scan_distribution":health_summary,
         "diagnostic_only":{"episodes":diagnostic_episodes.len(),"completed_episodes":diagnostic_complete.len(),"pending_episodes":diagnostic_episodes.len()-diagnostic_complete.len(),
             "all_delay_positive_episodes":diagnostic_robust,"best_observed_quote":diagnostic_best,"size_rejections":diagnostic_rejections,
@@ -935,6 +1396,10 @@ mod tests {
             diagnostic_max_rest_ms: 1000,
             evidence_interval_secs: 60,
             evidence_routes: 5,
+            focus_enabled: true,
+            focus_net_profit_floor: -0.10,
+            focus_delay_ms: 2000,
+            focus_routes: 5,
         };
         let leg = |token: &str| RelationLeg {
             condition_id: token.into(),
@@ -954,6 +1419,12 @@ mod tests {
             input: leg("a"),
             outputs: vec![leg("b"), leg("c")],
             protocol_verified: false,
+            event_title: "event".into(),
+            market_count: 3,
+            fee_enabled_legs: 0,
+            neg_risk_other_markets: 0,
+            earliest_deadline_at: None,
+            latest_deadline_at: None,
         };
         let mut books = HashMap::new();
         for (token, p) in [("a", 57), ("b", 34), ("c", 26)] {
@@ -975,6 +1446,33 @@ mod tests {
             );
         }
         assert!((evaluate(&route, &books, 10., &c, None).unwrap().net_profit - 0.3).abs() < 1e-8);
+        let mut with_chain = c.clone();
+        with_chain.chain_cost = 0.02;
+        let sensitivity = cost_sensitivity(&route, &books, 10., &with_chain, false);
+        assert!(
+            (sensitivity["scenario_net_pnl_usdc"]["no_fees_slippage_conversion_or_chain"]
+                .as_f64()
+                .unwrap()
+                - 0.3)
+                .abs()
+                < 1e-8
+        );
+        assert!(
+            (sensitivity["scenario_net_pnl_usdc"]["configured"]
+                .as_f64()
+                .unwrap()
+                - 0.28)
+                .abs()
+                < 1e-8
+        );
+        assert!(
+            (sensitivity["incremental_cost_usdc"]["chain"]
+                .as_f64()
+                .unwrap()
+                - 0.02)
+                .abs()
+                < 1e-8
+        );
         let mut charged = c.clone();
         charged.conversion_fee_bps = 100.;
         assert!(
@@ -1062,6 +1560,39 @@ mod tests {
         std::fs::remove_file(c.root.join("events.ndjson")).unwrap();
         std::fs::remove_file(c.root.join("runtime.log")).unwrap();
         std::fs::remove_file(c.root.join("report.json")).unwrap();
+        std::fs::remove_dir(c.root).unwrap();
+    }
+
+    #[test]
+    fn report_selects_latest_run_and_preserves_directory_counts() {
+        let mut c = Config::load().unwrap();
+        c.root = std::env::temp_dir().join(format!("conversion-runs-{}", uuid::Uuid::new_v4()));
+        let mut first = Journal::open(&c).unwrap();
+        first.event(json!({"event":"run_started"})).unwrap();
+        first
+            .event(json!({"event":"error","phase":"old_run"}))
+            .unwrap();
+        let old_id = first.run_id.clone();
+        drop(first);
+        let mut latest = Journal::open(&c).unwrap();
+        latest.event(json!({"event":"run_started"})).unwrap();
+        latest
+            .event(json!({"event":"scan_summary","routes":0,"candidates":0}))
+            .unwrap();
+        let latest_id = latest.run_id.clone();
+        drop(latest);
+        report(&c).unwrap();
+        let result: Value =
+            serde_json::from_reader(File::open(c.root.join("report.json")).unwrap()).unwrap();
+        assert_ne!(old_id, latest_id);
+        assert_eq!(result["selected_run_id"], latest_id);
+        assert_eq!(result["event_counts"]["error"], Value::Null);
+        assert_eq!(result["directory_event_counts"]["error"], 1);
+        assert_eq!(result["run_summaries"][old_id]["selected"], false);
+        assert_eq!(result["run_summaries"][latest_id]["selected"], true);
+        for name in ["events.ndjson", "runtime.log", "report.json"] {
+            std::fs::remove_file(c.root.join(name)).unwrap();
+        }
         std::fs::remove_dir(c.root).unwrap();
     }
 }

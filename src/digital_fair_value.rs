@@ -496,7 +496,7 @@ impl DryRunConfig {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct LiveRestBook {
     #[serde(default)]
     asset_id: Option<String>,
@@ -505,15 +505,138 @@ struct LiveRestBook {
     #[serde(default)]
     timestamp: Option<Value>,
     #[serde(default)]
+    hash: Option<String>,
+    #[serde(default)]
     bids: Vec<LiveRestLevel>,
     #[serde(default)]
     asks: Vec<LiveRestLevel>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct LiveRestLevel {
     price: String,
     size: String,
+}
+
+const LIVE_EXECUTION_VERSION: u64 = 5;
+
+fn exchange_timestamp(value: Option<&Value>) -> Option<i64> {
+    let value = value?;
+    value
+        .as_i64()
+        .or_else(|| value.as_str()?.parse().ok())
+        .filter(|v| *v > 0)
+}
+
+fn validate_exchange_age(
+    timestamp: Option<i64>,
+    now: i64,
+    max_age: i64,
+) -> std::result::Result<i64, &'static str> {
+    let timestamp = timestamp.ok_or("rest_timestamp_missing_or_invalid")?;
+    let age = now
+        .checked_sub(timestamp)
+        .ok_or("rest_timestamp_missing_or_invalid")?;
+    if age < 0 {
+        return Err("rest_exchange_timestamp_in_future");
+    }
+    if age > max_age {
+        return Err("rest_exchange_timestamp_stale");
+    }
+    Ok(age)
+}
+
+fn validate_rest_book(
+    book: &LiveRestBook,
+    token: &str,
+    market: &str,
+    now: i64,
+    max_age: i64,
+) -> std::result::Result<i64, &'static str> {
+    if book.asset_id.as_deref() != Some(token) {
+        return Err("rest_token_mismatch_or_missing");
+    }
+    if !book
+        .market
+        .as_deref()
+        .is_some_and(|v| v.eq_ignore_ascii_case(market))
+    {
+        return Err("rest_market_mismatch_or_missing");
+    }
+    validate_exchange_age(exchange_timestamp(book.timestamp.as_ref()), now, max_age)
+}
+
+/// The deadline and latency include body download and JSON decoding, not just headers.
+async fn fetch_rest_book(
+    config: &DryRunConfig,
+    client: &reqwest::Client,
+    token: &str,
+) -> Result<(LiveRestBook, Value)> {
+    let started = Instant::now();
+    let request_started_at = Utc::now();
+    timeout(Duration::from_secs(6), async {
+        let response = client.get(format!("{}/book", config.clob_url.trim_end_matches('/')))
+            .query(&[("token_id", token)]).send().await?.error_for_status()?;
+        let headers = ["date", "age", "cache-control", "cf-cache-status", "x-cache"]
+            .into_iter().filter_map(|k| response.headers().get(k)?.to_str().ok().map(|v| (k.to_owned(), v.to_owned())))
+            .collect::<BTreeMap<_,_>>();
+        let book = response.json::<LiveRestBook>().await?;
+        let audit = serde_json::json!({"request_started_at":request_started_at,"received_at":Utc::now(),
+            "rest_latency_ms":started.elapsed().as_millis(),"headers":headers,
+            "hash":book.hash,"exchange_timestamp":book.timestamp,"requested_token_id":token,
+            "response_token_id":book.asset_id,"response_market":book.market,
+            "bids":book.bids,"asks":book.asks});
+        Ok::<_,anyhow::Error>((book,audit))
+    }).await.context("REST book request/body timed out")?
+}
+
+/// Historical rows remain in raw accounting, never silently promoted to v5 evidence.
+fn fill_quality_reasons(fill: &Value) -> Vec<&'static str> {
+    let mut reasons = Vec::new();
+    let audit = &fill["execution_audit"];
+    let checked = audit["age_checked_at_ms"].as_i64().or_else(|| {
+        fill["recorded_at"]
+            .as_str()?
+            .parse::<chrono::DateTime<Utc>>()
+            .ok()
+            .map(|t| t.timestamp_millis())
+    });
+    match checked {
+        Some(now) => {
+            if let Err(reason) = validate_exchange_age(
+                exchange_timestamp(audit.get("exchange_timestamp")),
+                now,
+                1000,
+            ) {
+                reasons.push(reason);
+            }
+        }
+        None => reasons.push("missing_execution_time"),
+    }
+    match audit["model_audit"]["feed_age_ms"].as_i64() {
+        Some(0..=2000) => {}
+        Some(_) => reasons.push("reference_feed_outside_0_2000ms"),
+        None => reasons.push("missing_reference_feed_age"),
+    }
+    if !matches!(fill["rest_latency_ms"].as_u64(), Some(0..=2000)) {
+        reasons.push("rest_latency_missing_or_exceeded");
+    }
+    if fill["execution_version"].as_u64() != Some(LIVE_EXECUTION_VERSION) {
+        reasons.push("legacy_execution_unverified");
+    } else {
+        let identity_valid = audit["requested_token_id"].as_str().is_some_and(|token| {
+            !token.is_empty() && audit["response_token_id"].as_str() == Some(token)
+        }) && audit["expected_market"].as_str().is_some_and(|market| {
+            !market.is_empty()
+                && audit["response_market"]
+                    .as_str()
+                    .is_some_and(|v| v.eq_ignore_ascii_case(market))
+        });
+        if audit["rest_book_validated"] != true || !identity_valid {
+            reasons.push("missing_or_invalid_rest_identity_evidence");
+        }
+    }
+    reasons
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -628,7 +751,7 @@ pub async fn run_dry_run() -> Result<()> {
         "event": "run_started",
         "recorded_at": Utc::now(),
         "strategy": "short-duration-digital-fair-value",
-        "execution_version": 4,
+        "execution_version": LIVE_EXECUTION_VERSION,
         "config": {
             "symbols": config.symbols.clone(),
             "checkpoint_secs": config.checkpoint_secs,
@@ -983,6 +1106,12 @@ pub fn run_dry_run_report() -> Result<PathBuf> {
         capital: f64,
     }
     let mut overall = Bucket::default();
+    let mut eligible = Bucket::default();
+    let mut eligible_by_asset = BTreeMap::<String, Bucket>::new();
+    let mut quality_buckets = BTreeMap::<String, Bucket>::new();
+    let mut quality_reasons = BTreeMap::<String, usize>::new();
+    let mut by_feed_age = BTreeMap::<String, Bucket>::new();
+    let mut by_exchange_age = BTreeMap::<String, Bucket>::new();
     let mut by_asset = BTreeMap::<String, Bucket>::new();
     let mut by_probability = BTreeMap::<String, Bucket>::new();
     let mut by_latency = BTreeMap::<String, Bucket>::new();
@@ -1076,6 +1205,64 @@ pub fn run_dry_run_report() -> Result<PathBuf> {
             .as_u64()
             .map(|ms| latency_bucket(ms).to_string())
             .unwrap_or_else(|| "unknown".into());
+        let reasons = fill_quality_reasons(fill_event);
+        for reason in &reasons {
+            *quality_reasons.entry((*reason).into()).or_default() += 1;
+        }
+        let quality_key = if reasons.is_empty() {
+            "eligible"
+        } else {
+            "research_only"
+        };
+        let feed_key = match fill_event["execution_audit"]["model_audit"]["feed_age_ms"].as_i64() {
+            Some(0..=1000) => "le_1s",
+            Some(1001..=2000) => "1_2s",
+            Some(2001..) => "gt_2s",
+            _ => "unknown_or_future",
+        };
+        let execution_time = fill_event["execution_audit"]["age_checked_at_ms"]
+            .as_i64()
+            .or_else(|| {
+                fill_event["recorded_at"]
+                    .as_str()?
+                    .parse::<chrono::DateTime<Utc>>()
+                    .ok()
+                    .map(|t| t.timestamp_millis())
+            });
+        let exchange_age = execution_time
+            .zip(exchange_timestamp(
+                fill_event["execution_audit"].get("exchange_timestamp"),
+            ))
+            .and_then(|(t, s)| t.checked_sub(s));
+        let exchange_key = match exchange_age {
+            Some(0..=1000) => "le_1s",
+            Some(1001..=2000) => "1_2s",
+            Some(2001..) => "gt_2s",
+            _ => "unknown_or_future",
+        };
+        let add = |b: &mut Bucket| {
+            b.samples += 1;
+            b.wins += usize::from(won);
+            b.probability_sum += probability;
+            b.brier_sum += (probability - if won { 1.0 } else { 0.0 }).powi(2);
+            b.pnl += pnl;
+            b.capital += fill_event["cost_usdc"].as_f64().unwrap_or(0.0)
+                + fill_event["fees_usdc"].as_f64().unwrap_or(0.0);
+        };
+        add(quality_buckets
+            .entry(format!(
+                "{quality_key}/{asset}/{}",
+                fill_event["signal_book_source"]
+                    .as_str()
+                    .unwrap_or("unknown")
+            ))
+            .or_default());
+        add(by_feed_age.entry(feed_key.into()).or_default());
+        add(by_exchange_age.entry(exchange_key.into()).or_default());
+        if reasons.is_empty() {
+            add(&mut eligible);
+            add(eligible_by_asset.entry(asset.clone()).or_default());
+        }
         for bucket in [
             &mut overall,
             by_entry_price
@@ -1126,13 +1313,13 @@ pub fn run_dry_run_report() -> Result<PathBuf> {
         })
     };
     let all_assets_ready = enabled_assets.iter().all(|asset| {
-        by_asset.get(asset).is_some_and(|bucket| {
+        eligible_by_asset.get(asset).is_some_and(|bucket| {
             bucket.samples >= min_asset_samples
                 && bucket.pnl > 0.0
                 && bucket.brier_sum / bucket.samples.max(1) as f64 <= max_brier
         })
     });
-    let brier_score = overall.brier_sum / overall.samples.max(1) as f64;
+    let brier_score = eligible.brier_sum / eligible.samples.max(1) as f64;
     let pending_fills = fill_events
         .keys()
         .filter(|id| !settled_ids.contains(**id))
@@ -1149,14 +1336,23 @@ pub fn run_dry_run_report() -> Result<PathBuf> {
         && pending_fills == 0
         && duplicate_fills == 0;
     let canary_ready = integrity_ok
-        && overall.samples > 0
-        && overall.pnl > 0.0
+        && eligible.samples > 0
+        && eligible.pnl > 0.0
         && brier_score <= max_brier
         && all_assets_ready;
     let report = serde_json::json!({
         "strategy":"short-duration-digital-fair-value",
         "generated_at":Utc::now(),"source":input,
         "overall":bucket_json(&overall),
+        "eligible":bucket_json(&eligible),
+        "eligible_by_asset":eligible_by_asset.iter().map(|(k,v)|(k.clone(),bucket_json(v))).collect::<BTreeMap<_,_>>(),
+        "data_quality":{"policy_version":1,"required_execution_version":LIVE_EXECUTION_VERSION,
+            "max_exchange_age_ms":1000,"max_reference_feed_age_ms":2000,"max_rest_latency_ms":2000,
+            "exclusion_reasons_overlapping":quality_reasons,
+            "by_quality_asset_source":quality_buckets.iter().map(|(k,v)|(k.clone(),bucket_json(v))).collect::<BTreeMap<_,_>>(),
+            "note":"overall is raw simulated accounting. Only eligible enters canary gates; legacy/unknown evidence stays research-only. Offline filtering is not a replay."},
+        "by_reference_feed_age":by_feed_age.iter().map(|(k,v)|(k.clone(),bucket_json(v))).collect::<BTreeMap<_,_>>(),
+        "by_execution_exchange_age":by_exchange_age.iter().map(|(k,v)|(k.clone(),bucket_json(v))).collect::<BTreeMap<_,_>>(),
         "research_audit":dry_run_research_summary(&events),
         "by_entry_price":by_entry_price.iter().map(|(k,v)|(k.clone(),bucket_json(v))).collect::<BTreeMap<_,_>>(),
         "by_reference_direction":by_direction.iter().map(|(k,v)|(k.clone(),bucket_json(v))).collect::<BTreeMap<_,_>>(),
@@ -1175,7 +1371,7 @@ pub fn run_dry_run_report() -> Result<PathBuf> {
         "canary_gate":{
             "ready":canary_ready,"enabled_assets":enabled_assets,
             "min_samples_per_asset":min_asset_samples,"max_brier_score":max_brier,
-            "all_assets_ready":all_assets_ready,"positive_total_pnl":overall.pnl > 0.0
+            "all_assets_ready":all_assets_ready,"positive_total_pnl":eligible.pnl > 0.0,"sample_scope":"eligible"
         }
     });
     if let Some(parent) = output.parent() {
@@ -1289,10 +1485,23 @@ fn scan_live_markets(
             .map(|mut s| s.audited_markets.insert(market.slug.clone()))
             .unwrap_or(false);
         if audit_first {
+            let market_midpoint = monitor
+                .winner_book_top(market.yes_token_id)
+                .filter(|top| live_ws_top_usable(top, now_ms, config))
+                .and_then(|top| Some((top.bid_price?.to_f64()?, top.ask_price?.to_f64()?)))
+                .filter(|(bid, ask)| *bid >= 0.0 && *ask <= 1.0 && bid <= ask)
+                .map(|(bid, ask)| (bid + ask) / 2.0);
             let _ = journal.append(serde_json::json!({
                 "event":"model_observation", "recorded_at":Utc::now(),
                 "slug":market.slug,"asset":market.crypto_symbol,
                 "checkpoint_secs":config.checkpoint_secs,
+                "seconds_remaining":remaining_ms as f64 / 1000.0,
+                "opening_twap":state.opening,"current_twap":state.current,
+                "probability_up":fair_up_probability(
+                    state.opening.to_f64().unwrap_or(0.0),state.current.to_f64().unwrap_or(0.0),
+                    remaining_ms as f64 / 1000.0,state.observed_volatility_bps.max(state.minimum_volatility_bps)),
+                "reference_topic":"crypto_prices_twap_sixty",
+                "market_probability_up":market_midpoint,
                 "model_audit":live_model_audit(state, window_start_ms, now_ms, remaining_ms as f64 / 1000.0, true)
             }));
         }
@@ -1389,21 +1598,44 @@ async fn evaluate_rest_fallback(
 ) {
     let up_token_id = market.yes_token_id.to_string();
     let down_token_id = market.no_token_id.to_string();
+    let market_id = market.market_id.to_string();
     let (up_result, down_result) = tokio::join!(
-        fetch_live_rest_top(&config, &client, &up_token_id, &journal, &market.slug),
-        fetch_live_rest_top(&config, &client, &down_token_id, &journal, &market.slug),
+        fetch_live_rest_top(
+            &config,
+            &client,
+            &up_token_id,
+            &market_id,
+            &journal,
+            &market.slug
+        ),
+        fetch_live_rest_top(
+            &config,
+            &client,
+            &down_token_id,
+            &market_id,
+            &journal,
+            &market.slug
+        ),
     );
-    let (up, up_latency_ms) = match up_result {
+    let (up, up_latency_ms, up_timestamp) = match up_result {
         Ok(value) => value,
         Err(error) => {
+            if error.to_string().starts_with("rest_") {
+                record_window_rejection(&stats, &market.slug, &error.to_string());
+                return;
+            }
             record_window_rejection(&stats, &market.slug, "rest_up_book_failed");
             warn!(target: LIVE_TARGET, slug = %market.slug, %error, "UP REST book fallback failed");
             return;
         }
     };
-    let (down, down_latency_ms) = match down_result {
+    let (down, down_latency_ms, down_timestamp) = match down_result {
         Ok(value) => value,
         Err(error) => {
+            if error.to_string().starts_with("rest_") {
+                record_window_rejection(&stats, &market.slug, &error.to_string());
+                return;
+            }
             record_window_rejection(&stats, &market.slug, "rest_down_book_failed");
             warn!(target: LIVE_TARGET, slug = %market.slug, %error, "DOWN REST book fallback failed");
             return;
@@ -1426,6 +1658,15 @@ async fn evaluate_rest_fallback(
         return;
     }
     let now_ms = Utc::now().timestamp_millis();
+    for timestamp in [up_timestamp, down_timestamp] {
+        if let Err(reason) = validate_exchange_age(Some(timestamp), now_ms, config.max_book_age_ms)
+        {
+            record_window_rejection(&stats, &market.slug, reason);
+            let _ = journal.append(serde_json::json!({"event":"signal_rejected","recorded_at":Utc::now(),
+                "slug":market.slug,"reason":reason,"exchange_timestamp":timestamp,"age_checked_at_ms":now_ms}));
+            return;
+        }
+    }
     let adjusted_remaining_ms = window_end_ms.saturating_sub(now_ms).min(remaining_ms);
     if adjusted_remaining_ms <= 0 {
         record_window_rejection(&stats, &market.slug, "rest_fallback_completed_after_window");
@@ -1466,34 +1707,35 @@ async fn fetch_live_rest_top(
     config: &DryRunConfig,
     client: &reqwest::Client,
     token_id: &str,
+    market_id: &str,
     journal: &EventJournal,
     slug: &str,
-) -> Result<(LiveBookTop, u64)> {
+) -> Result<(LiveBookTop, u64, i64)> {
     let started = Instant::now();
-    let response = timeout(
-        Duration::from_secs(6),
-        client
-            .get(format!("{}/book", config.clob_url.trim_end_matches('/')))
-            .query(&[("token_id", token_id)])
-            .send(),
-    )
-    .await
-    .context("REST book fallback timed out")??;
-    let status = response.status();
-    if !status.is_success() {
-        bail!("REST book fallback returned HTTP {status}");
+    let (book, mut request_audit) = fetch_rest_book(config, client, token_id).await?;
+    // Routine polls retain bounded evidence; execution audits keep full depth.
+    for side in ["bids", "asks"] {
+        if let Some(levels) = request_audit[side].as_array_mut() {
+            levels.truncate(5);
+        }
     }
-    let book = response.json::<LiveRestBook>().await?;
+    request_audit["truncated_levels"] = serde_json::json!(5);
+    let validation = validate_rest_book(
+        &book,
+        token_id,
+        market_id,
+        Utc::now().timestamp_millis(),
+        config.max_book_age_ms,
+    );
     journal.append(
         serde_json::json!({"event":"rest_book_audit","recorded_at":Utc::now(),
         "slug":slug,"requested_token_id":token_id,"response_token_id":book.asset_id,
         "response_market":book.market,"exchange_timestamp":book.timestamp,
         "bid_levels":book.bids.len(),"ask_levels":book.asks.len(),
-        "rest_latency_ms":started.elapsed().as_millis()}),
+        "rest_latency_ms":started.elapsed().as_millis(),"validation_error":validation.err(),
+        "request_audit":request_audit}),
     )?;
-    if book.asset_id.as_deref().is_some_and(|id| id != token_id) {
-        bail!("REST response token mismatch");
-    }
+    validation.map_err(anyhow::Error::msg)?;
     let best_bid = book
         .bids
         .iter()
@@ -1523,6 +1765,7 @@ async fn fetch_live_rest_top(
             ask_size: best_ask.map(|level| level.1),
         },
         started.elapsed().as_millis() as u64,
+        exchange_timestamp(book.timestamp.as_ref()).context("rest_timestamp_missing_or_invalid")?,
     ))
 }
 
@@ -1682,6 +1925,7 @@ fn evaluate_live_tops(
         market.slug.clone(),
         market.crypto_symbol.clone(),
         token.to_string(),
+        market.market_id.to_string(),
         buy_up,
         probability,
         bid,
@@ -1912,6 +2156,7 @@ async fn execute_live_shadow(
     slug: String,
     asset: String,
     token_id: String,
+    market_id: String,
     buy_up: bool,
     probability: f64,
     signal_bid: f64,
@@ -1926,10 +2171,7 @@ async fn execute_live_shadow(
     let execution_started = Instant::now();
     sleep(Duration::from_millis(config.execution_delay_ms)).await;
     let started = Instant::now();
-    let request = client
-        .get(format!("{}/book", config.clob_url.trim_end_matches('/')))
-        .query(&[("token_id", token_id.as_str())]);
-    let response = timeout(Duration::from_secs(6), request.send()).await;
+    let response = fetch_rest_book(&config, &client, &token_id).await;
     let latency_ms = started.elapsed().as_millis() as u64;
     if latency_ms > config.max_rest_latency_ms {
         if let Ok(mut guard) = stats.lock() {
@@ -1949,13 +2191,7 @@ async fn execute_live_shadow(
             "Fair-value shadow rejected: REST latency exceeded limit");
         return;
     }
-    let book = match response {
-        Ok(Ok(response)) if response.status().is_success() => {
-            response.json::<LiveRestBook>().await.ok()
-        }
-        _ => None,
-    };
-    let Some(book) = book else {
+    let Ok((book, request_audit)) = response else {
         if let Ok(mut guard) = stats.lock() {
             guard.shadow_rejections = guard.shadow_rejections.saturating_add(1);
             guard.record_rest_latency(latency_ms);
@@ -1970,14 +2206,25 @@ async fn execute_live_shadow(
         }));
         return;
     };
-    if book.asset_id.as_deref().is_some_and(|id| id != token_id) {
+    let _ = journal.append(serde_json::json!({"event":"execution_book_audit","recorded_at":Utc::now(),
+        "evaluation_id":evaluation_id,"slug":slug,"expected_market":market_id,"request_audit":request_audit}));
+    let checked_at_ms = Utc::now().timestamp_millis();
+    if let Err(reason) = validate_rest_book(
+        &book,
+        &token_id,
+        &market_id,
+        checked_at_ms,
+        config.max_book_age_ms,
+    ) {
         if let Ok(mut guard) = stats.lock() {
             guard.shadow_rejections += 1;
-            guard.reject(&slug, "execution_token_mismatch");
+            guard.record_rest_latency(latency_ms);
+            guard.reject(&slug, reason);
         }
         let _ = journal.append(
             serde_json::json!({"event":"shadow_rejected","recorded_at":Utc::now(),
-            "evaluation_id":evaluation_id,"slug":slug,"reason":"execution_token_mismatch"}),
+            "evaluation_id":evaluation_id,"slug":slug,"reason":reason,"rest_latency_ms":latency_ms,
+            "request_audit":request_audit,"expected_market":market_id}),
         );
         return;
     }
@@ -2113,13 +2360,44 @@ async fn execute_live_shadow(
         }));
         return;
     }
+    let commit_ms = Utc::now().timestamp_millis();
+    let final_rejection = validate_rest_book(
+        &book,
+        &token_id,
+        &market_id,
+        commit_ms,
+        config.max_book_age_ms,
+    )
+    .err()
+    .or_else(|| (commit_ms >= window_end_ms).then_some("execution_expired_before_record"))
+    .or_else(|| {
+        (commit_ms - state.observed_at_ms > config.max_feed_age_ms)
+            .then_some("reference_feed_stale_before_record")
+    });
+    if let Some(reason) = final_rejection {
+        if let Ok(mut guard) = stats.lock() {
+            guard.shadow_rejections += 1;
+            guard.record_rest_latency(latency_ms);
+            guard.reject(&slug, reason);
+        }
+        let _ = journal.append(
+            serde_json::json!({"event":"shadow_rejected","recorded_at":Utc::now(),
+            "evaluation_id":evaluation_id,"slug":slug,"reason":reason,"age_checked_at_ms":commit_ms,
+            "rest_latency_ms":latency_ms,"request_audit":request_audit}),
+        );
+        return;
+    }
     let execution_audit = serde_json::json!({
-        "model_audit":live_model_audit(state, window_end_ms-300_000, now_ms, (window_end_ms-now_ms) as f64/1000.0, buy_up),
+        "model_audit":live_model_audit(state, window_end_ms-300_000, commit_ms, (window_end_ms-commit_ms) as f64/1000.0, buy_up),
         "opening_twap":state.opening,"current_twap":state.current,
         "volatility":state.volatility_bps_per_sqrt_second,
         "seconds_remaining":(window_end_ms-now_ms) as f64/1000.0,
         "total_latency_ms":execution_started.elapsed().as_millis(),
         "response_token_id":book.asset_id,"response_market":book.market,"exchange_timestamp":book.timestamp,
+        "requested_token_id":token_id,"expected_market":market_id,
+        "rest_book_validated":true,"book_age_limit_ms":config.max_book_age_ms,
+        "exchange_age_ms":commit_ms-exchange_timestamp(book.timestamp.as_ref()).unwrap_or(0),
+        "age_checked_at_ms":commit_ms,"model_evaluated_at_ms":now_ms,"request_audit":request_audit,
         "executable_depth_usdc":cumulative_depth
     });
     let expected_pnl = probability * fill.shares - cost - fees;
@@ -2134,7 +2412,7 @@ async fn execute_live_shadow(
         "event":"shadow_fill","evaluation_id":evaluation_id,"recorded_at":Utc::now(),
         "asset":asset,"slug":slug,"buy_up":buy_up,"probability":probability,
         "signal_probability":signal_probability,"execution_model_observed_at_ms":state.observed_at_ms,
-        "execution_version":4,"checkpoint_secs":config.checkpoint_secs,"budget_usdc":config.order_usdc,
+        "execution_version":LIVE_EXECUTION_VERSION,"checkpoint_secs":config.checkpoint_secs,"budget_usdc":config.order_usdc,
         "execution_audit":execution_audit,
         "shares":fill.shares,"requested_shares":target,"fill_ratio":fill_ratio,"cost_usdc":cost,
         "average_price":average,"fees_usdc":fees,"expected_pnl_usdc":expected_pnl,
@@ -2982,6 +3260,203 @@ fn env_decimal_list(name: &str, default: &[&str]) -> Result<Vec<Decimal>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rest_identity_and_exchange_age_fail_closed() {
+        let mut b: super::LiveRestBook = serde_json::from_value(serde_json::json!({
+            "asset_id":"token","market":"0xAbC","timestamp":"1000000","bids":[],"asks":[]
+        }))
+        .unwrap();
+        assert_eq!(
+            super::validate_rest_book(&b, "token", "0xabc", 1_001_000, 1000),
+            Ok(1000)
+        );
+        assert_eq!(
+            super::validate_rest_book(&b, "token", "0xabc", 1_001_001, 1000),
+            Err("rest_exchange_timestamp_stale")
+        );
+        assert_eq!(
+            super::validate_rest_book(&b, "token", "0xabc", 999_999, 1000),
+            Err("rest_exchange_timestamp_in_future")
+        );
+        assert_eq!(
+            super::validate_rest_book(&b, "other", "0xabc", 1_000_000, 1000),
+            Err("rest_token_mismatch_or_missing")
+        );
+        b.asset_id = None;
+        assert_eq!(
+            super::validate_rest_book(&b, "token", "0xabc", 1_000_000, 1000),
+            Err("rest_token_mismatch_or_missing")
+        );
+        b.asset_id = Some("token".into());
+        b.market = None;
+        assert_eq!(
+            super::validate_rest_book(&b, "token", "0xabc", 1_000_000, 1000),
+            Err("rest_market_mismatch_or_missing")
+        );
+        b.market = Some("wrong".into());
+        assert_eq!(
+            super::validate_rest_book(&b, "token", "0xabc", 1_000_000, 1000),
+            Err("rest_market_mismatch_or_missing")
+        );
+        b.market = Some("0xabc".into());
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!("bad"),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+        ] {
+            b.timestamp = Some(value);
+            assert_eq!(
+                super::validate_rest_book(&b, "token", "0xabc", 1_000_000, 1000),
+                Err("rest_timestamp_missing_or_invalid")
+            );
+        }
+    }
+
+    #[test]
+    fn report_quality_excludes_legacy_stale_and_unknown_evidence() {
+        let mut fill = serde_json::json!({"execution_version":5,"rest_latency_ms":30,
+            "execution_audit":{"age_checked_at_ms":1001000,"exchange_timestamp":"1000000",
+            "rest_book_validated":true,"requested_token_id":"t","response_token_id":"t",
+            "expected_market":"m","response_market":"m","model_audit":{"feed_age_ms":2000}}});
+        assert!(super::fill_quality_reasons(&fill).is_empty());
+        fill["execution_version"] = serde_json::json!(4);
+        assert!(super::fill_quality_reasons(&fill).contains(&"legacy_execution_unverified"));
+        fill["execution_version"] = serde_json::json!(5);
+        fill["execution_audit"]["exchange_timestamp"] = serde_json::json!(642480);
+        assert!(super::fill_quality_reasons(&fill).contains(&"rest_exchange_timestamp_stale"));
+        fill["execution_audit"]["exchange_timestamp"] = serde_json::json!(1000000);
+        fill["execution_audit"]["model_audit"]["feed_age_ms"] = serde_json::json!(2001);
+        assert!(super::fill_quality_reasons(&fill).contains(&"reference_feed_outside_0_2000ms"));
+        fill["execution_audit"]["response_token_id"] = serde_json::Value::Null;
+        assert!(super::fill_quality_reasons(&fill)
+            .contains(&"missing_or_invalid_rest_identity_evidence"));
+        assert!(!super::fill_quality_reasons(&serde_json::json!({})).is_empty());
+    }
+
+    #[tokio::test]
+    async fn rest_latency_includes_body_and_preserves_evidence() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            let _ = stream.read(&mut request).await.unwrap();
+            let body = r#"{"asset_id":"t","market":"m","timestamp":"1000000","hash":"h","bids":[],"asks":[]}"#;
+            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nX-Cache: MISS\r\nConnection: close\r\n\r\n",body.len()).as_bytes()).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+            stream.write_all(body.as_bytes()).await.unwrap();
+        });
+        let mut config = dry_run_config();
+        config.clob_url = format!("http://{address}");
+        let (_, audit) = super::fetch_rest_book(&config, &reqwest::Client::new(), "t")
+            .await
+            .unwrap();
+        assert!(audit["rest_latency_ms"].as_u64().unwrap() >= 100);
+        assert_eq!(audit["headers"]["x-cache"], "MISS");
+        assert_eq!(audit["hash"], "h");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rest_body_stall_has_a_total_deadline() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 9999\r\n\r\n{")
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        });
+        let mut config = dry_run_config();
+        config.clob_url = format!("http://{address}");
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            super::fetch_rest_book(&config, &reqwest::Client::new(), "t"),
+        )
+        .await
+        .unwrap();
+        assert!(result.unwrap_err().to_string().contains("timed out"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn old_book_cannot_enter_signal_or_execution_paths() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                let _ = stream.read(&mut request).await.unwrap();
+                let body = r#"{"asset_id":"t","market":"m","timestamp":"1789143832592","hash":"h","bids":[{"price":"0.50","size":"100"}],"asks":[{"price":"0.51","size":"100"}]}"#;
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        let root =
+            std::env::temp_dir().join(format!("fair-value-book-test-{}", uuid::Uuid::new_v4()));
+        let path = root.join("events.ndjson");
+        let journal = EventJournal::open(&path, "test".into()).unwrap();
+        let mut config = dry_run_config();
+        config.clob_url = format!("http://{address}");
+        config.execution_delay_ms = 0;
+        let client = reqwest::Client::new();
+        let result = fetch_live_rest_top(&config, &client, "t", "m", &journal, "btc-test").await;
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "rest_exchange_timestamp_stale"
+        );
+        let stats = Arc::new(Mutex::new(DryRunWindowStats::default()));
+        execute_live_shadow(
+            Arc::new(ChainlinkTwapStore::default()),
+            config,
+            client,
+            journal.clone(),
+            stats.clone(),
+            "test-evaluation".into(),
+            "btc-test".into(),
+            "btc".into(),
+            "t".into(),
+            "m".into(),
+            true,
+            0.99,
+            0.50,
+            0.51,
+            100.,
+            0.4,
+            "rest_fallback",
+            1,
+            10.,
+            Utc::now().timestamp_millis() + 10000,
+        )
+        .await;
+        assert_eq!(stats.lock().unwrap().shadow_fills, 0);
+        assert_eq!(stats.lock().unwrap().shadow_rejections, 1);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("rest_exchange_timestamp_stale"));
+        assert!(!text.contains("\"event\":\"shadow_fill\""));
+        server.await.unwrap();
+        drop(journal);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&root).unwrap();
+    }
     #[test]
     fn execution_depth_uses_only_affordable_edge_positive_levels() {
         let config = dry_run_config();

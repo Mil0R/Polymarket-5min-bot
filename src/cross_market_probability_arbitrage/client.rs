@@ -197,6 +197,14 @@ struct TradableMarket {
     fee: FeePolicy,
 }
 
+fn rotate_and_limit<T>(mut values: Vec<T>, offset: usize, limit: usize) -> (Vec<T>, usize, usize) {
+    let before = values.len();
+    let selection_offset = if before == 0 { 0 } else { offset % before };
+    values.rotate_left(selection_offset);
+    values.truncate(limit);
+    (values, selection_offset, before.saturating_sub(limit))
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct SemanticReview {
     status: String,
@@ -238,6 +246,15 @@ impl CrossMarketProbabilityResearchClient {
     pub async fn discover_conversion_routes_at(
         &self,
         page_offset: usize,
+    ) -> Result<(Vec<super::conversion::Route>, BTreeMap<String, usize>)> {
+        self.discover_conversion_routes_at_with_route_offset(page_offset, 0)
+            .await
+    }
+
+    pub async fn discover_conversion_routes_at_with_route_offset(
+        &self,
+        page_offset: usize,
+        route_offset: usize,
     ) -> Result<(Vec<super::conversion::Route>, BTreeMap<String, usize>)> {
         let events = self.fetch_events_at(page_offset).await?;
         let mut routes = Vec::new();
@@ -308,6 +325,15 @@ impl CrossMarketProbabilityResearchClient {
                 continue;
             }
             for input in &markets {
+                let mut deadlines = markets.iter().filter_map(|market| market.deadline_at);
+                let earliest_deadline_at = deadlines.next().map(|first| {
+                    markets
+                        .iter()
+                        .filter_map(|market| market.deadline_at)
+                        .fold(first, |current, value| current.min(value))
+                });
+                let latest_deadline_at =
+                    markets.iter().filter_map(|market| market.deadline_at).max();
                 routes.push(super::conversion::Route {
                     id: format!("conversion:{}:{}", event.id, input.condition_id),
                     event_id: event.id.clone(),
@@ -319,11 +345,38 @@ impl CrossMarketProbabilityResearchClient {
                         .map(|m| relation_leg(m, Outcome::Yes))
                         .collect(),
                     protocol_verified: false,
+                    event_title: event.title.clone(),
+                    market_count: markets.len(),
+                    fee_enabled_legs: markets.iter().filter(|market| market.fee.enabled).count(),
+                    neg_risk_other_markets: markets
+                        .iter()
+                        .filter(|market| market.neg_risk_other)
+                        .count(),
+                    earliest_deadline_at,
+                    latest_deadline_at,
                 });
             }
         }
-        diagnostics.insert("routes_before_limit".into(), routes.len());
-        routes.truncate(self.config.max_relationships);
+        routes.sort_by(|a, b| {
+            a.fee_enabled_legs
+                .cmp(&b.fee_enabled_legs)
+                .then_with(|| a.market_count.cmp(&b.market_count))
+                .then_with(
+                    || match (&a.earliest_deadline_at, &b.earliest_deadline_at) {
+                        (Some(a), Some(b)) => a.cmp(b),
+                        (Some(_), None) => std::cmp::Ordering::Less,
+                        (None, Some(_)) => std::cmp::Ordering::Greater,
+                        (None, None) => std::cmp::Ordering::Equal,
+                    },
+                )
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        let routes_before_limit = routes.len();
+        let (routes, selection_offset, routes_truncated) =
+            rotate_and_limit(routes, route_offset, self.config.max_relationships);
+        diagnostics.insert("routes_before_limit".into(), routes_before_limit);
+        diagnostics.insert("route_selection_offset".into(), selection_offset);
+        diagnostics.insert("routes_truncated".into(), routes_truncated);
         diagnostics.insert("routes_emitted".into(), routes.len());
         Ok((routes, diagnostics))
     }
@@ -1126,6 +1179,23 @@ fn value_i64(value: &Value) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn route_limit_rotates_through_truncated_candidates() {
+        let first = rotate_and_limit((0..7).collect::<Vec<_>>(), 0, 3);
+        let second = rotate_and_limit((0..7).collect::<Vec<_>>(), 3, 3);
+        let third = rotate_and_limit((0..7).collect::<Vec<_>>(), 6, 3);
+        assert_eq!(first, (vec![0, 1, 2], 0, 4));
+        assert_eq!(second, (vec![3, 4, 5], 3, 4));
+        assert_eq!(third, (vec![6, 0, 1], 6, 4));
+        let seen = first
+            .0
+            .into_iter()
+            .chain(second.0)
+            .chain(third.0)
+            .collect::<HashSet<_>>();
+        assert_eq!(seen.len(), 7);
+    }
 
     #[test]
     fn keyset_envelope_requires_events_and_accepts_terminal_cursor() {

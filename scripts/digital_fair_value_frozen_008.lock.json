@@ -1,0 +1,11 @@
+{
+  "stage": "probability_only",
+  "model": "results/short-duration-digital-fair-value/study-006-007-v2/model.json",
+  "model_sha256": "d0de136f4eb66f302e8f2d3d375a88aafc560a16f0fd7d0bd6812fc643d068f1",
+  "manifest": "scripts/digital_fair_value_frozen_008.json",
+  "manifest_sha256": "dac18267162603fea6247670ccbdf484c9ebc8a1e9f65389f3ad5fe563d228a5",
+  "start": "2026-09-14T02:05:00Z",
+  "end": "2026-09-21T02:05:00Z",
+  "checkpoint_secs": 30,
+  "execution_gate": "NOT_EVALUABLE"
+}

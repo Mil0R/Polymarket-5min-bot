@@ -1,0 +1,20 @@
+{
+  "root": "..",
+  "frozen_test": true,
+  "start": "2026-09-14T02:05:00Z",
+  "end": "2026-09-21T02:05:00Z",
+  "checkpoints": [30],
+  "inputs": [
+    "results/short-duration-digital-fair-value/server-low-latency-008-5m-30s/events.ndjson"
+  ],
+  "probability_gate": {
+    "min_paired_samples_per_asset": 75,
+    "min_utc_days": 5,
+    "requirements": [
+      "selected_brier_below_market",
+      "selected_log_loss_below_market",
+      "selected_brier_below_current_model",
+      "selected_log_loss_below_current_model"
+    ]
+  }
+}

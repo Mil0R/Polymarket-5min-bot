@@ -1,0 +1,14 @@
+{
+  "root": "..",
+  "start": "2026-09-11T00:00:00Z",
+  "train_end": "2026-09-12T00:00:00Z",
+  "validation_end": "2026-09-13T00:00:00Z",
+  "end": "2026-09-14T02:05:00Z",
+  "checkpoints": [10, 30],
+  "inputs": [
+    "results/short-duration-digital-fair-value/server-low-latency-006-5m-10s/events.ndjson",
+    "results/short-duration-digital-fair-value/server-low-latency-006-5m-30s/events.ndjson",
+    "results/short-duration-digital-fair-value/server-low-latency-007-5m-10s/events.ndjson",
+    "results/short-duration-digital-fair-value/server-low-latency-007-5m-30s/events.ndjson"
+  ]
+}
