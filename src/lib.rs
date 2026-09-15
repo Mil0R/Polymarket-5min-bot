@@ -48,6 +48,7 @@ pub use proxy_relay::{
 
 pub mod bayesian_consistency_arbitrage;
 pub mod cross_market_probability_arbitrage;
+pub mod cross_venue_arbitrage;
 pub mod digital_fair_value;
 pub mod digital_fair_value_calibration;
 pub mod market_making;

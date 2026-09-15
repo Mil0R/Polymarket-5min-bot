@@ -10,6 +10,7 @@
 | Wallet-Copy Trading | 链上钱包跟随交易 | Copy Trading | 信号跟随 | 筛选具备持续质量的钱包，将其链上行为转换为受共识、市场质量和风险额度约束的跟随订单 |
 | Market Making | 做市与流动性提供 | Maker Liquidity | 双边报价研究 | 评估 post-only 双边报价、队列成交代理、逆向选择、价差收益和 maker 激励 |
 | Cross-Market Probability Arbitrage | 跨市场概率套利 | Bayesian Arbitrage | 跨市场一致性套利研究 | 寻找父市场、条件子市场或相关事件之间违反条件概率一致性的可对冲价格关系 |
+| Cross-Venue Arbitrage | 跨交易所套利 | 无 | 同事件跨平台对冲研究 | PMP 发现候选，核验 Kalshi 与 Polymarket 结算等价配对的双边盘口、费用与延迟后净收益 |
 | Short-Duration Digital Fair Value | 短期限数字期权公允价值 | 无 | 有方向风险的概率相对价值研究 | 根据 Price to Beat、Chainlink TWAP、剩余期限和实时波动率估计 Up/Down 公允概率，交易扣除成本后的盘口偏差 |
 
 ## 代码和运行入口
@@ -21,6 +22,7 @@
 | Wallet-Copy Trading | `wallet_copy_trading` | `wallet_copy_trading`、`wallet_copy_trading_sim`、`wallet_copy_scout`、`wallet_copy_audit` | `results/wallet-copy-trading/`、`results/wallet-copy-candidates/`、`results/wallet-copy-audits/` |
 | Market Making | `market_making` | `market_making` | `results/market-making/` |
 | Cross-Market Probability Arbitrage | `cross_market_probability_arbitrage` | `cross_market_probability_arbitrage` | `results/cross-market-probability-arbitrage/` |
+| Cross-Venue Arbitrage | `cross_venue_arbitrage` | `cross_venue_arbitrage` | `results/cross-venue-arbitrage/` |
 | Short-Duration Digital Fair Value | `digital_fair_value` | `short_duration_digital_fair_value` | `results/backtests/short-duration-digital-fair-value/`；实时目录待第二阶段实现 |
 
 ## 环境变量前缀
@@ -32,6 +34,7 @@
 | Wallet-Copy Trading | `WALLET_COPY_TRADING_*` | `COPY_TRADING_*`、`COPY_*` |
 | Market Making | `MARKET_MAKING_*` | `MAKER_*` |
 | Cross-Market Probability Arbitrage | `CROSS_MARKET_PROBABILITY_ARBITRAGE_*` | `BAYESIAN_*` |
+| Cross-Venue Arbitrage | `CROSS_VENUE_ARBITRAGE_*`，供应商密钥 `PMP_API_KEY` | 无 |
 | Short-Duration Digital Fair Value | `SHORT_DURATION_DIGITAL_FAIR_VALUE_*` | 无 |
 
 通用连接、签名、日志和运行模式参数（例如 `CLOB_API_URL`、`SIGNATURE_TYPE`、

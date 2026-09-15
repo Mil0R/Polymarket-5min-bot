@@ -11,6 +11,7 @@
 | cross_market_probability_arbitrage | CROSS_MARKET_PROBABILITY_ARBITRAGE_SYSTEM_LOG_FILE |
 | bayesian_consistency_arbitrage | BAYESIAN_CONSISTENCY_ARBITRAGE_SYSTEM_LOG_FILE |
 | neg_risk_conversion_arbitrage | NEG_RISK_CONVERSION_ARBITRAGE_SYSTEM_LOG_FILE |
+| cross_venue_arbitrage | CROSS_VENUE_ARBITRAGE_SYSTEM_LOG_FILE |
 | short_duration_digital_fair_value | SHORT_DURATION_DIGITAL_FAIR_VALUE_SYSTEM_LOG_FILE |
 
 新系统日志保存 tracing 事件，沿用日志轮转设置。策略专用 journal、结果、报告不改路径；程序直接 println 的报告/进度内容仍在控制台，不等同于 tracing 系统日志。Market Making 等研究程序新增文件 tracing 输出，同时保留控制台 tracing。
