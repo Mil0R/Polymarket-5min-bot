@@ -7,6 +7,7 @@
 ```bash
 cargo build --release --bin cross_venue_arbitrage
 ./target/release/cross_venue_arbitrage scan
+./target/release/cross_venue_arbitrage leads
 ./target/release/cross_venue_arbitrage shadow
 ./target/release/cross_venue_arbitrage report
 ```
@@ -19,17 +20,22 @@ cargo build --release --bin cross_venue_arbitrage
 
 `scan` 执行一轮候选获取及已审核配对的盘口验证。`shadow` 持续运行，Ctrl+C 后生成报告；异常退出后，下一次继续追加，历史记录不覆盖。只有 ARB / ARB_FLAGGED / WATCH 标签通过后，才检查数据年龄和登记配对；全部 ALIGNED 时，即使配对齐全也不会自动探测盘口。`report` 离线读取最新 run_id，使用该运行记录的参数。每日分段 NDJSON 便于增量同步，不自动删除历史分段。同一目录只允许一个写进程。
 
+`leads` 从最新运行报告生成 `pair-leads.json` 人工审核队列，包含 sport/game、观察次数、独立来源快照、最大显示价差、标签和字段一致性诊断。PMP 行缺少精确合约 ID、比赛日期及明确 outcome，因此该命令不会改写 `pairs.json`，也不会把模糊标题自动批准为交易配对。审核者必须独立定位两边合约后再执行 `inspect`。
+
 默认保存位置：
 
-- `logs/cross-venue-arbitrage/shadow-run-001/system.log`：控制台摘要对应的独立系统日志。
-- `results/cross-venue-arbitrage/shadow-run-001/events-YYYY-MM-DD.ndjson`：原始 MCP 响应、候选、拒绝原因、规则元数据、盘口、报价和延迟观测。
+- `logs/cross-venue-arbitrage/shadow-run-002/system.log`：控制台摘要对应的独立系统日志。
+- `results/cross-venue-arbitrage/shadow-run-002/events-YYYY-MM-DD.ndjson`：原始 MCP 响应、候选、拒绝原因、规则元数据、盘口、报价和延迟观测。
 - 同目录 `report.json`：每次生成的最新报告；原始事件一直追加。
+- 同目录 `pair-leads.json`：运行 `leads` 后生成的未审核发现清单；不是交易登记表。
 
 ## Pro 与免费接口
 
 自行在 `.env` 填写 `PMP_API_KEY`。代码只将 Key 发送到固定 PMP MCP 地址，禁止重定向，不记录 Key。`pro_key_present` / `api_key_present` 只说明本地有 Key；当前不自动验证服务端订阅权益，因此 `pro_entitlement_verified=false`、`coverage_status=unverified`。`returned=total_count` 说明接口声明的条数匹配，不证明覆盖全市场。`truncated` 缺失时明确记录 unknown。
 
 PMP 每 120 秒读取一次；按 `as_of` 自行计算年龄，默认大于 900 秒或供应商 `stale=true` 时拒绝。现有样本来源时间戳约 15 分钟更新一次；900 秒只用于候选发现，不表示报价仍可成交。盘口的 1 秒 REST / 5 秒年龄限制独立生效。报告分别统计年龄超限、vendor stale 和合并 stale；这些扫描计数不等于被拒绝的套利机会。`ARB` / `ARB FLAGGED` 为主候选，`WATCH` 默认同时采集对照。
+
+报告同时审计 `cheaper_venue` 与两个显示 implied percentage 的方向。`displayed_direction_mismatch` 只表示在“两个百分比代表同一结果”的解释下出现表面矛盾；由于来源缺少明确 outcome，该指标不能单独证明供应商数据错误。任何候选都必须回到精确合约和实际盘口验证。
 
 供应商明确返回 `No arbitrage data available right now.` 时，保存原始响应并记录 `provider_no_data`，等待下一轮；不能把该响应解释为已确认没有套利或网络故障。HTTP 5xx、网络错误和明确临时 RPC 错误最多尝试 3 次（2s / 4s 两次退避），每次记录 `feed_attempt`。401/403、429、schema 和未知工具错误不进行短间隔重试。历史日志原始错误用语保留在 `rejections`；`feed_health` 按原始响应重分类，统计不可重复相加。
 
@@ -96,6 +102,8 @@ PMP 每 120 秒读取一次；按 `as_of` 自行计算年龄，默认大于 900 
 Polymarket 检查 token 身份、盘口 timestamp（默认最长 5 秒）和请求耗时（默认最长 1 秒），未来时间最多容忍 2 秒。Kalshi 标准订单簿没有在此版本可验证的交易所更新时间，故仅验证请求/接收时间；所有正值都称为 `conditional`，不能计为真实成交或作为实盘晋级证据。
 
 `conditional_worst_delay_profit_sum` 是首个机会在所有延迟与顺序场景中的最差正收益之和，不是账户 PnL。未通过场景、部分成交损失、订阅费、资金占用与再平衡费用不可忽略。`actual_fills=0`、`realized_pnl=0`、`live_ready=false` 固定输出。
+
+报告分别输出整个目录和所选运行的坏行数量。旧运行的截断记录保留用于审计，但不会阻止完整的新运行被标记为稳健；属于当前运行或无法归属的坏行仍会 fail closed。建议每轮模型更新使用独立批次目录，避免同步中的半行和历史数据混淆。
 
 ## 分阶段验收
 

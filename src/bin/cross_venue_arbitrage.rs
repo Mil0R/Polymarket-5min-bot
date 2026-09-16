@@ -4,7 +4,7 @@ use anyhow::Result;
 async fn main() -> Result<()> {
     let command = std::env::args().nth(1).unwrap_or_else(|| "help".into());
     if matches!(command.as_str(), "help" | "--help" | "-h") {
-        println!("Usage: cross_venue_arbitrage [scan|inspect|probe|shadow|report]\nPMP discovery + Kalshi/Polymarket read-only research. inspect prints rule-review fingerprints; probe checks manually reviewed pairs without PMP. Diagnostic results use separate inspect/ and probe/ subdirectories. No orders or signers.");
+        println!("Usage: cross_venue_arbitrage [scan|leads|inspect|probe|shadow|report]\nPMP discovery + Kalshi/Polymarket read-only research. leads writes an unresolved manual-review queue without changing the registry; inspect prints rule-review fingerprints; probe checks manually reviewed pairs without PMP. Diagnostic results use separate inspect/ and probe/ subdirectories. No orders or signers.");
         return Ok(());
     }
     if matches!(command.as_str(), "inspect" | "probe") {

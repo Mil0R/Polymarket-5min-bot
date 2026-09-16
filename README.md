@@ -185,12 +185,13 @@ cargo run --release --bin neg_risk_conversion_arbitrage -- report
 ```
 
 Cross-Venue Arbitrage consumes PMP sports candidates and probes reviewed Kalshi /
-Polymarket pairs with public order books. It supports `scan`, `inspect`, `probe`, `shadow`,
+Polymarket pairs with public order books. It supports `scan`, `leads`, `inspect`, `probe`, `shadow`,
 and `report`; no orders are submitted. Set `PMP_API_KEY` for Pro coverage and follow
 the [pair review and Shadow guide](docs/CROSS_VENUE_ARBITRAGE.zh-CN.md).
 
 ```bash
 cargo run --release --bin cross_venue_arbitrage -- scan
+cargo run --release --bin cross_venue_arbitrage -- leads
 cargo run --release --bin cross_venue_arbitrage -- inspect
 cargo run --release --bin cross_venue_arbitrage -- probe
 cargo run --release --bin cross_venue_arbitrage -- shadow

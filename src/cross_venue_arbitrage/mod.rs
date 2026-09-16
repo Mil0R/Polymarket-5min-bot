@@ -15,6 +15,25 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[derive(Default)]
+struct EventAudit {
+    malformed_total: usize,
+    malformed_unattributed: usize,
+    malformed_by_run: BTreeMap<String, usize>,
+}
+
+#[derive(Default)]
+struct DiscoveryLead {
+    sport: String,
+    game: String,
+    repeated_rows: usize,
+    unique_snapshots: HashSet<String>,
+    signals: BTreeMap<String, usize>,
+    max_gap_pp: Option<f64>,
+    last_as_of: Option<String>,
+    displayed_direction_mismatches: usize,
+}
+
 const MCP: &str = "https://predictionmarketspicks.com/api/mcp/mcp";
 const KALSHI: &str = "https://external-api.kalshi.com/trade-api/v2";
 const GAMMA: &str = "https://gamma-api.polymarket.com";
@@ -408,6 +427,20 @@ fn signal(row: &Value) -> String {
         .replace(' ', "_")
 }
 
+fn displayed_direction_mismatch(row: &Value) -> bool {
+    let Some(kalshi) = row["kalshi_implied_pct"].as_f64() else {
+        return false;
+    };
+    let Some(poly) = row["polymarket_implied_pct"].as_f64() else {
+        return false;
+    };
+    match row["cheaper_venue"].as_str() {
+        Some("polymarket") => poly > kalshi,
+        Some("kalshi") => kalshi > poly,
+        _ => false,
+    }
+}
+
 fn source_is_stale(data: &Value, age: i64, max_age: i64) -> bool {
     age > max_age || data["stale"] == true
 }
@@ -654,7 +687,11 @@ async fn cycle(
     );
     selected.truncate(c.max_pairs);
     funnel.insert("selected_pairs".into(), selected.len());
-    j.event("feed_summary",json!({"signals":counts,"funnel":funnel,"registry_pairs":pairs.len(),"returned":rows.len(),"total_count":data["total_count"],"truncated":data["truncated"],"truncated_unknown":data["truncated"].is_null(),"age_seconds":age,"source_age_exceeded":age>c.max_signal_age_secs,"vendor_stale":data["stale"],"source_stale":source_is_stale(data,age,c.max_signal_age_secs),"selected_pairs":selected.len(),"pro_key_present":key.is_some(),"pro_entitlement_verified":false}))?;
+    let displayed_direction_mismatches = rows
+        .iter()
+        .filter(|row| displayed_direction_mismatch(row))
+        .count();
+    j.event("feed_summary",json!({"signals":counts,"funnel":funnel,"registry_pairs":pairs.len(),"returned":rows.len(),"total_count":data["total_count"],"truncated":data["truncated"],"truncated_unknown":data["truncated"].is_null(),"age_seconds":age,"source_age_exceeded":age>c.max_signal_age_secs,"vendor_stale":data["stale"],"source_stale":source_is_stale(data,age,c.max_signal_age_secs),"selected_pairs":selected.len(),"pro_key_present":key.is_some(),"pro_entitlement_verified":false,"displayed_direction_mismatches":displayed_direction_mismatches,"source_identity_sufficient_for_automatic_pairing":false}))?;
     tracing::info!(?counts,age_seconds=age,selected_pairs=selected.len(),truncated=?data["truncated"],"PMP candidate summary");
     for p in selected {
         let result = probe(http, p, c, j, seen).await;
@@ -740,8 +777,31 @@ pub async fn run(command: &str) -> Result<()> {
     if command == "report" {
         return report(&c);
     }
+    if command == "leads" {
+        report(&c)?;
+        let report: Value = serde_json::from_reader(File::open(c.root.join("report.json"))?)?;
+        let output = json!({
+            "generated_at": Utc::now(),
+            "source_run_id": report["selected_run_id"],
+            "automatic_registry_write": false,
+            "warning": "Discovery labels lack exact contract IDs, dates and explicit outcome identity. Manually resolve both venues and run inspect before approval.",
+            "leads": report["discovery_leads"],
+        });
+        let target = c.root.join("pair-leads.json");
+        let temporary = c
+            .root
+            .join(format!("pair-leads-{}.tmp", uuid::Uuid::new_v4()));
+        serde_json::to_writer_pretty(File::create(&temporary)?, &output)?;
+        fs::rename(temporary, &target)?;
+        println!(
+            "Review queue: {} | leads={} | registry unchanged",
+            target.display(),
+            output["leads"].as_array().map_or(0, Vec::len)
+        );
+        return Ok(());
+    }
     if !matches!(command, "scan" | "shadow" | "inspect" | "probe") {
-        bail!("expected scan, shadow, inspect, probe or report");
+        bail!("expected scan, leads, shadow, inspect, probe or report");
     }
     // Diagnostic runs must not become the latest run of the shadow report.
     if matches!(command, "inspect" | "probe") {
@@ -840,7 +900,16 @@ pub async fn run(command: &str) -> Result<()> {
     report(&c)
 }
 
-fn events(root: &Path, mut visit: impl FnMut(Value)) -> Result<usize> {
+fn partial_run_id(line: &str) -> Option<String> {
+    let marker = "\"run_id\"";
+    let rest = &line[line.find(marker)? + marker.len()..];
+    let rest = rest.trim_start().strip_prefix(':')?.trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let id = rest.split('"').next()?;
+    safe_id(id).then(|| id.to_string())
+}
+
+fn events(root: &Path, mut visit: impl FnMut(Value)) -> Result<EventAudit> {
     let mut paths = fs::read_dir(root)?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| {
@@ -850,21 +919,35 @@ fn events(root: &Path, mut visit: impl FnMut(Value)) -> Result<usize> {
         })
         .collect::<Vec<_>>();
     paths.sort();
-    let mut malformed = 0;
+    let mut audit = EventAudit::default();
+    let mut active_run: Option<String> = None;
     for path in paths {
         for line in BufReader::new(File::open(path)?).lines() {
-            match serde_json::from_str::<Value>(&line?) {
-                Ok(v) => visit(v),
-                Err(_) => malformed += 1,
+            let line = line?;
+            match serde_json::from_str::<Value>(&line) {
+                Ok(v) => {
+                    if let Some(id) = v["run_id"].as_str() {
+                        active_run = Some(id.to_string());
+                    }
+                    visit(v)
+                }
+                Err(_) => {
+                    audit.malformed_total += 1;
+                    if let Some(id) = partial_run_id(&line).or_else(|| active_run.clone()) {
+                        *audit.malformed_by_run.entry(id).or_default() += 1;
+                    } else {
+                        audit.malformed_unattributed += 1;
+                    }
+                }
             }
         }
     }
-    Ok(malformed)
+    Ok(audit)
 }
 fn report(c: &Config) -> Result<()> {
     let mut last_run = String::new();
     let mut runs = BTreeMap::<String, usize>::new();
-    let malformed = events(&c.root, |e| {
+    let audit = events(&c.root, |e| {
         if let Some(id) = e["run_id"].as_str() {
             *runs.entry(id.into()).or_default() += 1;
             if e["event"] == "run_started" {
@@ -905,6 +988,9 @@ fn report(c: &Config) -> Result<()> {
     let mut first_time: Option<DateTime<Utc>> = None;
     let mut last_time: Option<DateTime<Utc>> = None;
     let mut first_episodes = HashSet::<String>::new();
+    let mut discovery_leads = BTreeMap::<String, DiscoveryLead>::new();
+    let mut semantic_mismatches_repeated = 0usize;
+    let mut semantic_mismatch_snapshots = HashSet::<String>::new();
     events(&c.root, |e| {
         if e["run_id"].as_str() != Some(&last_run) {
             return;
@@ -981,8 +1067,41 @@ fn report(c: &Config) -> Result<()> {
                 .entry(feed_status(&d["body"]).0.into())
                 .or_default() += 1;
             raw_source_stale = d["body"]["result"]["structuredContent"]["stale"] == true;
-            if let Some(at) = d["body"]["result"]["structuredContent"]["as_of"].as_str() {
+            let source = &d["body"]["result"]["structuredContent"];
+            if let Some(at) = source["as_of"].as_str() {
                 unique_source_snapshots.insert(at.to_string());
+            }
+            let as_of = source["as_of"].as_str().unwrap_or("unknown");
+            for row in source["gaps"].as_array().into_iter().flatten() {
+                let Some(sport) = row["sport"].as_str() else {
+                    continue;
+                };
+                let Some(game) = row["game"].as_str() else {
+                    continue;
+                };
+                let key = format!("{sport}\u{1f}{game}");
+                let lead = discovery_leads.entry(key).or_default();
+                lead.sport = sport.to_string();
+                lead.game = game.to_string();
+                lead.repeated_rows += 1;
+                lead.unique_snapshots.insert(as_of.to_string());
+                *lead.signals.entry(signal(row)).or_default() += 1;
+                if let Some(gap) = row["gap_pp"].as_f64().filter(|v| v.is_finite()) {
+                    lead.max_gap_pp = Some(lead.max_gap_pp.map_or(gap, |v| v.max(gap)));
+                }
+                if lead.last_as_of.as_deref().is_none_or(|v| v < as_of) {
+                    lead.last_as_of = Some(as_of.to_string());
+                }
+                if displayed_direction_mismatch(row) {
+                    lead.displayed_direction_mismatches += 1;
+                    semantic_mismatches_repeated += 1;
+                    semantic_mismatch_snapshots.insert(format!(
+                        "{as_of}\u{1f}{sport}\u{1f}{game}\u{1f}{}\u{1f}{}\u{1f}{}",
+                        row["kalshi_implied_pct"],
+                        row["polymarket_implied_pct"],
+                        row["cheaper_venue"]
+                    ));
+                }
             }
         }
         if kind == "feed_attempt" {
@@ -1067,7 +1186,9 @@ fn report(c: &Config) -> Result<()> {
             .iter()
             .filter_map(|d| d["delay_ms"].as_u64())
             .collect::<HashSet<_>>();
-        let ok = malformed == 0
+        let selected_run_malformed = audit.malformed_by_run.get(&last_run).copied().unwrap_or(0);
+        let ok = selected_run_malformed == 0
+            && audit.malformed_unattributed == 0
             && !configured_delays.is_empty()
             && found == configured_delays
             && obs.len() == configured_delays.len()
@@ -1111,12 +1232,57 @@ fn report(c: &Config) -> Result<()> {
         let failures=request_failures.get(&venue).copied().unwrap_or(0);
         (venue,json!({"samples":n,"p50_ms":values[n/2],"p95_ms":values[(n-1)*95/100],"max_ms":values[n-1],"failed_requests":failures}))
     }).collect::<BTreeMap<_,_>>();
-    let result = json!({"generated_at":Utc::now(),"selected_run_id":last_run,"selected_mode":selected_mode,"runs_event_counts":runs,"directory_malformed_lines":malformed,
+    let selected_run_malformed = audit.malformed_by_run.get(&last_run).copied().unwrap_or(0);
+    let include_watch = selected_config["include_watch"].as_bool().unwrap_or(true);
+    let mut lead_values = discovery_leads.into_values().collect::<Vec<_>>();
+    lead_values.sort_by(|a, b| {
+        let eligible = |lead: &DiscoveryLead| {
+            lead.signals
+                .iter()
+                .filter(|(signal, _)| eligible_signal(signal, include_watch))
+                .map(|(_, count)| count)
+                .sum::<usize>()
+        };
+        eligible(b)
+            .cmp(&eligible(a))
+            .then_with(|| {
+                b.max_gap_pp
+                    .unwrap_or(f64::NEG_INFINITY)
+                    .total_cmp(&a.max_gap_pp.unwrap_or(f64::NEG_INFINITY))
+            })
+            .then_with(|| b.unique_snapshots.len().cmp(&a.unique_snapshots.len()))
+            .then_with(|| a.sport.cmp(&b.sport))
+            .then_with(|| a.game.cmp(&b.game))
+    });
+    let leads = lead_values
+        .into_iter()
+        .enumerate()
+        .map(|(index, lead)| {
+            let eligible_rows = lead
+                .signals
+                .iter()
+                .filter(|(signal, _)| eligible_signal(signal, include_watch))
+                .map(|(_, count)| count)
+                .sum::<usize>();
+            json!({
+            "rank":index+1,"sport":lead.sport,"game":lead.game,"repeated_rows":lead.repeated_rows,
+            "eligible_signal_rows_repeated":eligible_rows,
+            "unique_source_snapshots":lead.unique_snapshots.len(),"signals_repeated":lead.signals,
+            "max_displayed_gap_pp":lead.max_gap_pp,"last_as_of":lead.last_as_of,
+            "displayed_direction_mismatches_repeated":lead.displayed_direction_mismatches,
+            "review_status":"unresolved","review_priority":if eligible_rows > 0 {"eligible_signal"} else {"diagnostic_only"},"automatic_pairing_allowed":false,
+            "missing_identity_fields":["event_date","explicit_outcome","kalshi_ticker","polymarket_slug","token_ids"]
+        })})
+        .collect::<Vec<_>>();
+    let result = json!({"generated_at":Utc::now(),"selected_run_id":last_run,"selected_mode":selected_mode,"runs_event_counts":runs,"directory_malformed_lines":audit.malformed_total,
+        "selected_run_malformed_lines":selected_run_malformed,"malformed_unattributed_lines":audit.malformed_unattributed,"selected_run_data_integrity_ok":selected_run_malformed==0 && audit.malformed_unattributed==0,"malformed_lines_by_run":audit.malformed_by_run,
         "first_recorded_at":first_time,"last_recorded_at":last_time,"elapsed_secs":elapsed_secs,
         "event_counts":counts,"rejections":rejections,
         "feed_health":{"attempt_status_counts":attempt_statuses,"raw_response_status_counts":raw_statuses,"legacy_http_cycle_errors":historical_http_errors,"note":"Raw responses and attempts overlap; do not add them. Historical provider_no_data was recorded as cycle_error; it is not a verified network failure."},
         "selection":{"funnel_counts":funnel,"candidate_outcomes":candidate_outcomes,"note":"Age-exceeded scans are not rejected opportunities. Historical registry size cannot be inferred from zero selected pairs."},
-        "source":{"returned_rows_repeated":returned,"returned_rows_distribution":row_distribution,"returned_equals_total_cycles":total_matches,"api_key_present":key_present,"pro_entitlement_verified":false,"coverage_status":"unverified","truncated_scans":truncated,"truncated_unknown_cycles":truncated_unknown,"source_stale_cycles":source_stale_cycles,"source_age_exceeded_cycles":age_exceeded_cycles,"vendor_stale_cycles":vendor_stale_cycles,"max_age_secs":ages.last(),"median_age_secs":ages.get(ages.len()/2),"signal_counts_repeated":signal_counts,"unique_source_snapshots":unique_source_snapshots.len()},
+        "source":{"returned_rows_repeated":returned,"returned_rows_distribution":row_distribution,"returned_equals_total_cycles":total_matches,"api_key_present":key_present,"pro_entitlement_verified":false,"coverage_status":"unverified","truncated_scans":truncated,"truncated_unknown_cycles":truncated_unknown,"source_stale_cycles":source_stale_cycles,"source_age_exceeded_cycles":age_exceeded_cycles,"vendor_stale_cycles":vendor_stale_cycles,"max_age_secs":ages.last(),"median_age_secs":ages.get(ages.len()/2),"signal_counts_repeated":signal_counts,"unique_source_snapshots":unique_source_snapshots.len(),"identity_sufficient_for_automatic_pairing":false},
+        "source_semantics_audit":{"displayed_direction_mismatches_repeated":semantic_mismatches_repeated,"unique_mismatch_snapshots":semantic_mismatch_snapshots.len(),"interpretation":"A mismatch only means cheaper_venue conflicts with the displayed implied percentages under a same-outcome interpretation. It does not prove provider error; exact outcome identity is absent."},
+        "discovery_leads":leads,
         "rest_latency":latency_summary,"best_priced_quote":best_priced,
         "subscription_overhead":{"monthly_usd":monthly,"prorated_30day_usd":overhead,"note":"Separate operating cost; conditional quote sums are not portfolio income"},
         "unique_pair_opportunities":opportunities.len(),"robust_conditional_pairs":robust,"conditional_worst_delay_profit_sum":worst_sum,
@@ -1409,5 +1575,81 @@ mod tests {
             latency_ms: 1,
         };
         assert_eq!(feed_data(&response).unwrap()["truncated"], true);
+    }
+
+    #[test]
+    fn displayed_direction_audit_is_diagnostic_not_pair_approval() {
+        assert!(displayed_direction_mismatch(&json!({
+            "cheaper_venue":"polymarket",
+            "kalshi_implied_pct":51.0,
+            "polymarket_implied_pct":52.0
+        })));
+        assert!(!displayed_direction_mismatch(&json!({
+            "cheaper_venue":"polymarket",
+            "kalshi_implied_pct":52.0,
+            "polymarket_implied_pct":51.0
+        })));
+
+        let mut c = Config::load().unwrap();
+        c.root = std::env::temp_dir().join(format!("cross-leads-{}", uuid::Uuid::new_v4()));
+        let j = Journal::new(&c.root).unwrap();
+        j.event("run_started", json!({"config":c,"mode":"shadow"}))
+            .unwrap();
+        j.event(
+            "pmp_raw",
+            json!({"body":{"result":{"structuredContent":{
+                "as_of":"2026-09-16T00:00:00Z",
+                "gaps":[{"sport":"MLB","game":"Boston vs Texas","signal":"ALIGNED","gap_pp":1.0,"cheaper_venue":"polymarket","kalshi_implied_pct":51.0,"polymarket_implied_pct":52.0}]
+            }}}}),
+        )
+        .unwrap();
+        report(&c).unwrap();
+        let r: Value =
+            serde_json::from_reader(File::open(c.root.join("report.json")).unwrap()).unwrap();
+        assert_eq!(
+            r["source_semantics_audit"]["displayed_direction_mismatches_repeated"],
+            1
+        );
+        assert_eq!(r["discovery_leads"][0]["review_status"], "unresolved");
+        assert_eq!(r["discovery_leads"][0]["automatic_pairing_allowed"], false);
+        drop(j);
+        fs::remove_dir_all(c.root).unwrap();
+    }
+
+    #[test]
+    fn malformed_old_run_does_not_disqualify_latest_run() {
+        let mut c = Config::load().unwrap();
+        c.root = std::env::temp_dir().join(format!("cross-torn-{}", uuid::Uuid::new_v4()));
+        c.delays_ms = vec![500];
+        let old = Journal::new(&c.root).unwrap();
+        old.event("run_started", json!({"config":c,"mode":"shadow"}))
+            .unwrap();
+        let old_id = old.run_id.clone();
+        let event_path = old.path();
+        drop(old);
+        let mut file = OpenOptions::new().append(true).open(&event_path).unwrap();
+        write!(
+            file,
+            "{{\"schema_version\":1,\"run_id\":\"{old_id}\",\"event\":\"pmp_raw\""
+        )
+        .unwrap();
+        drop(file);
+
+        let latest = Journal::new(&c.root).unwrap();
+        latest
+            .event("run_started", json!({"config":c,"mode":"shadow"}))
+            .unwrap();
+        latest.event("opportunity",json!({"pair_id":"test","episode_id":"one","first_in_run":true,"quote":{"net_profit":0.4}})).unwrap();
+        latest.event("delayed_probe",json!({"episode_id":"one","delay_ms":500,"quote":{"net_per_pair":0.03,"net_profit":0.3},"stress":{"poly_first_locked_cost_pnl":0.2,"kalshi_first_locked_cost_pnl":0.1}})).unwrap();
+        report(&c).unwrap();
+        let r: Value =
+            serde_json::from_reader(File::open(c.root.join("report.json")).unwrap()).unwrap();
+        assert_eq!(r["directory_malformed_lines"], 1);
+        assert_eq!(r["malformed_lines_by_run"][old_id], 1);
+        assert_eq!(r["selected_run_malformed_lines"], 0);
+        assert_eq!(r["selected_run_data_integrity_ok"], true);
+        assert_eq!(r["robust_conditional_pairs"], 1);
+        drop(latest);
+        fs::remove_dir_all(c.root).unwrap();
     }
 }
