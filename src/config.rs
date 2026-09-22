@@ -230,6 +230,8 @@ pub struct Config {
     pub late_resolution_winner_trading_state_journal_file: String,
     /// Late-Resolution Winner Trading candidate and counterfactual evaluation journal.
     pub late_resolution_winner_trading_evaluation_journal_file: String,
+    /// Free-space reserve enforced before every winner journal append.
+    pub late_resolution_winner_trading_journal_min_free_bytes: u64,
     /// Observe and simulate fills without submitting, cancelling, merging or selling.
     pub dry_run: bool,
     /// Explicit, fail-closed mode for the first real-money validation run.
@@ -300,6 +302,10 @@ impl Config {
             env::var("LATE_RESOLUTION_WINNER_TRADING_EVALUATION_JOURNAL_FILE").unwrap_or_else(
                 |_| format!("results/late-resolution-winner-trading/{mode}/evaluations.ndjson"),
             );
+        let late_resolution_winner_trading_journal_min_free_bytes = env_parse(
+            "LATE_RESOLUTION_WINNER_TRADING_JOURNAL_MIN_FREE_BYTES",
+            "2147483648",
+        )?;
         let risk_max_exposure_usdc =
             env_parse("BINARY_COMPLEMENT_ARBITRAGE_MAX_EXPOSURE_USDC", "1000.0")?;
         let paper_initial_balance_usdc = env_parse(
@@ -546,6 +552,7 @@ impl Config {
                 .filter(|value| !value.trim().is_empty()),
             late_resolution_winner_trading_state_journal_file,
             late_resolution_winner_trading_evaluation_journal_file,
+            late_resolution_winner_trading_journal_min_free_bytes,
             dry_run,
             canary_mode: env_bool("CANARY_MODE", false)?,
             canary_max_pair_notional_usdc: env_parse("CANARY_MAX_PAIR_NOTIONAL_USDC", "3.0")?,
@@ -896,6 +903,11 @@ impl Config {
             .is_empty()
         {
             bail!("LATE_RESOLUTION_WINNER_TRADING_EVALUATION_JOURNAL_FILE cannot be empty");
+        }
+        if self.late_resolution_winner_trading_journal_min_free_bytes < 16 * 1024 * 1024 {
+            bail!(
+                "LATE_RESOLUTION_WINNER_TRADING_JOURNAL_MIN_FREE_BYTES must be at least 16777216"
+            );
         }
         if !self
             .late_resolution_winner_trading_rtds_url

@@ -402,13 +402,34 @@ fn main() -> Result<()> {
     let mut floor_active = 0_u64;
     let mut max_opening_skew_ms = 0_u64;
     let mut horizon_stats = BTreeMap::<String, (u64, f64)>::new();
+    let mut invalid_lines = 0_u64;
+    let mut recovered_suffix_events = 0_u64;
     for (index, line) in reader.lines().enumerate() {
         let line = line.with_context(|| format!("cannot read line {}", index + 1))?;
         if line.trim().is_empty() {
             continue;
         }
-        let value: Value = serde_json::from_str(&line)
-            .with_context(|| format!("invalid JSON at {}:{}", path.display(), index + 1))?;
+        let value: Value = match serde_json::from_str(&line) {
+            Ok(value) => value,
+            Err(error) => {
+                invalid_lines += 1;
+                let recovered = line
+                    .match_indices("{\"action\":")
+                    .filter(|(offset, _)| *offset > 0)
+                    .find_map(|(offset, _)| serde_json::from_str::<Value>(&line[offset..]).ok());
+                if let Some(value) = recovered {
+                    recovered_suffix_events += 1;
+                    value
+                } else {
+                    eprintln!(
+                        "warning: skipped invalid journal line {}:{}: {error}",
+                        path.display(),
+                        index + 1
+                    );
+                    continue;
+                }
+            }
+        };
         match value.get("action").and_then(Value::as_str) {
             Some("sensitivity_observed") => {
                 if let Some(groups) = value["decision"]["groups"].as_array() {
@@ -557,7 +578,7 @@ fn main() -> Result<()> {
                             .map(|meta| meta.research_cohorts.clone())
                             .unwrap_or_default();
                     }
-                    let shadow = ShadowFill {
+                    let mut shadow = ShadowFill {
                         evaluation_id: id.to_string(),
                         simulated_at: execution
                             .get("simulated_at")
@@ -578,19 +599,32 @@ fn main() -> Result<()> {
                         filled: decimal(execution.get("filled")),
                         cost: decimal(execution.get("cost")),
                     };
+                    let sensitivity_groups: Vec<_> = shadow
+                        .research_cohorts
+                        .iter()
+                        .filter(|group| group.starts_with("sensitivity_"))
+                        .cloned()
+                        .collect();
+                    // New journals share one physical execution between the
+                    // main rejected-shadow and sensitivity tracks. Attribute
+                    // that result to both report sections without counting a
+                    // second execution event.
+                    for group in &sensitivity_groups {
+                        let key = (
+                            execution["run_id"].as_str().unwrap_or("legacy").to_string(),
+                            slug.clone(),
+                            group.clone(),
+                        );
+                        sensitivity_shadows
+                            .entry(key)
+                            .or_insert_with(|| shadow.clone());
+                    }
                     if shadow.candidate_stage == "sensitivity_confirmed" {
-                        for group in &shadow.research_cohorts {
-                            let key = (
-                                execution["run_id"].as_str().unwrap_or("legacy").to_string(),
-                                slug.clone(),
-                                group.clone(),
-                            );
-                            sensitivity_shadows
-                                .entry(key)
-                                .or_insert_with(|| shadow.clone());
-                        }
                         continue;
                     }
+                    shadow
+                        .research_cohorts
+                        .retain(|group| !group.starts_with("sensitivity_"));
                     shadows.insert(id.to_string(), shadow.clone());
                     let replace = latest_shadow_by_slug
                         .get(&slug)
@@ -642,6 +676,14 @@ fn main() -> Result<()> {
         }
     }
 
+    if invalid_lines > 0 {
+        println!(
+            "JOURNAL INTEGRITY: status=FAILED invalid_lines={invalid_lines} recovered_suffix_events={recovered_suffix_events} dropped_invalid_lines={}; recovered data is diagnostic only",
+            invalid_lines.saturating_sub(recovered_suffix_events)
+        );
+    } else {
+        println!("JOURNAL INTEGRITY: status=OK invalid_lines=0");
+    }
     reference_audit(&path, &raw_evaluations)?;
     println!("HISTORICAL TWAP HORIZONS (correlated candidate observations; not settlement-calibrated volatility):");
     for (label, (n, sum)) in horizon_stats {

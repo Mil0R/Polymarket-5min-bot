@@ -118,6 +118,7 @@ cargo run              # 运行程序
 | `BINARY_COMPLEMENT_ARBITRAGE_STATE_JOURNAL_FILE` | `results/binary-complement-arbitrage/{paper|live}/orders.ndjson` | Binary Complement Arbitrage 订单对与恢复状态 |
 | `LATE_RESOLUTION_WINNER_TRADING_STATE_JOURNAL_FILE` | `results/late-resolution-winner-trading/{paper|live}/orders.ndjson` | Late-Resolution Winner Trading 下单、成交与结算状态 |
 | `LATE_RESOLUTION_WINNER_TRADING_EVALUATION_JOURNAL_FILE` | `results/late-resolution-winner-trading/{paper|live}/evaluations.ndjson` | Late-Resolution Winner Trading 候选与反事实评估数据 |
+| `LATE_RESOLUTION_WINNER_TRADING_JOURNAL_MIN_FREE_BYTES` | `2147483648` | 每次写状态/评估 journal 前保留的磁盘空间；低于阈值时停止写入并保持 fail closed |
 | `LATE_RESOLUTION_WINNER_TRADING_MAX_BOOK_AGE_MS` | `1000` | Late-Resolution Winner Trading 独立 WS 行情年龄；疑似候选或缺书时才进行严格 REST 确认 |
 | `BINARY_COMPLEMENT_ARBITRAGE_SHADOW_LOG_FILE` | 未设置 | 可选的深度拒绝候选 NDJSON 研究日志，不改变准入阈值 |
 | `LOG_FILE` | TUI 下为 `logs/system.log` | 系统日志；配置分策略日志后不再重复对应策略事件 |

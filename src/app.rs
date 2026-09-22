@@ -474,17 +474,25 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or_else(|| std::path::Path::new("."));
     const MIN_READY_DISK_BYTES: u64 = 64 * 1024 * 1024;
+    let min_ready_disk_bytes = if late_resolution_winner_trading_available {
+        config.late_resolution_winner_trading_journal_min_free_bytes
+    } else {
+        MIN_READY_DISK_BYTES
+    };
     let disk_healthy = fs2::available_space(journal_dir)
-        .map(|bytes| bytes >= MIN_READY_DISK_BYTES)
+        .map(|bytes| bytes >= min_ready_disk_bytes)
         .unwrap_or(false);
     service_health.set_disk_healthy(disk_healthy);
     service_health.set_no_unresolved_orders(!_risk_manager.has_unresolved_state());
     service_health.set_safety_ok(!live_safety.is_tripped());
 
     let late_resolution_winner_trading_journal = if late_resolution_winner_trading_available {
-        let journal = Arc::new(LateResolutionWinnerTradingJournal::open(
-            &config.late_resolution_winner_trading_state_journal_file,
-        )?);
+        let journal = Arc::new(
+            LateResolutionWinnerTradingJournal::open_with_min_free_bytes(
+                &config.late_resolution_winner_trading_state_journal_file,
+                config.late_resolution_winner_trading_journal_min_free_bytes,
+            )?,
+        );
         let restored = journal.pending().len();
         if restored > 0 {
             warn!(target: "polypulse::strategy::late_resolution_winner_trading",
@@ -549,8 +557,9 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
         None
     };
     let winner_evaluation_journal = if late_resolution_winner_trading_available {
-        let journal = Arc::new(WinnerEvaluationJournal::open(
+        let journal = Arc::new(WinnerEvaluationJournal::open_with_min_free_bytes(
             &config.late_resolution_winner_trading_evaluation_journal_file,
+            config.late_resolution_winner_trading_journal_min_free_bytes,
         )?);
         journal.record_run_started(
             &run_id.to_string(),
@@ -2382,6 +2391,11 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                                 && research_cohorts
                                     .iter()
                                     .any(|cohort| cohort == "hybrid_chainlink_veto");
+                            // A rejected candidate can be confirmed by both the
+                            // sensitivity and main Shadow tracks in the same scan.
+                            // Defer the sensitivity execution so both tracks can
+                            // share one delayed book read and one persisted result.
+                            let mut sensitivity_groups_to_execute = Vec::new();
                             evaluation.candidate_stage = if model.admitted() {
                                 "production"
                             } else if hybrid_paper_admitted {
@@ -2437,12 +2451,18 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                                             market = %market.crypto_symbol, %evaluation_id, groups = ?groups,
                                             price = %signal.price, %size, "Winner sensitivity Shadow opportunity confirmed");
                                         for group in &groups { winner_sensitivity_executed.insert(format!("{}:{group}", market.slug)); }
-                                        // All groups confirmed now share one delayed snapshot and execution result.
-                                        window_session.spawn_trade(record_winner_shadow(executor.clone(), journal.clone(),
-                                            runtime_metrics.clone(), token, signal.price, size, fee_per_share,
-                                            config.paper_late_resolution_winner_trading_delay_ms, run_id.to_string(),
-                                            evaluation_id.clone(), market.slug.clone(), market.crypto_symbol.clone(),
-                                            "sensitivity_confirmed".into(), groups));
+                                        if model.admitted() || hybrid_paper_admitted {
+                                            // No rejected-shadow path will run for
+                                            // admitted candidates, so execute the
+                                            // sensitivity observation immediately.
+                                            window_session.spawn_trade(record_winner_shadow(executor.clone(), journal.clone(),
+                                                runtime_metrics.clone(), token, signal.price, size, fee_per_share,
+                                                config.paper_late_resolution_winner_trading_delay_ms, run_id.to_string(),
+                                                evaluation_id.clone(), market.slug.clone(), market.crypto_symbol.clone(),
+                                                "sensitivity_confirmed".into(), groups));
+                                        } else {
+                                            sensitivity_groups_to_execute = groups;
+                                        }
                                     }
                                 }
                             }
@@ -2486,8 +2506,43 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                                     "Late-Resolution Winner Trading rejected by independent Chainlink model"
                                 );
                                 if config.dry_run {
+                                    let mut spawn_sensitivity_only = |groups: Vec<String>| {
+                                        if groups.is_empty() {
+                                            return;
+                                        }
+                                        let size = fee_inclusive_depth_capped_size(
+                                            signal.price,
+                                            fee_per_share,
+                                            hybrid_max_order,
+                                            ask_size,
+                                        );
+                                        if size > dec!(0) {
+                                            window_session.spawn_trade(record_winner_shadow(
+                                                executor.clone(),
+                                                winner_evaluation_journal
+                                                    .as_ref()
+                                                    .expect("initialized journal")
+                                                    .clone(),
+                                                runtime_metrics.clone(),
+                                                token,
+                                                signal.price,
+                                                size,
+                                                fee_per_share,
+                                                config.paper_late_resolution_winner_trading_delay_ms,
+                                                run_id.to_string(),
+                                                evaluation_id.clone(),
+                                                market.slug.clone(),
+                                                market.crypto_symbol.clone(),
+                                                "sensitivity_confirmed".to_string(),
+                                                groups,
+                                            ));
+                                        }
+                                    };
                                     let Some(observed_at_ms) = model.observed_at_ms else {
                                         winner_shadow_confirmations.reject(&market.slug);
+                                        spawn_sensitivity_only(std::mem::take(
+                                            &mut sensitivity_groups_to_execute,
+                                        ));
                                         continue;
                                     };
                                     let confirmation = winner_shadow_confirmations.observe(
@@ -2519,14 +2574,23 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                                             market = %market.crypto_symbol,
                                             "Late-Resolution Winner Trading rejected-shadow confirmation persistence failed"
                                         );
+                                        spawn_sensitivity_only(std::mem::take(
+                                            &mut sensitivity_groups_to_execute,
+                                        ));
                                         continue;
                                     }
                                     if !confirmation.confirmed {
                                         runtime_metrics
                                             .record_late_resolution_winner_trading_shadow_awaiting_confirmation();
+                                        spawn_sensitivity_only(std::mem::take(
+                                            &mut sensitivity_groups_to_execute,
+                                        ));
                                         continue;
                                     }
                                     if winner_shadow_executed.contains(&market.slug) {
+                                        spawn_sensitivity_only(std::mem::take(
+                                            &mut sensitivity_groups_to_execute,
+                                        ));
                                         continue;
                                     }
                                     let shadow_size = fee_inclusive_depth_capped_size(
@@ -2540,6 +2604,12 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                                         runtime_metrics.record_late_resolution_winner_trading_shadow_confirmed();
                                         runtime_metrics
                                             .record_late_resolution_winner_trading_shadow_execution_attempt();
+                                        let mut combined_cohorts = research_cohorts.clone();
+                                        combined_cohorts.append(
+                                            &mut sensitivity_groups_to_execute,
+                                        );
+                                        combined_cohorts.sort();
+                                        combined_cohorts.dedup();
                                         window_session.spawn_trade(record_winner_shadow(
                                             executor.clone(),
                                             winner_evaluation_journal
@@ -2559,7 +2629,7 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                                             market.slug.clone(),
                                             market.crypto_symbol.clone(),
                                             "rejected_confirmed".to_string(),
-                                            research_cohorts.clone(),
+                                            combined_cohorts,
                                         ));
                                     }
                                 }
@@ -3009,38 +3079,23 @@ async fn record_winner_shadow(
     let request_latency_ms = result.as_ref().ok().map(|r| r.request_latency_ms);
     let total_latency_ms = result.as_ref().ok().map(|r| r.total_latency_ms);
     let (outcome, filled, cost, average_price, estimated_fee, error) = match result {
-        Ok(execution) if execution.filled > dec!(0) => {
-            if candidate_stage != "sensitivity_confirmed" {
-                metrics.record_late_resolution_winner_trading_shadow_execution_fill();
-            }
-            (
-                "filled",
-                execution.filled,
-                execution.cost,
-                execution.average_price,
-                execution.estimated_fee,
-                None,
-            )
-        }
-        Ok(_) => {
-            if candidate_stage != "sensitivity_confirmed" {
-                metrics.record_late_resolution_winner_trading_shadow_execution_no_fill();
-            }
-            ("no_fill", dec!(0), dec!(0), dec!(0), dec!(0), None)
-        }
-        Err(error) => {
-            if candidate_stage != "sensitivity_confirmed" {
-                metrics.record_late_resolution_winner_trading_shadow_execution_failure();
-            }
-            (
-                "error",
-                dec!(0),
-                dec!(0),
-                dec!(0),
-                dec!(0),
-                Some(error.to_string()),
-            )
-        }
+        Ok(execution) if execution.filled > dec!(0) => (
+            "filled",
+            execution.filled,
+            execution.cost,
+            execution.average_price,
+            execution.estimated_fee,
+            None,
+        ),
+        Ok(_) => ("no_fill", dec!(0), dec!(0), dec!(0), dec!(0), None),
+        Err(error) => (
+            "error",
+            dec!(0),
+            dec!(0),
+            dec!(0),
+            dec!(0),
+            Some(error.to_string()),
+        ),
     };
     let execution = WinnerShadowExecution {
         request_latency_ms,
@@ -3061,15 +3116,34 @@ async fn record_winner_shadow(
         estimated_fee,
         error,
     };
-    if let Err(error) = journal.record_shadow_execution(execution) {
-        warn!(target: "polypulse::strategy::late_resolution_winner_trading",
-            %error,
-            %evaluation_id,
-            market = %asset,
-            stage = %candidate_stage,
-            "Late-Resolution Winner Trading shadow persistence failed"
-        );
-        return;
+    match journal.record_shadow_execution(execution) {
+        Ok(true) => {}
+        Ok(false) => {
+            debug!(target: "polypulse::strategy::late_resolution_winner_trading",
+                %evaluation_id,
+                market = %asset,
+                stage = %candidate_stage,
+                "Late-Resolution Winner Trading duplicate shadow result suppressed"
+            );
+            return;
+        }
+        Err(error) => {
+            warn!(target: "polypulse::strategy::late_resolution_winner_trading",
+                %error,
+                %evaluation_id,
+                market = %asset,
+                stage = %candidate_stage,
+                "Late-Resolution Winner Trading shadow persistence failed"
+            );
+            return;
+        }
+    }
+    if candidate_stage != "sensitivity_confirmed" {
+        match outcome {
+            "filled" => metrics.record_late_resolution_winner_trading_shadow_execution_fill(),
+            "no_fill" => metrics.record_late_resolution_winner_trading_shadow_execution_no_fill(),
+            _ => metrics.record_late_resolution_winner_trading_shadow_execution_failure(),
+        }
     }
     if candidate_stage == "sensitivity_confirmed" {
         info!(target: "polypulse::console::late_resolution_winner_trading", %evaluation_id,

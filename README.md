@@ -127,6 +127,7 @@ Get these from Polymarket → Settings → Builder.
 | `BINARY_COMPLEMENT_ARBITRAGE_STATE_JOURNAL_FILE` | `results/binary-complement-arbitrage/{paper|live}/orders.ndjson` | Binary Complement Arbitrage order-pair/recovery journal |
 | `LATE_RESOLUTION_WINNER_TRADING_STATE_JOURNAL_FILE` | `results/late-resolution-winner-trading/{paper|live}/orders.ndjson` | Late-Resolution Winner Trading order, fill, and settlement journal |
 | `LATE_RESOLUTION_WINNER_TRADING_EVALUATION_JOURNAL_FILE` | `results/late-resolution-winner-trading/{paper|live}/evaluations.ndjson` | Candidate/counterfactual evaluations with `run_id`, strategy stage, and model-vs-market probability calibration fields |
+| `LATE_RESOLUTION_WINNER_TRADING_JOURNAL_MIN_FREE_BYTES` | `2147483648` | Free-space reserve checked before every state/evaluation append; the journal fails closed below this limit |
 | `BINARY_COMPLEMENT_ARBITRAGE_SHADOW_LOG_FILE` | unset | Optional NDJSON research log for price-positive candidates rejected by depth; never changes admission |
 | `LOG_FILE` | `logs/system.log` in TUI mode | System log; strategy events move to their configured strategy file without duplication |
 | `BINARY_COMPLEMENT_ARBITRAGE_STRATEGY_LOG_FILE` / `LATE_RESOLUTION_WINNER_TRADING_STRATEGY_LOG_FILE` | unset | Optional mutually exclusive per-strategy text logs |

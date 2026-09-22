@@ -7,6 +7,7 @@
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use fs2::FileExt;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
@@ -14,6 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use crate::late_resolution_winner_model::ModelEvaluation;
@@ -489,12 +491,108 @@ enum WinnerEvaluationEvent {
 /// survivorship bias.
 pub struct WinnerEvaluationJournal {
     path: PathBuf,
-    writer: Mutex<File>,
+    writer: DurableNdjsonWriter,
     unresolved: Mutex<HashMap<String, WinnerEvaluation>>,
+    shadow_execution_ids: Mutex<HashSet<String>>,
+}
+
+/// Fail-closed append writer for journals that must never continue after a
+/// partial or otherwise uncertain write. The free-space reserve prevents the
+/// known ENOSPC failure mode; truncation restores the last complete boundary
+/// if the filesystem still reports a write error after the guard passes.
+struct DurableNdjsonWriter {
+    file: Mutex<File>,
+    directory: PathBuf,
+    min_free_bytes: u64,
+    failed: AtomicBool,
+}
+
+impl DurableNdjsonWriter {
+    fn open(path: &Path, min_free_bytes: u64) -> Result<Self> {
+        let directory = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        if min_free_bytes > 0 {
+            let available = fs2::available_space(&directory)
+                .with_context(|| format!("check free space for {}", directory.display()))?;
+            if available < min_free_bytes {
+                anyhow::bail!(
+                    "journal free-space guard: {available} bytes available, {min_free_bytes} required in {}",
+                    directory.display()
+                );
+            }
+        }
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        file.try_lock_exclusive().with_context(|| {
+            format!(
+                "lock journal {} exclusively; another process may be using it",
+                path.display()
+            )
+        })?;
+        Ok(Self {
+            file: Mutex::new(file),
+            directory,
+            min_free_bytes,
+            failed: AtomicBool::new(false),
+        })
+    }
+
+    fn append<T: Serialize>(&self, event: &T) -> Result<()> {
+        if self.failed.load(Ordering::Relaxed) {
+            anyhow::bail!("journal is fail-closed after an earlier write failure");
+        }
+        let mut encoded = serde_json::to_vec(event)?;
+        encoded.push(b'\n');
+        let mut file = self
+            .file
+            .lock()
+            .map_err(|_| anyhow::anyhow!("journal writer lock poisoned"))?;
+        if self.min_free_bytes > 0 {
+            // This check happens before any bytes are written, so rejecting an append here does
+            // not leave journal state uncertain. Keep it retryable: once operators restore disk
+            // capacity, the next event may be persisted without restarting the process. Actual
+            // write/flush/sync failures below still poison the writer permanently.
+            let available = fs2::available_space(&self.directory).with_context(|| {
+                format!(
+                    "check free space before appending journal in {}",
+                    self.directory.display()
+                )
+            })?;
+            if available < self.min_free_bytes.saturating_add(encoded.len() as u64) {
+                anyhow::bail!(
+                    "journal free-space guard tripped: {available} bytes available, reserve {}",
+                    self.min_free_bytes
+                );
+            }
+        }
+        let original_len = file.metadata()?.len();
+        if let Err(error) = file
+            .write_all(&encoded)
+            .and_then(|_| file.flush())
+            .and_then(|_| file.sync_data())
+        {
+            self.failed.store(true, Ordering::Relaxed);
+            let rollback = file.set_len(original_len).and_then(|_| file.sync_all());
+            return match rollback {
+                Ok(()) => Err(error).context("append complete NDJSON event; partial tail rolled back"),
+                Err(rollback_error) => Err(anyhow::anyhow!(
+                    "append complete NDJSON event failed: {error}; rollback to {original_len} bytes also failed: {rollback_error}"
+                )),
+            };
+        }
+        Ok(())
+    }
 }
 
 impl WinnerEvaluationJournal {
+    #[cfg(test)]
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_min_free_bytes(path, 0)
+    }
+
+    pub fn open_with_min_free_bytes(path: impl AsRef<Path>, min_free_bytes: u64) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path
             .parent()
@@ -503,32 +601,32 @@ impl WinnerEvaluationJournal {
             std::fs::create_dir_all(parent)?;
         }
         let mut unresolved = HashMap::new();
+        let mut shadow_execution_ids = HashSet::new();
         if path.exists() {
+            let repair = repair_evaluation_journal(&path)?;
+            if repair.quarantined_lines > 0 {
+                tracing::warn!(
+                    path = %path.display(),
+                    quarantined_lines = repair.quarantined_lines,
+                    recovered_events = repair.recovered_events,
+                    quarantine = %repair.quarantine.display(),
+                    "Repaired invalid Late-Resolution Winner Trading evaluation journal records"
+                );
+            }
             let lines = BufReader::new(File::open(&path)?)
                 .lines()
                 .collect::<std::io::Result<Vec<_>>>()?;
-            let last_record = lines.iter().rposition(|line| !line.trim().is_empty());
             for (index, line) in lines.iter().enumerate() {
                 if line.trim().is_empty() {
                     continue;
                 }
-                let event: WinnerEvaluationEvent = match serde_json::from_str(line) {
-                    Ok(event) => event,
-                    Err(error) if Some(index) == last_record => {
-                        quarantine_incomplete_tail(&path, &lines, index)?;
-                        tracing::warn!(path = %path.display(), line = index + 1, %error, "Quarantined incomplete Late-Resolution Winner Trading evaluation journal tail");
-                        break;
-                    }
-                    Err(error) => {
-                        return Err(error).with_context(|| {
-                            format!(
-                                "invalid Late-Resolution Winner Trading evaluation record at {}:{}",
-                                path.display(),
-                                index + 1
-                            )
-                        });
-                    }
-                };
+                let event: WinnerEvaluationEvent = serde_json::from_str(line).with_context(|| {
+                    format!(
+                        "invalid Late-Resolution Winner Trading evaluation record after repair at {}:{}",
+                        path.display(),
+                        index + 1
+                    )
+                })?;
                 match event {
                     WinnerEvaluationEvent::RunStarted { version: 1, .. } => {}
                     WinnerEvaluationEvent::Evaluated {
@@ -545,7 +643,12 @@ impl WinnerEvaluationJournal {
                         unresolved.remove(&evaluation_id);
                     }
                     WinnerEvaluationEvent::MarketResolved { version: 1, .. } => {}
-                    WinnerEvaluationEvent::ShadowExecuted { version: 1, .. } => {}
+                    WinnerEvaluationEvent::ShadowExecuted {
+                        version: 1,
+                        execution,
+                    } => {
+                        shadow_execution_ids.insert(execution.evaluation_id.clone());
+                    }
                     WinnerEvaluationEvent::ConfirmationObserved { version: 1, .. } => {}
                     WinnerEvaluationEvent::SensitivityObserved { version: 1, .. } => {}
                     _ => anyhow::bail!(
@@ -554,11 +657,12 @@ impl WinnerEvaluationJournal {
                 }
             }
         }
-        let writer = OpenOptions::new().create(true).append(true).open(&path)?;
+        let writer = DurableNdjsonWriter::open(&path, min_free_bytes)?;
         Ok(Self {
             path,
-            writer: Mutex::new(writer),
+            writer,
             unresolved: Mutex::new(unresolved),
+            shadow_execution_ids: Mutex::new(shadow_execution_ids),
         })
     }
 
@@ -593,11 +697,21 @@ impl WinnerEvaluationJournal {
         Ok(())
     }
 
-    pub fn record_shadow_execution(&self, execution: WinnerShadowExecution) -> Result<()> {
+    pub fn record_shadow_execution(&self, execution: WinnerShadowExecution) -> Result<bool> {
+        let evaluation_id = execution.evaluation_id.clone();
+        let mut ids = self
+            .shadow_execution_ids
+            .lock()
+            .expect("Late-Resolution Winner Trading shadow execution lock poisoned");
+        if ids.contains(&evaluation_id) {
+            return Ok(false);
+        }
         self.append(&WinnerEvaluationEvent::ShadowExecuted {
             version: 1,
             execution: Box::new(execution),
-        })
+        })?;
+        ids.insert(evaluation_id);
+        Ok(true)
     }
 
     pub fn record_sensitivity(&self, decision: serde_json::Value) -> Result<()> {
@@ -706,15 +820,7 @@ impl WinnerEvaluationJournal {
     }
 
     fn append(&self, event: &WinnerEvaluationEvent) -> Result<()> {
-        let encoded = serde_json::to_string(event)?;
-        let mut writer = self
-            .writer
-            .lock()
-            .expect("Late-Resolution Winner Trading evaluation journal lock poisoned");
-        writeln!(writer, "{encoded}")?;
-        writer.flush()?;
-        writer.sync_data()?;
-        Ok(())
+        self.writer.append(event)
     }
 }
 
@@ -821,7 +927,7 @@ struct LateResolutionWinnerTradingRiskState {
 /// map is rebuilt by replaying the journal on startup.
 pub struct LateResolutionWinnerTradingJournal {
     path: PathBuf,
-    writer: Mutex<File>,
+    writer: DurableNdjsonWriter,
     pending: Mutex<HashMap<String, PendingLateResolutionWinnerTrading>>,
     awaiting_redeem: Mutex<HashMap<String, PendingLateResolutionWinnerTrading>>,
     states: Mutex<HashMap<String, WinnerLifecycleState>>,
@@ -848,7 +954,12 @@ struct WinnerJournalReplay {
 }
 
 impl LateResolutionWinnerTradingJournal {
+    #[cfg(test)]
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_min_free_bytes(path, 0)
+    }
+
+    pub fn open_with_min_free_bytes(path: impl AsRef<Path>, min_free_bytes: u64) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path
             .parent()
@@ -862,19 +973,15 @@ impl LateResolutionWinnerTradingJournal {
             })?;
         }
         let replay = replay_journal(&path)?;
-        let writer = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .with_context(|| {
-                format!(
-                    "failed to open late-resolution-winner-trading journal {}",
-                    path.display()
-                )
-            })?;
+        let writer = DurableNdjsonWriter::open(&path, min_free_bytes).with_context(|| {
+            format!(
+                "failed to open late-resolution-winner-trading journal {}",
+                path.display()
+            )
+        })?;
         Ok(Self {
             path,
-            writer: Mutex::new(writer),
+            writer,
             pending: Mutex::new(replay.pending),
             awaiting_redeem: Mutex::new(replay.awaiting_redeem),
             states: Mutex::new(replay.states),
@@ -1204,15 +1311,7 @@ impl LateResolutionWinnerTradingJournal {
     }
 
     fn append(&self, event: &WinnerJournalEvent) -> Result<()> {
-        let encoded = serde_json::to_string(event)?;
-        let mut writer = self
-            .writer
-            .lock()
-            .expect("late-resolution-winner-trading journal lock poisoned");
-        writeln!(writer, "{encoded}")?;
-        writer.flush()?;
-        writer.sync_data()?;
-        Ok(())
+        self.writer.append(event)
     }
 }
 
@@ -1354,6 +1453,90 @@ fn record_risk_result(
     } else {
         risk.consecutive_losses = 0;
     }
+}
+
+#[derive(Default)]
+struct EvaluationJournalRepair {
+    quarantined_lines: usize,
+    recovered_events: usize,
+    quarantine: PathBuf,
+}
+
+/// Repair evaluation-only history after an interrupted append. Invalid source
+/// lines are preserved in a quarantine file. If a complete event follows a
+/// partial prefix on the same line, retain that complete suffix in the active
+/// journal so later settlement evidence is not lost.
+fn repair_evaluation_journal(path: &Path) -> Result<EvaluationJournalRepair> {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(EvaluationJournalRepair::default());
+        }
+        Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
+    };
+    let mut valid = Vec::new();
+    let mut quarantined = Vec::new();
+    let mut recovered_events = 0;
+    for (index, line) in contents.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if serde_json::from_str::<WinnerEvaluationEvent>(line).is_ok() {
+            valid.push(line.to_string());
+            continue;
+        }
+        quarantined.push(format!("line {}: {line}", index + 1));
+        let recovered = line
+            .match_indices("{\"action\":")
+            .filter(|(offset, _)| *offset > 0)
+            .find_map(|(offset, _)| {
+                let suffix = &line[offset..];
+                serde_json::from_str::<WinnerEvaluationEvent>(suffix)
+                    .ok()
+                    .map(|_| suffix.to_string())
+            });
+        if let Some(event) = recovered {
+            valid.push(event);
+            recovered_events += 1;
+        }
+    }
+    if quarantined.is_empty() {
+        return Ok(EvaluationJournalRepair::default());
+    }
+
+    let stamp = Utc::now().timestamp_millis();
+    let quarantine = PathBuf::from(format!("{}.corrupt-{stamp}", path.display()));
+    let mut quarantined_contents = quarantined.join("\n");
+    quarantined_contents.push('\n');
+    std::fs::write(&quarantine, quarantined_contents)
+        .with_context(|| format!("write quarantine {}", quarantine.display()))?;
+
+    let temporary = PathBuf::from(format!("{}.repair-{stamp}.tmp", path.display()));
+    let mut repaired_contents = valid.join("\n");
+    if !repaired_contents.is_empty() {
+        repaired_contents.push('\n');
+    }
+    let mut repaired = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)
+        .with_context(|| format!("create repaired journal {}", temporary.display()))?;
+    repaired.write_all(repaired_contents.as_bytes())?;
+    repaired.sync_all()?;
+    drop(repaired);
+    std::fs::rename(&temporary, path).with_context(|| {
+        format!(
+            "atomically install repaired journal {} over {}",
+            temporary.display(),
+            path.display()
+        )
+    })?;
+
+    Ok(EvaluationJournalRepair {
+        quarantined_lines: quarantined.len(),
+        recovered_events,
+        quarantine,
+    })
 }
 
 fn quarantine_incomplete_tail(path: &Path, lines: &[String], index: usize) -> Result<()> {
@@ -1791,27 +1974,29 @@ mod tests {
                     candidate_stage: "rejected_shadow".into(),
                 })
                 .unwrap();
-            journal
-                .record_shadow_execution(WinnerShadowExecution {
-                    request_latency_ms: Some(20),
-                    total_latency_ms: Some(270),
-                    run_id: "run-1".into(),
-                    evaluation_id: "eval-1".into(),
-                    slug: "btc-updown-5m-1".into(),
-                    simulated_at: now,
-                    delay_ms: 250,
-                    candidate_stage: "rejected".into(),
-                    research_cohorts: vec!["all_candidates".into()],
-                    outcome: "filled".into(),
-                    limit_price: dec!(0.95),
-                    requested: dec!(20),
-                    filled: dec!(7.5),
-                    cost: dec!(7.1499375),
-                    average_price: dec!(0.953325),
-                    estimated_fee: dec!(0.0249375),
-                    error: None,
-                })
-                .unwrap();
+            let shadow = WinnerShadowExecution {
+                request_latency_ms: Some(20),
+                total_latency_ms: Some(270),
+                run_id: "run-1".into(),
+                evaluation_id: "eval-1".into(),
+                slug: "btc-updown-5m-1".into(),
+                simulated_at: now,
+                delay_ms: 250,
+                candidate_stage: "rejected".into(),
+                research_cohorts: vec!["all_candidates".into()],
+                outcome: "filled".into(),
+                limit_price: dec!(0.95),
+                requested: dec!(20),
+                filled: dec!(7.5),
+                cost: dec!(7.1499375),
+                average_price: dec!(0.953325),
+                estimated_fee: dec!(0.0249375),
+                error: None,
+            };
+            assert!(journal.record_shadow_execution(shadow.clone()).unwrap());
+            let mut duplicate_track = shadow;
+            duplicate_track.candidate_stage = "sensitivity_confirmed".into();
+            assert!(!journal.record_shadow_execution(duplicate_track).unwrap());
             assert_eq!(journal.due_slugs(now), vec!["btc-updown-5m-1"]);
         }
         let journal = WinnerEvaluationJournal::open(&path).unwrap();
@@ -1958,10 +2143,116 @@ mod tests {
         let journal = LateResolutionWinnerTradingJournal::open(&path).unwrap();
         assert_eq!(journal.pending(), vec![buy.clone()]);
         journal.record_settled(&buy, dec!(0.6)).unwrap();
+        drop(journal);
         assert!(LateResolutionWinnerTradingJournal::open(&path)
             .unwrap()
             .pending()
             .is_empty());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn evaluation_journal_recovers_complete_event_after_partial_prefix() {
+        let path = std::env::temp_dir().join(format!(
+            "polypulse-winner-evaluation-repair-{}.ndjson",
+            uuid::Uuid::new_v4()
+        ));
+        let now = Utc::now();
+        let started = WinnerEvaluationEvent::RunStarted {
+            version: 1,
+            run_id: "run-repair".into(),
+            started_at: now,
+            mode: "paper".into(),
+            hybrid_paper_enabled: true,
+        };
+        let resolved = WinnerEvaluationEvent::Resolved {
+            version: 1,
+            evaluation_id: "eval-recovered".into(),
+            slug: "eth-updown-5m-recovered".into(),
+            won: true,
+            counterfactual_pnl_per_share: dec!(0.02),
+            resolved_at: now,
+        };
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n{{\"action\":\"evaluated\",\"broken\":{}\n",
+                serde_json::to_string(&started).unwrap(),
+                serde_json::to_string(&resolved).unwrap()
+            ),
+        )
+        .unwrap();
+
+        drop(WinnerEvaluationJournal::open(&path).unwrap());
+        let repaired = std::fs::read_to_string(&path).unwrap();
+        let events: Vec<WinnerEvaluationEvent> = repaired
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            &events[1],
+            WinnerEvaluationEvent::Resolved { evaluation_id, .. }
+                if evaluation_id == "eval-recovered"
+        ));
+
+        let file_name = path.file_name().unwrap().to_string_lossy();
+        let quarantine_prefix = format!("{file_name}.corrupt-");
+        let quarantine = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|candidate| {
+                candidate
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with(&quarantine_prefix))
+            })
+            .expect("repair must preserve the invalid source line");
+        assert!(std::fs::read_to_string(&quarantine)
+            .unwrap()
+            .contains("broken"));
+        std::fs::remove_file(quarantine).unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn winner_journals_reject_open_when_free_space_reserve_is_unavailable() {
+        let state_path = std::env::temp_dir().join(format!(
+            "polypulse-winner-space-state-{}.ndjson",
+            uuid::Uuid::new_v4()
+        ));
+        let evaluation_path = std::env::temp_dir().join(format!(
+            "polypulse-winner-space-evaluation-{}.ndjson",
+            uuid::Uuid::new_v4()
+        ));
+        assert!(
+            LateResolutionWinnerTradingJournal::open_with_min_free_bytes(&state_path, u64::MAX)
+                .is_err()
+        );
+        assert!(
+            WinnerEvaluationJournal::open_with_min_free_bytes(&evaluation_path, u64::MAX).is_err()
+        );
+    }
+
+    #[test]
+    fn free_space_guard_rejections_do_not_poison_an_open_writer() {
+        let path = std::env::temp_dir().join(format!(
+            "polypulse-winner-space-retry-{}.ndjson",
+            uuid::Uuid::new_v4()
+        ));
+        let mut writer = DurableNdjsonWriter::open(&path, 0).unwrap();
+        writer.min_free_bytes = u64::MAX;
+
+        for _ in 0..2 {
+            let error = writer
+                .append(&serde_json::json!({"action": "test"}))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("journal free-space guard tripped"));
+            assert!(!error.contains("journal is fail-closed"));
+        }
+
+        drop(writer);
         std::fs::remove_file(path).unwrap();
     }
 }
