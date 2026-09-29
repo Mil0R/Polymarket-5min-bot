@@ -50,10 +50,6 @@ pub fn init_research_system_logger(prefix: &str, fallback: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn init_logger(quiet_stdout: bool) -> Result<()> {
-    init_logger_for_strategies(quiet_stdout, true, true, true)
-}
-
 pub fn init_logger_for_strategies(
     quiet_stdout: bool,
     binary: bool,
