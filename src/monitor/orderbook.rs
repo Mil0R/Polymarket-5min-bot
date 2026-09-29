@@ -88,10 +88,16 @@ pub(crate) fn replay_book_frame(frame: &str) -> Result<BookUpdate> {
 
 impl OrderBookMonitor {
     pub fn new() -> Self {
+        Self::with_ws_client(WsClient::default())
+    }
+
+    /// Reuse a WebSocket client across market windows so the SDK keeps one
+    /// connection and reconnection task instead of creating one per window.
+    pub fn with_ws_client(ws_client: WsClient) -> Self {
         Self {
             // Use unauthenticated client: orderbook is public, no auth needed
             // Only user data (orders, trades) requires auth
-            ws_client: WsClient::default(),
+            ws_client,
             books: DashMap::new(),
             book_received_at_ms: DashMap::new(),
             market_map: HashMap::new(),
@@ -128,14 +134,7 @@ impl OrderBookMonitor {
         &self,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<BookUpdate>> + Send + '_>>> {
         // Collect all token_ids to subscribe
-        let mut token_ids: Vec<U256> = self
-            .market_map
-            .values()
-            .flat_map(|(yes, no)| [*yes, *no])
-            .collect();
-        token_ids.extend(self.extra_tokens.iter().copied());
-        token_ids.sort_unstable();
-        token_ids.dedup();
+        let token_ids = self.subscribed_token_ids();
 
         if token_ids.is_empty() {
             return Err(anyhow::anyhow!("No markets to subscribe"));
@@ -151,6 +150,19 @@ impl OrderBookMonitor {
         // Convert SDK Error to anyhow::Error
         let stream = stream.map(|result| result.map_err(|e| anyhow::anyhow!("{}", e)));
         Ok(Box::pin(stream))
+    }
+
+    /// Tokens registered for this window, including open-position recovery.
+    pub fn subscribed_token_ids(&self) -> Vec<U256> {
+        let mut token_ids: Vec<U256> = self
+            .market_map
+            .values()
+            .flat_map(|(yes, no)| [*yes, *no])
+            .collect();
+        token_ids.extend(self.extra_tokens.iter().copied());
+        token_ids.sort_unstable();
+        token_ids.dedup();
+        token_ids
     }
 
     /// Handle orderbook update
@@ -234,6 +246,12 @@ impl OrderBookMonitor {
         })
     }
 
+    /// Copy the latest WebSocket depth for research journaling. Callers must
+    /// still check its exchange timestamp and local receive age.
+    pub fn winner_book_snapshot(&self, token_id: U256) -> Option<BookUpdate> {
+        self.books.get(&token_id).map(|book| book.clone())
+    }
+
     pub fn connection_state(&self) -> MarketWsConnectionState {
         match self.ws_client.connection_state(ChannelType::Market) {
             ConnectionState::Disconnected => MarketWsConnectionState::Disconnected,
@@ -253,7 +271,8 @@ impl OrderBookMonitor {
         self.book_received_at_ms.clear();
     }
 
-    /// Clear all subscriptions
+    /// Clear cached data and local market mappings; SDK subscriptions are
+    /// switched by the caller after the next window has subscribed.
     pub fn clear(&mut self) {
         self.books.clear();
         self.book_received_at_ms.clear();

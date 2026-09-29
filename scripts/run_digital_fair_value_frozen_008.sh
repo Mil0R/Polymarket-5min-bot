@@ -62,8 +62,9 @@ for line in open(p):
     if e.get('event')=='model_observation':
         first=first or e.get('recorded_at'); last=e.get('recorded_at')
         paired += e.get('market_probability_up') is not None
-print(f"status=COLLECTING observations={counts['model_observation']} paired={paired} fills={counts['shadow_fill']} resolutions={counts['resolution']} first={first} last={last}")
+print(f"journal=OBSERVING_UNVERIFIED observations={counts['model_observation']} paired={paired} fills={counts['shadow_fill']} resolutions={counts['resolution']} first={first} last={last}")
 PY
+    python3 scripts/digital_fair_value_frozen_audit.py --manifest "$manifest" --model "$model"
 }
 
 case "$action" in
@@ -76,6 +77,9 @@ case "$action" in
     start)
         verify
         within_period
+        if [[ -s "$events" ]]; then
+            python3 scripts/digital_fair_value_frozen_audit.py --manifest "$manifest" --model "$model"
+        fi
         echo "starting frozen probability observation: batch=$batch checkpoint=30s"
         SDDFV_BINARY="$binary" exec bash scripts/run_digital_fair_value_research.sh 30 "$batch" dry-run
         ;;
@@ -92,6 +96,8 @@ if datetime.now(timezone.utc) < end:
 PY
         SDDFV_BINARY="$binary" bash scripts/run_digital_fair_value_research.sh 30 "$batch" report
         SDDFV_BINARY="$binary" bash scripts/run_digital_fair_value_research.sh 30 "$batch" calibrate
+        python3 scripts/digital_fair_value_frozen_audit.py \
+            --manifest "$manifest" --model "$model" --require-raw-coverage
         python3 scripts/digital_fair_value_study.py \
             --manifest "$manifest" \
             --model "$model" \

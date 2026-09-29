@@ -13,3 +13,4 @@ paper-order-state.ndjson
 *.png
 scripts/__pycache__/
 data/
+/.pi/remote-pi

@@ -6,6 +6,7 @@
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use futures::StreamExt;
+use polymarket_client_sdk::types::U256;
 use rusqlite::{Connection, Row};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
@@ -14,7 +15,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::hash::{Hash, Hasher};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,8 +25,10 @@ use std::time::Instant;
 use tokio::time::{sleep, timeout};
 use tracing::{info, warn};
 
+use crate::digital_fair_value_research_model::{Features as ResearchFeatures, ResearchModel};
 use crate::late_resolution_winner_model::{
-    run_chainlink_twap_feed, ChainlinkTwapStore, FairValueSnapshotReadiness, FairValueTwapSnapshot,
+    run_chainlink_twap_feed, run_chainlink_twap_feed_with_research, ChainlinkTwapStore,
+    FairValueSnapshotReadiness, FairValueTwapSnapshot, PriceFeedObserver,
 };
 use crate::market::{MarketDiscoverer, MarketInfo};
 use crate::monitor::OrderBookMonitor;
@@ -330,6 +333,7 @@ struct Report {
 }
 
 const LIVE_TARGET: &str = "polypulse::strategy::short_duration_digital_fair_value";
+const RESEARCH_REFERENCE_GAP_MS: i64 = 10_000;
 
 #[derive(Clone)]
 struct DryRunConfig {
@@ -345,6 +349,7 @@ struct DryRunConfig {
     simulated_order_failure_rate: f64,
     max_book_age_ms: i64,
     max_feed_age_ms: i64,
+    max_reference_local_age_ms: i64,
     opening_max_skew_ms: i64,
     volatility_lookback_secs: u64,
     min_observations: usize,
@@ -361,11 +366,30 @@ struct DryRunConfig {
     rtds_url: String,
     clob_url: String,
     results_file: PathBuf,
+    journal_min_free_bytes: u64,
+    journal_max_bytes: u64,
+    research_model: Option<Arc<ResearchModel>>,
+    research_snapshot_interval_ms: i64,
+    research_observation_only: bool,
+    research_capture_raw_reference: bool,
+    research_execution_probe: bool,
+    research_market_prior_weight: f64,
+    research_min_entry_price: f64,
 }
 
 impl DryRunConfig {
     fn from_env() -> Result<Self> {
         let _ = dotenvy::dotenv();
+        let research_model = match std::env::var_os(
+            "SHORT_DURATION_DIGITAL_FAIR_VALUE_RESEARCH_MODEL_FILE",
+        ) {
+            Some(path) if !path.is_empty() => {
+                let sha = std::env::var("SHORT_DURATION_DIGITAL_FAIR_VALUE_RESEARCH_MODEL_SHA256")
+                    .context("research model file requires SHORT_DURATION_DIGITAL_FAIR_VALUE_RESEARCH_MODEL_SHA256")?;
+                Some(Arc::new(ResearchModel::load(Path::new(&path), &sha)?))
+            }
+            _ => None,
+        };
         let symbols = std::env::var("SHORT_DURATION_DIGITAL_FAIR_VALUE_SYMBOLS")
             .or_else(|_| std::env::var("CRYPTO_SYMBOLS"))
             .unwrap_or_else(|_| "btc,eth,sol".to_string())
@@ -435,6 +459,10 @@ impl DryRunConfig {
             )?,
             max_book_age_ms: env_parse("SHORT_DURATION_DIGITAL_FAIR_VALUE_MAX_BOOK_AGE_MS", 1_000)?,
             max_feed_age_ms: env_parse("SHORT_DURATION_DIGITAL_FAIR_VALUE_FEED_MAX_AGE_MS", 5_000)?,
+            max_reference_local_age_ms: env_parse(
+                "SHORT_DURATION_DIGITAL_FAIR_VALUE_REFERENCE_LOCAL_MAX_AGE_MS",
+                2_000,
+            )?,
             opening_max_skew_ms: env_parse(
                 "SHORT_DURATION_DIGITAL_FAIR_VALUE_OPENING_MAX_SKEW_MS",
                 5_000,
@@ -466,6 +494,39 @@ impl DryRunConfig {
                 .unwrap_or_else(|_| {
                     PathBuf::from("results/short-duration-digital-fair-value/paper/events.ndjson")
                 }),
+            journal_min_free_bytes: env_parse(
+                "SHORT_DURATION_DIGITAL_FAIR_VALUE_JOURNAL_MIN_FREE_BYTES",
+                1_073_741_824_u64,
+            )?,
+            journal_max_bytes: env_parse(
+                "SHORT_DURATION_DIGITAL_FAIR_VALUE_JOURNAL_MAX_BYTES",
+                4_294_967_296_u64,
+            )?,
+            research_model,
+            research_snapshot_interval_ms: env_parse(
+                "SHORT_DURATION_DIGITAL_FAIR_VALUE_RESEARCH_SNAPSHOT_INTERVAL_MS",
+                0,
+            )?,
+            research_observation_only: env_parse(
+                "SHORT_DURATION_DIGITAL_FAIR_VALUE_RESEARCH_OBSERVATION_ONLY",
+                false,
+            )?,
+            research_capture_raw_reference: env_parse(
+                "SHORT_DURATION_DIGITAL_FAIR_VALUE_RESEARCH_CAPTURE_RAW_REFERENCE",
+                false,
+            )?,
+            research_execution_probe: env_parse(
+                "SHORT_DURATION_DIGITAL_FAIR_VALUE_RESEARCH_EXECUTION_PROBE",
+                false,
+            )?,
+            research_market_prior_weight: env_parse(
+                "SHORT_DURATION_DIGITAL_FAIR_VALUE_RESEARCH_MARKET_PRIOR_WEIGHT",
+                0.75,
+            )?,
+            research_min_entry_price: env_parse(
+                "SHORT_DURATION_DIGITAL_FAIR_VALUE_RESEARCH_MIN_ENTRY_PRICE",
+                0.30,
+            )?,
         };
         if config.symbols.is_empty()
             || !matches!(config.checkpoint_secs, 10 | 30 | 60)
@@ -485,12 +546,36 @@ impl DryRunConfig {
             || !(0.0..=1.0).contains(&config.simulated_order_failure_rate)
             || config.max_book_age_ms <= 0
             || config.max_feed_age_ms <= 0
+            || config.max_reference_local_age_ms <= 0
             || config.opening_max_skew_ms < 0
             || !(0.0..1.0).contains(&config.liquidity_haircut)
             || config.liquidity_haircut == 0.0
             || config.order_usdc < 1.0
+            || config.journal_min_free_bytes < 16 * 1024 * 1024
+            || (config.journal_max_bytes != 0 && config.journal_max_bytes < 16 * 1024 * 1024)
+            || (config.research_snapshot_interval_ms != 0
+                && !(250..=10_000).contains(&config.research_snapshot_interval_ms))
+            || (config.research_observation_only
+                && !config.research_execution_probe
+                && config.research_snapshot_interval_ms == 0)
+            || (config.research_execution_probe && !config.research_observation_only)
+            || (config.research_execution_probe && config.execution_delay_ms < 1_000)
+            || !config.research_market_prior_weight.is_finite()
+            || !(0.0..=1.0).contains(&config.research_market_prior_weight)
+            || !config.research_min_entry_price.is_finite()
+            || !(0.0..=1.0).contains(&config.research_min_entry_price)
         {
             bail!("invalid dry-run configuration; supported research checkpoints are 10, 30 and 60 seconds");
+        }
+        if let Some(model) = &config.research_model {
+            for asset in &config.symbols {
+                if !model.has_group(asset, config.checkpoint_secs) {
+                    bail!(
+                        "research model has no fitted group for {asset}/{}s",
+                        config.checkpoint_secs
+                    );
+                }
+            }
         }
         Ok(config)
     }
@@ -518,7 +603,10 @@ struct LiveRestLevel {
     size: String,
 }
 
-const LIVE_EXECUTION_VERSION: u64 = 5;
+const LIVE_EXECUTION_VERSION: u64 = 6;
+const QUALITY_MAX_REFERENCE_OBSERVATION_AGE_MS: i64 = 5_000;
+const QUALITY_MAX_REFERENCE_LOCAL_AGE_MS: i64 = 2_000;
+const QUALITY_MAX_REFERENCE_NETWORK_LATENCY_MS: i64 = 2_000;
 
 fn exchange_timestamp(value: Option<&Value>) -> Option<i64> {
     let value = value?;
@@ -613,10 +701,29 @@ fn fill_quality_reasons(fill: &Value) -> Vec<&'static str> {
         }
         None => reasons.push("missing_execution_time"),
     }
-    match audit["model_audit"]["feed_age_ms"].as_i64() {
-        Some(0..=2000) => {}
-        Some(_) => reasons.push("reference_feed_outside_0_2000ms"),
-        None => reasons.push("missing_reference_feed_age"),
+    let model_audit = &audit["model_audit"];
+    if fill["execution_version"].as_u64() == Some(LIVE_EXECUTION_VERSION) {
+        match model_audit["observation_age_ms"].as_i64() {
+            Some(0..=QUALITY_MAX_REFERENCE_OBSERVATION_AGE_MS) => {}
+            Some(_) => reasons.push("reference_observation_age_outside_0_5000ms"),
+            None => reasons.push("missing_reference_observation_age"),
+        }
+        match model_audit["local_receive_age_ms"].as_i64() {
+            Some(0..=QUALITY_MAX_REFERENCE_LOCAL_AGE_MS) => {}
+            Some(_) => reasons.push("reference_local_age_outside_0_2000ms"),
+            None => reasons.push("missing_reference_local_receive_age"),
+        }
+        match model_audit["network_receive_latency_ms"].as_i64() {
+            Some(0..=QUALITY_MAX_REFERENCE_NETWORK_LATENCY_MS) => {}
+            Some(_) => reasons.push("reference_network_latency_outside_0_2000ms"),
+            None => reasons.push("missing_reference_network_latency"),
+        }
+    } else {
+        match model_audit["feed_age_ms"].as_i64() {
+            Some(0..=2000) => {}
+            Some(_) => reasons.push("reference_feed_outside_0_2000ms"),
+            None => reasons.push("missing_reference_feed_age"),
+        }
     }
     if !matches!(fill["rest_latency_ms"].as_u64(), Some(0..=2000)) {
         reasons.push("rest_latency_missing_or_exceeded");
@@ -650,6 +757,8 @@ struct LiveBookTop {
 struct DryRunWindowStats {
     #[serde(skip)]
     audited_markets: std::collections::HashSet<String>,
+    #[serde(skip)]
+    research_snapshot_last_ms: HashMap<String, i64>,
     scan_ticks: u64,
     market_evaluations: u64,
     opportunities: u64,
@@ -690,40 +799,158 @@ impl DryRunWindowStats {
     }
 }
 
+struct JournalState {
+    file: File,
+    bytes_written: u64,
+}
+
 #[derive(Clone)]
 struct EventJournal {
-    file: Arc<Mutex<File>>,
+    state: Arc<Mutex<JournalState>>,
     run_id: String,
+    directory: PathBuf,
+    min_free_bytes: u64,
+    max_bytes: u64,
+    failed: Arc<AtomicBool>,
 }
 
 impl EventJournal {
-    fn open(path: &Path, run_id: String) -> Result<Self> {
+    fn open(path: &Path, run_id: String, min_free_bytes: u64, max_bytes: u64) -> Result<Self> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
+        let repaired_bytes = repair_incomplete_journal_tail(path)?;
+        if repaired_bytes > 0 {
+            warn!(target: LIVE_TARGET, path = %path.display(), repaired_bytes,
+                "Removed incomplete NDJSON tail before appending a new run");
+        }
+        let directory = path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        let bytes_written = fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+        let available = fs2::available_space(&directory)
+            .with_context(|| format!("check free space for {}", directory.display()))?;
+        if available < min_free_bytes {
+            bail!(
+                "journal free-space guard: {} bytes available, {} required in {}",
+                available,
+                min_free_bytes,
+                directory.display()
+            );
+        }
+        if max_bytes != 0 && bytes_written >= max_bytes {
+            bail!(
+                "journal size guard: {} already has {} bytes (limit {})",
+                path.display(),
+                bytes_written,
+                max_bytes
+            );
+        }
         Ok(Self {
-            file: Arc::new(Mutex::new(
-                OpenOptions::new().create(true).append(true).open(path)?,
-            )),
+            state: Arc::new(Mutex::new(JournalState {
+                file: OpenOptions::new().create(true).append(true).open(path)?,
+                bytes_written,
+            })),
             run_id,
+            directory,
+            min_free_bytes,
+            max_bytes,
+            failed: Arc::new(AtomicBool::new(false)),
         })
     }
 
     fn append(&self, mut value: Value) -> Result<()> {
+        if self.failed.load(Ordering::Relaxed) {
+            bail!("journal is fail-closed after an earlier write failure");
+        }
         if let Some(object) = value.as_object_mut() {
             object
                 .entry("run_id".to_string())
                 .or_insert_with(|| Value::String(self.run_id.clone()));
         }
-        let mut file = self
-            .file
+        // Serialize the complete line before touching the file.  A failed
+        // serializer can therefore never leave half a JSON object behind.
+        let mut encoded = serde_json::to_vec(&value)?;
+        encoded.push(b'\n');
+        let available = match fs2::available_space(&self.directory) {
+            Ok(available) => available,
+            Err(error) => {
+                self.failed.store(true, Ordering::Relaxed);
+                return Err(error)
+                    .with_context(|| format!("check free space for {}", self.directory.display()));
+            }
+        };
+        if available < self.min_free_bytes.saturating_add(encoded.len() as u64) {
+            self.failed.store(true, Ordering::Relaxed);
+            bail!(
+                "journal free-space guard tripped: {} bytes available, reserve {}",
+                available,
+                self.min_free_bytes
+            );
+        }
+        let mut state = self
+            .state
             .lock()
             .map_err(|_| anyhow::anyhow!("journal lock poisoned"))?;
-        serde_json::to_writer(&mut *file, &value)?;
-        writeln!(file)?;
-        file.flush()?;
+        if self.max_bytes != 0
+            && state.bytes_written.saturating_add(encoded.len() as u64) > self.max_bytes
+        {
+            self.failed.store(true, Ordering::Relaxed);
+            bail!(
+                "journal size guard tripped at {} bytes (limit {})",
+                state.bytes_written,
+                self.max_bytes
+            );
+        }
+        if let Err(error) = state
+            .file
+            .write_all(&encoded)
+            .and_then(|_| state.file.flush())
+        {
+            self.failed.store(true, Ordering::Relaxed);
+            return Err(error).context("append complete NDJSON event");
+        }
+        state.bytes_written = state.bytes_written.saturating_add(encoded.len() as u64);
         Ok(())
     }
+}
+
+/// A disk-full write can end in the middle of the final NDJSON record.  Before
+/// a new run appends anything, truncate only that incomplete tail.  Complete
+/// historical lines are never rewritten.
+fn repair_incomplete_journal_tail(path: &Path) -> Result<u64> {
+    let mut file = match OpenOptions::new().read(true).write(true).open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error).with_context(|| format!("open {}", path.display())),
+    };
+    let len = file.metadata()?.len();
+    if len == 0 {
+        return Ok(0);
+    }
+    file.seek(SeekFrom::End(-1))?;
+    let mut last = [0_u8; 1];
+    file.read_exact(&mut last)?;
+    if last[0] == b'\n' {
+        return Ok(0);
+    }
+    let mut cursor = len;
+    let mut truncate_to = 0_u64;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    while cursor > 0 {
+        let take = cursor.min(buffer.len() as u64) as usize;
+        cursor -= take as u64;
+        file.seek(SeekFrom::Start(cursor))?;
+        file.read_exact(&mut buffer[..take])?;
+        if let Some(index) = buffer[..take].iter().rposition(|byte| *byte == b'\n') {
+            truncate_to = cursor + index as u64 + 1;
+            break;
+        }
+    }
+    file.set_len(truncate_to)?;
+    file.sync_all()?;
+    Ok(len.saturating_sub(truncate_to))
 }
 
 /// Forced-safe stage-2 runner. It uses public Gamma, RTDS and CLOB market-data
@@ -746,12 +973,29 @@ pub async fn run_dry_run() -> Result<()> {
         .install_default()
         .ok();
     crate::utils::logger::init_logger_for_strategies(false, false, false, false)?;
-    let journal = EventJournal::open(&config.results_file, run_id.clone())?;
+    let journal = EventJournal::open(
+        &config.results_file,
+        run_id.clone(),
+        config.journal_min_free_bytes,
+        config.journal_max_bytes,
+    )?;
+    let research_model_metadata = config.research_model.as_ref().map(|model| serde_json::json!({
+        "sha256":model.sha256,
+        "selected_by_asset":config.symbols.iter().map(|asset| {
+            (asset.clone(), model.selected_name(asset, config.checkpoint_secs).unwrap_or("missing").to_string())
+        }).collect::<BTreeMap<_,_>>()
+    }));
     journal.append(serde_json::json!({
         "event": "run_started",
         "recorded_at": Utc::now(),
         "strategy": "short-duration-digital-fair-value",
         "execution_version": LIVE_EXECUTION_VERSION,
+        "decision_model":if config.research_observation_only {
+            "none_observation_only"
+        } else {
+            "gaussian_floor_v1"
+        },
+        "research_model":research_model_metadata,
         "config": {
             "symbols": config.symbols.clone(),
             "checkpoint_secs": config.checkpoint_secs,
@@ -765,7 +1009,30 @@ pub async fn run_dry_run() -> Result<()> {
             "min_edge": config.min_edge,
             "order_usdc": config.order_usdc,
             "max_book_age_ms": config.max_book_age_ms,
-            "max_feed_age_ms": config.max_feed_age_ms
+            "max_feed_age_ms": config.max_feed_age_ms,
+            "max_reference_local_age_ms":config.max_reference_local_age_ms,
+            "journal_min_free_bytes":config.journal_min_free_bytes,
+            "journal_max_bytes":config.journal_max_bytes,
+            "research_snapshot_interval_ms":config.research_snapshot_interval_ms,
+            "research_observation_only":config.research_observation_only,
+            "research_capture_raw_reference":config.research_capture_raw_reference,
+            "research_execution_probe":config.research_execution_probe,
+            "book_transport":if config.research_execution_probe { "rest_paired_probe" } else { "websocket_with_rest_fallback" },
+            "research_market_prior_weight":config.research_market_prior_weight,
+            "research_min_entry_price":config.research_min_entry_price,
+            "reference_price_capture":if config.research_capture_raw_reference {
+                "twap_chainlink_spot_binance_research_only"
+            } else if config.research_snapshot_interval_ms > 0 || config.research_execution_probe {
+                "checkpoint_snapshots_only"
+            } else { "twap_only" },
+            "reference_price_parser":if config.research_snapshot_interval_ms > 0
+                || config.research_capture_raw_reference || config.research_execution_probe {
+                "topic_aware_v2"
+            } else { "twap_only" },
+            "reference_gap_threshold_ms":if config.research_snapshot_interval_ms > 0
+                || config.research_capture_raw_reference || config.research_execution_probe {
+                Some(RESEARCH_REFERENCE_GAP_MS)
+            } else { None }
         }
     }))?;
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -775,12 +1042,88 @@ pub async fn run_dry_run() -> Result<()> {
         signal_shutdown.store(true, Ordering::Relaxed);
     });
     let store = Arc::new(ChainlinkTwapStore::default());
-    tokio::spawn(run_chainlink_twap_feed(
-        config.rtds_url.clone(),
-        store.clone(),
-        shutdown.clone(),
-        Arc::new(RuntimeMetrics::default()),
-    ));
+    let feed_metrics = Arc::new(RuntimeMetrics::default());
+    if config.research_snapshot_interval_ms > 0
+        || config.research_capture_raw_reference
+        || config.research_execution_probe
+    {
+        let observed_assets = config.symbols.clone();
+        let reference_journal = journal.clone();
+        let reference_shutdown = shutdown.clone();
+        let capture_raw_reference = config.research_capture_raw_reference;
+        let last_reference_receives = Mutex::new(HashMap::<(String, String), i64>::new());
+        let observer: PriceFeedObserver = Arc::new(move |sample| {
+            if !observed_assets.contains(&sample.asset) {
+                return;
+            }
+            let previous_received_at_ms = match last_reference_receives.lock() {
+                Ok(mut last) => last.insert(
+                    (sample.topic.clone(), sample.asset.clone()),
+                    sample.received_at_ms,
+                ),
+                Err(_) => {
+                    warn!(target: LIVE_TARGET, "Reference price gap tracker poisoned; stopping research run");
+                    reference_shutdown.store(true, Ordering::Relaxed);
+                    return;
+                }
+            };
+            if let Some(gap_ms) =
+                research_reference_gap_ms(previous_received_at_ms, sample.received_at_ms)
+            {
+                if let Err(error) = reference_journal.append(serde_json::json!({
+                    "event":"reference_feed_gap",
+                    "recorded_at":Utc::now(),
+                    "topic":&sample.topic,
+                    "asset":&sample.asset,
+                    "previous_received_at_ms":previous_received_at_ms,
+                    "received_at_ms":sample.received_at_ms,
+                    "gap_ms":gap_ms,
+                    "threshold_ms":RESEARCH_REFERENCE_GAP_MS
+                })) {
+                    warn!(target: LIVE_TARGET, %error, "Could not persist reference feed gap; stopping research run");
+                    reference_shutdown.store(true, Ordering::Relaxed);
+                    return;
+                }
+            }
+            let source_role = if sample.topic == "crypto_prices_twap_sixty" {
+                "settlement_twap"
+            } else {
+                "research_spot_only"
+            };
+            if !capture_raw_reference {
+                return;
+            }
+            if let Err(error) = reference_journal.append(serde_json::json!({
+                "event":"reference_price_observation",
+                "recorded_at":Utc::now(),
+                "topic":sample.topic,
+                "symbol":sample.symbol,
+                "asset":sample.asset,
+                "value":sample.value,
+                "observed_at_ms":sample.observed_at_ms,
+                "publisher_at_ms":sample.publisher_at_ms,
+                "received_at_ms":sample.received_at_ms,
+                "source_role":source_role
+            })) {
+                warn!(target: LIVE_TARGET, %error, "Could not persist reference price; stopping research run");
+                reference_shutdown.store(true, Ordering::Relaxed);
+            }
+        });
+        tokio::spawn(run_chainlink_twap_feed_with_research(
+            config.rtds_url.clone(),
+            store.clone(),
+            shutdown.clone(),
+            feed_metrics,
+            observer,
+        ));
+    } else {
+        tokio::spawn(run_chainlink_twap_feed(
+            config.rtds_url.clone(),
+            store.clone(),
+            shutdown.clone(),
+            feed_metrics,
+        ));
+    }
     wait_for_feed_readiness(&config, &store, &shutdown).await;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
@@ -809,7 +1152,12 @@ pub async fn run_dry_run() -> Result<()> {
         for market in &markets {
             monitor.subscribe_market(market)?;
         }
-        let mut stream = monitor.create_orderbook_stream()?;
+        // REST probe sampling must not depend on book WebSocket availability.
+        let mut stream: std::pin::Pin<Box<dyn futures::Stream<Item = Result<
+            polymarket_client_sdk::clob::ws::types::response::BookUpdate>> + Send>> =
+            if config.research_execution_probe {
+                Box::pin(futures::stream::pending())
+            } else { monitor.create_orderbook_stream()? };
         let mut stream_reconnect_attempt = 0u32;
         let attempted = Arc::new(Mutex::new(std::collections::HashSet::new()));
         let stats = Arc::new(Mutex::new(DryRunWindowStats::default()));
@@ -941,13 +1289,44 @@ pub async fn run_dry_run() -> Result<()> {
     run_result
 }
 
+fn research_reference_gap_ms(
+    previous_received_at_ms: Option<i64>,
+    received_at_ms: i64,
+) -> Option<i64> {
+    previous_received_at_ms
+        .and_then(|previous| received_at_ms.checked_sub(previous))
+        .filter(|gap_ms| *gap_ms >= RESEARCH_REFERENCE_GAP_MS)
+}
+
 /// Build an auditable calibration/readiness report from the append-only
 /// dry-run journal.  This never contacts Polymarket and never submits orders.
 fn dry_run_research_summary(events: &[Value]) -> Value {
+    #[derive(Default)]
+    struct ModelVolatilityStats {
+        samples: u64,
+        floor_active: u64,
+        max_abs_opening_skew_ms: i64,
+        observed_sum: f64,
+        observed_max: f64,
+        configured_floor: f64,
+    }
     let mut event_counts = BTreeMap::<String, u64>::new();
     let mut rejections = BTreeMap::<String, u64>::new();
     let mut terminals = BTreeMap::<String, u64>::new();
-    let mut model_by_asset = BTreeMap::<String, (u64, u64, i64)>::new();
+    let mut model_by_asset = BTreeMap::<String, ModelVolatilityStats>::new();
+    let mut fill_decision_models = BTreeMap::<String, u64>::new();
+    let mut research_forecast_observations = 0_u64;
+    let mut depth_truncated_snapshots = 0_u64;
+    let mut reference_observations_by_topic = BTreeMap::<String, u64>::new();
+    let mut reference_feed_gaps_by_topic = BTreeMap::<String, u64>::new();
+    let mut reference_feed_max_gap_ms = 0_i64;
+    let mut reference_gap_tracking_enabled = false;
+    let mut rest_research_snapshots = 0_u64;
+    let mut rest_complete_research_snapshots = 0_u64;
+    let mut residual_probes = 0_u64;
+    let mut residual_usable_delayed_asks = 0_u64;
+    let mut residual_baseline_sources = BTreeMap::<String, u64>::new();
+    let mut residual_book_errors = BTreeMap::<String, u64>::new();
     let mut rest_samples = 0_u64;
     let mut rest_total = 0_u64;
     let mut rest_max = 0_u64;
@@ -956,6 +1335,50 @@ fn dry_run_research_summary(events: &[Value]) -> Value {
         *event_counts
             .entry(event["event"].as_str().unwrap_or("unknown").into())
             .or_default() += 1;
+        if event["event"] == "run_started"
+            && event["config"]["reference_gap_threshold_ms"]
+                .as_i64()
+                .is_some()
+        {
+            reference_gap_tracking_enabled = true;
+        }
+        if event["event"] == "residual_execution_observation" {
+            residual_probes += 1;
+            *residual_baseline_sources
+                .entry(
+                    event["signal"]["baseline"]["source"]
+                        .as_str()
+                        .unwrap_or("unknown")
+                        .to_owned(),
+                )
+                .or_default() += 1;
+            for phase in ["signal", "delayed"] {
+                for side in ["up", "down"] {
+                    let book = &event[phase]["books"][side];
+                    if phase == "delayed"
+                        && book["valid"] == true
+                        && book["asks"].as_array().is_some_and(|rows| !rows.is_empty())
+                    {
+                        residual_usable_delayed_asks += 1;
+                    }
+                    if let Some(errors) = book["errors"].as_array() {
+                        for error in errors {
+                            *residual_book_errors
+                                .entry(format!(
+                                    "{phase}/{side}/{}",
+                                    error.as_str().unwrap_or("unknown")
+                                ))
+                                .or_default() += 1;
+                        }
+                    }
+                    if book["error"].is_string() {
+                        *residual_book_errors
+                            .entry(format!("{phase}/{side}/request_failed"))
+                            .or_default() += 1;
+                    }
+                }
+            }
+        }
         if event["event"] == "window_summary" {
             let stats = &event["stats"];
             evaluations += stats["market_evaluations"].as_u64().unwrap_or(0);
@@ -980,18 +1403,98 @@ fn dry_run_research_summary(events: &[Value]) -> Value {
             let stats = model_by_asset
                 .entry(event["asset"].as_str().unwrap_or("unknown").into())
                 .or_default();
-            stats.0 += 1;
-            stats.1 += u64::from(a["volatility_floor_active"].as_bool().unwrap_or(false));
-            stats.2 = stats
-                .2
+            stats.samples += 1;
+            stats.floor_active +=
+                u64::from(a["volatility_floor_active"].as_bool().unwrap_or(false));
+            stats.max_abs_opening_skew_ms = stats
+                .max_abs_opening_skew_ms
                 .max(a["opening_skew_ms"].as_i64().unwrap_or(0).saturating_abs());
+            if let Some(observed) = a["observed_volatility_bps"]
+                .as_f64()
+                .filter(|value| value.is_finite() && *value >= 0.0)
+            {
+                stats.observed_sum += observed;
+                stats.observed_max = stats.observed_max.max(observed);
+            }
+            stats.configured_floor = a["minimum_volatility_bps"]
+                .as_f64()
+                .unwrap_or(stats.configured_floor);
+            research_forecast_observations += u64::from(event["research_model"].is_object());
+        }
+        if event["event"] == "shadow_fill" {
+            *fill_decision_models
+                .entry(
+                    event["decision_model"]
+                        .as_str()
+                        .unwrap_or("legacy_unknown")
+                        .into(),
+                )
+                .or_default() += 1;
+        }
+        if event["event"] == "research_market_snapshot" {
+            depth_truncated_snapshots += u64::from(
+                event["up_depth"]["levels_truncated"]
+                    .as_bool()
+                    .unwrap_or(false)
+                    || event["down_depth"]["levels_truncated"]
+                        .as_bool()
+                        .unwrap_or(false),
+            );
+            if event["book_source"] == "rest_fallback" && event["fetch_success"] == true {
+                rest_research_snapshots += 1;
+                rest_complete_research_snapshots +=
+                    u64::from(event["paired_book_complete"] == true);
+            }
+        }
+        if event["event"] == "reference_price_observation" {
+            *reference_observations_by_topic
+                .entry(event["topic"].as_str().unwrap_or("unknown").into())
+                .or_default() += 1;
+        }
+        if event["event"] == "reference_feed_gap" {
+            *reference_feed_gaps_by_topic
+                .entry(event["topic"].as_str().unwrap_or("unknown").into())
+                .or_default() += 1;
+            reference_feed_max_gap_ms =
+                reference_feed_max_gap_ms.max(event["gap_ms"].as_i64().unwrap_or(0));
         }
     }
     serde_json::json!({"event_counts":event_counts,"market_evaluations":evaluations,
         "window_rejection_counts":rejections,"terminal_market_window_counts":terminals,
         "rest_samples":rest_samples,"rest_average_ms":if rest_samples>0 {Some(rest_total as f64/rest_samples as f64)}else{None},"rest_max_ms":rest_max,
-        "model_observation_by_asset":model_by_asset.iter().map(|(asset,(n,floor,skew))|(asset.clone(),serde_json::json!({"samples":n,"floor_active":floor,"max_abs_opening_skew_ms":skew}))).collect::<BTreeMap<_,_>>(),
+        "shadow_fill_decision_models":fill_decision_models,
+        "model_observations_with_research_forecast":research_forecast_observations,
+        "depth_truncated_research_snapshots":depth_truncated_snapshots,
+        "reference_observations_by_topic":reference_observations_by_topic,
+        "reference_gap_tracking_enabled":reference_gap_tracking_enabled,
+        "reference_feed_gaps_by_topic":reference_gap_tracking_enabled.then_some(reference_feed_gaps_by_topic),
+        "reference_feed_max_gap_ms":reference_gap_tracking_enabled.then_some(reference_feed_max_gap_ms),
+        "rest_research_snapshots":rest_research_snapshots,
+        "rest_complete_research_snapshots":rest_complete_research_snapshots,
+        "residual_execution_probe":{"episodes":residual_probes,
+            "usable_delayed_ask_sides":residual_usable_delayed_asks,
+            "baseline_sources":residual_baseline_sources,"book_errors":residual_book_errors,
+            "pnl_policy":"offline residual study only; ask presence is not a fill"},
+        "model_observation_by_asset":model_by_asset.iter().map(|(asset,stats)|(asset.clone(),serde_json::json!({
+            "samples":stats.samples,
+            "floor_active":stats.floor_active,
+            "floor_active_rate":if stats.samples>0 {Some(stats.floor_active as f64/stats.samples as f64)}else{None},
+            "observed_volatility_bps_average":if stats.samples>0 {Some(stats.observed_sum/stats.samples as f64)}else{None},
+            "observed_volatility_bps_max":stats.observed_max,
+            "configured_floor_bps":stats.configured_floor,
+            "max_abs_opening_skew_ms":stats.max_abs_opening_skew_ms
+        }))).collect::<BTreeMap<_,_>>(),
         "notes":["Absent model observations in legacy data mean unknown, not zero floor usage.","Terminal counts describe the last recorded state, not every scan.","Research checkpoints are overlapping opportunity windows; compare separate runs without pooling correlated fills."]})
+}
+
+/// Recover a complete JSON event that was appended after a disk-full partial
+/// prefix by an older binary.  The report remains integrity-failed whenever
+/// this path is used; recovery exists so diagnostics are still available.
+fn recover_json_suffix(line: &str) -> Option<Value> {
+    line.char_indices()
+        .skip(1)
+        .filter(|(_, ch)| *ch == '{')
+        .find_map(|(offset, _)| serde_json::from_str::<Value>(&line[offset..]).ok())
 }
 
 pub fn run_dry_run_report() -> Result<PathBuf> {
@@ -1026,15 +1529,30 @@ pub fn run_dry_run_report() -> Result<PathBuf> {
     let file =
         File::open(&input).with_context(|| format!("open dry-run journal {}", input.display()))?;
     let mut events = Vec::new();
+    let mut malformed_journal_lines = 0usize;
+    let mut recovered_journal_suffixes = 0usize;
+    let mut dropped_journal_lines = 0usize;
     for (line_no, line) in BufReader::new(file).lines().enumerate() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
         }
-        events.push(
-            serde_json::from_str::<Value>(&line)
-                .with_context(|| format!("parse {} line {}", input.display(), line_no + 1))?,
-        );
+        match serde_json::from_str::<Value>(&line) {
+            Ok(event) => events.push(event),
+            Err(error) => {
+                malformed_journal_lines += 1;
+                if let Some(event) = recover_json_suffix(&line) {
+                    recovered_journal_suffixes += 1;
+                    events.push(event);
+                    warn!(target: LIVE_TARGET, path = %input.display(), line = line_no + 1,
+                        %error, "Recovered a valid event after a malformed NDJSON prefix");
+                } else {
+                    dropped_journal_lines += 1;
+                    warn!(target: LIVE_TARGET, path = %input.display(), line = line_no + 1,
+                        %error, "Skipped an unrecoverable malformed NDJSON line");
+                }
+            }
+        }
     }
     let mut opportunities = HashMap::<String, (String, f64)>::new();
     let mut fills = HashMap::<String, (String, f64, u64)>::new();
@@ -1111,6 +1629,8 @@ pub fn run_dry_run_report() -> Result<PathBuf> {
     let mut quality_buckets = BTreeMap::<String, Bucket>::new();
     let mut quality_reasons = BTreeMap::<String, usize>::new();
     let mut by_feed_age = BTreeMap::<String, Bucket>::new();
+    let mut by_reference_local_age = BTreeMap::<String, Bucket>::new();
+    let mut by_reference_network_latency = BTreeMap::<String, Bucket>::new();
     let mut by_exchange_age = BTreeMap::<String, Bucket>::new();
     let mut by_asset = BTreeMap::<String, Bucket>::new();
     let mut by_probability = BTreeMap::<String, Bucket>::new();
@@ -1122,6 +1642,11 @@ pub fn run_dry_run_report() -> Result<PathBuf> {
     let mut by_direction = BTreeMap::<String, Bucket>::new();
     let mut by_checkpoint = BTreeMap::<String, Bucket>::new();
     let mut by_total_latency = BTreeMap::<String, Bucket>::new();
+    let mut probability_comparators = BTreeMap::<String, Bucket>::new();
+    let mut counterfactual_buckets = BTreeMap::<String, Bucket>::new();
+    let mut counterfactual_evaluated = BTreeMap::<String, usize>::new();
+    let mut counterfactual_rejections = BTreeMap::<String, BTreeMap<String, usize>>::new();
+    let mut counterfactual_unavailable_fills = 0usize;
     let fill_events = events
         .iter()
         .filter(|e| e["event"] == "shadow_fill")
@@ -1155,7 +1680,7 @@ pub fn run_dry_run_report() -> Result<PathBuf> {
             continue;
         };
         let version = fill_event["execution_version"].as_u64().unwrap_or(0);
-        if version < 3 {
+        if version != LIVE_EXECUTION_VERSION {
             legacy_samples += 1;
         }
         let fallback = opportunities
@@ -1220,6 +1745,23 @@ pub fn run_dry_run_report() -> Result<PathBuf> {
             Some(2001..) => "gt_2s",
             _ => "unknown_or_future",
         };
+        let reference_local_age_key =
+            match fill_event["execution_audit"]["model_audit"]["local_receive_age_ms"].as_i64() {
+                Some(0..=1000) => "le_1s",
+                Some(1001..=2000) => "1_2s",
+                Some(2001..) => "gt_2s",
+                _ => "unknown_or_future",
+            };
+        let reference_network_latency_key = match fill_event["execution_audit"]["model_audit"]
+            ["network_receive_latency_ms"]
+            .as_i64()
+        {
+            Some(0..=500) => "le_500ms",
+            Some(501..=1000) => "501_1000ms",
+            Some(1001..=2000) => "1001_2000ms",
+            Some(2001..) => "gt_2s",
+            _ => "unknown_or_future",
+        };
         let execution_time = fill_event["execution_audit"]["age_checked_at_ms"]
             .as_i64()
             .or_else(|| {
@@ -1249,6 +1791,86 @@ pub fn run_dry_run_report() -> Result<PathBuf> {
             b.capital += fill_event["cost_usdc"].as_f64().unwrap_or(0.0)
                 + fill_event["fees_usdc"].as_f64().unwrap_or(0.0);
         };
+        let mut add_probability_comparator = |name: &str, probability: Option<f64>| {
+            let Some(probability) =
+                probability.filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
+            else {
+                return;
+            };
+            let bucket = probability_comparators.entry(name.to_string()).or_default();
+            bucket.samples += 1;
+            bucket.wins += usize::from(won);
+            bucket.probability_sum += probability;
+            bucket.brier_sum += (probability - if won { 1.0 } else { 0.0 }).powi(2);
+        };
+        add_probability_comparator("gaussian_floor_v1", Some(probability));
+        add_probability_comparator(
+            "gaussian_without_floor_research_only",
+            fill_event["execution_audit"]["model_audit"]["probability_without_floor"].as_f64(),
+        );
+        for scale in ["0.25", "0.50", "1.00"] {
+            add_probability_comparator(
+                &format!("gaussian_floor_scale_{scale}_research_only"),
+                fill_event["execution_audit"]["model_audit"]["floor_sensitivity_probability"]
+                    [scale]
+                    .as_f64(),
+            );
+        }
+        let buy_up = fill_event["buy_up"].as_bool().unwrap_or(true);
+        add_probability_comparator(
+            "frozen_research_model",
+            fill_event["research_model"][if buy_up {
+                "probability_up"
+            } else {
+                "probability_down"
+            }]
+            .as_f64(),
+        );
+        add_probability_comparator(
+            "market_anchored_v1_research_only",
+            fill_event["research_model"]["market_anchored"][if buy_up {
+                "probability_up"
+            } else {
+                "probability_down"
+            }]
+            .as_f64(),
+        );
+        add_probability_comparator(
+            "execution_market_midpoint",
+            fill_event["delayed_bid"]
+                .as_f64()
+                .zip(fill_event["delayed_ask"].as_f64())
+                .map(|(bid, ask)| ((bid + ask) / 2.0).clamp(0.0, 1.0)),
+        );
+        if let Some(cohorts) = fill_event["counterfactual_cohorts"]["cohorts"].as_object() {
+            for (name, cohort) in cohorts {
+                *counterfactual_evaluated.entry(name.clone()).or_default() += 1;
+                if cohort["eligible"].as_bool() == Some(true) {
+                    let cohort_probability = cohort["probability"]
+                        .as_f64()
+                        .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
+                        .unwrap_or(probability);
+                    let bucket = counterfactual_buckets.entry(name.clone()).or_default();
+                    bucket.samples += 1;
+                    bucket.wins += usize::from(won);
+                    bucket.probability_sum += cohort_probability;
+                    bucket.brier_sum += (cohort_probability - if won { 1.0 } else { 0.0 }).powi(2);
+                    bucket.pnl += pnl;
+                    bucket.capital += fill_event["cost_usdc"].as_f64().unwrap_or(0.0)
+                        + fill_event["fees_usdc"].as_f64().unwrap_or(0.0);
+                } else if let Some(reasons) = cohort["rejection_reasons"].as_array() {
+                    for reason in reasons.iter().filter_map(Value::as_str) {
+                        *counterfactual_rejections
+                            .entry(name.clone())
+                            .or_default()
+                            .entry(reason.to_string())
+                            .or_default() += 1;
+                    }
+                }
+            }
+        } else {
+            counterfactual_unavailable_fills += 1;
+        }
         add(quality_buckets
             .entry(format!(
                 "{quality_key}/{asset}/{}",
@@ -1258,6 +1880,12 @@ pub fn run_dry_run_report() -> Result<PathBuf> {
             ))
             .or_default());
         add(by_feed_age.entry(feed_key.into()).or_default());
+        add(by_reference_local_age
+            .entry(reference_local_age_key.into())
+            .or_default());
+        add(by_reference_network_latency
+            .entry(reference_network_latency_key.into())
+            .or_default());
         add(by_exchange_age.entry(exchange_key.into()).or_default());
         if reasons.is_empty() {
             add(&mut eligible);
@@ -1312,6 +1940,36 @@ pub fn run_dry_run_report() -> Result<PathBuf> {
             "capital_usdc":bucket.capital,"return_on_settled_capital":if bucket.capital>0.0 {Some(bucket.pnl/bucket.capital)} else {None}
         })
     };
+    let counterfactual_names = counterfactual_evaluated
+        .keys()
+        .chain(counterfactual_buckets.keys())
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let counterfactual_summary = counterfactual_names
+        .into_iter()
+        .map(|name| {
+            let evaluated = counterfactual_evaluated.get(&name).copied().unwrap_or(0);
+            let outcomes = counterfactual_buckets
+                .get(&name)
+                .map(|bucket| bucket_json(bucket))
+                .unwrap_or_else(|| bucket_json(&Bucket::default()));
+            let admitted = outcomes["samples"].as_u64().unwrap_or(0) as usize;
+            let rejections = counterfactual_rejections
+                .get(&name)
+                .cloned()
+                .unwrap_or_default();
+            (
+                name,
+                serde_json::json!({
+                    "evaluated":evaluated,
+                    "admitted":admitted,
+                    "rejected":evaluated.saturating_sub(admitted),
+                    "rejection_reasons_overlapping":rejections,
+                    "outcomes":outcomes
+                }),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     let all_assets_ready = enabled_assets.iter().all(|asset| {
         eligible_by_asset.get(asset).is_some_and(|bucket| {
             bucket.samples >= min_asset_samples
@@ -1329,7 +1987,8 @@ pub fn run_dry_run_report() -> Result<PathBuf> {
         .filter(|e| e["event"] == "shadow_fill")
         .count()
         - fill_events.len();
-    let integrity_ok = duplicate_resolutions == 0
+    let integrity_ok = malformed_journal_lines == 0
+        && duplicate_resolutions == 0
         && orphan_resolutions == 0
         && overbudget == 0
         && legacy_samples == 0
@@ -1346,24 +2005,44 @@ pub fn run_dry_run_report() -> Result<PathBuf> {
         "overall":bucket_json(&overall),
         "eligible":bucket_json(&eligible),
         "eligible_by_asset":eligible_by_asset.iter().map(|(k,v)|(k.clone(),bucket_json(v))).collect::<BTreeMap<_,_>>(),
-        "data_quality":{"policy_version":1,"required_execution_version":LIVE_EXECUTION_VERSION,
-            "max_exchange_age_ms":1000,"max_reference_feed_age_ms":2000,"max_rest_latency_ms":2000,
+        "data_quality":{"policy_version":2,"required_execution_version":LIVE_EXECUTION_VERSION,
+            "max_exchange_age_ms":1000,
+            "max_reference_observation_age_ms":QUALITY_MAX_REFERENCE_OBSERVATION_AGE_MS,
+            "max_reference_local_age_ms":QUALITY_MAX_REFERENCE_LOCAL_AGE_MS,
+            "max_reference_network_latency_ms":QUALITY_MAX_REFERENCE_NETWORK_LATENCY_MS,
+            "max_rest_latency_ms":2000,
             "exclusion_reasons_overlapping":quality_reasons,
             "by_quality_asset_source":quality_buckets.iter().map(|(k,v)|(k.clone(),bucket_json(v))).collect::<BTreeMap<_,_>>(),
             "note":"overall is raw simulated accounting. Only eligible enters canary gates; legacy/unknown evidence stays research-only. Offline filtering is not a replay."},
         "by_reference_feed_age":by_feed_age.iter().map(|(k,v)|(k.clone(),bucket_json(v))).collect::<BTreeMap<_,_>>(),
+        "by_reference_local_age":by_reference_local_age.iter().map(|(k,v)|(k.clone(),bucket_json(v))).collect::<BTreeMap<_,_>>(),
+        "by_reference_network_latency":by_reference_network_latency.iter().map(|(k,v)|(k.clone(),bucket_json(v))).collect::<BTreeMap<_,_>>(),
         "by_execution_exchange_age":by_exchange_age.iter().map(|(k,v)|(k.clone(),bucket_json(v))).collect::<BTreeMap<_,_>>(),
         "research_audit":dry_run_research_summary(&events),
         "by_entry_price":by_entry_price.iter().map(|(k,v)|(k.clone(),bucket_json(v))).collect::<BTreeMap<_,_>>(),
         "by_reference_direction":by_direction.iter().map(|(k,v)|(k.clone(),bucket_json(v))).collect::<BTreeMap<_,_>>(),
         "by_checkpoint":by_checkpoint.iter().map(|(k,v)|(k.clone(),bucket_json(v))).collect::<BTreeMap<_,_>>(),
         "by_total_execution_latency":by_total_latency.iter().map(|(k,v)|(k.clone(),bucket_json(v))).collect::<BTreeMap<_,_>>(),
+        "probability_comparators":{
+            "scope":"same fills selected by gaussian_floor_v1; calibration comparison only, not counterfactual PnL",
+            "models":probability_comparators.iter().map(|(k,v)|(k.clone(),bucket_json(v))).collect::<BTreeMap<_,_>>()
+        },
+        "counterfactual_cohorts":{
+            "schema_version":1,
+            "scope":"strict subsets of Gaussian-selected fills using the same direction, delayed REST book, simulated fill, slippage, fees and settlement; not an independent replay",
+            "decision_role":"research_only",
+            "unavailable_legacy_fills":counterfactual_unavailable_fills,
+            "cohorts":counterfactual_summary
+        },
         "by_run":by_run.iter().map(|(k,v)|(k.clone(),bucket_json(v))).collect::<BTreeMap<_,_>>(),
         "by_source":by_source.iter().map(|(k,v)|(k.clone(),bucket_json(v))).collect::<BTreeMap<_,_>>(),
         "by_execution_version":by_version.iter().map(|(k,v)|(k.clone(),bucket_json(v))).collect::<BTreeMap<_,_>>(),
         "integrity":{"overbudget_fills":overbudget,"duplicate_resolutions":duplicate_resolutions,
             "orphan_resolutions":orphan_resolutions,"legacy_samples":legacy_samples,
-            "pending_fills":pending_fills,"duplicate_fills":duplicate_fills,"ok":integrity_ok},
+            "pending_fills":pending_fills,"duplicate_fills":duplicate_fills,
+            "malformed_journal_lines":malformed_journal_lines,
+            "recovered_journal_suffixes":recovered_journal_suffixes,
+            "dropped_journal_lines":dropped_journal_lines,"ok":integrity_ok},
         "by_asset":by_asset.iter().map(|(k,v)|(k.clone(),bucket_json(v))).collect::<BTreeMap<_,_>>(),
         "by_probability":by_probability.iter().map(|(k,v)|(k.clone(),bucket_json(v))).collect::<BTreeMap<_,_>>(),
         "by_rest_latency":by_latency.iter().map(|(k,v)|(k.clone(),bucket_json(v))).collect::<BTreeMap<_,_>>(),
@@ -1444,15 +2123,17 @@ fn scan_live_markets(
         guard.scan_ticks = guard.scan_ticks.saturating_add(1);
     }
     for market in markets {
-        if attempted
+        let already_attempted = attempted
             .lock()
             .map(|guard| guard.contains(&market.slug))
-            .unwrap_or(true)
-        {
+            .unwrap_or(true);
+        if already_attempted && config.research_snapshot_interval_ms == 0 {
             continue;
         }
-        if let Ok(mut guard) = stats.lock() {
-            guard.market_evaluations = guard.market_evaluations.saturating_add(1);
+        if !already_attempted {
+            if let Ok(mut guard) = stats.lock() {
+                guard.market_evaluations = guard.market_evaluations.saturating_add(1);
+            }
         }
         let floor = config
             .min_volatility
@@ -1480,6 +2161,28 @@ fn scan_live_markets(
                 continue;
             }
         };
+        if !reference_transport_fresh(state, now_ms, config.max_reference_local_age_ms) {
+            record_window_rejection(stats, &market.slug, "reference_transport_stale");
+            continue;
+        }
+        if config.research_execution_probe {
+            let inserted = attempted
+                .lock()
+                .map(|mut guard| guard.insert(market.slug.clone()))
+                .unwrap_or(false);
+            if inserted {
+                tokio::spawn(capture_residual_execution_observation(
+                    config.clone(),
+                    market.clone(),
+                    store.clone(),
+                    client.clone(),
+                    journal.clone(),
+                    stats.clone(),
+                    window_end_ms,
+                ));
+            }
+            continue;
+        }
         let audit_first = stats
             .lock()
             .map(|mut s| s.audited_markets.insert(market.slug.clone()))
@@ -1491,8 +2194,23 @@ fn scan_live_markets(
                 .and_then(|top| Some((top.bid_price?.to_f64()?, top.ask_price?.to_f64()?)))
                 .filter(|(bid, ask)| *bid >= 0.0 && *ask <= 1.0 && bid <= ask)
                 .map(|(bid, ask)| (bid + ask) / 2.0);
+            let research_model = market_anchored_research_audit(
+                research_model_audit(
+                    config,
+                    &market.crypto_symbol,
+                    state,
+                    remaining_ms as f64 / 1_000.0,
+                ),
+                market_midpoint,
+                config.research_market_prior_weight,
+            );
             let _ = journal.append(serde_json::json!({
                 "event":"model_observation", "recorded_at":Utc::now(),
+                "decision_model":if config.research_observation_only {
+                    "none_observation_only"
+                } else {
+                    "gaussian_floor_v1"
+                },
                 "slug":market.slug,"asset":market.crypto_symbol,
                 "checkpoint_secs":config.checkpoint_secs,
                 "seconds_remaining":remaining_ms as f64 / 1000.0,
@@ -1502,6 +2220,9 @@ fn scan_live_markets(
                     remaining_ms as f64 / 1000.0,state.observed_volatility_bps.max(state.minimum_volatility_bps)),
                 "reference_topic":"crypto_prices_twap_sixty",
                 "market_probability_up":market_midpoint,
+                "research_model":research_model,
+                "twap_path":twap_path_audit(store,&market.crypto_symbol,now_ms),
+                "spot_path":spot_path_audit(store,&market.crypto_symbol,now_ms),
                 "model_audit":live_model_audit(state, window_start_ms, now_ms, remaining_ms as f64 / 1000.0, true)
             }));
         }
@@ -1513,6 +2234,93 @@ fn scan_live_markets(
             && down
                 .as_ref()
                 .is_some_and(|top| live_ws_top_usable(top, now_ms, config));
+        if config.research_snapshot_interval_ms > 0 {
+            let should_record = stats
+                .lock()
+                .map(|mut guard| {
+                    let last = guard
+                        .research_snapshot_last_ms
+                        .get(&market.slug)
+                        .copied()
+                        .unwrap_or(i64::MIN);
+                    if now_ms.saturating_sub(last) < config.research_snapshot_interval_ms {
+                        false
+                    } else {
+                        guard
+                            .research_snapshot_last_ms
+                            .insert(market.slug.clone(), now_ms);
+                        true
+                    }
+                })
+                .unwrap_or(false);
+            if should_record {
+                let _ = journal.append(serde_json::json!({
+                    "event":"research_market_snapshot","recorded_at":Utc::now(),
+                    "slug":market.slug,"asset":market.crypto_symbol,
+                    "window_start_ms":window_start_ms,"window_end_ms":window_end_ms,
+                    "seconds_remaining":remaining_ms as f64/1_000.0,
+                    "book_source":"websocket","book_usable":ws_usable,
+                    "already_attempted":already_attempted,
+                    "up":websocket_top_audit(up.as_ref()),
+                    "down":websocket_top_audit(down.as_ref()),
+                    "up_depth":websocket_depth_audit(monitor,market.yes_token_id),
+                    "down_depth":websocket_depth_audit(monitor,market.no_token_id),
+                    "reference_observed_at_ms":state.observed_at_ms,
+                    "reference_age_ms":now_ms-state.observed_at_ms,
+                    "reference_timing":reference_timing_audit(state,now_ms),
+                    "opening_twap":state.opening,"current_twap":state.current,
+                    "twap_anchors":twap_anchor_audit(store,&market.crypto_symbol,now_ms),
+                    "spot_asof":spot_asof_audit(store,&market.crypto_symbol,now_ms),
+                    "decision_probability_up":live_probability(state,remaining_ms as f64/1_000.0),
+                    "research_model":research_model_audit(config,&market.crypto_symbol,state,remaining_ms as f64/1_000.0)
+                }));
+            }
+        }
+        // Run 006+ can collect checkpoint/market evidence without repeatedly
+        // simulating a decision model already rejected by the prior batch.
+        // One REST attempt is allowed when the first WS book is incomplete;
+        // the market is then terminal for this observation-only window.
+        if config.research_observation_only {
+            if already_attempted {
+                continue;
+            }
+            let inserted = attempted
+                .lock()
+                .map(|mut guard| guard.insert(market.slug.clone()))
+                .unwrap_or(false);
+            if !inserted {
+                continue;
+            }
+            if ws_usable {
+                if let Ok(mut guard) = stats.lock() {
+                    guard
+                        .terminal_reason_by_market
+                        .insert(market.slug.clone(), "research_observed_ws".to_string());
+                }
+                continue;
+            }
+            if let Ok(mut guard) = stats.lock() {
+                guard.rest_fallback_attempts = guard.rest_fallback_attempts.saturating_add(1);
+            }
+            tokio::spawn(evaluate_rest_fallback(
+                store.clone(),
+                config.clone(),
+                client.clone(),
+                journal.clone(),
+                stats.clone(),
+                attempted.clone(),
+                market.clone(),
+                state,
+                remaining_ms,
+                window_end_ms,
+            ));
+            continue;
+        }
+        // Preserve the post-rejection top-of-book trajectory for offline retry
+        // studies, but do not let an already-attempted market signal twice.
+        if already_attempted {
+            continue;
+        }
         if !ws_usable {
             let last = rest_fallback_last_ms
                 .get(&market.slug)
@@ -1569,6 +2377,208 @@ fn record_window_rejection(stats: &Arc<Mutex<DryRunWindowStats>>, slug: &str, re
     }
 }
 
+/// Bounded, sorted depth, with invalid/stale responses kept as diagnostic evidence.
+fn residual_book_evidence(
+    result: Result<(LiveRestBook, Value)>,
+    config: &DryRunConfig,
+    token: &str,
+    market: &str,
+    now: i64,
+) -> Value {
+    let (book, mut audit) = match result {
+        Ok(value) => value,
+        Err(error) => return serde_json::json!({"valid":false,"error":error.to_string()}),
+    };
+    let mut errors = Vec::new();
+    if let Err(error) = validate_rest_book(&book, token, market, now, config.max_book_age_ms) {
+        errors.push(error);
+    }
+    if !audit["rest_latency_ms"]
+        .as_u64()
+        .is_some_and(|ms| ms <= config.max_rest_latency_ms)
+    {
+        errors.push("rest_latency_exceeded");
+    }
+    let levels = |rows: &[LiveRestLevel], ascending: bool| {
+        let mut parsed = rows
+            .iter()
+            .filter_map(|row| {
+                let price = row.price.parse::<f64>().ok()?;
+                let size = row.size.parse::<f64>().ok()?;
+                (price.is_finite()
+                    && size.is_finite()
+                    && (0.0..=1.0).contains(&price)
+                    && size > 0.0)
+                    .then_some((price, size))
+            })
+            .collect::<Vec<_>>();
+        parsed.sort_by(|a, b| {
+            if ascending {
+                a.0.total_cmp(&b.0)
+            } else {
+                b.0.total_cmp(&a.0)
+            }
+        });
+        parsed.truncate(20);
+        parsed
+            .into_iter()
+            .map(|(price, size)| serde_json::json!({"price":price,"size":size}))
+            .collect::<Vec<_>>()
+    };
+    let bids = levels(&book.bids, false);
+    let asks = levels(&book.asks, true);
+    let bid = bids.first().and_then(|v| v["price"].as_f64());
+    let ask = asks.first().and_then(|v| v["price"].as_f64());
+    if bid.zip(ask).is_some_and(|(bid, ask)| bid > ask) {
+        errors.push("crossed_rest_book");
+    }
+    // Do not duplicate unbounded depth in the HTTP audit.
+    if let Some(object) = audit.as_object_mut() {
+        object.remove("bids");
+        object.remove("asks");
+    }
+    serde_json::json!({"valid":errors.is_empty(),"errors":errors,
+        "best_bid":bid,"best_ask":ask,"bids":bids,"asks":asks,
+        "bid_levels_total":book.bids.len(),"ask_levels_total":book.asks.len(),
+        "depth_limit":20,"age_checked_at_ms":now,"http":audit})
+}
+
+/// A midpoint is a price comparator, not a fill price. A complementary ask
+/// interval is retained separately and must never masquerade as a midpoint.
+fn residual_market_baseline(up: &Value, down: &Value) -> Value {
+    let midpoint = |book: &Value| {
+        if book["valid"] != true {
+            return None;
+        }
+        Some((book["best_bid"].as_f64()? + book["best_ask"].as_f64()?) / 2.0)
+    };
+    if let Some(p) = midpoint(up) {
+        return serde_json::json!({"probability_up":p,"midpoint_up":p,"source":"up_midpoint"});
+    }
+    if let Some(p) = midpoint(down) {
+        return serde_json::json!({"probability_up":1.0-p,"midpoint_up":1.0-p,"source":"down_midpoint"});
+    }
+    if up["valid"] == true && down["valid"] == true {
+        if let Some((upper, lower)) = up["best_ask"]
+            .as_f64()
+            .zip(down["best_ask"].as_f64().map(|ask| 1.0 - ask))
+        {
+            if lower <= upper {
+                return serde_json::json!({"probability_up":(lower+upper)/2.0,
+                    "midpoint_up":null,"source":"complementary_ask_interval",
+                    "lower_up":lower,"upper_up":upper});
+            }
+        }
+    }
+    serde_json::json!({"probability_up":null,"midpoint_up":null,"source":"unavailable"})
+}
+
+async fn residual_book_pair(
+    config: &DryRunConfig,
+    client: &reqwest::Client,
+    market: &MarketInfo,
+) -> Value {
+    let up_token = market.yes_token_id.to_string();
+    let down_token = market.no_token_id.to_string();
+    let market_id = market.market_id.to_string();
+    let (up, down) = tokio::join!(
+        fetch_rest_book(config, client, &up_token),
+        fetch_rest_book(config, client, &down_token)
+    );
+    let now = Utc::now().timestamp_millis();
+    serde_json::json!({"sampled_at_ms":now,
+        "up":residual_book_evidence(up,config,&up_token,&market_id,now),
+        "down":residual_book_evidence(down,config,&down_token,&market_id,now)})
+}
+
+fn record_residual_rest_stats(stats: &Arc<Mutex<DryRunWindowStats>>, books: &Value) {
+    if let Ok(mut guard) = stats.lock() {
+        for side in ["up", "down"] {
+            if let Some(latency) = books[side]["http"]["rest_latency_ms"].as_u64() {
+                guard.rest_latency_samples += 1;
+                guard.rest_latency_total_ms += latency;
+                guard.rest_latency_max_ms = guard.rest_latency_max_ms.max(latency);
+            }
+        }
+    }
+}
+
+/// Public REST observations only. Signal features are frozen BEFORE waiting;
+/// settlement labels and the delayed book cannot influence the prediction.
+async fn capture_residual_execution_observation(
+    config: DryRunConfig,
+    market: MarketInfo,
+    store: Arc<ChainlinkTwapStore>,
+    client: reqwest::Client,
+    journal: EventJournal,
+    stats: Arc<Mutex<DryRunWindowStats>>,
+    window_end_ms: i64,
+) {
+    let signal_books = residual_book_pair(&config, &client, &market).await;
+    record_residual_rest_stats(&stats, &signal_books);
+    let signal_ms = signal_books["sampled_at_ms"].as_i64().unwrap_or_default();
+    let Some(state) = fresh_execution_state(
+        &config,
+        &store,
+        &market.crypto_symbol,
+        window_end_ms,
+        signal_ms,
+    ) else {
+        record_window_rejection(&stats, &market.slug, "residual_signal_reference_not_ready");
+        let _ = journal.append(serde_json::json!({"event":"residual_capture_rejected","recorded_at":Utc::now(),
+            "slug":market.slug,"asset":market.crypto_symbol,"reason":"signal_reference_not_ready","books":signal_books}));
+        return;
+    };
+    let baseline = residual_market_baseline(&signal_books["up"], &signal_books["down"]);
+    let remaining = (window_end_ms - signal_ms) as f64 / 1000.0;
+    let probability = live_probability(state, remaining);
+    let model_audit = live_model_audit(state, window_end_ms - 300_000, signal_ms, remaining, true);
+    let research_model = research_model_audit(&config, &market.crypto_symbol, state, remaining);
+    let episode_id = uuid::Uuid::new_v4().to_string();
+    let signal = serde_json::json!({"books":signal_books,"baseline":baseline,
+        "sampled_at_ms":signal_ms,"seconds_remaining":remaining,
+        "probability_up":probability,"research_model":research_model,"model_audit":model_audit,
+        "opening_twap":state.opening,"current_twap":state.current,
+        "reference_timing":reference_timing_audit(state,signal_ms),
+        "twap_anchors":twap_anchor_audit(&store,&market.crypto_symbol,signal_ms),
+        "spot_asof":spot_asof_audit(&store,&market.crypto_symbol,signal_ms)});
+    if journal
+        .append(
+            serde_json::json!({"event":"model_observation","recorded_at":Utc::now(),
+        "episode_id":episode_id,"slug":market.slug,"asset":market.crypto_symbol,
+        "checkpoint_secs":config.checkpoint_secs,"seconds_remaining":remaining,
+        "observation_source":"residual_execution_probe","decision_model":"none_observation_only",
+        "probability_up":probability,"model_audit":model_audit,"research_model":research_model,
+        "market_probability_up":baseline["midpoint_up"],"market_baseline":baseline,
+        "opening_twap":state.opening,"current_twap":state.current}),
+        )
+        .is_err()
+    {
+        return;
+    }
+    let wait_started = Instant::now();
+    sleep(Duration::from_millis(config.execution_delay_ms)).await;
+    let delayed_books = residual_book_pair(&config, &client, &market).await;
+    record_residual_rest_stats(&stats, &delayed_books);
+    let delayed_ms = delayed_books["sampled_at_ms"].as_i64().unwrap_or_default();
+    let _ = journal.append(serde_json::json!({"event":"residual_execution_observation","schema_version":1,
+        "recorded_at":Utc::now(),"episode_id":episode_id,"slug":market.slug,"asset":market.crypto_symbol,
+        "checkpoint_secs":config.checkpoint_secs,"window_end_ms":window_end_ms,"signal":signal,
+        "delayed":{"books":delayed_books,"sampled_at_ms":delayed_ms,
+            "actual_delay_ms":delayed_ms-signal_ms,"monotonic_delay_ms":wait_started.elapsed().as_millis(),
+            "before_expiry":delayed_ms<window_end_ms},
+        "execution_policy":{"order_usdc":config.order_usdc,"fee_rate":config.fee_rate,
+            "fee_exponent":config.fee_exponent,"slippage_bps":config.slippage_bps,
+            "failure_rate":config.simulated_order_failure_rate,"liquidity_haircut":config.liquidity_haircut,
+            "min_partial_fill_ratio":config.min_partial_fill_ratio,"min_net_edge":config.min_edge},
+        "decision_role":"offline_replay_only","actual_order_submitted":false}));
+    if let Ok(mut guard) = stats.lock() {
+        guard
+            .terminal_reason_by_market
+            .insert(market.slug, "residual_execution_observed".to_string());
+    }
+}
+
 fn live_ws_top_usable(top: &WinnerBookTop, now_ms: i64, config: &DryRunConfig) -> bool {
     now_ms.saturating_sub(top.received_at_ms) <= config.max_book_age_ms
         && top.bid_price.is_some()
@@ -1584,6 +2594,14 @@ fn live_top_from_ws(top: WinnerBookTop) -> LiveBookTop {
     }
 }
 
+fn live_top_complete(top: &LiveBookTop) -> bool {
+    matches!((top.bid, top.ask, top.ask_size),
+        (Some(bid), Some(ask), Some(size))
+            if bid.is_finite() && ask.is_finite() && size.is_finite()
+                && (0.0..=1.0).contains(&bid) && (0.0..=1.0).contains(&ask)
+                && bid <= ask && size > 0.0)
+}
+
 async fn evaluate_rest_fallback(
     store: Arc<ChainlinkTwapStore>,
     config: DryRunConfig,
@@ -1596,6 +2614,7 @@ async fn evaluate_rest_fallback(
     remaining_ms: i64,
     window_end_ms: i64,
 ) {
+    let snapshot_id = uuid::Uuid::new_v4().to_string();
     let up_token_id = market.yes_token_id.to_string();
     let down_token_id = market.no_token_id.to_string();
     let market_id = market.market_id.to_string();
@@ -1606,7 +2625,8 @@ async fn evaluate_rest_fallback(
             &up_token_id,
             &market_id,
             &journal,
-            &market.slug
+            &market.slug,
+            &snapshot_id,
         ),
         fetch_live_rest_top(
             &config,
@@ -1614,7 +2634,8 @@ async fn evaluate_rest_fallback(
             &down_token_id,
             &market_id,
             &journal,
-            &market.slug
+            &market.slug,
+            &snapshot_id,
         ),
     );
     let (up, up_latency_ms, up_timestamp) = match up_result {
@@ -1683,6 +2704,77 @@ async fn evaluate_rest_fallback(
         return;
     };
     let probability_up = live_probability(state, adjusted_remaining_ms as f64 / 1_000.0);
+    if config.research_snapshot_interval_ms > 0 {
+        let paired_book_complete = live_top_complete(&up) && live_top_complete(&down);
+        let _ = journal.append(serde_json::json!({
+            "event":"research_market_snapshot","recorded_at":Utc::now(),
+            "snapshot_id":snapshot_id,"slug":market.slug,"asset":market.crypto_symbol,
+            "window_end_ms":window_end_ms,
+            "seconds_remaining":adjusted_remaining_ms as f64/1_000.0,
+            "book_source":"rest_fallback","fetch_success":true,
+            "book_usable":paired_book_complete,
+            "paired_book_complete":paired_book_complete,
+            "up":{"bid":up.bid,"ask":up.ask,"ask_size":up.ask_size,"exchange_timestamp_ms":up_timestamp},
+            "down":{"bid":down.bid,"ask":down.ask,"ask_size":down.ask_size,"exchange_timestamp_ms":down_timestamp},
+            "rest_latency_ms":rest_latency_ms,
+            "reference_observed_at_ms":state.observed_at_ms,
+            "reference_age_ms":now_ms-state.observed_at_ms,
+            "reference_timing":reference_timing_audit(state,now_ms),
+            "opening_twap":state.opening,"current_twap":state.current,
+            "twap_anchors":twap_anchor_audit(&store,&market.crypto_symbol,now_ms),
+            "spot_asof":spot_asof_audit(&store,&market.crypto_symbol,now_ms),
+            "decision_probability_up":probability_up,
+            "research_model":research_model_audit(&config,&market.crypto_symbol,state,adjusted_remaining_ms as f64/1_000.0)
+        }));
+    }
+    if config.research_observation_only {
+        let market_probability_up = up
+            .bid
+            .zip(up.ask)
+            .map(|(bid, ask)| ((bid + ask) / 2.0).clamp(0.0, 1.0));
+        if let Some(market_probability_up) = market_probability_up {
+            let research_model = market_anchored_research_audit(
+                research_model_audit(
+                    &config,
+                    &market.crypto_symbol,
+                    state,
+                    adjusted_remaining_ms as f64 / 1_000.0,
+                ),
+                Some(market_probability_up),
+                config.research_market_prior_weight,
+            );
+            let _ = journal.append(serde_json::json!({
+                "event":"model_observation","recorded_at":Utc::now(),
+                "observation_source":"rest_fallback",
+                "decision_model":"none_observation_only",
+                "slug":market.slug,"asset":market.crypto_symbol,
+                "checkpoint_secs":config.checkpoint_secs,
+                "seconds_remaining":adjusted_remaining_ms as f64/1_000.0,
+                "opening_twap":state.opening,"current_twap":state.current,
+                "probability_up":probability_up,
+                "reference_topic":"crypto_prices_twap_sixty",
+                "market_probability_up":market_probability_up,
+                "research_model":research_model,
+                "twap_path":twap_path_audit(&store,&market.crypto_symbol,now_ms),
+                "spot_path":spot_path_audit(&store,&market.crypto_symbol,now_ms),
+                "model_audit":live_model_audit(
+                    state,window_end_ms-300_000,now_ms,
+                    adjusted_remaining_ms as f64/1_000.0,true)
+            }));
+        }
+        if let Ok(mut guard) = stats.lock() {
+            guard.terminal_reason_by_market.insert(
+                market.slug.clone(),
+                if market_probability_up.is_some() {
+                    "research_observed_rest"
+                } else {
+                    "research_rest_book_incomplete"
+                }
+                .to_string(),
+            );
+        }
+        return;
+    }
     evaluate_live_tops(
         &store,
         &config,
@@ -1710,6 +2802,7 @@ async fn fetch_live_rest_top(
     market_id: &str,
     journal: &EventJournal,
     slug: &str,
+    snapshot_id: &str,
 ) -> Result<(LiveBookTop, u64, i64)> {
     let started = Instant::now();
     let (book, mut request_audit) = fetch_rest_book(config, client, token_id).await?;
@@ -1729,6 +2822,7 @@ async fn fetch_live_rest_top(
     );
     journal.append(
         serde_json::json!({"event":"rest_book_audit","recorded_at":Utc::now(),
+        "snapshot_id":snapshot_id,
         "slug":slug,"requested_token_id":token_id,"response_token_id":book.asset_id,
         "response_market":book.market,"exchange_timestamp":book.timestamp,
         "bid_levels":book.bids.len(),"ask_levels":book.asks.len(),
@@ -1866,8 +2960,25 @@ fn evaluate_live_tops(
         return;
     }
     let evaluation_id = uuid::Uuid::new_v4().to_string();
+    let selected_midpoint = ((bid + ask) / 2.0).clamp(0.0, 1.0);
+    let market_probability_up = if buy_up {
+        selected_midpoint
+    } else {
+        1.0 - selected_midpoint
+    };
+    let research_forecast = market_anchored_research_audit(
+        research_model_audit(
+            config,
+            &market.crypto_symbol,
+            state,
+            remaining_ms as f64 / 1_000.0,
+        ),
+        Some(market_probability_up),
+        config.research_market_prior_weight,
+    );
     let event = serde_json::json!({
         "event":"opportunity",
+        "decision_model":"gaussian_floor_v1",
         "checkpoint_secs":config.checkpoint_secs,
         "model_audit":live_model_audit(state, window_start_ms, Utc::now().timestamp_millis(), remaining_ms as f64 / 1000.0, buy_up),
         "evaluation_id":evaluation_id,
@@ -1885,6 +2996,9 @@ fn evaluate_live_tops(
         "twap_observed_at_ms":state.observed_at_ms,
         "volatility_bps_per_sqrt_second":state.volatility_bps_per_sqrt_second,
         "probability":probability,
+        "research_model":research_forecast,
+        "twap_path":twap_path_audit(store,&market.crypto_symbol,Utc::now().timestamp_millis()),
+        "spot_path":spot_path_audit(store,&market.crypto_symbol,Utc::now().timestamp_millis()),
         "signal_bid":bid,
         "signal_ask":ask,
         "signal_ask_size":ask_size,
@@ -1994,16 +3108,31 @@ fn fresh_execution_state(
     if now_ms >= end_ms {
         return None;
     }
-    store.fair_value_snapshot(
-        asset,
-        end_ms - 300_000,
-        now_ms,
-        config.opening_max_skew_ms,
-        config.max_feed_age_ms,
-        config.volatility_lookback_secs,
-        config.min_observations,
-        config.min_volatility.get(asset).copied().unwrap_or(1.5),
-    )
+    store
+        .fair_value_snapshot(
+            asset,
+            end_ms - 300_000,
+            now_ms,
+            config.opening_max_skew_ms,
+            config.max_feed_age_ms,
+            config.volatility_lookback_secs,
+            config.min_observations,
+            config.min_volatility.get(asset).copied().unwrap_or(1.5),
+        )
+        .filter(|state| {
+            reference_transport_fresh(*state, now_ms, config.max_reference_local_age_ms)
+        })
+}
+
+fn reference_transport_fresh(
+    state: FairValueTwapSnapshot,
+    now_ms: i64,
+    max_local_age_ms: i64,
+) -> bool {
+    state
+        .received_at_ms
+        .and_then(|received| now_ms.checked_sub(received))
+        .is_some_and(|age| (0..=max_local_age_ms).contains(&age))
 }
 
 fn executable_asks(
@@ -2094,6 +3223,266 @@ fn live_probability(state: FairValueTwapSnapshot, remaining_secs: f64) -> f64 {
     )
 }
 
+fn research_model_audit(
+    config: &DryRunConfig,
+    asset: &str,
+    state: FairValueTwapSnapshot,
+    remaining_secs: f64,
+) -> Value {
+    let Some(model) = &config.research_model else {
+        return Value::Null;
+    };
+    let current_probability_up = live_probability(state, remaining_secs);
+    let Some(forecast) = model.forecast(
+        asset,
+        config.checkpoint_secs,
+        ResearchFeatures {
+            opening: state.opening.to_f64().unwrap_or(0.0),
+            current: state.current.to_f64().unwrap_or(0.0),
+            remaining_secs,
+            observed_volatility_bps: state.observed_volatility_bps,
+            minimum_volatility_bps: state.minimum_volatility_bps,
+            current_probability_up,
+        },
+    ) else {
+        return Value::Null;
+    };
+    serde_json::json!({
+        "sha256":model.sha256,
+        "selected":model.selected_name(asset,config.checkpoint_secs),
+        "kind":forecast.selected_kind,
+        "probability_up":forecast.probability_up,
+        "probability_down":1.0-forecast.probability_up,
+        "decision_role":"research_only"
+    })
+}
+
+/// Research-only market-prior comparator.  It deliberately cannot affect
+/// admission or execution: the next batch measures whether shrinking the
+/// standalone model toward executable market probability improves calibration
+/// before any decision model is changed.
+fn market_anchored_research_audit(
+    mut audit: Value,
+    market_probability_up: Option<f64>,
+    market_weight: f64,
+) -> Value {
+    let Some(object) = audit.as_object_mut() else {
+        return audit;
+    };
+    let model_probability_up = object.get("probability_up").and_then(Value::as_f64);
+    let candidate = model_probability_up
+        .zip(market_probability_up)
+        .filter(|(model, market)| {
+            model.is_finite()
+                && market.is_finite()
+                && (0.0..=1.0).contains(model)
+                && (0.0..=1.0).contains(market)
+        })
+        .map(|(model, market)| {
+            let probability_up =
+                (market_weight * market + (1.0 - market_weight) * model).clamp(1e-6, 1.0 - 1e-6);
+            serde_json::json!({
+                "kind":"market_anchored_v1",
+                "decision_role":"research_only",
+                "market_weight":market_weight,
+                "market_probability_up":market,
+                "standalone_probability_up":model,
+                "probability_up":probability_up,
+                "probability_down":1.0-probability_up
+            })
+        });
+    object.insert(
+        "market_anchored".to_string(),
+        candidate.unwrap_or(Value::Null),
+    );
+    audit
+}
+
+/// Same-direction, same-execution research cohorts for a Gaussian-selected
+/// shadow fill.  Every cohort reuses the delayed REST book, simulated fill,
+/// slippage and fee of the parent fill.  These are strict subsets, not an
+/// independent replay and never an order-admission input.
+fn research_counterfactual_cohorts(
+    config: &DryRunConfig,
+    buy_up: bool,
+    gaussian_probability: f64,
+    selected_market_midpoint: Option<f64>,
+    research_forecast: &Value,
+    average_price: f64,
+    fee_per_share: f64,
+    model_audit: &Value,
+) -> Value {
+    let direction_agrees = model_audit["directional_margin_bps"]
+        .as_f64()
+        .is_some_and(|margin| margin > 0.0);
+    let entry_price_ok = average_price >= config.research_min_entry_price;
+    let anchored_probability = research_forecast["market_anchored"][if buy_up {
+        "probability_up"
+    } else {
+        "probability_down"
+    }]
+    .as_f64()
+    .filter(|value| value.is_finite() && (0.0..=1.0).contains(value));
+    let anchored_net_edge = anchored_probability.map(|p| p - average_price - fee_per_share);
+    let anchored_edge_ok = anchored_net_edge.is_some_and(|edge| edge >= config.min_edge);
+    let gaussian_net_edge = gaussian_probability - average_price - fee_per_share;
+    let gaussian_minus_market =
+        selected_market_midpoint.map(|market| gaussian_probability - market);
+    let anchored_minus_market = anchored_probability
+        .zip(selected_market_midpoint)
+        .map(|(anchored, market)| anchored - market);
+    let cohort =
+        |eligible: bool, probability: Option<f64>, net_edge: Option<f64>, reasons: Vec<&str>| {
+            serde_json::json!({
+                "eligible":eligible,
+                "probability":probability,
+                "net_edge_after_costs":net_edge,
+                "rejection_reasons":reasons
+            })
+        };
+    let entry_reasons = (!entry_price_ok)
+        .then_some("entry_price_below_research_floor")
+        .into_iter()
+        .collect::<Vec<_>>();
+    let direction_reasons = (!direction_agrees)
+        .then_some("reference_direction_opposes_selection")
+        .into_iter()
+        .collect::<Vec<_>>();
+    let anchored_reasons = if anchored_probability.is_none() {
+        vec!["market_anchored_probability_missing"]
+    } else if !anchored_edge_ok {
+        vec!["market_anchored_net_edge_below_threshold"]
+    } else {
+        Vec::new()
+    };
+    let mut combined_reasons = entry_reasons.clone();
+    combined_reasons.extend(direction_reasons.iter().copied());
+    let mut anchored_combined_reasons = anchored_reasons.clone();
+    anchored_combined_reasons.extend(entry_reasons.iter().copied());
+    anchored_combined_reasons.extend(direction_reasons.iter().copied());
+    serde_json::json!({
+        "schema_version":1,
+        "decision_role":"research_only",
+        "scope":"same_direction_same_delayed_execution_subset",
+        "market_relative":{
+            "selected_market_midpoint":selected_market_midpoint,
+            "gaussian_minus_market":gaussian_minus_market,
+            "market_anchored_minus_market":anchored_minus_market
+        },
+        "assumptions":{
+            "minimum_entry_price":config.research_min_entry_price,
+            "minimum_net_edge":config.min_edge,
+            "average_price":average_price,
+            "fee_per_share":fee_per_share
+        },
+        "cohorts":{
+            "market_anchored_edge":cohort(
+                anchored_edge_ok, anchored_probability, anchored_net_edge, anchored_reasons),
+            "entry_price_floor":cohort(
+                entry_price_ok, Some(gaussian_probability), Some(gaussian_net_edge), entry_reasons),
+            "reference_direction_agreement":cohort(
+                direction_agrees, Some(gaussian_probability), Some(gaussian_net_edge), direction_reasons),
+            "entry_and_direction":cohort(
+                entry_price_ok && direction_agrees,
+                Some(gaussian_probability), Some(gaussian_net_edge), combined_reasons),
+            "market_anchored_entry_and_direction":cohort(
+                anchored_edge_ok && entry_price_ok && direction_agrees,
+                anchored_probability, anchored_net_edge, anchored_combined_reasons)
+        }
+    })
+}
+
+fn twap_path_audit(store: &ChainlinkTwapStore, asset: &str, now_ms: i64) -> Value {
+    let samples = store.fair_value_recent_twap_samples(asset, now_ms, 90_000);
+    serde_json::json!({
+        "topic":"crypto_prices_twap_sixty",
+        "lookback_ms":90_000,
+        "samples":samples.iter().map(|sample| serde_json::json!({
+            "observed_at_ms":sample.observed_at_ms,
+            "value":sample.value
+        })).collect::<Vec<_>>()
+    })
+}
+
+fn spot_path_audit(store: &ChainlinkTwapStore, asset: &str, now_ms: i64) -> Value {
+    let streams = ["crypto_prices_chainlink", "crypto_prices"]
+        .into_iter()
+        .map(|topic| {
+            let samples = store.fair_value_recent_spot_samples(topic, asset, now_ms, 90_000);
+            serde_json::json!({"topic":topic,"samples":samples})
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({"lookback_ms":90_000,"streams":streams,"decision_role":"research_only"})
+}
+
+fn spot_asof_audit(store: &ChainlinkTwapStore, asset: &str, now_ms: i64) -> Value {
+    let latest = ["crypto_prices_chainlink", "crypto_prices"]
+        .into_iter()
+        .map(|topic| {
+            let samples = store.fair_value_recent_spot_samples(topic, asset, now_ms, 90_000);
+            serde_json::json!({"topic":topic,"sample":samples.last()})
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({"lookback_ms":90_000,"streams":latest,"decision_role":"research_only"})
+}
+
+fn twap_anchor_audit(store: &ChainlinkTwapStore, asset: &str, now_ms: i64) -> Value {
+    let samples = store.fair_value_recent_twap_samples(asset, now_ms, 90_000);
+    let anchors = [0_i64, 30_000, 60_000, 90_000].map(|ago_ms| {
+        let target = now_ms.saturating_sub(ago_ms);
+        let sample = samples
+            .iter()
+            .rev()
+            .find(|sample| sample.observed_at_ms <= target);
+        serde_json::json!({"ago_ms":ago_ms,"observed_at_ms":sample.map(|s|s.observed_at_ms),
+            "value":sample.map(|s|s.value)})
+    });
+    serde_json::json!({"topic":"crypto_prices_twap_sixty","anchors":anchors})
+}
+
+fn websocket_top_audit(top: Option<&WinnerBookTop>) -> Value {
+    match top {
+        Some(top) => serde_json::json!({
+            "bid":top.bid_price,"ask":top.ask_price,"ask_size":top.ask_size,
+            "received_at_ms":top.received_at_ms,
+            "exchange_updated_at_ms":top.exchange_updated_at_ms
+        }),
+        None => Value::Null,
+    }
+}
+
+fn websocket_depth_audit(monitor: &OrderBookMonitor, token_id: U256) -> Value {
+    let Some(book) = monitor.winner_book_snapshot(token_id) else {
+        return Value::Null;
+    };
+    let mut asks = book
+        .asks
+        .iter()
+        .filter(|level| level.size > Decimal::ZERO)
+        .collect::<Vec<_>>();
+    asks.sort_by_key(|level| level.price);
+    let mut bids = book
+        .bids
+        .iter()
+        .filter(|level| level.size > Decimal::ZERO)
+        .collect::<Vec<_>>();
+    bids.sort_by_key(|level| std::cmp::Reverse(level.price));
+    let compact =
+        |levels: &[&polymarket_client_sdk::clob::ws::types::response::OrderBookLevel]| {
+            levels
+                .iter()
+                .take(20)
+                .map(|level| serde_json::json!({"price":level.price,"size":level.size}))
+                .collect::<Vec<_>>()
+        };
+    serde_json::json!({
+        "exchange_updated_at_ms":book.timestamp,
+        "ask_levels_total":asks.len(),"bid_levels_total":bids.len(),
+        "levels_truncated":asks.len()>20 || bids.len()>20,
+        "asks":compact(&asks),"bids":compact(&bids)
+    })
+}
+
 fn live_model_audit(
     state: FairValueTwapSnapshot,
     window_start_ms: i64,
@@ -2111,14 +3500,69 @@ fn live_model_audit(
         .to_f64()
         .unwrap_or(0.0)
         * 10000.0;
-    serde_json::json!({"version":1,"opening_observed_at_ms":state.opening_observed_at_ms,
+    let floor_sensitivity = [0.25_f64, 0.5, 1.0]
+        .into_iter()
+        .map(|scale| {
+            let up = fair_up_probability(
+                state.opening.to_f64().unwrap_or(0.0),
+                state.current.to_f64().unwrap_or(0.0),
+                remaining_secs,
+                state
+                    .observed_volatility_bps
+                    .max(state.minimum_volatility_bps * scale),
+            );
+            (format!("{scale:.2}"), if buy_up { up } else { 1.0 - up })
+        })
+        .collect::<BTreeMap<_, _>>();
+    let observation_age_ms = now_ms.saturating_sub(state.observed_at_ms);
+    let upstream_publish_delay_ms = state
+        .publisher_at_ms
+        .map(|publisher| publisher.saturating_sub(state.observed_at_ms));
+    let network_receive_latency_ms = state
+        .publisher_at_ms
+        .zip(state.received_at_ms)
+        .map(|(publisher, received)| received.saturating_sub(publisher));
+    let local_receive_age_ms = state
+        .received_at_ms
+        .map(|received| now_ms.saturating_sub(received));
+    serde_json::json!({"version":2,"opening_observed_at_ms":state.opening_observed_at_ms,
         "opening_skew_ms":state.opening_observed_at_ms-window_start_ms,
-        "feed_age_ms":now_ms-state.observed_at_ms,"observations":state.observation_count,
+        "feed_age_ms":observation_age_ms,
+        "reference_timing_version":2,
+        "observation_age_ms":observation_age_ms,
+        "upstream_publish_delay_ms":upstream_publish_delay_ms,
+        "network_receive_latency_ms":network_receive_latency_ms,
+        "local_receive_age_ms":local_receive_age_ms,
+        "reference_observed_at_ms":state.observed_at_ms,
+        "reference_publisher_at_ms":state.publisher_at_ms,
+        "reference_received_at_ms":state.received_at_ms,
+        "observations":state.observation_count,
         "observed_volatility_bps":state.observed_volatility_bps,
         "minimum_volatility_bps":state.minimum_volatility_bps,
+        "effective_volatility_bps":state.volatility_bps_per_sqrt_second,
+        "volatility_floor_ratio":if state.minimum_volatility_bps > 0.0 {
+            Some(state.observed_volatility_bps/state.minimum_volatility_bps)
+        } else { None },
         "volatility_floor_active":state.observed_volatility_bps < state.minimum_volatility_bps,
         "probability_without_floor":if buy_up {raw_up} else {1.0-raw_up},
+        "floor_sensitivity_probability":floor_sensitivity,
         "directional_margin_bps":if buy_up {margin} else {-margin}})
+}
+
+fn reference_timing_audit(state: FairValueTwapSnapshot, now_ms: i64) -> Value {
+    serde_json::json!({
+        "version":2,
+        "observed_at_ms":state.observed_at_ms,
+        "publisher_at_ms":state.publisher_at_ms,
+        "received_at_ms":state.received_at_ms,
+        "observation_age_ms":now_ms.saturating_sub(state.observed_at_ms),
+        "upstream_publish_delay_ms":state.publisher_at_ms
+            .map(|publisher|publisher.saturating_sub(state.observed_at_ms)),
+        "network_receive_latency_ms":state.publisher_at_ms.zip(state.received_at_ms)
+            .map(|(publisher,received)|received.saturating_sub(publisher)),
+        "local_receive_age_ms":state.received_at_ms
+            .map(|received|now_ms.saturating_sub(received))
+    })
 }
 
 fn live_edge_evaluation(
@@ -2137,7 +3581,9 @@ fn live_edge_evaluation(
     if ask < bid {
         return Err("crossed_book");
     }
-    if ask - bid > config.max_spread {
+    // CLOB prices arrive as decimal ticks. Comparing their f64 subtraction
+    // directly against a decimal threshold rejects 0.07 - 0.04 at 0.03.
+    if ask - bid > config.max_spread + 1e-9 {
         return Err("spread_too_wide");
     }
     if ask * size < config.min_depth_usdc {
@@ -2248,6 +3694,12 @@ async fn execute_live_shadow(
     } else {
         1.0 - up_probability
     };
+    let mut research_forecast = research_model_audit(
+        &config,
+        &asset,
+        state,
+        (window_end_ms - now_ms) as f64 / 1000.0,
+    );
     let delayed_bid = book
         .bids
         .iter()
@@ -2275,6 +3727,15 @@ async fn execute_live_shadow(
     });
     let delayed_ask = asks.first().map(|level| level.0).unwrap_or(1.0);
     let delayed_ask_size = asks.first().map(|level| level.1).unwrap_or(0.0);
+    let delayed_selected_midpoint =
+        delayed_bid.map(|bid| ((bid + delayed_ask) / 2.0).clamp(0.0, 1.0));
+    let delayed_market_probability_up =
+        delayed_selected_midpoint.map(|midpoint| if buy_up { midpoint } else { 1.0 - midpoint });
+    research_forecast = market_anchored_research_audit(
+        research_forecast,
+        delayed_market_probability_up,
+        config.research_market_prior_weight,
+    );
     // Bound every consumed level, not only the final average price.
     let raw_asks = asks;
     let asks = executable_asks(&config, &raw_asks, probability);
@@ -2292,6 +3753,7 @@ async fn execute_live_shadow(
         let _ = journal.append(serde_json::json!({"event":"shadow_rejected","evaluation_id":evaluation_id,
             "recorded_at":Utc::now(),"slug":slug,"reason":format!("delayed_{reason}"),
             "signal_probability":signal_probability,"probability":probability,"delayed_bid":delayed_bid,"delayed_ask":delayed_ask,
+            "research_model":research_forecast,
             "raw_ask_levels":raw_asks.len(),"executable_ask_levels":asks.len(),
             "executable_best_ask":asks.first().map(|x|x.0),"executable_depth_usdc":cumulative_depth,
             "model_audit":live_model_audit(state,window_end_ms-300_000,now_ms,(window_end_ms-now_ms) as f64/1000.0,buy_up)}));
@@ -2373,6 +3835,10 @@ async fn execute_live_shadow(
     .or_else(|| {
         (commit_ms - state.observed_at_ms > config.max_feed_age_ms)
             .then_some("reference_feed_stale_before_record")
+    })
+    .or_else(|| {
+        (!reference_transport_fresh(state, commit_ms, config.max_reference_local_age_ms))
+            .then_some("reference_transport_stale_before_record")
     });
     if let Some(reason) = final_rejection {
         if let Ok(mut guard) = stats.lock() {
@@ -2400,6 +3866,16 @@ async fn execute_live_shadow(
         "age_checked_at_ms":commit_ms,"model_evaluated_at_ms":now_ms,"request_audit":request_audit,
         "executable_depth_usdc":cumulative_depth
     });
+    let counterfactual_cohorts = research_counterfactual_cohorts(
+        &config,
+        buy_up,
+        probability,
+        delayed_selected_midpoint,
+        &research_forecast,
+        average,
+        fees / fill.shares,
+        &execution_audit["model_audit"],
+    );
     let expected_pnl = probability * fill.shares - cost - fees;
     if let Ok(mut guard) = stats.lock() {
         guard.shadow_fills = guard.shadow_fills.saturating_add(1);
@@ -2410,6 +3886,8 @@ async fn execute_live_shadow(
     }
     let _ = journal.append(serde_json::json!({
         "event":"shadow_fill","evaluation_id":evaluation_id,"recorded_at":Utc::now(),
+        "decision_model":"gaussian_floor_v1","research_model":research_forecast,
+        "counterfactual_cohorts":counterfactual_cohorts,
         "asset":asset,"slug":slug,"buy_up":buy_up,"probability":probability,
         "signal_probability":signal_probability,"execution_model_observed_at_ms":state.observed_at_ms,
         "execution_version":LIVE_EXECUTION_VERSION,"checkpoint_secs":config.checkpoint_secs,"budget_usdc":config.order_usdc,
@@ -3260,6 +4738,164 @@ fn env_decimal_list(name: &str, default: &[&str]) -> Result<Vec<Decimal>> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn residual_capture_links_signal_and_delayed_depth_without_orders() {
+        use crate::late_resolution_winner_model::{RtdsReferenceSample, TwapSample};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let market_id = polymarket_client_sdk::types::B256::ZERO;
+        let server = tokio::spawn(async move {
+            for _ in 0..4 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = vec![0_u8; 8192];
+                let len = socket.read(&mut bytes).await.unwrap();
+                let request = String::from_utf8_lossy(&bytes[..len]);
+                assert!(request.starts_with("GET /book?token_id="));
+                let token = if request.contains("token_id=1 ") {
+                    "1"
+                } else {
+                    "2"
+                };
+                let now = Utc::now().timestamp_millis();
+                let body = serde_json::json!({"asset_id":token,"market":market_id.to_string(),
+                    "timestamp":now.to_string(),"bids":[{"price":"0.45","size":"10"}],
+                    "asks":[{"price":"0.55","size":"10"}]})
+                .to_string();
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body);
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let mut config = dry_run_config();
+        config.clob_url = format!("http://{address}");
+        config.min_observations = 2;
+        let now = Utc::now().timestamp_millis();
+        let start = now - 270_000;
+        let end = start + 300_000;
+        let store = Arc::new(ChainlinkTwapStore::default());
+        for second in 0..=270 {
+            store.ingest(
+                "btc",
+                TwapSample {
+                    observed_at_ms: start + second * 1000,
+                    value: Decimal::from(100),
+                },
+            );
+        }
+        store.ingest_twap_reference_timing(RtdsReferenceSample {
+            topic: "crypto_prices_twap_sixty".into(),
+            symbol: "btc/usd".into(),
+            asset: "btc".into(),
+            observed_at_ms: now,
+            publisher_at_ms: Some(now),
+            received_at_ms: now,
+            value: Decimal::from(100),
+        });
+        let market = MarketInfo {
+            market_id,
+            slug: format!("btc-updown-5m-{}", start / 1000),
+            yes_token_id: U256::from(1),
+            no_token_id: U256::from(2),
+            title: "test".into(),
+            end_date: chrono::DateTime::from_timestamp_millis(end).unwrap(),
+            crypto_symbol: "btc".into(),
+            neg_risk: false,
+            outcome_prices: None,
+        };
+        let temp =
+            std::env::temp_dir().join(format!("sddfv-probe-{}.ndjson", uuid::Uuid::new_v4()));
+        let journal = EventJournal::open(&temp, "test-probe".into(), 0, 0).unwrap();
+        capture_residual_execution_observation(
+            config,
+            market,
+            store,
+            reqwest::Client::new(),
+            journal.clone(),
+            Arc::new(Mutex::new(DryRunWindowStats::default())),
+            end,
+        )
+        .await;
+        timeout(Duration::from_secs(10), server)
+            .await
+            .unwrap()
+            .unwrap();
+        let events = fs::read_to_string(&temp)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["event"], "model_observation");
+        assert_eq!(events[1]["event"], "residual_execution_observation");
+        assert_eq!(events[0]["episode_id"], events[1]["episode_id"]);
+        assert!(events[1]["delayed"]["actual_delay_ms"].as_i64().unwrap() >= 1000);
+        assert_eq!(events[1]["delayed"]["books"]["up"]["valid"], true);
+        assert_eq!(events[1]["actual_order_submitted"], false);
+        drop(journal);
+        let _ = fs::remove_file(temp);
+    }
+
+    #[test]
+    fn residual_probe_accepts_asks_without_bids_and_sorts_depth() {
+        let config = dry_run_config();
+        let book = serde_json::from_value(serde_json::json!({"asset_id":"t","market":"m",
+            "timestamp":"1000","bids":[],"asks":[{"price":"0.7","size":"2"},{"price":"0.6","size":"3"}]})).unwrap();
+        let evidence = super::residual_book_evidence(
+            Ok((book, serde_json::json!({"rest_latency_ms":20}))),
+            &config,
+            "t",
+            "m",
+            1020,
+        );
+        assert_eq!(evidence["valid"], true);
+        assert_eq!(evidence["best_ask"], 0.6);
+        assert_eq!(evidence["best_bid"], serde_json::Value::Null);
+        let down = serde_json::json!({"valid":true,"best_ask":0.5});
+        let baseline = super::residual_market_baseline(&evidence, &down);
+        assert_eq!(baseline["source"], "complementary_ask_interval");
+        assert_eq!(baseline["midpoint_up"], serde_json::Value::Null);
+        assert_eq!(baseline["probability_up"], 0.55);
+        let invalid = serde_json::json!({"valid":false,"best_ask":0.4});
+        assert_eq!(
+            super::residual_market_baseline(&evidence, &invalid)["source"],
+            "unavailable"
+        );
+        let midpoint = serde_json::json!({"valid":true,"best_bid":0.4,"best_ask":0.5});
+        assert_eq!(
+            super::residual_market_baseline(&evidence, &midpoint)["source"],
+            "down_midpoint"
+        );
+    }
+
+    #[test]
+    fn residual_probe_marks_stale_and_crossed_books_invalid() {
+        let config = dry_run_config();
+        let parse = || {
+            serde_json::from_value(serde_json::json!({"asset_id":"t","market":"m",
+            "timestamp":"1000","bids":[{"price":"0.7","size":"2"}],
+            "asks":[{"price":"0.6","size":"3"}]}))
+            .unwrap()
+        };
+        let evidence = super::residual_book_evidence(
+            Ok((parse(), serde_json::json!({"rest_latency_ms":20}))),
+            &config,
+            "t",
+            "m",
+            3000,
+        );
+        assert_eq!(evidence["valid"], false);
+        assert!(evidence["errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "rest_exchange_timestamp_stale"));
+        assert!(evidence["errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "crossed_rest_book"));
+    }
+
     #[test]
     fn rest_identity_and_exchange_age_fail_closed() {
         let mut b: super::LiveRestBook = serde_json::from_value(serde_json::json!({
@@ -3315,19 +4951,23 @@ mod tests {
 
     #[test]
     fn report_quality_excludes_legacy_stale_and_unknown_evidence() {
-        let mut fill = serde_json::json!({"execution_version":5,"rest_latency_ms":30,
+        let mut fill = serde_json::json!({"execution_version":6,"rest_latency_ms":30,
             "execution_audit":{"age_checked_at_ms":1001000,"exchange_timestamp":"1000000",
             "rest_book_validated":true,"requested_token_id":"t","response_token_id":"t",
-            "expected_market":"m","response_market":"m","model_audit":{"feed_age_ms":2000}}});
+            "expected_market":"m","response_market":"m","model_audit":{
+                "feed_age_ms":2000,"observation_age_ms":2000,
+                "local_receive_age_ms":500,"network_receive_latency_ms":250}}});
         assert!(super::fill_quality_reasons(&fill).is_empty());
-        fill["execution_version"] = serde_json::json!(4);
-        assert!(super::fill_quality_reasons(&fill).contains(&"legacy_execution_unverified"));
         fill["execution_version"] = serde_json::json!(5);
+        assert!(super::fill_quality_reasons(&fill).contains(&"legacy_execution_unverified"));
+        fill["execution_version"] = serde_json::json!(6);
         fill["execution_audit"]["exchange_timestamp"] = serde_json::json!(642480);
         assert!(super::fill_quality_reasons(&fill).contains(&"rest_exchange_timestamp_stale"));
         fill["execution_audit"]["exchange_timestamp"] = serde_json::json!(1000000);
-        fill["execution_audit"]["model_audit"]["feed_age_ms"] = serde_json::json!(2001);
-        assert!(super::fill_quality_reasons(&fill).contains(&"reference_feed_outside_0_2000ms"));
+        fill["execution_audit"]["model_audit"]["local_receive_age_ms"] = serde_json::json!(2001);
+        assert!(
+            super::fill_quality_reasons(&fill).contains(&"reference_local_age_outside_0_2000ms")
+        );
         fill["execution_audit"]["response_token_id"] = serde_json::Value::Null;
         assert!(super::fill_quality_reasons(&fill)
             .contains(&"missing_or_invalid_rest_identity_evidence"));
@@ -3413,12 +5053,13 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("fair-value-book-test-{}", uuid::Uuid::new_v4()));
         let path = root.join("events.ndjson");
-        let journal = EventJournal::open(&path, "test".into()).unwrap();
+        let journal = EventJournal::open(&path, "test".into(), 16 * 1024 * 1024, 0).unwrap();
         let mut config = dry_run_config();
         config.clob_url = format!("http://{address}");
         config.execution_delay_ms = 0;
         let client = reqwest::Client::new();
-        let result = fetch_live_rest_top(&config, &client, "t", "m", &journal, "btc-test").await;
+        let result =
+            fetch_live_rest_top(&config, &client, "t", "m", &journal, "btc-test", "snap").await;
         assert_eq!(
             result.unwrap_err().to_string(),
             "rest_exchange_timestamp_stale"
@@ -3510,7 +5151,7 @@ mod tests {
 
     #[test]
     fn execution_probability_tracks_new_feed_sample() {
-        use crate::late_resolution_winner_model::TwapSample;
+        use crate::late_resolution_winner_model::{RtdsReferenceSample, TwapSample};
         let mut config = dry_run_config();
         config.min_observations = 2;
         let store = super::ChainlinkTwapStore::default();
@@ -3523,6 +5164,15 @@ mod tests {
                 },
             );
         }
+        store.ingest_twap_reference_timing(RtdsReferenceSample {
+            topic: "crypto_prices_twap_sixty".into(),
+            symbol: "btc/usd".into(),
+            asset: "btc".into(),
+            observed_at_ms: 1_298_000,
+            publisher_at_ms: Some(1_298_000),
+            received_at_ms: 1_298_000,
+            value: Decimal::from(100),
+        });
         let before =
             super::fresh_execution_state(&config, &store, "btc", 1_300_000, 1_298_000).unwrap();
         store.ingest(
@@ -3532,6 +5182,15 @@ mod tests {
                 value: Decimal::from(99),
             },
         );
+        store.ingest_twap_reference_timing(RtdsReferenceSample {
+            topic: "crypto_prices_twap_sixty".into(),
+            symbol: "btc/usd".into(),
+            asset: "btc".into(),
+            observed_at_ms: 1_299_000,
+            publisher_at_ms: Some(1_299_000),
+            received_at_ms: 1_299_000,
+            value: Decimal::from(99),
+        });
         let after =
             super::fresh_execution_state(&config, &store, "btc", 1_300_000, 1_299_000).unwrap();
         assert!(super::live_probability(after, 1.0) < super::live_probability(before, 2.0));
@@ -3553,6 +5212,7 @@ mod tests {
             simulated_order_failure_rate: 0.02,
             max_book_age_ms: 1_000,
             max_feed_age_ms: 5_000,
+            max_reference_local_age_ms: 2_000,
             opening_max_skew_ms: 5_000,
             volatility_lookback_secs: 120,
             min_observations: 20,
@@ -3569,6 +5229,15 @@ mod tests {
             rtds_url: String::new(),
             clob_url: String::new(),
             results_file: PathBuf::new(),
+            journal_min_free_bytes: 16 * 1024 * 1024,
+            journal_max_bytes: 0,
+            research_model: None,
+            research_snapshot_interval_ms: 0,
+            research_observation_only: false,
+            research_capture_raw_reference: false,
+            research_execution_probe: false,
+            research_market_prior_weight: 0.75,
+            research_min_entry_price: 0.30,
         }
     }
 
@@ -3580,6 +5249,88 @@ mod tests {
         assert!((at_money - 0.5).abs() < 1e-6);
         assert!(above > 0.5);
         assert!(above_later > above);
+    }
+
+    #[test]
+    fn market_anchored_research_probability_cannot_change_live_decision() {
+        let audit = serde_json::json!({
+            "probability_up":0.8,"probability_down":0.2,"decision_role":"research_only"
+        });
+        let anchored = market_anchored_research_audit(audit, Some(0.2), 0.75);
+        assert!(
+            (anchored["market_anchored"]["probability_up"]
+                .as_f64()
+                .unwrap()
+                - 0.35)
+                .abs()
+                < 1e-12
+        );
+        assert_eq!(
+            anchored["market_anchored"]["decision_role"],
+            "research_only"
+        );
+    }
+
+    #[test]
+    fn counterfactual_cohorts_reuse_the_parent_execution_costs() {
+        let config = dry_run_config();
+        let research = serde_json::json!({
+            "market_anchored":{"probability_up":0.70,"probability_down":0.30}
+        });
+        let audit = serde_json::json!({"directional_margin_bps":2.0});
+        let result = research_counterfactual_cohorts(
+            &config,
+            true,
+            0.80,
+            Some(0.60),
+            &research,
+            0.65,
+            0.01,
+            &audit,
+        );
+        assert_eq!(result["decision_role"], "research_only");
+        assert_eq!(
+            result["scope"],
+            "same_direction_same_delayed_execution_subset"
+        );
+        assert_eq!(result["cohorts"]["market_anchored_edge"]["eligible"], true);
+        assert_eq!(result["cohorts"]["entry_and_direction"]["eligible"], true);
+        assert!(
+            (result["cohorts"]["market_anchored_edge"]["net_edge_after_costs"]
+                .as_f64()
+                .unwrap()
+                - 0.04)
+                .abs()
+                < 1e-12
+        );
+    }
+
+    #[test]
+    fn counterfactual_guardrails_reject_low_price_and_opposing_reference() {
+        let config = dry_run_config();
+        let research = serde_json::json!({
+            "market_anchored":{"probability_up":0.40,"probability_down":0.60}
+        });
+        let result = research_counterfactual_cohorts(
+            &config,
+            true,
+            0.75,
+            Some(0.20),
+            &research,
+            0.20,
+            0.01,
+            &serde_json::json!({"directional_margin_bps":-1.0}),
+        );
+        assert_eq!(result["cohorts"]["entry_price_floor"]["eligible"], false);
+        assert_eq!(
+            result["cohorts"]["reference_direction_agreement"]["eligible"],
+            false
+        );
+        assert_eq!(result["cohorts"]["entry_and_direction"]["eligible"], false);
+        assert_eq!(
+            result["cohorts"]["market_anchored_entry_and_direction"]["eligible"],
+            false
+        );
     }
 
     #[test]
@@ -3622,6 +5373,47 @@ mod tests {
     }
 
     #[test]
+    fn spread_filter_accepts_exact_three_cent_tick_but_rejects_four() {
+        let mut config = dry_run_config();
+        config.min_depth_usdc = 1.0;
+        assert!(live_edge_evaluation(&config, 0.9, Some(0.04), Some(0.07), Some(100.0)).is_ok());
+        assert_eq!(
+            live_edge_evaluation(&config, 0.9, Some(0.04), Some(0.08), Some(100.0)),
+            Err("spread_too_wide")
+        );
+    }
+
+    #[test]
+    fn rest_book_is_complete_only_with_both_quotes_and_ask_size() {
+        let complete = LiveBookTop {
+            bid: Some(0.04),
+            ask: Some(0.07),
+            ask_size: Some(100.0),
+        };
+        assert!(live_top_complete(&complete));
+        assert!(!live_top_complete(&LiveBookTop {
+            bid: None,
+            ..complete
+        }));
+        assert!(!live_top_complete(&LiveBookTop {
+            ask: None,
+            ..complete
+        }));
+        assert!(!live_top_complete(&LiveBookTop {
+            ask_size: None,
+            ..complete
+        }));
+        assert!(!live_top_complete(&LiveBookTop {
+            ask_size: Some(0.0),
+            ..complete
+        }));
+        assert!(!live_top_complete(&LiveBookTop {
+            bid: Some(0.08),
+            ..complete
+        }));
+    }
+
+    #[test]
     fn delayed_rejections_preserve_raw_book_and_cost_reasons() {
         let config = dry_run_config();
         let raw = [(0.84, 100.0)];
@@ -3656,6 +5448,8 @@ mod tests {
             opening: Decimal::from(100),
             current: Decimal::from_str("100.01").unwrap(),
             observed_at_ms: 295_000,
+            publisher_at_ms: Some(295_100),
+            received_at_ms: Some(295_250),
             opening_observed_at_ms: 2_000,
             observed_volatility_bps: 0.01,
             minimum_volatility_bps: 0.8,
@@ -3666,6 +5460,9 @@ mod tests {
         assert_eq!(audit["opening_skew_ms"], 2000);
         assert_eq!(audit["feed_age_ms"], 1000);
         assert_eq!(audit["volatility_floor_active"], true);
+        assert!(audit["floor_sensitivity_probability"]["0.25"].is_number());
+        assert!(audit["floor_sensitivity_probability"]["0.50"].is_number());
+        assert!(audit["floor_sensitivity_probability"]["1.00"].is_number());
         assert!(
             audit["probability_without_floor"].as_f64().unwrap() > live_probability(state, 4.0)
         );
@@ -3680,16 +5477,89 @@ mod tests {
     #[test]
     fn research_summary_handles_legacy_and_multiple_rejections() {
         let events = vec![
+            serde_json::json!({"event":"run_started","config":{"reference_gap_threshold_ms":10000}}),
             serde_json::json!({"event":"window_summary","stats":{"market_evaluations":4,"rest_latency_samples":2,"rest_latency_total_ms":60,"rest_latency_max_ms":40,"rejection_counts":{"up_incomplete_book":2,"down_incomplete_book":2},"terminal_reason_by_market":{"btc":"incomplete"}}}),
+            serde_json::json!({"event":"shadow_fill","decision_model":"gaussian_floor_v1","research_model":{"selected":"empirical"}}),
+            serde_json::json!({"event":"shadow_fill"}),
+            serde_json::json!({"event":"model_observation","asset":"btc","research_model":{"selected":"empirical"}}),
+            serde_json::json!({"event":"reference_price_observation","topic":"crypto_prices_chainlink"}),
+            serde_json::json!({"event":"reference_feed_gap","topic":"crypto_prices_chainlink","gap_ms":18000}),
+            serde_json::json!({"event":"research_market_snapshot","book_source":"rest_fallback","fetch_success":true,"paired_book_complete":false}),
         ];
         let summary = dry_run_research_summary(&events);
         assert_eq!(summary["market_evaluations"], 4);
         assert_eq!(summary["rest_average_ms"], 30.0);
         assert_eq!(summary["window_rejection_counts"]["up_incomplete_book"], 2);
-        assert!(summary["model_observation_by_asset"]
-            .as_object()
-            .unwrap()
-            .is_empty());
+        assert_eq!(
+            summary["shadow_fill_decision_models"]["gaussian_floor_v1"],
+            1
+        );
+        assert_eq!(summary["shadow_fill_decision_models"]["legacy_unknown"], 1);
+        assert_eq!(summary["model_observations_with_research_forecast"], 1);
+        assert_eq!(
+            summary["reference_observations_by_topic"]["crypto_prices_chainlink"],
+            1
+        );
+        assert_eq!(
+            summary["reference_feed_gaps_by_topic"]["crypto_prices_chainlink"],
+            1
+        );
+        assert_eq!(summary["reference_feed_max_gap_ms"], 18_000);
+        assert_eq!(summary["reference_gap_tracking_enabled"], true);
+        assert_eq!(summary["rest_research_snapshots"], 1);
+        assert_eq!(summary["rest_complete_research_snapshots"], 0);
+    }
+
+    #[test]
+    fn research_reference_gap_uses_local_receive_timestamps() {
+        assert_eq!(research_reference_gap_ms(None, 20_000), None);
+        assert_eq!(research_reference_gap_ms(Some(10_000), 19_999), None);
+        assert_eq!(
+            research_reference_gap_ms(Some(10_000), 20_000),
+            Some(10_000)
+        );
+        assert_eq!(research_reference_gap_ms(Some(20_000), 10_000), None);
+    }
+
+    #[test]
+    fn legacy_report_does_not_claim_zero_reference_gaps() {
+        let summary =
+            dry_run_research_summary(&[serde_json::json!({"event":"run_started","config":{}})]);
+        assert_eq!(summary["reference_gap_tracking_enabled"], false);
+        assert!(summary["reference_feed_gaps_by_topic"].is_null());
+        assert!(summary["reference_feed_max_gap_ms"].is_null());
+    }
+
+    #[test]
+    fn journal_open_removes_only_an_incomplete_tail() {
+        let root = std::env::temp_dir().join(format!(
+            "fair-value-journal-repair-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("events.ndjson");
+        std::fs::write(&path, b"{\"event\":\"complete\"}\n{\"event\":\"partial").unwrap();
+        let journal = EventJournal::open(&path, "run".into(), 16 * 1024 * 1024, 0).unwrap();
+        journal.append(serde_json::json!({"event":"next"})).unwrap();
+        let lines = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            lines.lines().collect::<Vec<_>>(),
+            vec![
+                "{\"event\":\"complete\"}",
+                "{\"event\":\"next\",\"run_id\":\"run\"}"
+            ]
+        );
+        drop(journal);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&root).unwrap();
+    }
+
+    #[test]
+    fn report_parser_recovers_suffix_but_not_corrupt_prefix() {
+        let line = "{\"event\":\"cut{\"event\":\"run_started\",\"run_id\":\"new\"}";
+        let recovered = recover_json_suffix(line).unwrap();
+        assert_eq!(recovered["event"], "run_started");
+        assert_eq!(recovered["run_id"], "new");
     }
 
     #[test]

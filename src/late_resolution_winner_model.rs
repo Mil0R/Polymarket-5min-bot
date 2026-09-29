@@ -25,6 +25,20 @@ const HISTORY_MILLIS: i64 = 10 * 60 * 1_000;
 // small bounded publisher-clock skew while continuing to reject implausibly
 // future-dated data.
 const MAX_FUTURE_CLOCK_SKEW_MS: i64 = 10_000;
+const RESEARCH_TWAP_SILENCE_LIMIT: Duration = Duration::from_secs(12);
+const NORMAL_TWAP_SILENCE_LIMIT: Duration = Duration::from_secs(30);
+const RTDS_FRAME_SILENCE_LIMIT: Duration = Duration::from_secs(30);
+const RESEARCH_FEED_LOG_TARGET: &str = "polypulse::strategy::short_duration_digital_fair_value";
+
+macro_rules! warn_price_feed {
+    ($research:expr, $($fields:tt)*) => {{
+        if $research {
+            warn!(target: RESEARCH_FEED_LOG_TARGET, $($fields)*);
+        } else {
+            warn!($($fields)*);
+        }
+    }};
+}
 
 fn effective_sample_age_ms(now_ms: i64, observed_at_ms: i64) -> Option<i64> {
     let age_ms = now_ms.checked_sub(observed_at_ms)?;
@@ -41,9 +55,29 @@ pub struct TwapSample {
     pub value: Decimal,
 }
 
+/// Public RTDS reference-price update. A spot update is a research feature,
+/// never a substitute for the market's Chainlink TWAP settlement feed.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RtdsReferenceSample {
+    pub topic: String,
+    pub symbol: String,
+    pub asset: String,
+    pub observed_at_ms: i64,
+    pub publisher_at_ms: Option<i64>,
+    pub received_at_ms: i64,
+    pub value: Decimal,
+}
+
+pub type PriceFeedObserver = Arc<dyn Fn(RtdsReferenceSample) + Send + Sync>;
+
 #[derive(Default)]
 pub struct ChainlinkTwapStore {
     samples: RwLock<HashMap<String, VecDeque<TwapSample>>>,
+    /// Latest transport timestamps for the settlement TWAP.  Keep these
+    /// separate from event-time price history so model math cannot
+    /// accidentally substitute receive time for the settlement timestamp.
+    twap_reference_timing: RwLock<HashMap<String, RtdsReferenceSample>>,
+    research_spot_samples: RwLock<HashMap<String, VecDeque<RtdsReferenceSample>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -55,6 +89,8 @@ pub struct FairValueTwapSnapshot {
     pub opening: Decimal,
     pub current: Decimal,
     pub observed_at_ms: i64,
+    pub publisher_at_ms: Option<i64>,
+    pub received_at_ms: Option<i64>,
     pub volatility_bps_per_sqrt_second: f64,
 }
 
@@ -104,6 +140,68 @@ impl ChainlinkTwapStore {
         {
             samples.pop_front();
         }
+    }
+
+    fn ingest_research_spot(&self, sample: RtdsReferenceSample) {
+        let key = format!("{}:{}", sample.topic, sample.asset);
+        let Ok(mut all) = self.research_spot_samples.write() else {
+            return;
+        };
+        let samples = all.entry(key).or_default();
+        if samples
+            .back()
+            .is_some_and(|last| sample.received_at_ms < last.received_at_ms)
+        {
+            return;
+        }
+        let received_at_ms = sample.received_at_ms;
+        samples.push_back(sample);
+        let cutoff = received_at_ms.saturating_sub(HISTORY_MILLIS);
+        while samples
+            .front()
+            .is_some_and(|oldest| oldest.received_at_ms < cutoff)
+        {
+            samples.pop_front();
+        }
+    }
+
+    pub fn ingest_twap_reference_timing(&self, sample: RtdsReferenceSample) {
+        let Ok(mut all) = self.twap_reference_timing.write() else {
+            return;
+        };
+        let replace = all.get(&sample.asset).is_none_or(|current| {
+            sample.observed_at_ms > current.observed_at_ms
+                || (sample.observed_at_ms == current.observed_at_ms
+                    && sample.received_at_ms >= current.received_at_ms)
+        });
+        if replace {
+            all.insert(sample.asset.clone(), sample);
+        }
+    }
+
+    /// Only prices received locally before `now_ms` are eligible for a
+    /// research snapshot. This prevents as-of joins from using future data.
+    pub fn fair_value_recent_spot_samples(
+        &self,
+        topic: &str,
+        asset: &str,
+        now_ms: i64,
+        lookback_ms: i64,
+    ) -> Vec<RtdsReferenceSample> {
+        let key = format!("{}:{}", topic, normalize_asset(asset));
+        let Ok(all) = self.research_spot_samples.read() else {
+            return Vec::new();
+        };
+        all.get(&key)
+            .into_iter()
+            .flat_map(|samples| samples.iter())
+            .filter(|sample| {
+                sample.received_at_ms >= now_ms.saturating_sub(lookback_ms)
+                    && sample.received_at_ms <= now_ms
+                    && sample.observed_at_ms <= now_ms
+            })
+            .cloned()
+            .collect()
     }
 
     /// Read-only state for independent fair-value research. The opening sample
@@ -183,6 +281,12 @@ impl ChainlinkTwapStore {
         if history.len() < min_observations {
             return FairValueSnapshotReadiness::InsufficientObservations;
         }
+        let timing = self
+            .twap_reference_timing
+            .read()
+            .ok()
+            .and_then(|all| all.get(&asset).cloned())
+            .filter(|sample| sample.observed_at_ms == current.observed_at_ms);
         FairValueSnapshotReadiness::Ready(FairValueTwapSnapshot {
             opening_observed_at_ms: opening.observed_at_ms,
             observed_volatility_bps: volatility_bps_per_sqrt_second(&history),
@@ -191,6 +295,8 @@ impl ChainlinkTwapStore {
             opening: opening.value,
             current: current.value,
             observed_at_ms: current.observed_at_ms,
+            publisher_at_ms: timing.as_ref().and_then(|sample| sample.publisher_at_ms),
+            received_at_ms: timing.as_ref().map(|sample| sample.received_at_ms),
             volatility_bps_per_sqrt_second: volatility_bps_per_sqrt_second(&history)
                 .max(min_volatility_bps_per_sqrt_second),
         })
@@ -204,6 +310,29 @@ impl ChainlinkTwapStore {
             .get(&asset)?
             .back()
             .map(|sample| sample.observed_at_ms)
+    }
+
+    /// Observations already available at `now_ms`, in event-time order. The
+    /// fair-value research journal uses this to preserve the rolling TWAP
+    /// path without making any assumption about the stream's weighting rule.
+    pub fn fair_value_recent_twap_samples(
+        &self,
+        asset: &str,
+        now_ms: i64,
+        lookback_ms: i64,
+    ) -> Vec<TwapSample> {
+        let asset = normalize_asset(asset);
+        let Ok(all) = self.samples.read() else {
+            return Vec::new();
+        };
+        all.get(&asset)
+            .into_iter()
+            .flat_map(|samples| samples.iter().copied())
+            .filter(|sample| {
+                sample.observed_at_ms >= now_ms.saturating_sub(lookback_ms)
+                    && sample.observed_at_ms <= now_ms
+            })
+            .collect()
     }
 
     pub fn evaluate(&self, input: WinnerModelInput, policy: WinnerModelPolicy) -> ModelEvaluation {
@@ -585,6 +714,28 @@ pub async fn run_chainlink_twap_feed(
     shutdown: Arc<AtomicBool>,
     metrics: Arc<RuntimeMetrics>,
 ) {
+    run_price_feed(url, store, shutdown, metrics, None).await;
+}
+
+/// Research-only variant: also subscribes to Chainlink and Binance spot
+/// updates and exposes local receive timestamps through `observer`.
+pub async fn run_chainlink_twap_feed_with_research(
+    url: String,
+    store: Arc<ChainlinkTwapStore>,
+    shutdown: Arc<AtomicBool>,
+    metrics: Arc<RuntimeMetrics>,
+    observer: PriceFeedObserver,
+) {
+    run_price_feed(url, store, shutdown, metrics, Some(observer)).await;
+}
+
+async fn run_price_feed(
+    url: String,
+    store: Arc<ChainlinkTwapStore>,
+    shutdown: Arc<AtomicBool>,
+    metrics: Arc<RuntimeMetrics>,
+    observer: Option<PriceFeedObserver>,
+) {
     while !shutdown.load(Ordering::Relaxed) {
         match timeout(
             Duration::from_secs(10),
@@ -594,60 +745,75 @@ pub async fn run_chainlink_twap_feed(
         {
             Ok(Ok((mut socket, _))) => {
                 metrics.record_late_resolution_winner_trading_rtds_connection();
-                let subscription = serde_json::json!({
-                    "action": "subscribe",
-                    "subscriptions": [{
-                        "topic": "crypto_prices_twap_sixty",
-                        "type": "update"
-                    }]
-                });
+                let subscription = price_feed_subscription(observer.is_some());
                 if let Err(error) = socket
                     .send(Message::Text(subscription.to_string().into()))
                     .await
                 {
-                    warn!(%error, "Chainlink TWAP subscription failed");
+                    warn_price_feed!(observer.is_some(), %error, "Chainlink TWAP subscription failed");
                 } else {
-                    info!("Connected to Polymarket RTDS Chainlink 60s TWAP feed");
+                    if observer.is_some() {
+                        info!(target: RESEARCH_FEED_LOG_TARGET,
+                            research_spot = true, "Connected to Polymarket RTDS Chainlink 60s TWAP feed");
+                    } else {
+                        info!(
+                            research_spot = false,
+                            "Connected to Polymarket RTDS Chainlink 60s TWAP feed"
+                        );
+                    }
                     let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
-                    let mut last_message_at = Instant::now();
+                    let mut last_frame_at = Instant::now();
+                    let mut last_twap_at = Instant::now();
                     loop {
                         tokio::select! {
                             _ = heartbeat.tick() => {
-                                if last_message_at.elapsed() > Duration::from_secs(30) {
+                                if let Some(reason) = rtds_silence_reason(
+                                    last_frame_at.elapsed(),
+                                    last_twap_at.elapsed(),
+                                    observer.is_some(),
+                                ) {
                                     metrics.record_late_resolution_winner_trading_rtds_disconnect();
-                                    warn!(silence_secs = last_message_at.elapsed().as_secs(), "Chainlink TWAP feed stale; reconnecting");
+                                    warn_price_feed!(observer.is_some(), reason, frame_silence_secs = last_frame_at.elapsed().as_secs(),
+                                        twap_silence_secs = last_twap_at.elapsed().as_secs(),
+                                        "Chainlink TWAP feed stale; reconnecting");
                                     break;
                                 }
                                 if let Err(error) = socket.send(Message::Text("PING".into())).await {
                                     metrics.record_late_resolution_winner_trading_rtds_disconnect();
-                                    warn!(%error, "Chainlink TWAP heartbeat failed; reconnecting");
+                                    warn_price_feed!(observer.is_some(), %error, "Chainlink TWAP heartbeat failed; reconnecting");
                                     break;
                                 }
                             }
                             message = socket.next() => {
                                 if message.is_some() {
-                                    last_message_at = Instant::now();
+                                    last_frame_at = Instant::now();
                                 }
                                 match message {
-                                    Some(Ok(Message::Text(text))) => ingest_rtds_message(&store, &metrics, text.as_str()),
+                                    Some(Ok(Message::Text(text))) => {
+                                        if ingest_rtds_message(&store, &metrics, text.as_str(), observer.as_ref()) {
+                                            last_twap_at = Instant::now();
+                                        }
+                                    }
                                     Some(Ok(Message::Binary(bytes))) => {
                                         if let Ok(text) = std::str::from_utf8(&bytes) {
-                                            ingest_rtds_message(&store, &metrics, text);
+                                            if ingest_rtds_message(&store, &metrics, text, observer.as_ref()) {
+                                                last_twap_at = Instant::now();
+                                            }
                                         }
                                     }
                                     Some(Ok(Message::Close(frame))) => {
                                         metrics.record_late_resolution_winner_trading_rtds_disconnect();
-                                        warn!(?frame, "Chainlink TWAP feed closed; reconnecting");
+                                        warn_price_feed!(observer.is_some(), ?frame, "Chainlink TWAP feed closed; reconnecting");
                                         break;
                                     }
                                     Some(Err(error)) => {
                                         metrics.record_late_resolution_winner_trading_rtds_disconnect();
-                                        warn!(%error, "Chainlink TWAP feed read failed; reconnecting");
+                                        warn_price_feed!(observer.is_some(), %error, "Chainlink TWAP feed read failed; reconnecting");
                                         break;
                                     }
                                     None => {
                                         metrics.record_late_resolution_winner_trading_rtds_disconnect();
-                                        warn!("Chainlink TWAP feed ended; reconnecting");
+                                        warn_price_feed!(observer.is_some(), "Chainlink TWAP feed ended; reconnecting");
                                         break;
                                     }
                                     _ => {}
@@ -663,11 +829,11 @@ pub async fn run_chainlink_twap_feed(
             }
             Ok(Err(error)) => {
                 metrics.record_late_resolution_winner_trading_rtds_connect_failure();
-                warn!(%error, "Chainlink TWAP feed connection failed");
+                warn_price_feed!(observer.is_some(), %error, "Chainlink TWAP feed connection failed");
             }
             Err(_) => {
                 metrics.record_late_resolution_winner_trading_rtds_connect_failure();
-                warn!(url = %url, "Chainlink TWAP feed connection timed out");
+                warn_price_feed!(observer.is_some(), url = %url, "Chainlink TWAP feed connection timed out");
             }
         }
         if !shutdown.load(Ordering::Relaxed) {
@@ -676,38 +842,112 @@ pub async fn run_chainlink_twap_feed(
     }
 }
 
-fn ingest_rtds_message(store: &ChainlinkTwapStore, metrics: &RuntimeMetrics, text: &str) {
+fn rtds_silence_reason(
+    frame_silence: Duration,
+    twap_silence: Duration,
+    research_mode: bool,
+) -> Option<&'static str> {
+    let twap_limit = if research_mode {
+        RESEARCH_TWAP_SILENCE_LIMIT
+    } else {
+        NORMAL_TWAP_SILENCE_LIMIT
+    };
+    if twap_silence >= twap_limit {
+        Some("twap_updates_stale")
+    } else if frame_silence >= RTDS_FRAME_SILENCE_LIMIT {
+        Some("websocket_frames_stale")
+    } else {
+        None
+    }
+}
+
+fn price_feed_subscription(research_spot: bool) -> Value {
+    let mut subscriptions = vec![serde_json::json!({
+        "topic":"crypto_prices_twap_sixty","type":"update"
+    })];
+    if research_spot {
+        subscriptions.push(serde_json::json!({
+            "topic":"crypto_prices_chainlink","type":"*"
+        }));
+        subscriptions.push(serde_json::json!({
+            "topic":"crypto_prices","type":"update"
+        }));
+    }
+    serde_json::json!({"action":"subscribe","subscriptions":subscriptions})
+}
+
+fn ingest_rtds_message(
+    store: &ChainlinkTwapStore,
+    metrics: &RuntimeMetrics,
+    text: &str,
+    observer: Option<&PriceFeedObserver>,
+) -> bool {
+    let received_at_ms = Utc::now().timestamp_millis();
     let Ok(value) = serde_json::from_str::<Value>(text) else {
         debug!(message = text, "Ignored non-JSON RTDS message");
-        return;
+        return false;
     };
+    let Some(topic) = value.get("topic").and_then(Value::as_str) else {
+        return false;
+    };
+    if !matches!(
+        topic,
+        "crypto_prices_twap_sixty" | "crypto_prices_chainlink" | "crypto_prices"
+    ) {
+        return false;
+    }
     let Some(payload) = value.get("payload") else {
-        return;
+        return false;
     };
     let Some(symbol) = payload.get("symbol").and_then(Value::as_str) else {
-        return;
+        return false;
     };
-    let Some(observed_at_ms) = payload.get("timestamp").and_then(Value::as_i64) else {
-        return;
+    let Some(observed_at_ms) = payload
+        .get("timestamp")
+        .and_then(|value| value.as_i64().or_else(|| value.as_str()?.parse().ok()))
+    else {
+        return false;
     };
-    let price = payload
-        .get("full_accuracy_value")
-        .and_then(Value::as_str)
-        .and_then(|raw| Decimal::from_str(raw).ok())
-        .map(|raw| raw / dec!(1_000_000_000_000_000_000))
-        .or_else(|| {
-            payload.get("value").and_then(|value| match value {
-                Value::String(raw) => Decimal::from_str(raw).ok(),
-                Value::Number(raw) => Decimal::from_str(&raw.to_string()).ok(),
-                _ => None,
-            })
-        });
-    if let Some(value) = price {
+    if observed_at_ms <= 0 {
+        return false;
+    }
+    let price = parse_rtds_price(topic, payload);
+    let Some(price) = price.filter(|price| *price > Decimal::ZERO) else {
+        return false;
+    };
+    let asset = if topic == "crypto_prices" {
+        symbol
+            .to_ascii_lowercase()
+            .strip_suffix("usdt")
+            .unwrap_or("")
+            .to_owned()
+    } else {
+        normalize_asset(symbol)
+    };
+    if asset.is_empty() {
+        return false;
+    }
+    let sample = RtdsReferenceSample {
+        topic: topic.to_owned(),
+        symbol: symbol.to_owned(),
+        asset,
+        observed_at_ms,
+        publisher_at_ms: value
+            .get("timestamp")
+            .and_then(|value| value.as_i64().or_else(|| value.as_str()?.parse().ok())),
+        received_at_ms,
+        value: price,
+    };
+    let mut is_new_twap = false;
+    if topic == "crypto_prices_twap_sixty" {
+        is_new_twap = store
+            .latest_observed_at_ms(&sample.asset)
+            .is_none_or(|previous| observed_at_ms > previous);
         trace!(
             symbol,
             observed_at_ms,
-            received_at_ms = Utc::now().timestamp_millis(),
-            age_ms = Utc::now().timestamp_millis().saturating_sub(observed_at_ms),
+            received_at_ms,
+            age_ms = received_at_ms.saturating_sub(observed_at_ms),
             "Received Chainlink TWAP observation"
         );
         metrics.record_late_resolution_winner_trading_rtds_observation(observed_at_ms);
@@ -715,9 +955,42 @@ fn ingest_rtds_message(store: &ChainlinkTwapStore, metrics: &RuntimeMetrics, tex
             symbol,
             TwapSample {
                 observed_at_ms,
-                value,
+                value: price,
             },
         );
+        store.ingest_twap_reference_timing(sample.clone());
+    } else {
+        store.ingest_research_spot(sample.clone());
+    }
+    if let Some(observer) = observer {
+        observer(sample);
+    }
+    is_new_twap
+}
+
+fn parse_rtds_price(topic: &str, payload: &Value) -> Option<Decimal> {
+    let human_value = || {
+        payload.get("value").and_then(|value| match value {
+            Value::String(raw) => Decimal::from_str(raw).ok(),
+            Value::Number(raw) => Decimal::from_str(&raw.to_string()).ok(),
+            _ => None,
+        })
+    };
+    let full_accuracy = || {
+        payload
+            .get("full_accuracy_value")
+            .and_then(Value::as_str)
+            .and_then(|raw| Decimal::from_str(raw).ok())
+    };
+    if topic == "crypto_prices" {
+        // Binance RTDS prices are already human-readable USD values. In
+        // particular, its full_accuracy_value must never be divided by 1e18.
+        human_value().or_else(full_accuracy)
+    } else {
+        // Chainlink spot and the settlement TWAP expose E18 raw values.
+        full_accuracy()
+            .map(|raw| raw / dec!(1_000_000_000_000_000_000))
+            .or_else(human_value)
     }
 }
 
@@ -1055,6 +1328,23 @@ mod tests {
     }
 
     #[test]
+    fn fair_value_research_path_excludes_future_samples() {
+        let store = ChainlinkTwapStore::default();
+        for observed_at_ms in [1_000, 2_000, 3_000] {
+            store.ingest(
+                "btc",
+                TwapSample {
+                    observed_at_ms,
+                    value: dec!(100),
+                },
+            );
+        }
+        let path = store.fair_value_recent_twap_samples("btc", 2_500, 1_000);
+        assert_eq!(path.len(), 1);
+        assert_eq!(path[0].observed_at_ms, 2_000);
+    }
+
+    #[test]
     fn tolerates_bounded_rtds_publisher_clock_skew_but_rejects_far_future_samples() {
         let store = ChainlinkTwapStore::default();
         for index in 0..5_i64 {
@@ -1150,13 +1440,222 @@ mod tests {
     #[test]
     fn parses_exact_e18_rtds_value() {
         let store = ChainlinkTwapStore::default();
-        ingest_rtds_message(
+        assert!(ingest_rtds_message(
             &store,
             &RuntimeMetrics::default(),
             r#"{"topic":"crypto_prices_twap_sixty","payload":{"symbol":"btc/usd","full_accuracy_value":"65000500000000000000000","timestamp":1000}}"#,
-        );
+            None,
+        ));
         let samples = store.samples.read().unwrap();
         assert_eq!(samples["btc"].back().unwrap().value, dec!(65000.5));
+    }
+
+    #[test]
+    fn repeated_twap_timestamp_does_not_refresh_feed_watchdog() {
+        let store = ChainlinkTwapStore::default();
+        let message = r#"{"topic":"crypto_prices_twap_sixty","payload":{"symbol":"btc/usd","value":65000,"timestamp":1000}}"#;
+        assert!(ingest_rtds_message(
+            &store,
+            &RuntimeMetrics::default(),
+            message,
+            None
+        ));
+        assert!(!ingest_rtds_message(
+            &store,
+            &RuntimeMetrics::default(),
+            message,
+            None
+        ));
+    }
+
+    #[test]
+    fn binance_full_accuracy_is_not_e18_and_value_takes_priority() {
+        let store = ChainlinkTwapStore::default();
+        let now = Utc::now().timestamp_millis();
+        let event = serde_json::json!({
+            "topic":"crypto_prices","timestamp":now,
+            "payload":{"symbol":"btcusdt","timestamp":now,
+                "full_accuracy_value":"81280.040000","value":81280.04}
+        });
+        assert!(!ingest_rtds_message(
+            &store,
+            &RuntimeMetrics::default(),
+            &event.to_string(),
+            None
+        ));
+        let samples = store.fair_value_recent_spot_samples(
+            "crypto_prices",
+            "btc",
+            Utc::now().timestamp_millis(),
+            90_000,
+        );
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].value, dec!(81280.04));
+        assert!(store.samples.read().unwrap().get("btc").is_none());
+        assert_eq!(
+            parse_rtds_price(
+                "crypto_prices",
+                &serde_json::json!({"full_accuracy_value":"81280.040000"})
+            ),
+            Some(dec!(81280.040000))
+        );
+    }
+
+    #[test]
+    fn pong_cannot_mask_missing_twap_updates() {
+        assert_eq!(
+            rtds_silence_reason(Duration::from_secs(1), Duration::from_secs(12), true),
+            Some("twap_updates_stale")
+        );
+        assert_eq!(
+            rtds_silence_reason(Duration::from_secs(1), Duration::from_secs(12), false),
+            None
+        );
+        assert_eq!(
+            rtds_silence_reason(Duration::from_secs(31), Duration::from_secs(1), true),
+            Some("websocket_frames_stale")
+        );
+        assert_eq!(
+            rtds_silence_reason(Duration::from_secs(1), Duration::from_secs(31), false),
+            Some("twap_updates_stale")
+        );
+        let store = ChainlinkTwapStore::default();
+        assert!(!ingest_rtds_message(
+            &store,
+            &RuntimeMetrics::default(),
+            "PONG",
+            None
+        ));
+    }
+
+    #[test]
+    fn research_subscription_adds_spot_only_for_research() {
+        let normal = price_feed_subscription(false).to_string();
+        let research = price_feed_subscription(true).to_string();
+        assert!(normal.contains("crypto_prices_twap_sixty"));
+        assert!(!normal.contains("crypto_prices_chainlink"));
+        assert!(research.contains("crypto_prices_chainlink"));
+        assert!(research.contains("crypto_prices"));
+    }
+
+    #[test]
+    fn spot_feed_never_changes_settlement_twap_and_captures_receive_time() {
+        let store = ChainlinkTwapStore::default();
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = observed.clone();
+        let observer: PriceFeedObserver = Arc::new(move |sample| sink.lock().unwrap().push(sample));
+        let now = Utc::now().timestamp_millis();
+        let event = serde_json::json!({
+            "topic":"crypto_prices_chainlink","timestamp":now-10,
+            "payload":{"symbol":"btc/usd","timestamp":now-20,"value":"65000.5"}
+        });
+        ingest_rtds_message(
+            &store,
+            &RuntimeMetrics::default(),
+            &event.to_string(),
+            Some(&observer),
+        );
+        assert!(store.samples.read().unwrap().get("btc").is_none());
+        let received = observed.lock().unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].publisher_at_ms, Some(now - 10));
+        assert!(received[0].received_at_ms >= now);
+        assert_eq!(received[0].value, dec!(65000.5));
+        let spot = store.fair_value_recent_spot_samples(
+            "crypto_prices_chainlink",
+            "btc",
+            received[0].received_at_ms,
+            90_000,
+        );
+        assert_eq!(spot.len(), 1);
+    }
+
+    #[test]
+    fn twap_snapshot_preserves_observed_publisher_and_receive_times() {
+        let store = ChainlinkTwapStore::default();
+        let now = Utc::now().timestamp_millis();
+        for offset in [1_000_i64, 0] {
+            let observed = now - offset;
+            let event = serde_json::json!({
+                "topic":"crypto_prices_twap_sixty",
+                "timestamp":observed+100,
+                "payload":{
+                    "symbol":"btc/usd",
+                    "timestamp":observed,
+                    "full_accuracy_value":"65000500000000000000000"
+                }
+            });
+            assert!(ingest_rtds_message(
+                &store,
+                &RuntimeMetrics::default(),
+                &event.to_string(),
+                None
+            ));
+        }
+        let FairValueSnapshotReadiness::Ready(snapshot) = store.fair_value_snapshot_readiness(
+            "btc",
+            now - 1_000,
+            now + 1_000,
+            100,
+            5_000,
+            120,
+            2,
+            0.8,
+        ) else {
+            panic!("expected ready snapshot");
+        };
+        assert_eq!(snapshot.observed_at_ms, now);
+        assert_eq!(snapshot.publisher_at_ms, Some(now + 100));
+        assert!(snapshot.received_at_ms.is_some());
+    }
+
+    #[test]
+    fn spot_asof_query_excludes_future_receive_and_source_times() {
+        let store = ChainlinkTwapStore::default();
+        for (received_at_ms, observed_at_ms) in [(1000, 900), (2000, 1900), (3000, 4000)] {
+            store.ingest_research_spot(RtdsReferenceSample {
+                topic: "crypto_prices".into(),
+                symbol: "btcusdt".into(),
+                asset: "btc".into(),
+                observed_at_ms,
+                publisher_at_ms: None,
+                received_at_ms,
+                value: dec!(100),
+            });
+        }
+        assert_eq!(
+            store
+                .fair_value_recent_spot_samples("crypto_prices", "btc", 1500, 90_000)
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .fair_value_recent_spot_samples("crypto_prices", "btc", 3500, 90_000)
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn binance_symbol_maps_to_asset_without_updating_twap() {
+        let store = ChainlinkTwapStore::default();
+        let now = Utc::now().timestamp_millis();
+        let event = serde_json::json!({
+            "topic":"crypto_prices","timestamp":now,
+            "payload":{"symbol":"ETHUSDT","timestamp":now,"value":3500.25}
+        });
+        ingest_rtds_message(&store, &RuntimeMetrics::default(), &event.to_string(), None);
+        assert!(store.samples.read().unwrap().get("eth").is_none());
+        let samples = store.fair_value_recent_spot_samples(
+            "crypto_prices",
+            "eth",
+            Utc::now().timestamp_millis(),
+            90_000,
+        );
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].symbol, "ETHUSDT");
+        assert_eq!(samples[0].value, dec!(3500.25));
     }
 
     #[test]

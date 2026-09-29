@@ -1,0 +1,144 @@
+REFERENCE AUDIT: cached Gamma priceToBeat/finalPrice; refresh missing values with --reference-audit
+  missing_or_unusable=224 source_not_explicit_60s=0; candidate-selected samples, cross-horizon groups overlap; no automatic calibration
+HISTORICAL TWAP HORIZONS (correlated candidate observations; not settlement-calibrated volatility):
+  btc 10s observations=50 mean_bps_per_sqrt_second=0.146639
+  btc 20s observations=50 mean_bps_per_sqrt_second=0.193334
+  btc 40s observations=50 mean_bps_per_sqrt_second=0.239974
+  btc 60s observations=49 mean_bps_per_sqrt_second=0.213854
+  eth 10s observations=347 mean_bps_per_sqrt_second=0.234468
+  eth 20s observations=347 mean_bps_per_sqrt_second=0.317280
+  eth 40s observations=347 mean_bps_per_sqrt_second=0.391343
+  eth 60s observations=344 mean_bps_per_sqrt_second=0.372288
+ENTRY SELECTION AUDIT (one record per run/market; no retrospective direction replacement):
+direction_flip_markets=1
+first_candidate    markets=208  wins=202  win_rate=  97.12% lower95=  93.85% cf_pnl/share= -1.079520 shadow=0    shadow_wins=0    shadow_pnl=         0 shadow_return=  0.000%
+  filled_win_lower95=0.00% approximate_break_even=0.00% (cost/share; assumes comparable win probabilities)
+  pending=1; counterfactual only, no execution assumption
+first_confirmed    markets=76   wins=75   win_rate=  98.68% lower95=  92.92% cf_pnl/share=  0.751914 shadow=0    shadow_wins=0    shadow_pnl=         0 shadow_return=  0.000%
+  filled_win_lower95=0.00% approximate_break_even=0.00% (cost/share; assumes comparable win probabilities)
+  pending=1; counterfactual only, no execution assumption
+last_candidate     markets=208  wins=203  win_rate=  97.60% lower95=  94.50% cf_pnl/share= -0.471730 shadow=0    shadow_wins=0    shadow_pnl=         0 shadow_return=  0.000%
+  filled_win_lower95=0.00% approximate_break_even=0.00% (cost/share; assumes comparable win probabilities)
+  pending=1; counterfactual only, no execution assumption
+
+SENSITIVITY SHADOW (first attempt per run/market/group; groups overlap; never sum PnL):
+sensitivity_f0.1_r0.5 evaluations=404 admitted_evaluations=68 confirmed_evaluations=30 pending_attempts=0
+sensitivity_f0.1_r0.5 markets=13   wins=13   win_rate= 100.00% lower95=  77.19% cf_pnl/share=         0 shadow=10   shadow_wins=10   shadow_pnl=1.14731126 shadow_return=  2.299%
+  filled_win_lower95=72.25% approximate_break_even=97.75% (cost/share; assumes comparable win probabilities)
+sensitivity_f0.1_r1 evaluations=404 admitted_evaluations=68 confirmed_evaluations=30 pending_attempts=0
+sensitivity_f0.1_r1 markets=13   wins=13   win_rate= 100.00% lower95=  77.19% cf_pnl/share=         0 shadow=10   shadow_wins=10   shadow_pnl=1.14731126 shadow_return=  2.299%
+  filled_win_lower95=72.25% approximate_break_even=97.75% (cost/share; assumes comparable win probabilities)
+sensitivity_f0.25_r0.5 evaluations=404 admitted_evaluations=34 confirmed_evaluations=15 pending_attempts=0
+sensitivity_f0.25_r0.5 markets=6    wins=6    win_rate= 100.00% lower95=  60.97% cf_pnl/share=         0 shadow=5    shadow_wins=5    shadow_pnl=0.57439590 shadow_return=  2.304%
+  filled_win_lower95=56.55% approximate_break_even=97.75% (cost/share; assumes comparable win probabilities)
+sensitivity_f0.25_r1 evaluations=404 admitted_evaluations=34 confirmed_evaluations=15 pending_attempts=0
+sensitivity_f0.25_r1 markets=6    wins=6    win_rate= 100.00% lower95=  60.97% cf_pnl/share=         0 shadow=5    shadow_wins=5    shadow_pnl=0.57439590 shadow_return=  2.304%
+  filled_win_lower95=56.55% approximate_break_even=97.75% (cost/share; assumes comparable win probabilities)
+sensitivity_f0.5_r0.5 evaluations=404 admitted_evaluations=13 confirmed_evaluations=8 pending_attempts=0
+sensitivity_f0.5_r0.5 markets=3    wins=3    win_rate= 100.00% lower95=  43.85% cf_pnl/share=         0 shadow=3    shadow_wins=3    shadow_pnl=0.38476286 shadow_return=  2.576%
+  filled_win_lower95=43.85% approximate_break_even=97.49% (cost/share; assumes comparable win probabilities)
+sensitivity_f0.5_r1 evaluations=404 admitted_evaluations=8 confirmed_evaluations=4 pending_attempts=0
+sensitivity_f0.5_r1 markets=2    wins=2    win_rate= 100.00% lower95=  34.24% cf_pnl/share=         0 shadow=2    shadow_wins=2    shadow_pnl=0.28994634 shadow_return=  2.917%
+  filled_win_lower95=34.24% approximate_break_even=97.17% (cost/share; assumes comparable win probabilities)
+sensitivity_f1_r0.5 evaluations=404 admitted_evaluations=0 confirmed_evaluations=0 pending_attempts=0
+sensitivity_f1_r0.5 markets=0    wins=0    win_rate=   0.00% lower95=   0.00% cf_pnl/share=         0 shadow=0    shadow_wins=0    shadow_pnl=         0 shadow_return=  0.000%
+  filled_win_lower95=0.00% approximate_break_even=0.00% (cost/share; assumes comparable win probabilities)
+sensitivity_f1_r1 evaluations=404 admitted_evaluations=0 confirmed_evaluations=0 pending_attempts=0
+sensitivity_f1_r1  markets=0    wins=0    win_rate=   0.00% lower95=   0.00% cf_pnl/share=         0 shadow=0    shadow_wins=0    shadow_pnl=         0 shadow_return=  0.000%
+  filled_win_lower95=0.00% approximate_break_even=0.00% (cost/share; assumes comparable win probabilities)
+Late-Resolution Winner Trading market-level report: results-incoming/20260919T130130Z/late-resolution-winner-trading/evaluations.ndjson
+Runs recorded: 5
+  run_id=012f09f5-6fee-4ff4-b1b9-91d9d8b6246d started_at=2026-09-17T09:07:07.115652708Z mode=paper hybrid_paper_enabled=true
+  run_id=0455ffa7-5a2e-4504-af2b-f611626f477a started_at=2026-09-14T06:17:14.744503092Z mode=paper hybrid_paper_enabled=true
+  run_id=3e2be8c9-a0f7-44c9-bb0e-f1068d2a1ea5 started_at=2026-09-16T12:02:03.199663930Z mode=paper hybrid_paper_enabled=true
+  run_id=44da0163-2221-4358-aeb1-79f01a66d309 started_at=2026-09-18T23:39:28.324633394Z mode=paper hybrid_paper_enabled=true
+  run_id=e69b28af-ce38-4827-b262-d63f1e6857e8 started_at=2026-09-15T09:13:53.200089257Z mode=paper hybrid_paper_enabled=true
+
+PRIMARY RESEARCH RESULT: confirmation-consistent shadow cohorts (latest attempt per market; simulated, NOT account PnL):
+Wins/win_rate describe all resolved attempts, including no-fill; shadow counts and PnL describe fills only. Cohorts overlap; do not sum them.
+all_candidates     markets=76   wins=75   win_rate=  98.68% lower95=  92.92% cf_pnl/share=         0 shadow=53   shadow_wins=52   shadow_pnl=1.28790426 shadow_return=  0.488%
+  filled_win_lower95=90.06% approximate_break_even=97.64% (cost/share; assumes comparable win probabilities)
+asset_btc          markets=4    wins=4    win_rate= 100.00% lower95=  51.01% cf_pnl/share=         0 shadow=2    shadow_wins=2    shadow_pnl=0.38877910 shadow_return=  3.911%
+  filled_win_lower95=34.24% approximate_break_even=96.24% (cost/share; assumes comparable win probabilities)
+asset_eth          markets=72   wins=71   win_rate=  98.61% lower95=  92.54% cf_pnl/share=         0 shadow=51   shadow_wins=50   shadow_pnl=0.89912516 shadow_return=  0.354%
+  filled_win_lower95=89.70% approximate_break_even=97.70% (cost/share; assumes comparable win probabilities)
+chainlink_direction_agrees markets=65   wins=64   win_rate=  98.46% lower95=  91.79% cf_pnl/share=         0 shadow=45   shadow_wins=44   shadow_pnl=0.35121532 shadow_return=  0.157%
+  filled_win_lower95=88.43% approximate_break_even=97.63% (cost/share; assumes comparable win probabilities)
+hybrid_chainlink_veto markets=50   wins=49   win_rate=  98.00% lower95=  89.50% cf_pnl/share=         0 shadow=44   shadow_wins=43   shadow_pnl=0.20748550 shadow_return=  0.095%
+  filled_win_lower95=88.19% approximate_break_even=97.64% (cost/share; assumes comparable win probabilities)
+model_probability_above_market markets=1    wins=1    win_rate= 100.00% lower95=  20.65% cf_pnl/share=         0 shadow=1    shadow_wins=1    shadow_pnl=0.09481652 shadow_return=  1.898%
+  filled_win_lower95=20.65% approximate_break_even=98.14% (cost/share; assumes comparable win probabilities)
+model_probability_below_market markets=75   wins=74   win_rate=  98.67% lower95=  92.83% cf_pnl/share=         0 shadow=52   shadow_wins=51   shadow_pnl=1.19308774 shadow_return=  0.461%
+  filled_win_lower95=89.88% approximate_break_even=97.63% (cost/share; assumes comparable win probabilities)
+price_096_098      markets=76   wins=75   win_rate=  98.68% lower95=  92.92% cf_pnl/share=         0 shadow=53   shadow_wins=52   shadow_pnl=1.28790426 shadow_return=  0.488%
+  filled_win_lower95=90.06% approximate_break_even=97.64% (cost/share; assumes comparable win probabilities)
+price_0_96         markets=9    wins=9    win_rate= 100.00% lower95=  70.09% cf_pnl/share=         0 shadow=3    shadow_wins=3    shadow_pnl=0.61135856 shadow_return=  4.140%
+  filled_win_lower95=43.85% approximate_break_even=96.02% (cost/share; assumes comparable win probabilities)
+price_0_97         markets=18   wins=18   win_rate= 100.00% lower95=  82.41% cf_pnl/share=         0 shadow=9    shadow_wins=9    shadow_pnl=1.44776838 shadow_return=  3.231%
+  filled_win_lower95=70.09% approximate_break_even=96.87% (cost/share; assumes comparable win probabilities)
+price_0_98         markets=49   wins=48   win_rate=  97.96% lower95=  89.31% cf_pnl/share=         0 shadow=41   shadow_wins=40   shadow_pnl=-0.77122268 shadow_return= -0.377%
+  filled_win_lower95=87.40% approximate_break_even=97.93% (cost/share; assumes comparable win probabilities)
+stage_rejected_confirmed markets=76   wins=75   win_rate=  98.68% lower95=  92.92% cf_pnl/share=         0 shadow=53   shadow_wins=52   shadow_pnl=1.28790426 shadow_return=  0.488%
+  filled_win_lower95=90.06% approximate_break_even=97.64% (cost/share; assumes comparable win probabilities)
+
+SECONDARY counterfactual outcomes: linked shadow is a selected-evaluation SUBSET, NOT the complete shadow result or strategy ROI:
+all_stages         markets=208  wins=203  win_rate=  97.60% lower95=  94.50% cf_pnl/share= -0.471730 shadow=21   shadow_wins=20   shadow_pnl=-2.51980702 shadow_return= -2.412%
+  filled_win_lower95=77.33% approximate_break_even=97.60% (cost/share; assumes comparable win probabilities)
+hybrid_paper       markets=1    wins=1    win_rate= 100.00% lower95=  20.65% cf_pnl/share=  0.037312 shadow=0    shadow_wins=0    shadow_pnl=         0 shadow_return=  0.000%
+  filled_win_lower95=0.00% approximate_break_even=0.00% (cost/share; assumes comparable win probabilities)
+rejected_shadow    markets=207  wins=202  win_rate=  97.58% lower95=  94.47% cf_pnl/share= -0.509042 shadow=21   shadow_wins=20   shadow_pnl=-2.51980702 shadow_return= -2.412%
+  filled_win_lower95=77.33% approximate_break_even=97.60% (cost/share; assumes comparable win probabilities)
+
+Counterfactual by asset and ask price:
+btc @0.96          markets=5    wins=5    win_rate= 100.00% lower95=  56.55% cf_pnl/share=  0.186560 shadow=1    shadow_wins=1    shadow_pnl=0.19364928 shadow_return=  3.876%
+  filled_win_lower95=20.65% approximate_break_even=96.27% (cost/share; assumes comparable win probabilities)
+btc @0.97          markets=13   wins=10   win_rate=  76.92% lower95=  49.74% cf_pnl/share= -2.636481 shadow=0    shadow_wins=0    shadow_pnl=         0 shadow_return=  0.000%
+  filled_win_lower95=0.00% approximate_break_even=0.00% (cost/share; assumes comparable win probabilities)
+btc @0.98          markets=24   wins=24   win_rate= 100.00% lower95=  86.20% cf_pnl/share=  0.447072 shadow=0    shadow_wins=0    shadow_pnl=         0 shadow_return=  0.000%
+  filled_win_lower95=0.00% approximate_break_even=0.00% (cost/share; assumes comparable win probabilities)
+eth @0.96          markets=9    wins=8    win_rate=  88.89% lower95=  56.50% cf_pnl/share= -0.664192 shadow=0    shadow_wins=0    shadow_pnl=         0 shadow_return=  0.000%
+  filled_win_lower95=0.00% approximate_break_even=0.00% (cost/share; assumes comparable win probabilities)
+eth @0.97          markets=29   wins=29   win_rate= 100.00% lower95=  88.30% cf_pnl/share=  0.810927 shadow=1    shadow_wins=1    shadow_pnl=0.14372982 shadow_return=  2.877%
+  filled_win_lower95=20.65% approximate_break_even=97.20% (cost/share; assumes comparable win probabilities)
+eth @0.98          markets=128  wins=127  win_rate=  99.22% lower95=  95.71% cf_pnl/share=  1.384384 shadow=19   shadow_wins=18   shadow_pnl=-2.85718612 shadow_return= -3.024%
+  filled_win_lower95=75.36% approximate_break_even=97.69% (cost/share; assumes comparable win probabilities)
+
+Counterfactual by seconds remaining:
+00-20s             markets=12   wins=12   win_rate= 100.00% lower95=  75.75% cf_pnl/share=  0.251555 shadow=1    shadow_wins=1    shadow_pnl=0.09481652 shadow_return=  1.898%
+  filled_win_lower95=20.65% approximate_break_even=98.14% (cost/share; assumes comparable win probabilities)
+21-40s             markets=75   wins=72   win_rate=  96.00% lower95=  88.89% cf_pnl/share= -1.388139 shadow=10   shadow_wins=9    shadow_pnl=-3.71053480 shadow_return= -7.493%
+  filled_win_lower95=59.58% approximate_break_even=97.29% (cost/share; assumes comparable win probabilities)
+41-60s             markets=121  wins=119  win_rate=  98.35% lower95=  94.17% cf_pnl/share=  0.664854 shadow=10   shadow_wins=10   shadow_pnl=1.09591126 shadow_return=  2.194%
+  filled_win_lower95=72.25% approximate_break_even=97.85% (cost/share; assumes comparable win probabilities)
+
+All failed checks (overlapping; primary rejection counters omit later failures):
+  InsufficientDepth: 55
+  NetEvTooLow: 395
+  ReversalBoundary: 396
+  SpreadTooWide: 7
+  StalePrice: 7
+
+Model audit: samples=397 volatility_floor_active=397 max_abs_opening_skew_ms=2000
+
+Resolved selected-market probability calibration (selection-biased research sample, not out-of-sample validation):
+  btc model=0.90+ markets=2 mean_probability=0.9271 observed_win_rate=1.0000 brier=0.0053
+  btc model=below_0.90 markets=39 mean_probability=0.6702 observed_win_rate=0.9231 brier=0.1496
+  eth model=0.90+ markets=9 mean_probability=0.9455 observed_win_rate=1.0000 brier=0.0041
+  eth model=below_0.90 markets=156 mean_probability=0.6119 observed_win_rate=0.9872 brier=0.1661
+
+Model-vs-market probability calibration:
+  missing_model_inputs_excluded=7 (placeholder zero is not a probability forecast)
+hybrid_paper       evaluations=1    model_below_market=0    avg_model_minus_market=0.020226129221988
+rejected_shadow    evaluations=396  model_below_market=391  avg_model_minus_market=-0.3355483380142510575757575758
+
+Evaluations by run:
+  run_id=012f09f5-6fee-4ff4-b1b9-91d9d8b6246d evaluations=87
+  run_id=0455ffa7-5a2e-4504-af2b-f611626f477a evaluations=74
+  run_id=3e2be8c9-a0f7-44c9-bb0e-f1068d2a1ea5 evaluations=60
+  run_id=44da0163-2221-4358-aeb1-79f01a66d309 evaluations=41
+  run_id=e69b28af-ce38-4827-b262-d63f1e6857e8 evaluations=142
+
+Actual/paper order lifecycle by stage: results-incoming/20260919T130130Z/late-resolution-winner-trading/orders.ndjson
+  no order journal found or no lifecycle records
+
+Strict-model execution readiness: 0/100 fully settled production fills (insufficient; keep dry-run fail-closed)

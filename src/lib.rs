@@ -51,6 +51,7 @@ pub mod cross_market_probability_arbitrage;
 pub mod cross_venue_arbitrage;
 pub mod digital_fair_value;
 pub mod digital_fair_value_calibration;
+pub mod digital_fair_value_research_model;
 pub mod market_making;
 pub mod merge;
 pub mod polybacktest;

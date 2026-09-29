@@ -114,11 +114,15 @@ def load(config, root):
                 row = dict(fields, slug=slug, checkpoint=h, asset=e['asset'], time=t, split=split,
                            y=int(label['winner_up']), market=finite(e.get('market_probability_up')),
                            age=finite(audit.get('feed_age_ms')),
-                           observed_at=timestamp(e['recorded_at']), source=source)
+                           observed_at=timestamp(e['recorded_at']), source=source,
+                           online_research=e.get('research_model'))
                 key = (slug, h)
                 if key in seen:
                     excluded['duplicate_observations'] += 1
-                    if row['observed_at'] >= seen[key]['observed_at']:
+                    # Keep one independent market/checkpoint. A later REST
+                    # observation may replace the first record only when it
+                    # supplies the market midpoint required for paired tests.
+                    if seen[key]['market'] is not None or row['market'] is None:
                         continue
                 seen[key] = row
         provenance.append({'journal': str(path), 'sha256': digest.hexdigest(),
@@ -218,6 +222,32 @@ def frozen_probability_gate(result, models, policy):
             'scope':'Probability quality only; execution profitability remains a separate blocked gate.'}
 
 
+def check_online_model_parity(rows, models, model_sha):
+    """Fail a frozen evaluation if its logged online forecast differs from Python."""
+    audited = 0
+    for row in rows:
+        online = row.get('online_research')
+        if not isinstance(online, dict):
+            continue
+        group = f"{row['asset']}/{row['checkpoint']}s"
+        model = models.get(group, {})
+        if model.get('status') != 'fitted':
+            raise ValueError(f'online research forecast has no fitted group: {group}')
+        if online.get('sha256') != model_sha or online.get('selected') != model['selected']:
+            raise ValueError(f'online research model identity mismatch: {row["slug"]}')
+        actual = finite(online.get('probability_up'))
+        expected = predict(row, model['candidates'][model['selected']])
+        # The Rust Gaussian CDF uses a bounded approximation of math.erf.
+        if actual is None or abs(actual - expected) > 2e-6:
+            raise ValueError(f'online/offline probability mismatch: {row["slug"]} '
+                             f'logged={actual} expected={expected}')
+        audited += 1
+    if audited and audited != len(rows):
+        raise ValueError(f'partial online model coverage: {audited}/{len(rows)} observations')
+    return {'audited_observations':audited, 'tolerance':2e-6,
+            'status':'PASSED' if audited else 'NOT_RECORDED'}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--manifest', type=Path, required=True)
@@ -240,6 +270,8 @@ def main():
         models = fit(rows)
     result = evaluate(rows, models)
     if args.model:
+        model_sha = hashlib.sha256(args.model.read_bytes()).hexdigest()
+        result['online_model_parity'] = check_online_model_parity(rows, models, model_sha)
         result['probability_gate'] = frozen_probability_gate(
             result, models, config['probability_gate'])
     args.output.mkdir(parents=True, exist_ok=False)
@@ -264,7 +296,9 @@ def main():
         if a and b and c:
             lines.append(f'| {group} | {a["samples"]} | {a["brier"]:.5f} | {b["brier"]:.5f} | {c["brier"]:.5f} |')
     if args.model:
-        lines.extend(['', 'Probability gate: '+result['probability_gate']['status']+'.'])
+        lines.extend(['', 'Probability gate: '+result['probability_gate']['status']+'.',
+                      'Online/offline model parity: '+result['online_model_parity']['status']+
+                      f' ({result["online_model_parity"]["audited_observations"]} observations).'])
     else:
         lines.extend(['', 'Historical review is already inspected data, not independent out-of-sample proof.'])
     lines.extend(['Execution gate: NOT_EVALUABLE. Promotion: BLOCKED.', '', 'Detailed paired, age and both-side calibration scores: study.json.'])

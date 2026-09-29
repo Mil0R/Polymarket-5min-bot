@@ -2,7 +2,7 @@
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::BTreeMap,
     fs::File,
     io::{BufRead, BufReader},
     path::PathBuf,
@@ -12,6 +12,49 @@ fn number(v: &Value) -> Option<f64> {
     v.as_f64()
         .or_else(|| v.as_str()?.parse().ok())
         .filter(|x| x.is_finite())
+}
+
+fn has_market_probability(observation: &Value) -> bool {
+    number(&observation["market_probability_up"])
+        .is_some_and(|probability| (0.0..=1.0).contains(&probability))
+}
+
+/// Keep one observation per market/checkpoint, preferring a later REST-backed
+/// record only when it supplies the executable market probability missing from
+/// the first checkpoint record. This makes observation-only runs improve paired
+/// coverage without allowing repeated snapshots to multiply the sample size.
+fn load_model_observations(input: &PathBuf) -> Result<(Vec<Value>, usize)> {
+    let mut observations = BTreeMap::<(String, i64), Value>::new();
+    let mut duplicates = 0usize;
+    for line in BufReader::new(File::open(input)?).lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let event: Value = serde_json::from_str(&line)?;
+        if event["event"] != "model_observation" {
+            continue;
+        }
+        let slug = event["slug"]
+            .as_str()
+            .context("observation missing slug")?
+            .to_owned();
+        let checkpoint = event["checkpoint_secs"]
+            .as_i64()
+            .context("observation missing checkpoint")?;
+        match observations.entry((slug, checkpoint)) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(event);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                duplicates += 1;
+                if !has_market_probability(entry.get()) && has_market_probability(&event) {
+                    entry.insert(event);
+                }
+            }
+        }
+    }
+    Ok((observations.into_values().collect(), duplicates))
 }
 
 fn terminal(event: &Value) -> Option<Value> {
@@ -82,6 +125,46 @@ impl Scores {
     }
 }
 
+fn add_paired_scores(
+    scores: &mut BTreeMap<String, Scores>,
+    base: &str,
+    observation: &Value,
+    won: bool,
+) {
+    let Some(market) =
+        number(&observation["market_probability_up"]).filter(|p| (0.0..=1.0).contains(p))
+    else {
+        return;
+    };
+    for (name, value) in [
+        ("model", &observation["probability_up"]),
+        (
+            "without_floor",
+            &observation["model_audit"]["probability_without_floor"],
+        ),
+        (
+            "frozen_research_model",
+            &observation["research_model"]["probability_up"],
+        ),
+        (
+            "market_anchored_v1",
+            &observation["research_model"]["market_anchored"]["probability_up"],
+        ),
+    ] {
+        let Some(candidate) = number(value).filter(|p| (0.0..=1.0).contains(p)) else {
+            continue;
+        };
+        scores
+            .entry(format!("{base}/{name}/candidate"))
+            .or_default()
+            .add(candidate, won);
+        scores
+            .entry(format!("{base}/{name}/market"))
+            .or_default()
+            .add(market, won);
+    }
+}
+
 pub async fn run(refresh: bool) -> Result<PathBuf> {
     dotenvy::dotenv().ok();
     rustls::crypto::ring::default_provider()
@@ -97,29 +180,7 @@ pub async fn run(refresh: bool) -> Result<PathBuf> {
     } else {
         BTreeMap::new()
     };
-    let mut observations = Vec::new();
-    let mut seen = HashSet::new();
-    let mut duplicates = 0;
-    for line in BufReader::new(File::open(&input)?).lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let e: Value = serde_json::from_str(&line)?;
-        if e["event"] != "model_observation" {
-            continue;
-        }
-        let slug = e["slug"].as_str().context("observation missing slug")?;
-        let checkpoint = e["checkpoint_secs"]
-            .as_i64()
-            .context("observation missing checkpoint")?;
-        // Across restarts retain the first observation for each market/checkpoint.
-        if !seen.insert((slug.to_owned(), checkpoint)) {
-            duplicates += 1;
-            continue;
-        }
-        observations.push(e);
-    }
+    let (observations, duplicates) = load_model_observations(&input)?;
     let mut fetch_errors = Vec::new();
     if refresh {
         let client = reqwest::Client::builder()
@@ -203,6 +264,14 @@ pub async fn run(refresh: bool) -> Result<PathBuf> {
                 "without_floor",
                 &e["model_audit"]["probability_without_floor"],
             ),
+            (
+                "frozen_research_model",
+                &e["research_model"]["probability_up"],
+            ),
+            (
+                "market_anchored_v1",
+                &e["research_model"]["market_anchored"]["probability_up"],
+            ),
         ] {
             let Some(p) = number(value).filter(|p| (0.0..=1.0).contains(p)) else {
                 if name == "model" {
@@ -235,6 +304,25 @@ pub async fn run(refresh: bool) -> Result<PathBuf> {
                     .entry(format!("paired_market/{group}"))
                     .or_default()
                     .add(q, won);
+                for (name, value) in [
+                    (
+                        "paired_frozen_research_model",
+                        &e["research_model"]["probability_up"],
+                    ),
+                    (
+                        "paired_market_anchored_v1",
+                        &e["research_model"]["market_anchored"]["probability_up"],
+                    ),
+                ] {
+                    if let Some(candidate) =
+                        number(value).filter(|value| (0.0..=1.0).contains(value))
+                    {
+                        scores
+                            .entry(format!("{name}/{group}"))
+                            .or_default()
+                            .add(candidate, won);
+                    }
+                }
             }
         }
         let residual = number(&label["final_price"])
@@ -256,6 +344,7 @@ pub async fn run(refresh: bool) -> Result<PathBuf> {
     serde_json::to_writer_pretty(
         File::create(&output)?,
         &json!({"generated_at":chrono::Utc::now(),"source":input,
+        "schema_version":2,
         "observations":observations.len(),"duplicates_excluded":duplicates,"missing_labels":missing_labels,
         "missing_model_probabilities":missing_probabilities,"fetch_errors":fetch_errors,
         "scores":scores.iter().map(|(k,v)|(k.clone(),v.value())).collect::<BTreeMap<_,_>>(),"samples":samples,
@@ -263,8 +352,9 @@ pub async fn run(refresh: bool) -> Result<PathBuf> {
             "mean_bps":v.iter().sum::<f64>()/v.len() as f64,
             "rms_bps":(v.iter().map(|x|x*x).sum::<f64>()/v.len() as f64).sqrt()}))).collect::<BTreeMap<_,_>>(),
         "limitations":["Model-ready windows only; not all scheduled windows. Missing data never means zero probability.",
-            "First observation per market/checkpoint across restarts. Checkpoint groups overlap; do not pool as independent trades.",
+            "One observation per market/checkpoint across restarts; a REST-backed paired record replaces an earlier record only when the market midpoint was missing. Checkpoint groups overlap; do not pool as independent trades.",
             "In-sample diagnostics only; no parameter fitting or automatic live promotion.",
+            "Market-anchored scores exist only when an executable market midpoint was recorded; compare models on identical paired samples.",
             "Legacy observations lack baseline probability/current TWAP; no synthetic reconstruction."]}),
     )?;
     println!(
@@ -296,23 +386,7 @@ pub fn run_split_validation() -> Result<PathBuf> {
         File::open(&cache_path).with_context(|| format!("open {}", cache_path.display()))?,
     )?;
 
-    let mut observations = Vec::new();
-    let mut seen = HashSet::new();
-    for line in BufReader::new(File::open(&input)?).lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let e: Value = serde_json::from_str(&line)?;
-        if e["event"] != "model_observation" {
-            continue;
-        }
-        let slug = e["slug"].as_str().context("observation missing slug")?;
-        let checkpoint = e["checkpoint_secs"].as_i64().unwrap_or_default();
-        if seen.insert((slug.to_owned(), checkpoint)) {
-            observations.push(e);
-        }
-    }
+    let (observations, _) = load_model_observations(&input)?;
 
     // A slug's final component is the market's UTC start timestamp. Sorting
     // unique slugs by it makes the holdout genuinely forward-looking while
@@ -357,6 +431,7 @@ pub fn run_split_validation() -> Result<PathBuf> {
     let mut sample_counts: BTreeMap<String, usize> = BTreeMap::new();
     let mut missing_labels = 0usize;
     let mut high_probability: BTreeMap<String, Scores> = BTreeMap::new();
+    let mut paired_scores: BTreeMap<String, Scores> = BTreeMap::new();
     for e in &observations {
         let slug = e["slug"].as_str().unwrap_or_default();
         let split = split_for(slug);
@@ -369,6 +444,7 @@ pub fn run_split_validation() -> Result<PathBuf> {
         let checkpoint = e["checkpoint_secs"].as_i64().unwrap_or_default();
         let base = format!("{split}/{asset}/{checkpoint}s");
         *sample_counts.entry(base.clone()).or_default() += 1;
+        add_paired_scores(&mut paired_scores, &base, e, won);
         for (source, value) in [
             ("model", &e["probability_up"]),
             (
@@ -376,6 +452,14 @@ pub fn run_split_validation() -> Result<PathBuf> {
                 &e["model_audit"]["probability_without_floor"],
             ),
             ("market_midpoint", &e["market_probability_up"]),
+            (
+                "frozen_research_model",
+                &e["research_model"]["probability_up"],
+            ),
+            (
+                "market_anchored_v1",
+                &e["research_model"]["market_anchored"]["probability_up"],
+            ),
         ] {
             let Some(probability) = number(value).filter(|p| (0.0..=1.0).contains(p)) else {
                 continue;
@@ -407,7 +491,7 @@ pub fn run_split_validation() -> Result<PathBuf> {
     serde_json::to_writer_pretty(
         File::create(&output)?,
         &json!({
-            "schema_version": 1,
+            "schema_version": 3,
             "generated_at": chrono::Utc::now(),
             "source": input,
             "reference_audit": cache_path,
@@ -418,11 +502,14 @@ pub fn run_split_validation() -> Result<PathBuf> {
                 "ordering": "market_start_timestamp_ascending", "market_is_atomic": true},
             "sample_counts": sample_counts,
             "scores": score_values,
+            "paired_scores": paired_scores.iter().map(|(k,v)|(k.clone(),v.value())).collect::<BTreeMap<_,_>>(),
+            "paired_policy": "Each candidate is compared against the market on identical market/checkpoint observations; missing candidate values exclude both sides of that pair.",
             "high_probability_ge_0_9": high_values,
             "limitations": [
                 "Scores are diagnostics; no parameter is fitted or promoted automatically.",
                 "Each market is assigned to one split, but checkpoints within a market remain correlated.",
                 "Market midpoint is a reference baseline, not a guaranteed executable price.",
+                "Market-anchored scores are a paired-sample diagnostic and cannot enter live admission.",
                 "A small holdout or high-probability group must not be treated as proof of profitability."
             ]
         }),
@@ -441,6 +528,28 @@ pub fn run_split_validation() -> Result<PathBuf> {
 mod tests {
     use super::*;
     #[test]
+    fn paired_scores_never_compare_different_sample_sets() {
+        let mut scores = BTreeMap::new();
+        add_paired_scores(
+            &mut scores,
+            "holdout/BTC/30s",
+            &json!({
+            "market_probability_up":0.7,"probability_up":0.8,
+            "research_model":{"probability_up":null}}),
+            true,
+        );
+        add_paired_scores(
+            &mut scores,
+            "holdout/BTC/30s",
+            &json!({
+            "market_probability_up":null,"probability_up":0.9}),
+            false,
+        );
+        assert_eq!(scores["holdout/BTC/30s/model/candidate"].n, 1);
+        assert_eq!(scores["holdout/BTC/30s/model/market"].n, 1);
+        assert!(!scores.contains_key("holdout/BTC/30s/frozen_research_model/market"));
+    }
+    #[test]
     fn scores_and_terminal_labels() {
         let mut s = Scores::default();
         s.add(0.8, true);
@@ -452,5 +561,25 @@ mod tests {
             &json!({"markets":[{"closed":false,"outcomes":["Up","Down"],"outcomePrices":[1,0]}]})
         )
         .is_none());
+    }
+
+    #[test]
+    fn paired_rest_observation_replaces_unpaired_first_record() {
+        let path = std::env::temp_dir().join(format!(
+            "polypulse-sddfv-calibration-{}.ndjson",
+            uuid::Uuid::new_v4()
+        ));
+        let first = json!({"event":"model_observation","slug":"btc-updown-5m-1",
+            "checkpoint_secs":30,"probability_up":0.7,"market_probability_up":null});
+        let paired = json!({"event":"model_observation","slug":"btc-updown-5m-1",
+            "checkpoint_secs":30,"probability_up":0.6,"market_probability_up":0.55,
+            "observation_source":"rest_fallback"});
+        std::fs::write(&path, format!("{first}\n{paired}\n")).unwrap();
+        let (observations, duplicates) = load_model_observations(&path).unwrap();
+        let _ = std::fs::remove_file(path);
+        assert_eq!(duplicates, 1);
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0]["market_probability_up"], 0.55);
+        assert_eq!(observations[0]["observation_source"], "rest_fallback");
     }
 }

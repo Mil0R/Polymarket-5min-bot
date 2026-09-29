@@ -1,5 +1,6 @@
 import unittest
-from digital_fair_value_study import partition, fit, predict, score, frozen_probability_gate
+from digital_fair_value_study import (partition, fit, predict, score,
+                                      frozen_probability_gate, check_online_model_parity)
 
 
 class StudyTests(unittest.TestCase):
@@ -47,6 +48,24 @@ class StudyTests(unittest.TestCase):
         models={'btc/30s':{'status':'fitted'}}
         policy={'min_paired_samples_per_asset':75,'min_utc_days':5}
         self.assertEqual(frozen_probability_gate(result,models,policy)['status'],'PASSED')
+
+    def test_floor_uses_arithmetic_margin(self):
+        row = dict(observed_vol=.1, floor=.8, remaining=30, margin=1.0)
+        self.assertAlmostEqual(predict(row, dict(kind='floor',scale=.5)), .6759615659304088, places=8)
+
+    def test_online_selected_model_parity_is_fail_closed(self):
+        row = dict(asset='btc', checkpoint=30, slug='btc-updown-5m-100',
+                   opening=100., current=100.01,
+                   online_research=dict(sha256='abc',selected='empirical',probability_up=.6))
+        models = {'btc/30s':dict(status='fitted',selected='empirical',
+                                 candidates={'empirical':dict(kind='empirical',residuals_bps=[-2,0,2])})}
+        self.assertEqual(check_online_model_parity([row],models,'abc')['status'],'PASSED')
+        row['online_research']['probability_up'] = .7
+        with self.assertRaisesRegex(ValueError,'probability mismatch'):
+            check_online_model_parity([row],models,'abc')
+        row['online_research']['probability_up'] = .6
+        with self.assertRaisesRegex(ValueError,'partial online model coverage'):
+            check_online_model_parity([row, dict(row, online_research=None)],models,'abc')
 
 
 if __name__ == '__main__':

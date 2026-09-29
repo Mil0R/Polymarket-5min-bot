@@ -767,6 +767,15 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
         Duration::from_secs(30),
         Duration::from_secs(30),
     );
+    // The SDK's connection and reconnection tasks are tied to the client, not
+    // to a stream. Recreating clients every five minutes leaves old sockets
+    // alive, eventually exhausting the process file-descriptor limit.
+    let market_ws_client = polymarket_client_sdk::clob::ws::Client::default();
+    let user_ws_client = polymarket_client_sdk_v2::clob::ws::Client::default()
+        .authenticate(clob_client.credentials().clone(), clob_client.address())
+        .context("Failed to authenticate user order stream")?;
+    let mut previous_market_tokens = Vec::new();
+    let mut previous_user_markets = Vec::new();
     #[allow(unreachable_code)]
     loop {
         winner_loop_heartbeat.fetch_add(1, Ordering::Relaxed);
@@ -796,7 +805,7 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
         });
 
         // Initialize orderbook monitor
-        let mut monitor = OrderBookMonitor::new();
+        let mut monitor = OrderBookMonitor::with_ws_client(market_ws_client.clone());
 
         // Subscribe to all markets
         for market in &markets {
@@ -847,6 +856,16 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                 continue;
             }
         };
+        // Subscribe the new window first so the SDK channel never has zero
+        // subscriptions. Removing its last subscription discards the channel
+        // and creates another background connection on the next window.
+        let current_market_tokens = monitor.subscribed_token_ids();
+        if !previous_market_tokens.is_empty() {
+            if let Err(error) = market_ws_client.unsubscribe_orderbook(&previous_market_tokens) {
+                warn!(%error, "Failed to unsubscribe previous market window");
+            }
+        }
+        previous_market_tokens = current_market_tokens;
         let mut market_ws_reconnecting = false;
         let mut market_ws_disconnect_started_at: Option<Instant> = None;
         let mut market_ws_seen_connected = matches!(
@@ -908,30 +927,31 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
 
         // Authenticated user stream closes the gap between the immediate post_order
         // response and later maker/partial fills.
-        let user_ws_client = match polymarket_client_sdk_v2::clob::ws::Client::default()
-            .authenticate(clob_client.credentials().clone(), clob_client.address())
-        {
-            Ok(client) => client,
-            Err(e) => {
-                error!(error = %e, "Failed to authenticate user order stream");
-                runtime_metrics.record_stream_connect_failure();
-                runtime_metrics.record_stream_reconnect();
-                sleep(connection_supervisor.connect_failed()).await;
-                continue;
+        let current_user_markets: Vec<_> = markets.iter().map(|market| market.market_id).collect();
+        let mut user_order_stream =
+            match user_ws_client.subscribe_orders(current_user_markets.clone()) {
+                Ok(stream) => Box::pin(stream),
+                Err(e) => {
+                    error!(error = %e, "Failed to subscribe authenticated user order stream");
+                    runtime_metrics.record_stream_connect_failure();
+                    runtime_metrics.record_stream_reconnect();
+                    sleep(connection_supervisor.connect_failed()).await;
+                    continue;
+                }
+            };
+        if !previous_user_markets.is_empty() {
+            if let Err(error) = user_ws_client.unsubscribe_orders(&previous_user_markets) {
+                warn!(%error, "Failed to unsubscribe previous user window");
             }
-        };
-        let mut user_order_stream = match user_ws_client
-            .subscribe_orders(markets.iter().map(|market| market.market_id).collect())
-        {
-            Ok(stream) => Box::pin(stream),
-            Err(e) => {
-                error!(error = %e, "Failed to subscribe authenticated user order stream");
-                runtime_metrics.record_stream_connect_failure();
-                runtime_metrics.record_stream_reconnect();
-                sleep(connection_supervisor.connect_failed()).await;
-                continue;
-            }
-        };
+        }
+        previous_user_markets = current_user_markets;
+        #[cfg(target_os = "linux")]
+        if let Ok(open_fds) = std::fs::read_dir("/proc/self/fd") {
+            info!(
+                open_fds = open_fds.count(),
+                "Window WebSocket subscriptions ready"
+            );
+        }
         let mut user_ws_seen_connected = user_ws_client
             .connection_state(polymarket_client_sdk_v2::clob::ws::ChannelType::User)
             .is_connected();
