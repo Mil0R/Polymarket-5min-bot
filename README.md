@@ -176,6 +176,39 @@ auditable rejection/fill summary:
 cargo run --release --bin short_duration_digital_fair_value -- backtest
 cargo run --release --bin short_duration_digital_fair_value -- dry-run
 ```
+
+The SDDFV-only [terminal-distribution calibration guide](docs/SHORT_DURATION_DIGITAL_FAIR_VALUE_TERMINAL_CALIBRATION_2026-10-01.zh-CN.md)
+adds chronological fitting, frozen artifacts, Rust/Python inference parity and
+linked delayed-book replay. Its new forward batch records conditional predictions
+in observation-only mode; no candidate currently passes the market-probability
+gate, and the shared winner-trading estimator is unchanged.
+
+```bash
+bash scripts/run_digital_fair_value_terminal_calibration.sh parity
+SDDFV_BINARY=./target/release/short_duration_digital_fair_value \
+  bash scripts/run_digital_fair_value_terminal_calibration.sh dry-run
+```
+
+The [BTC/ETH staged research guide](docs/SHORT_DURATION_DIGITAL_FAIR_VALUE_NEXT_ROUND_009.zh-CN.md)
+adds finite-capital accounting, bounded reference buckets, causal per-market
+fee/opening audits, market-offset calibration and a fixed 14-day protocol.
+009 development candidates currently fail the local profitability gate.
+`freeze`/`start` refuse promotion; `observe` only collects missing audit data.
+v2 models require the staged runner (not a direct `dry-run` invocation).
+The [010 capture update](docs/SHORT_DURATION_DIGITAL_FAIR_VALUE_CAPTURE_010.zh-CN.md)
+adds live opening evidence diagnostics, isolated reference feeds and mode-aware reports;
+new capture revisions require a new batch, without changing the 009 model or trade gates.
+The [011 capture repair](docs/SHORT_DURATION_DIGITAL_FAIR_VALUE_CAPTURE_011.zh-CN.md)
+adds a strictly matched official-page opening probe, model-unready book capture,
+checkpoint accounting and connection-local health audits. The page source is
+experimental; observe-only capture is not profitability validation.
+
+```bash
+bash scripts/run_digital_fair_value_next_round.sh parity
+SDDFV_BINARY=./target/release/short_duration_digital_fair_value \
+  bash scripts/run_digital_fair_value_next_round.sh observe market-offset-011
+```
+
 NegRisk Conversion Arbitrage provides a separate read-only stage-1 scanner,
 delayed exit shadow scenarios, and reports, reusing the Cross-Market Probability
 Arbitrage data client. See the [stage-1 guide](docs/NEG_RISK_CONVERSION_ARBITRAGE_STAGE1.zh-CN.md).

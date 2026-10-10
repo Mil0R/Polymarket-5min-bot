@@ -11,7 +11,7 @@ use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
@@ -69,6 +69,7 @@ pub struct RtdsReferenceSample {
 }
 
 pub type PriceFeedObserver = Arc<dyn Fn(RtdsReferenceSample) + Send + Sync>;
+pub type PriceFeedConnectionObserver = Arc<dyn Fn(Value) + Send + Sync>;
 
 #[derive(Default)]
 pub struct ChainlinkTwapStore {
@@ -719,6 +720,7 @@ pub async fn run_chainlink_twap_feed(
 
 /// Research-only variant: also subscribes to Chainlink and Binance spot
 /// updates and exposes local receive timestamps through `observer`.
+#[allow(dead_code)] // Keep the original combined research entry point available.
 pub async fn run_chainlink_twap_feed_with_research(
     url: String,
     store: Arc<ChainlinkTwapStore>,
@@ -736,6 +738,136 @@ async fn run_price_feed(
     metrics: Arc<RuntimeMetrics>,
     observer: Option<PriceFeedObserver>,
 ) {
+    let channels = if observer.is_some() {
+        FeedChannels::AllResearch
+    } else {
+        FeedChannels::Twap
+    };
+    run_price_feed_channels(url, store, shutdown, metrics, observer, channels, None).await;
+}
+
+/// SDDFV-only isolation. Existing winner trading / research callers keep their
+/// original one-connection subscriptions and reconnect thresholds unchanged.
+pub async fn run_fair_value_isolated_feeds(
+    url: String,
+    store: Arc<ChainlinkTwapStore>,
+    shutdown: Arc<AtomicBool>,
+    metrics: Arc<RuntimeMetrics>,
+    observer: PriceFeedObserver,
+    audit: PriceFeedConnectionObserver,
+) {
+    tokio::join!(
+        run_price_feed_channels(
+            url.clone(),
+            store.clone(),
+            shutdown.clone(),
+            metrics.clone(),
+            Some(observer.clone()),
+            FeedChannels::Twap,
+            Some(audit.clone())
+        ),
+        run_price_feed_channels(
+            url,
+            store,
+            shutdown,
+            metrics,
+            Some(observer),
+            FeedChannels::Spot,
+            Some(audit)
+        ),
+    );
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FeedChannels {
+    Twap,
+    Spot,
+    AllResearch,
+}
+
+impl FeedChannels {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Twap => "settlement_twap",
+            Self::Spot => "research_spot",
+            Self::AllResearch => "combined_research",
+        }
+    }
+    fn subscription(self) -> Value {
+        if self == Self::Spot {
+            serde_json::json!({"action":"subscribe","subscriptions":[
+                {"topic":"crypto_prices_chainlink","type":"*"}, {"topic":"crypto_prices","type":"update"}]})
+        } else {
+            price_feed_subscription(self == Self::AllResearch)
+        }
+    }
+    fn silence_reason(
+        self,
+        frame: Duration,
+        twap: Duration,
+        reference: Duration,
+        research: bool,
+    ) -> Option<&'static str> {
+        if self == Self::Spot {
+            if reference >= RESEARCH_TWAP_SILENCE_LIMIT {
+                Some("spot_updates_stale")
+            } else if frame >= RTDS_FRAME_SILENCE_LIMIT {
+                Some("websocket_frames_stale")
+            } else {
+                None
+            }
+        } else {
+            rtds_silence_reason(frame, twap, research)
+        }
+    }
+}
+
+fn notify_feed(
+    audit: Option<&PriceFeedConnectionObserver>,
+    channels: FeedChannels,
+    phase: &str,
+    reason: &str,
+) {
+    if let Some(audit) = audit {
+        audit(
+            serde_json::json!({"connection":channels.name(),"phase":phase,
+        "reason":reason,"recorded_at":Utc::now(),"decision_role":"transport_audit_only"}),
+        );
+    }
+}
+
+fn isolated_feed_health(
+    channels: FeedChannels,
+    frame: Duration,
+    twap: Duration,
+    reference: Duration,
+    pings: u64,
+    pongs: u64,
+    pong_age: Option<Duration>,
+) -> Value {
+    serde_json::json!({"event":"reference_feed_health","connection":channels.name(),
+        "recorded_at":Utc::now(),"decision_role":"transport_audit_only",
+        "frame_silence_ms":frame.as_millis(),
+        "twap_silence_ms":(channels!=FeedChannels::Spot).then_some(twap.as_millis()),
+        "spot_silence_ms":(channels==FeedChannels::Spot).then_some(reference.as_millis()),
+        "pings_sent":pings,"pongs_received":pongs,"last_pong_age_ms":pong_age.map(|d|d.as_millis()),
+        "note":"silence is connection-local; connected means subscription sent, not acknowledged"})
+}
+
+async fn run_price_feed_channels(
+    url: String,
+    store: Arc<ChainlinkTwapStore>,
+    shutdown: Arc<AtomicBool>,
+    metrics: Arc<RuntimeMetrics>,
+    observer: Option<PriceFeedObserver>,
+    channels: FeedChannels,
+    audit: Option<PriceFeedConnectionObserver>,
+) {
+    let feed_label = if audit.is_some() {
+        "RTDS reference"
+    } else {
+        "Chainlink TWAP"
+    };
     while !shutdown.load(Ordering::Relaxed) {
         match timeout(
             Duration::from_secs(10),
@@ -745,16 +877,44 @@ async fn run_price_feed(
         {
             Ok(Ok((mut socket, _))) => {
                 metrics.record_late_resolution_winner_trading_rtds_connection();
-                let subscription = price_feed_subscription(observer.is_some());
+                let subscription = channels.subscription();
                 if let Err(error) = socket
                     .send(Message::Text(subscription.to_string().into()))
                     .await
                 {
-                    warn_price_feed!(observer.is_some(), %error, "Chainlink TWAP subscription failed");
+                    notify_feed(
+                        audit.as_ref(),
+                        channels,
+                        "connect_failed",
+                        "subscription_send_failed",
+                    );
+                    warn_price_feed!(observer.is_some(),connection=channels.name(), %error, "{} subscription failed",feed_label);
                 } else {
+                    notify_feed(audit.as_ref(), channels, "connected", "subscription_sent");
+                    let last_reference_at = Arc::new(Mutex::new(Instant::now()));
+                    let observed_reference_at = last_reference_at.clone();
+                    let first_valid = Arc::new(AtomicBool::new(false));
+                    let data_audit = audit.clone();
+                    let connection_observer = observer.clone().map(|parent| {
+                        Arc::new(move |sample: RtdsReferenceSample| {
+                            if let Ok(mut received) = observed_reference_at.lock() {
+                                *received = Instant::now();
+                            }
+                            if !first_valid.swap(true,Ordering::Relaxed) {
+                                if let Some(audit)=&data_audit {audit(serde_json::json!({
+                                    "event":"reference_feed_connection","connection":channels.name(),
+                                    "phase":"first_valid_data","reason":"valid_reference_received",
+                                    "topic":sample.topic,"asset":sample.asset,"source_at_ms":sample.observed_at_ms,
+                                    "received_at_ms":sample.received_at_ms,"recorded_at":Utc::now(),
+                                    "decision_role":"transport_audit_only"}));}
+                            }
+                            parent(sample);
+                        }) as PriceFeedObserver
+                    });
                     if observer.is_some() {
                         info!(target: RESEARCH_FEED_LOG_TARGET,
-                            research_spot = true, "Connected to Polymarket RTDS Chainlink 60s TWAP feed");
+                            connection=channels.name(),research_spot = channels!=FeedChannels::Twap,
+                            "Connected to Polymarket RTDS reference feed");
                     } else {
                         info!(
                             research_spot = false,
@@ -764,25 +924,48 @@ async fn run_price_feed(
                     let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
                     let mut last_frame_at = Instant::now();
                     let mut last_twap_at = Instant::now();
+                    let mut last_health_at = Instant::now();
+                    let mut pings_sent = 0u64;
+                    let mut pongs_received = 0u64;
+                    let mut last_pong_at: Option<Instant> = None;
                     loop {
                         tokio::select! {
                             _ = heartbeat.tick() => {
-                                if let Some(reason) = rtds_silence_reason(
+                                let reference_silence=last_reference_at.lock().map(|t|t.elapsed()).unwrap_or(Duration::MAX);
+                                if let Some(reason) = channels.silence_reason(
                                     last_frame_at.elapsed(),
                                     last_twap_at.elapsed(),
+                                    reference_silence,
                                     observer.is_some(),
                                 ) {
+                                    notify_feed(audit.as_ref(),channels,"disconnected",reason);
                                     metrics.record_late_resolution_winner_trading_rtds_disconnect();
-                                    warn_price_feed!(observer.is_some(), reason, frame_silence_secs = last_frame_at.elapsed().as_secs(),
+                                    if let Some(audit)=&audit {
+                                        let mut health=isolated_feed_health(channels,last_frame_at.elapsed(),last_twap_at.elapsed(),reference_silence,
+                                            pings_sent,pongs_received,last_pong_at.map(|t|t.elapsed()));
+                                        health["reason"]=serde_json::json!(reason);audit(health);
+                                        warn!(target:RESEARCH_FEED_LOG_TARGET,reason,connection=channels.name(),
+                                            frame_silence_secs=last_frame_at.elapsed().as_secs(),
+                                            updates_silence_secs=if channels==FeedChannels::Spot{reference_silence.as_secs()}else{last_twap_at.elapsed().as_secs()},
+                                            "RTDS reference stream stale; reconnecting");
+                                    } else { warn_price_feed!(observer.is_some(), reason, frame_silence_secs = last_frame_at.elapsed().as_secs(),
+                                        connection=channels.name(),
                                         twap_silence_secs = last_twap_at.elapsed().as_secs(),
-                                        "Chainlink TWAP feed stale; reconnecting");
+                                        "Chainlink TWAP feed stale; reconnecting"); }
                                     break;
+                                }
+                                if last_health_at.elapsed()>=Duration::from_secs(60) {
+                                    if let Some(audit)=&audit {audit(isolated_feed_health(channels,last_frame_at.elapsed(),last_twap_at.elapsed(),reference_silence,
+                                        pings_sent,pongs_received,last_pong_at.map(|t|t.elapsed())));}
+                                    last_health_at=Instant::now();
                                 }
                                 if let Err(error) = socket.send(Message::Text("PING".into())).await {
+                                    notify_feed(audit.as_ref(),channels,"disconnected","heartbeat_send_failed");
                                     metrics.record_late_resolution_winner_trading_rtds_disconnect();
-                                    warn_price_feed!(observer.is_some(), %error, "Chainlink TWAP heartbeat failed; reconnecting");
+                                    warn_price_feed!(observer.is_some(),connection=channels.name(), %error, "{} heartbeat failed; reconnecting",feed_label);
                                     break;
                                 }
+                                pings_sent=pings_sent.saturating_add(1);
                             }
                             message = socket.next() => {
                                 if message.is_some() {
@@ -790,30 +973,39 @@ async fn run_price_feed(
                                 }
                                 match message {
                                     Some(Ok(Message::Text(text))) => {
-                                        if ingest_rtds_message(&store, &metrics, text.as_str(), observer.as_ref()) {
+                                        if text.trim().trim_matches('"').eq_ignore_ascii_case("pong") {
+                                            pongs_received=pongs_received.saturating_add(1);last_pong_at=Some(Instant::now());
+                                        }
+                                        if ingest_rtds_message(&store, &metrics, text.as_str(), connection_observer.as_ref()) {
                                             last_twap_at = Instant::now();
                                         }
                                     }
                                     Some(Ok(Message::Binary(bytes))) => {
                                         if let Ok(text) = std::str::from_utf8(&bytes) {
-                                            if ingest_rtds_message(&store, &metrics, text, observer.as_ref()) {
+                                            if ingest_rtds_message(&store, &metrics, text, connection_observer.as_ref()) {
                                                 last_twap_at = Instant::now();
                                             }
                                         }
                                     }
+                                    Some(Ok(Message::Pong(_)))=>{
+                                        pongs_received=pongs_received.saturating_add(1);last_pong_at=Some(Instant::now());
+                                    }
                                     Some(Ok(Message::Close(frame))) => {
+                                        notify_feed(audit.as_ref(),channels,"disconnected","websocket_closed");
                                         metrics.record_late_resolution_winner_trading_rtds_disconnect();
-                                        warn_price_feed!(observer.is_some(), ?frame, "Chainlink TWAP feed closed; reconnecting");
+                                        warn_price_feed!(observer.is_some(),connection=channels.name(), ?frame, "{} feed closed; reconnecting",feed_label);
                                         break;
                                     }
                                     Some(Err(error)) => {
+                                        notify_feed(audit.as_ref(),channels,"disconnected","websocket_read_failed");
                                         metrics.record_late_resolution_winner_trading_rtds_disconnect();
-                                        warn_price_feed!(observer.is_some(), %error, "Chainlink TWAP feed read failed; reconnecting");
+                                        warn_price_feed!(observer.is_some(),connection=channels.name(), %error, "{} feed read failed; reconnecting",feed_label);
                                         break;
                                     }
                                     None => {
+                                        notify_feed(audit.as_ref(),channels,"disconnected","websocket_ended");
                                         metrics.record_late_resolution_winner_trading_rtds_disconnect();
-                                        warn_price_feed!(observer.is_some(), "Chainlink TWAP feed ended; reconnecting");
+                                        warn_price_feed!(observer.is_some(),connection=channels.name(), "{} feed ended; reconnecting",feed_label);
                                         break;
                                     }
                                     _ => {}
@@ -828,12 +1020,24 @@ async fn run_price_feed(
                 }
             }
             Ok(Err(error)) => {
+                notify_feed(
+                    audit.as_ref(),
+                    channels,
+                    "connect_failed",
+                    "websocket_connect_failed",
+                );
                 metrics.record_late_resolution_winner_trading_rtds_connect_failure();
-                warn_price_feed!(observer.is_some(), %error, "Chainlink TWAP feed connection failed");
+                warn_price_feed!(observer.is_some(),connection=channels.name(), %error, "{} feed connection failed",feed_label);
             }
             Err(_) => {
+                notify_feed(
+                    audit.as_ref(),
+                    channels,
+                    "connect_failed",
+                    "websocket_connect_timeout",
+                );
                 metrics.record_late_resolution_winner_trading_rtds_connect_failure();
-                warn_price_feed!(observer.is_some(), url = %url, "Chainlink TWAP feed connection timed out");
+                warn_price_feed!(observer.is_some(),connection=channels.name(), url = %url, "{} feed connection timed out",feed_label);
             }
         }
         if !shutdown.load(Ordering::Relaxed) {
@@ -1045,6 +1249,84 @@ fn normal_cdf(value: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn spot_health_never_reports_an_unsubscribed_twap_silence() {
+        let h = isolated_feed_health(
+            FeedChannels::Spot,
+            Duration::from_secs(16),
+            Duration::from_secs(6850),
+            Duration::from_secs(16),
+            20,
+            19,
+            Some(Duration::from_secs(6)),
+        );
+        assert!(h["twap_silence_ms"].is_null());
+        assert_eq!(h["spot_silence_ms"], 16000);
+        assert_eq!(h["last_pong_age_ms"], 6000);
+        let h = isolated_feed_health(
+            FeedChannels::Twap,
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            Duration::from_secs(3),
+            1,
+            0,
+            None,
+        );
+        assert!(h["spot_silence_ms"].is_null());
+        assert_eq!(h["twap_silence_ms"], 2000);
+    }
+
+    #[test]
+    fn isolated_feed_channels_do_not_reconnect_healthy_spot_for_stale_twap() {
+        let twap = FeedChannels::Twap.subscription();
+        let spot = FeedChannels::Spot.subscription();
+        assert_eq!(twap["subscriptions"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            twap["subscriptions"][0]["topic"],
+            "crypto_prices_twap_sixty"
+        );
+        assert!(!spot.to_string().contains("crypto_prices_twap_sixty"));
+        assert_eq!(
+            FeedChannels::Spot.silence_reason(
+                Duration::from_secs(1),
+                Duration::from_secs(60),
+                Duration::from_secs(1),
+                true
+            ),
+            None
+        );
+        assert_eq!(
+            FeedChannels::Twap.silence_reason(
+                Duration::from_secs(1),
+                Duration::from_secs(13),
+                Duration::from_secs(1),
+                true
+            ),
+            Some("twap_updates_stale")
+        );
+        assert_eq!(
+            FeedChannels::Spot.silence_reason(
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_secs(13),
+                true
+            ),
+            Some("spot_updates_stale")
+        );
+        assert_eq!(
+            FeedChannels::Twap.silence_reason(
+                Duration::from_secs(1),
+                Duration::from_secs(13),
+                Duration::from_secs(13),
+                false
+            ),
+            None
+        );
+        assert_eq!(
+            FeedChannels::AllResearch.subscription(),
+            price_feed_subscription(true)
+        );
+    }
 
     #[test]
     fn fair_value_snapshot_is_past_only_and_uses_window_opening() {

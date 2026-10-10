@@ -25,9 +25,12 @@ use std::time::Instant;
 use tokio::time::{sleep, timeout};
 use tracing::{info, warn};
 
+use crate::digital_fair_value_opening::{self as opening_evidence, OpeningCache};
 use crate::digital_fair_value_research_model::{Features as ResearchFeatures, ResearchModel};
+use crate::digital_fair_value_risk::{PaperLedger, ReferenceHistory};
+use crate::digital_fair_value_terminal_model::TerminalModel;
 use crate::late_resolution_winner_model::{
-    run_chainlink_twap_feed, run_chainlink_twap_feed_with_research, ChainlinkTwapStore,
+    run_chainlink_twap_feed, run_fair_value_isolated_feeds, ChainlinkTwapStore,
     FairValueSnapshotReadiness, FairValueTwapSnapshot, PriceFeedObserver,
 };
 use crate::market::{MarketDiscoverer, MarketInfo};
@@ -360,6 +363,11 @@ struct DryRunConfig {
     min_price: f64,
     max_price: f64,
     order_usdc: f64,
+    paper_ledger: Arc<Mutex<PaperLedger>>,
+    reference_history: Arc<Mutex<ReferenceHistory>>,
+    capture_reference_buckets: bool,
+    audit_market_fees: bool,
+    opening_cache: Arc<Mutex<OpeningCache>>,
     liquidity_haircut: f64,
     fee_rate: f64,
     fee_exponent: u32,
@@ -369,6 +377,7 @@ struct DryRunConfig {
     journal_min_free_bytes: u64,
     journal_max_bytes: u64,
     research_model: Option<Arc<ResearchModel>>,
+    terminal_model: Option<Arc<TerminalModel>>,
     research_snapshot_interval_ms: i64,
     research_observation_only: bool,
     research_capture_raw_reference: bool,
@@ -387,6 +396,16 @@ impl DryRunConfig {
                 let sha = std::env::var("SHORT_DURATION_DIGITAL_FAIR_VALUE_RESEARCH_MODEL_SHA256")
                     .context("research model file requires SHORT_DURATION_DIGITAL_FAIR_VALUE_RESEARCH_MODEL_SHA256")?;
                 Some(Arc::new(ResearchModel::load(Path::new(&path), &sha)?))
+            }
+            _ => None,
+        };
+        let terminal_model = match std::env::var_os(
+            "SHORT_DURATION_DIGITAL_FAIR_VALUE_TERMINAL_MODEL_FILE",
+        ) {
+            Some(path) if !path.is_empty() => {
+                let sha = std::env::var("SHORT_DURATION_DIGITAL_FAIR_VALUE_TERMINAL_MODEL_SHA256")
+                    .context("terminal model file requires SHORT_DURATION_DIGITAL_FAIR_VALUE_TERMINAL_MODEL_SHA256")?;
+                Some(Arc::new(TerminalModel::load(Path::new(&path), &sha)?))
             }
             _ => None,
         };
@@ -479,6 +498,24 @@ impl DryRunConfig {
             min_price: env_parse("SHORT_DURATION_DIGITAL_FAIR_VALUE_MIN_PRICE", 0.05)?,
             max_price: env_parse("SHORT_DURATION_DIGITAL_FAIR_VALUE_MAX_PRICE", 0.95)?,
             order_usdc: env_parse("SHORT_DURATION_DIGITAL_FAIR_VALUE_ORDER_USDC", 5.0)?,
+            paper_ledger: Arc::new(Mutex::new(PaperLedger::new(
+                env_parse("SHORT_DURATION_DIGITAL_FAIR_VALUE_BUDGET_USDC", 1000.0)?,
+                env_parse("SHORT_DURATION_DIGITAL_FAIR_VALUE_MAX_EXPOSURE_USDC", 20.0)?,
+                env_parse(
+                    "SHORT_DURATION_DIGITAL_FAIR_VALUE_MAX_ASSET_EXPOSURE_USDC",
+                    10.0,
+                )?,
+            )?)),
+            reference_history: Arc::new(Mutex::new(ReferenceHistory::default())),
+            capture_reference_buckets: env_parse(
+                "SHORT_DURATION_DIGITAL_FAIR_VALUE_REFERENCE_BUCKETS",
+                false,
+            )?,
+            audit_market_fees: env_parse(
+                "SHORT_DURATION_DIGITAL_FAIR_VALUE_AUDIT_MARKET_FEES",
+                false,
+            )?,
+            opening_cache: Arc::new(Mutex::new(OpeningCache::default())),
             liquidity_haircut: env_parse(
                 "SHORT_DURATION_DIGITAL_FAIR_VALUE_DRY_RUN_LIQUIDITY_HAIRCUT",
                 0.50,
@@ -503,6 +540,7 @@ impl DryRunConfig {
                 4_294_967_296_u64,
             )?,
             research_model,
+            terminal_model,
             research_snapshot_interval_ms: env_parse(
                 "SHORT_DURATION_DIGITAL_FAIR_VALUE_RESEARCH_SNAPSHOT_INTERVAL_MS",
                 0,
@@ -528,6 +566,11 @@ impl DryRunConfig {
                 0.30,
             )?,
         };
+        if config.terminal_model.is_some()
+            && (!config.research_observation_only || !config.research_execution_probe)
+        {
+            bail!("terminal model requires observation-only linked execution probe mode");
+        }
         if config.symbols.is_empty()
             || !matches!(config.checkpoint_secs, 10 | 30 | 60)
             || config.scan_interval_ms < 25
@@ -550,7 +593,16 @@ impl DryRunConfig {
             || config.opening_max_skew_ms < 0
             || !(0.0..1.0).contains(&config.liquidity_haircut)
             || config.liquidity_haircut == 0.0
+            || !config.order_usdc.is_finite()
             || config.order_usdc < 1.0
+            || config.order_usdc
+                > config
+                    .paper_ledger
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("paper ledger lock poisoned"))?
+                    .snapshot()["max_asset_exposure_usdc"]
+                    .as_f64()
+                    .unwrap_or(0.0)
             || config.journal_min_free_bytes < 16 * 1024 * 1024
             || (config.journal_max_bytes != 0 && config.journal_max_bytes < 16 * 1024 * 1024)
             || (config.research_snapshot_interval_ms != 0
@@ -572,6 +624,16 @@ impl DryRunConfig {
                 if !model.has_group(asset, config.checkpoint_secs) {
                     bail!(
                         "research model has no fitted group for {asset}/{}s",
+                        config.checkpoint_secs
+                    );
+                }
+            }
+        }
+        if let Some(model) = &config.terminal_model {
+            for asset in &config.symbols {
+                if !model.has_group(asset, config.checkpoint_secs) {
+                    bail!(
+                        "terminal model has no candidates for {asset}/{}s",
                         config.checkpoint_secs
                     );
                 }
@@ -819,6 +881,9 @@ impl EventJournal {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        fs2::FileExt::try_lock_exclusive(&file)
+            .context("another SDDFV process owns this journal; use a separate batch")?;
         let repaired_bytes = repair_incomplete_journal_tail(path)?;
         if repaired_bytes > 0 {
             warn!(target: LIVE_TARGET, path = %path.display(), repaired_bytes,
@@ -849,7 +914,7 @@ impl EventJournal {
         }
         Ok(Self {
             state: Arc::new(Mutex::new(JournalState {
-                file: OpenOptions::new().create(true).append(true).open(path)?,
+                file,
                 bytes_written,
             })),
             run_id,
@@ -958,6 +1023,11 @@ fn repair_incomplete_journal_tail(path: &Path) -> Result<u64> {
 /// constructed anywhere in this path.
 pub async fn run_dry_run() -> Result<()> {
     let config = DryRunConfig::from_env()?;
+    let run_deadline_ms = check_staged_protocol(&config)?;
+    check_terminal_batch(
+        &config.results_file,
+        config.terminal_model.as_ref().map(|m| m.sha256.as_str()),
+    )?;
     let run_started_ms = Utc::now().timestamp_millis();
     let run_id = uuid::Uuid::new_v4().to_string();
     std::env::set_var("DRY_RUN", "true");
@@ -979,13 +1049,16 @@ pub async fn run_dry_run() -> Result<()> {
         config.journal_min_free_bytes,
         config.journal_max_bytes,
     )?;
+    // Recover virtual cash from this batch before writing a new run_started.
+    // Unknown/unconfirmed positions remain locked across restarts.
+    restore_paper_ledger(&config.results_file, &config.paper_ledger)?;
     let research_model_metadata = config.research_model.as_ref().map(|model| serde_json::json!({
         "sha256":model.sha256,
         "selected_by_asset":config.symbols.iter().map(|asset| {
             (asset.clone(), model.selected_name(asset, config.checkpoint_secs).unwrap_or("missing").to_string())
         }).collect::<BTreeMap<_,_>>()
     }));
-    journal.append(serde_json::json!({
+    let mut run_started_event = serde_json::json!({
         "event": "run_started",
         "recorded_at": Utc::now(),
         "strategy": "short-duration-digital-fair-value",
@@ -996,6 +1069,10 @@ pub async fn run_dry_run() -> Result<()> {
             "gaussian_floor_v1"
         },
         "research_model":research_model_metadata,
+        "paper_account":config.paper_ledger.lock().map_err(|_| anyhow::anyhow!("paper ledger lock poisoned"))?.snapshot(),
+        "terminal_model":config.terminal_model.as_ref().map(|model| serde_json::json!({
+            "sha256":model.sha256,"decision_role":"research_only",
+            "model_type":model.model_type(),"scale_unit":"terminal_return_bps"})),
         "config": {
             "symbols": config.symbols.clone(),
             "checkpoint_secs": config.checkpoint_secs,
@@ -1008,6 +1085,10 @@ pub async fn run_dry_run() -> Result<()> {
             "liquidity_haircut": config.liquidity_haircut,
             "min_edge": config.min_edge,
             "order_usdc": config.order_usdc,
+            "fee_rate_assumption":config.fee_rate,"fee_exponent_assumption":config.fee_exponent,
+            "min_price":config.min_price,"max_price":config.max_price,
+            "reference_buckets":config.capture_reference_buckets,
+            "audit_market_fees":config.audit_market_fees,
             "max_book_age_ms": config.max_book_age_ms,
             "max_feed_age_ms": config.max_feed_age_ms,
             "max_reference_local_age_ms":config.max_reference_local_age_ms,
@@ -1034,7 +1115,17 @@ pub async fn run_dry_run() -> Result<()> {
                 Some(RESEARCH_REFERENCE_GAP_MS)
             } else { None }
         }
-    }))?;
+    });
+    run_started_event["audit_capture_version"] =
+        serde_json::json!(opening_evidence::CAPTURE_VERSION);
+    run_started_event["experiment_mode"] =
+        serde_json::json!(read_experiment_mode(&config.results_file));
+    run_started_event["config"]["opening_evidence_sources"] =
+        serde_json::json!(["gamma_event_by_slug", "gamma_events_list"]);
+    run_started_event["config"]["reference_connections"] =
+        serde_json::json!("isolated_twap_and_research_spot");
+    journal.append(run_started_event)?;
+    resume_paper_resolutions(&config, &journal)?;
     let shutdown = Arc::new(AtomicBool::new(false));
     let signal_shutdown = shutdown.clone();
     tokio::spawn(async move {
@@ -1051,10 +1142,21 @@ pub async fn run_dry_run() -> Result<()> {
         let reference_journal = journal.clone();
         let reference_shutdown = shutdown.clone();
         let capture_raw_reference = config.research_capture_raw_reference;
+        let reference_history = config.reference_history.clone();
+        let capture_buckets = config.capture_reference_buckets;
         let last_reference_receives = Mutex::new(HashMap::<(String, String), i64>::new());
         let observer: PriceFeedObserver = Arc::new(move |sample| {
             if !observed_assets.contains(&sample.asset) {
                 return;
+            }
+            if capture_buckets {
+                match reference_history.lock() {
+                    Ok(mut history) => history.ingest(sample.clone()),
+                    Err(_) => {
+                        reference_shutdown.store(true, Ordering::Relaxed);
+                        return;
+                    }
+                }
             }
             let previous_received_at_ms = match last_reference_receives.lock() {
                 Ok(mut last) => last.insert(
@@ -1109,12 +1211,23 @@ pub async fn run_dry_run() -> Result<()> {
                 reference_shutdown.store(true, Ordering::Relaxed);
             }
         });
-        tokio::spawn(run_chainlink_twap_feed_with_research(
+        let connection_journal = journal.clone();
+        let connection_shutdown = shutdown.clone();
+        let connection_observer = Arc::new(move |mut event: Value| {
+            if event["event"].is_null() {
+                event["event"] = serde_json::json!("reference_feed_connection");
+            }
+            if connection_journal.append(event).is_err() {
+                connection_shutdown.store(true, Ordering::Relaxed);
+            }
+        });
+        tokio::spawn(run_fair_value_isolated_feeds(
             config.rtds_url.clone(),
             store.clone(),
             shutdown.clone(),
             feed_metrics,
             observer,
+            connection_observer,
         ));
     } else {
         tokio::spawn(run_chainlink_twap_feed(
@@ -1138,7 +1251,7 @@ pub async fn run_dry_run() -> Result<()> {
         results_file = %config.results_file.display(),
         "Short-Duration Digital Fair Value dry-run started (public read-only data)"
     );
-    while !shutdown.load(Ordering::Relaxed) {
+    while !shutdown.load(Ordering::Relaxed) && run_deadline_ms.is_none_or(|deadline| Utc::now().timestamp_millis()<deadline) {
         let discoverer = MarketDiscoverer::new(config.symbols.clone(), 5);
         let now = Utc::now();
         let window_start = discoverer.calculate_current_window_timestamp(now);
@@ -1147,6 +1260,35 @@ pub async fn run_dry_run() -> Result<()> {
         if markets.is_empty() {
             sleep(Duration::from_secs(2)).await;
             continue;
+        }
+        if config.research_execution_probe {
+            for market in &markets {
+                journal.append(serde_json::json!({"event":"checkpoint_capture",
+                    "recorded_at":Utc::now(),"slug":market.slug,"asset":market.crypto_symbol,
+                    "checkpoint_secs":config.checkpoint_secs,"window_end_ms":window_end_ms,
+                    "scheduled_at_ms":window_end_ms-config.checkpoint_secs*1000,
+                    "status":"planned","decision_role":"capture_audit_only"}))?;
+            }
+        }
+        if config.audit_market_fees {
+            for market in &markets {
+                let config = config.clone(); let market = market.clone();
+                let client = client.clone(); let journal = journal.clone(); let shutdown = shutdown.clone();
+                tokio::spawn(async move {
+                    let cutoff = window_end_ms - config.checkpoint_secs * 1000;
+                    while !shutdown.load(Ordering::Relaxed) && Utc::now().timestamp_millis() < cutoff {
+                        let audit=opening_evidence::fetch(&client,&market.slug,&market.market_id.to_string(),window_end_ms).await;
+                        if let Ok(mut cache)=config.opening_cache.lock() { cache.record(audit.clone()); }
+                        else { shutdown.store(true,Ordering::Relaxed); return; }
+                        if journal.append(serde_json::json!({"event":"opening_reference_observation",
+                            "recorded_at":Utc::now(),"slug":market.slug,"asset":market.crypto_symbol,
+                            "phase":"prefetch","decision_role":"opening_audit_only","evidence":audit})).is_err() {
+                            shutdown.store(true,Ordering::Relaxed); return;
+                        }
+                        sleep(Duration::from_secs(60)).await;
+                    }
+                });
+            }
         }
         let mut monitor = OrderBookMonitor::new();
         for market in &markets {
@@ -1177,7 +1319,8 @@ pub async fn run_dry_run() -> Result<()> {
             }
         }
         loop {
-            if shutdown.load(Ordering::Relaxed) || Utc::now().timestamp_millis() >= window_end_ms {
+            if shutdown.load(Ordering::Relaxed) || Utc::now().timestamp_millis() >= window_end_ms
+                || run_deadline_ms.is_some_and(|deadline|Utc::now().timestamp_millis()>=deadline) {
                 break;
             }
             tokio::select! {
@@ -1271,6 +1414,23 @@ pub async fn run_dry_run() -> Result<()> {
                 summary_delay_ms,
             ));
         }
+        if config.capture_reference_buckets && !shutdown.load(Ordering::Relaxed) {
+            for market in &markets {
+                let history=config.reference_history.clone();
+                let journal=journal.clone();
+                let asset=market.crypto_symbol.clone();
+                let slug=market.slug.clone();
+                tokio::spawn(async move {
+                    let wait_ms=(window_end_ms+10_000-Utc::now().timestamp_millis()).max(0) as u64;
+                    sleep(Duration::from_millis(wait_ms)).await;
+                    let now=Utc::now().timestamp_millis();
+                    let buckets=history.lock().ok().map(|h|h.audit(&asset,now,window_end_ms));
+                    let _=journal.append(serde_json::json!({"event":"terminal_reference_window",
+                        "recorded_at":Utc::now(),"slug":slug,"asset":asset,"window_end_ms":window_end_ms,
+                        "decision_role":"post_signal_audit_only","reference_buckets":buckets}));
+                });
+            }
+        }
         if !shutdown.load(Ordering::Relaxed) {
             sleep(Duration::from_millis(250)).await;
         }
@@ -1284,9 +1444,218 @@ pub async fn run_dry_run() -> Result<()> {
         "started_at_ms": run_started_ms,
         "stop_reason": stop_reason,
         "normal": run_result.is_ok()
+        ,"paper_account":config.paper_ledger.lock().ok().map(|ledger| ledger.snapshot())
     }));
     info!(target: LIVE_TARGET, normal = run_result.is_ok(), "Short-Duration Digital Fair Value dry-run stopped");
     run_result
+}
+
+fn check_terminal_batch(path: &Path, expected: Option<&str>) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    for line in BufReader::new(File::open(path)?).lines() {
+        let line = line?;
+        // Leave incomplete final journal lines to EventJournal's recovery code.
+        let Ok(event) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if event["event"] == "run_started" && event["terminal_model"]["sha256"].as_str() != expected
+        {
+            bail!("journal contains a different terminal model; use a NEW batch directory");
+        }
+    }
+    Ok(())
+}
+
+fn restore_paper_ledger(path: &Path, ledger: &Arc<Mutex<PaperLedger>>) -> Result<()> {
+    let mut ledger = ledger
+        .lock()
+        .map_err(|_| anyhow::anyhow!("paper ledger lock poisoned"))?;
+    for line in BufReader::new(File::open(path)?).lines() {
+        let event: Value = serde_json::from_str(&line?)?;
+        if event["event"] == "run_started" {
+            for key in [
+                "initial_balance_usdc",
+                "max_total_exposure_usdc",
+                "max_asset_exposure_usdc",
+            ] {
+                if let Some(value) = event["paper_account"][key].as_f64() {
+                    if Some(value) != ledger.snapshot()[key].as_f64() {
+                        bail!(
+                            "paper budget/exposure changed in an existing batch; use a NEW batch"
+                        );
+                    }
+                }
+            }
+        } else if event["event"] == "shadow_fill" {
+            ledger.reserve(
+                event["evaluation_id"].as_str().context("fill ID missing")?,
+                event["asset"].as_str().context("fill asset missing")?,
+                event["cost_usdc"].as_f64().context("fill cost missing")?
+                    + event["fees_usdc"].as_f64().context("fill fees missing")?,
+            )?;
+        } else if event["event"] == "resolution" {
+            if event["settlement_evidence"]["confirmation"] != "closed_terminal_prices" {
+                bail!("cannot restore unverified paper resolution");
+            }
+            let payout = if event["won"] == true {
+                event["shares"]
+                    .as_f64()
+                    .context("resolution shares missing")?
+            } else {
+                0.0
+            };
+            ledger.settle(
+                event["evaluation_id"]
+                    .as_str()
+                    .context("resolution ID missing")?,
+                payout,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn resume_paper_resolutions(config: &DryRunConfig, journal: &EventJournal) -> Result<()> {
+    let mut pending = BTreeMap::new();
+    for line in BufReader::new(File::open(&config.results_file)?).lines() {
+        let event: Value = serde_json::from_str(&line?)?;
+        if event["event"] == "shadow_fill" {
+            pending.insert(
+                event["evaluation_id"]
+                    .as_str()
+                    .context("missing fill ID")?
+                    .to_owned(),
+                event,
+            );
+        } else if event["event"] == "resolution" {
+            if let Some(id) = event["evaluation_id"].as_str() {
+                pending.remove(id);
+            }
+        }
+    }
+    for (id, event) in pending {
+        tokio::spawn(resolve_shadow_fill(
+            journal.clone(),
+            id,
+            event["slug"]
+                .as_str()
+                .context("missing pending slug")?
+                .to_owned(),
+            event["buy_up"]
+                .as_bool()
+                .context("missing pending direction")?,
+            event["asset"]
+                .as_str()
+                .context("missing pending asset")?
+                .to_owned(),
+            event["probability"]
+                .as_f64()
+                .context("missing pending probability")?,
+            event["shares"].as_f64().context("missing pending shares")?,
+            event["cost_usdc"]
+                .as_f64()
+                .context("missing pending cost")?,
+            event["fees_usdc"]
+                .as_f64()
+                .context("missing pending fees")?,
+            event["window_end_ms"]
+                .as_i64()
+                .context("missing pending end")?,
+            config.paper_ledger.clone(),
+        ));
+    }
+    Ok(())
+}
+
+fn check_staged_protocol(config: &DryRunConfig) -> Result<Option<i64>> {
+    let Some(model) = &config.terminal_model else {
+        return Ok(None);
+    };
+    if model.model_type() != "sddfv_terminal_residual_v2" {
+        return Ok(None);
+    }
+    let model_path = std::env::var("SHORT_DURATION_DIGITAL_FAIR_VALUE_TERMINAL_MODEL_FILE")?;
+    let root = Path::new(&model_path)
+        .parent()
+        .context("model parent missing")?;
+    let protocol_bytes = fs::read(root.join("protocol.json"))
+        .context("009 requires protocol.json; use staged runner")?;
+    let protocol: Value = serde_json::from_slice(&protocol_bytes)?;
+    let manifest: Value = serde_json::from_slice(
+        &fs::read(
+            config
+                .results_file
+                .parent()
+                .context("journal parent missing")?
+                .join("run-plan.json"),
+        )
+        .context(
+            "009 requires run-plan.json; use run_digital_fair_value_next_round.sh observe/start",
+        )?,
+    )?;
+    use sha2::{Digest, Sha256};
+    if manifest["audit_capture_version"] != opening_evidence::CAPTURE_VERSION {
+        bail!(
+            "opening/feed capture revision changed; use a NEW batch with the updated staged runner"
+        );
+    }
+    if protocol["model_sha256"] != model.sha256
+        || manifest["model_sha256"] != model.sha256
+        || manifest["protocol_sha256"] != format!("{:x}", Sha256::digest(&protocol_bytes))
+        || manifest["deadline_ms"].as_i64().unwrap_or(0) <= Utc::now().timestamp_millis()
+        || manifest["deadline_ms"].as_i64().unwrap_or(0)
+            - manifest["started_at_ms"].as_i64().unwrap_or(0)
+            > 14 * 86_400_000
+        || config.symbols != ["btc", "eth"]
+        || config.checkpoint_secs != 30
+        || !config.capture_reference_buckets
+        || !config.audit_market_fees
+    {
+        bail!("009 protocol/hash/deadline/settings mismatch; use staged runner and a NEW batch");
+    }
+    for (key, value) in [
+        ("budget", config.order_usdc),
+        ("slippage_bps", config.slippage_bps),
+        ("haircut", config.liquidity_haircut),
+        ("failure_rate", config.simulated_order_failure_rate),
+        ("min_edge", config.min_edge),
+        ("min_price", config.min_price),
+        ("max_price", config.max_price),
+    ] {
+        if protocol["execution_policy"][key].as_f64() != Some(value) {
+            bail!("009 frozen execution parameter mismatch: {key}");
+        }
+    }
+    let account = config
+        .paper_ledger
+        .lock()
+        .map_err(|_| anyhow::anyhow!("paper ledger poisoned"))?
+        .snapshot();
+    for (key, field) in [
+        ("initial_balance", "initial_balance_usdc"),
+        ("max_exposure", "max_total_exposure_usdc"),
+        ("max_asset_exposure", "max_asset_exposure_usdc"),
+    ] {
+        if protocol["execution_policy"][key].as_f64() != account[field].as_f64() {
+            bail!("009 frozen budget mismatch: {key}");
+        }
+    }
+    if manifest["mode"] == "start" {
+        let freeze: Value = serde_json::from_slice(
+            &fs::read(root.join("freeze.json")).context("009 start requires passed local gate")?,
+        )?;
+        if freeze["local_validation_passed"] != true
+            || freeze["model_sha256"] != model.sha256
+            || freeze["protocol_sha256"] != manifest["protocol_sha256"]
+        {
+            bail!("009 local freeze gate not passed");
+        }
+    } else if manifest["mode"] != "observe" {
+        bail!("009 unsupported run mode");
+    }
+    Ok(manifest["deadline_ms"].as_i64())
 }
 
 fn research_reference_gap_ms(
@@ -1296,6 +1665,15 @@ fn research_reference_gap_ms(
     previous_received_at_ms
         .and_then(|previous| received_at_ms.checked_sub(previous))
         .filter(|gap_ms| *gap_ms >= RESEARCH_REFERENCE_GAP_MS)
+}
+
+fn read_experiment_mode(journal: &Path) -> String {
+    journal
+        .parent()
+        .and_then(|root| fs::read(root.join("run-plan.json")).ok())
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|plan| plan["mode"].as_str().map(str::to_owned))
+        .unwrap_or_else(|| "unstaged_research".into())
 }
 
 /// Build an auditable calibration/readiness report from the append-only
@@ -1459,7 +1837,7 @@ fn dry_run_research_summary(events: &[Value]) -> Value {
                 reference_feed_max_gap_ms.max(event["gap_ms"].as_i64().unwrap_or(0));
         }
     }
-    serde_json::json!({"event_counts":event_counts,"market_evaluations":evaluations,
+    let mut summary = serde_json::json!({"event_counts":event_counts,"market_evaluations":evaluations,
         "window_rejection_counts":rejections,"terminal_market_window_counts":terminals,
         "rest_samples":rest_samples,"rest_average_ms":if rest_samples>0 {Some(rest_total as f64/rest_samples as f64)}else{None},"rest_max_ms":rest_max,
         "shadow_fill_decision_models":fill_decision_models,
@@ -1484,7 +1862,19 @@ fn dry_run_research_summary(events: &[Value]) -> Value {
             "configured_floor_bps":stats.configured_floor,
             "max_abs_opening_skew_ms":stats.max_abs_opening_skew_ms
         }))).collect::<BTreeMap<_,_>>(),
-        "notes":["Absent model observations in legacy data mean unknown, not zero floor usage.","Terminal counts describe the last recorded state, not every scan.","Research checkpoints are overlapping opportunity windows; compare separate runs without pooling correlated fills."]})
+        "notes":["Absent model observations in legacy data mean unknown, not zero floor usage.","Terminal counts describe the last recorded state, not every scan.","Research checkpoints are overlapping opportunity windows; compare separate runs without pooling correlated fills."]});
+    summary["paper_account"] = events
+        .iter()
+        .rev()
+        .find_map(|event| {
+            event
+                .get("paper_account")
+                .filter(|v| v.is_object())
+                .cloned()
+        })
+        .unwrap_or(Value::Null);
+    summary["capture_audit"] = opening_evidence::capture_summary(events);
+    summary
 }
 
 /// Recover a complete JSON event that was appended after a disk-full partial
@@ -1999,7 +2389,7 @@ pub fn run_dry_run_report() -> Result<PathBuf> {
         && eligible.pnl > 0.0
         && brier_score <= max_brier
         && all_assets_ready;
-    let report = serde_json::json!({
+    let mut report = serde_json::json!({
         "strategy":"short-duration-digital-fair-value",
         "generated_at":Utc::now(),"source":input,
         "overall":bucket_json(&overall),
@@ -2053,6 +2443,14 @@ pub fn run_dry_run_report() -> Result<PathBuf> {
             "all_assets_ready":all_assets_ready,"positive_total_pnl":eligible.pnl > 0.0,"sample_scope":"eligible"
         }
     });
+    report["experiment_mode"] = serde_json::json!(read_experiment_mode(&input));
+    report["profit_interpretation"] = serde_json::json!(
+        if report["experiment_mode"] == "observe" {
+            "Observation-only: zero fills/PnL is not a profitability test; use capture_audit and offline fixed-model analysis"
+        } else {
+            "Simulated accounting only; mode and independent evidence must be verified separately"
+        }
+    );
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -2135,6 +2533,38 @@ fn scan_live_markets(
                 guard.market_evaluations = guard.market_evaluations.saturating_add(1);
             }
         }
+        // Passive capture must not disappear because a decision prerequisite
+        // (opening sample, fresh reference, etc.) is missing. Such captures
+        // retain null forecasts and cannot enter execution/profit validation.
+        if config.research_execution_probe {
+            let inserted = attempted
+                .lock()
+                .map(|mut guard| guard.insert(market.slug.clone()))
+                .unwrap_or(false);
+            if inserted {
+                if journal
+                    .append(serde_json::json!({"event":"checkpoint_capture",
+                    "recorded_at":Utc::now(),"slug":market.slug,"asset":market.crypto_symbol,
+                    "checkpoint_secs":config.checkpoint_secs,"window_end_ms":window_end_ms,
+                    "scheduled_at_ms":window_end_ms-config.checkpoint_secs*1000,
+                    "status":"started","decision_role":"capture_audit_only"}))
+                    .is_err()
+                {
+                    record_window_rejection(stats, &market.slug, "checkpoint_journal_failed");
+                    continue;
+                }
+                tokio::spawn(capture_residual_execution_observation(
+                    config.clone(),
+                    market.clone(),
+                    store.clone(),
+                    client.clone(),
+                    journal.clone(),
+                    stats.clone(),
+                    window_end_ms,
+                ));
+            }
+            continue;
+        }
         let floor = config
             .min_volatility
             .get(&market.crypto_symbol)
@@ -2163,24 +2593,6 @@ fn scan_live_markets(
         };
         if !reference_transport_fresh(state, now_ms, config.max_reference_local_age_ms) {
             record_window_rejection(stats, &market.slug, "reference_transport_stale");
-            continue;
-        }
-        if config.research_execution_probe {
-            let inserted = attempted
-                .lock()
-                .map(|mut guard| guard.insert(market.slug.clone()))
-                .unwrap_or(false);
-            if inserted {
-                tokio::spawn(capture_residual_execution_observation(
-                    config.clone(),
-                    market.clone(),
-                    store.clone(),
-                    client.clone(),
-                    journal.clone(),
-                    stats.clone(),
-                    window_end_ms,
-                ));
-            }
             continue;
         }
         let audit_first = stats
@@ -2473,6 +2885,66 @@ fn residual_market_baseline(up: &Value, down: &Value) -> Value {
     serde_json::json!({"probability_up":null,"midpoint_up":null,"source":"unavailable"})
 }
 
+fn market_fee_evidence(market: &Value, slug: &str, condition: &str, observed_ms: i64) -> Value {
+    let mut audit = serde_json::json!({"verified":false,"source":"gamma_market",
+        "observed_at_ms":observed_ms,"slug":slug,"condition_id":condition,
+        "fees_enabled":market["feesEnabled"],"raw_schedule":market["feeSchedule"]});
+    if market["slug"] != slug || market["conditionId"].as_str() != Some(condition) {
+        audit["reason"] = Value::from("market_identity_mismatch");
+        return audit;
+    }
+    let parsed = || -> Option<(f64, u64)> {
+        if market["feesEnabled"] == false {
+            return Some((0.0, 1));
+        }
+        if market["feesEnabled"] != true {
+            return None;
+        }
+        let value = &market["feeSchedule"]["rate"];
+        let rate = value.as_f64().or_else(|| value.as_str()?.parse().ok())?;
+        let exponent = market["feeSchedule"]["exponent"].as_u64()?;
+        (rate.is_finite() && (0.0..=1.0).contains(&rate) && (1..=4).contains(&exponent))
+            .then_some((rate, exponent))
+    };
+    if let Some((rate, exponent)) = parsed() {
+        audit["verified"] = Value::Bool(true);
+        audit["rate"] = serde_json::json!(rate);
+        audit["exponent"] = serde_json::json!(exponent);
+        audit["formula"] = Value::from("shares * rate * (price * (1-price)) ** exponent");
+    } else {
+        audit["reason"] = Value::from("missing_or_invalid_fee_schedule");
+    }
+    audit
+}
+
+async fn audit_market_fee(client: &reqwest::Client, slug: &str, condition: &str) -> Value {
+    let result = async {
+        let response = client
+            .get("https://gamma-api.polymarket.com/markets")
+            .query(&[("slug", slug)])
+            .send()
+            .await?
+            .error_for_status()?;
+        let rows: Value = response.json().await?;
+        let row = rows
+            .as_array()
+            .and_then(|rows| rows.iter().find(|m| m["slug"] == slug))
+            .context("fee audit market not found")?;
+        Ok::<_, anyhow::Error>(market_fee_evidence(
+            row,
+            slug,
+            condition,
+            Utc::now().timestamp_millis(),
+        ))
+    }
+    .await;
+    result.unwrap_or_else(|error| {
+        serde_json::json!({"verified":false,"source":"gamma_market",
+        "slug":slug,"condition_id":condition,"observed_at_ms":Utc::now().timestamp_millis(),
+        "reason":"fee_lookup_failed","error":error.to_string()})
+    })
+}
+
 async fn residual_book_pair(
     config: &DryRunConfig,
     client: &reqwest::Client,
@@ -2514,68 +2986,248 @@ async fn capture_residual_execution_observation(
     stats: Arc<Mutex<DryRunWindowStats>>,
     window_end_ms: i64,
 ) {
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(20),
+        capture_residual_execution_inner(
+            config.clone(),
+            market.clone(),
+            store,
+            client,
+            journal.clone(),
+            stats.clone(),
+            window_end_ms,
+        ),
+    )
+    .await;
+    let reason = match outcome {
+        Ok(Ok(())) => return,
+        Ok(Err(reason)) => reason,
+        Err(_) => "checkpoint_capture_timeout",
+    };
+    record_window_rejection(&stats, &market.slug, reason);
+    let _ = journal.append(serde_json::json!({"event":"checkpoint_capture",
+        "recorded_at":Utc::now(),"slug":market.slug,"asset":market.crypto_symbol,
+        "checkpoint_secs":config.checkpoint_secs,"window_end_ms":window_end_ms,
+        "scheduled_at_ms":window_end_ms-config.checkpoint_secs*1000,
+        "status":"failed","reason":reason,"decision_role":"capture_audit_only"}));
+    warn!(slug=%market.slug,reason,"SDDFV checkpoint capture failed");
+}
+
+async fn capture_residual_execution_inner(
+    config: DryRunConfig,
+    market: MarketInfo,
+    store: Arc<ChainlinkTwapStore>,
+    client: reqwest::Client,
+    journal: EventJournal,
+    stats: Arc<Mutex<DryRunWindowStats>>,
+    window_end_ms: i64,
+) -> Result<(), &'static str> {
+    let condition_id = market.market_id.to_string();
+    let (market_fees, opening_lookup) = if config.audit_market_fees {
+        tokio::join!(
+            audit_market_fee(&client, &market.slug, &condition_id),
+            opening_evidence::fetch(&client, &market.slug, &condition_id, window_end_ms)
+        )
+    } else {
+        (
+            serde_json::json!({"verified":false,"source":"historical_static_assumption"}),
+            serde_json::json!({"verified":false,"slug":market.slug,"reason":"opening_audit_disabled"}),
+        )
+    };
+    if config.audit_market_fees {
+        if let Ok(mut cache) = config.opening_cache.lock() {
+            cache.record(opening_lookup.clone());
+        } else {
+            return Err("opening_cache_lock_failed");
+        }
+        if journal
+            .append(serde_json::json!({"event":"opening_reference_observation",
+            "recorded_at":Utc::now(),"slug":market.slug,"asset":market.crypto_symbol,
+            "phase":"checkpoint","decision_role":"opening_audit_only","evidence":opening_lookup}))
+            .is_err()
+        {
+            return Err("opening_audit_journal_failed");
+        }
+    }
     let signal_books = residual_book_pair(&config, &client, &market).await;
     record_residual_rest_stats(&stats, &signal_books);
     let signal_ms = signal_books["sampled_at_ms"].as_i64().unwrap_or_default();
-    let Some(state) = fresh_execution_state(
+    let (state, unavailable_reason) = residual_signal_readiness(
         &config,
         &store,
         &market.crypto_symbol,
         window_end_ms,
         signal_ms,
-    ) else {
-        record_window_rejection(&stats, &market.slug, "residual_signal_reference_not_ready");
-        let _ = journal.append(serde_json::json!({"event":"residual_capture_rejected","recorded_at":Utc::now(),
-            "slug":market.slug,"asset":market.crypto_symbol,"reason":"signal_reference_not_ready","books":signal_books}));
-        return;
-    };
+    );
     let baseline = residual_market_baseline(&signal_books["up"], &signal_books["down"]);
     let remaining = (window_end_ms - signal_ms) as f64 / 1000.0;
-    let probability = live_probability(state, remaining);
-    let model_audit = live_model_audit(state, window_end_ms - 300_000, signal_ms, remaining, true);
-    let research_model = research_model_audit(&config, &market.crypto_symbol, state, remaining);
+    let probability = state.map(|s| live_probability(s, remaining));
+    let model_audit =
+        state.map(|s| live_model_audit(s, window_end_ms - 300_000, signal_ms, remaining, true));
+    let research_model =
+        state.map(|s| research_model_audit(&config, &market.crypto_symbol, s, remaining));
     let episode_id = uuid::Uuid::new_v4().to_string();
-    let signal = serde_json::json!({"books":signal_books,"baseline":baseline,
+    let mut signal = serde_json::json!({"books":signal_books,"baseline":baseline,
+        "book_topology":opening_evidence::book_topology(&signal_books),
         "sampled_at_ms":signal_ms,"seconds_remaining":remaining,
+        "model_status":if state.is_some() {"ready"} else {"unavailable"},
+        "model_unavailable_reason":unavailable_reason,
         "probability_up":probability,"research_model":research_model,"model_audit":model_audit,
-        "opening_twap":state.opening,"current_twap":state.current,
-        "reference_timing":reference_timing_audit(state,signal_ms),
+        "opening_twap":state.map(|s|s.opening),"current_twap":state.map(|s|s.current),
+        "reference_timing":state.map(|s|reference_timing_audit(s,signal_ms)),
         "twap_anchors":twap_anchor_audit(&store,&market.crypto_symbol,signal_ms),
         "spot_asof":spot_asof_audit(&store,&market.crypto_symbol,signal_ms)});
-    if journal
-        .append(
-            serde_json::json!({"event":"model_observation","recorded_at":Utc::now(),
+    signal["market_fee_audit"] = market_fees;
+    let opening_audit = config
+        .opening_cache
+        .lock()
+        .ok()
+        .map(|cache| {
+            cache.snapshot(
+                &market.slug,
+                &market.market_id.to_string(),
+                window_end_ms,
+                signal_ms,
+            )
+        })
+        .unwrap_or(Value::Null);
+    let opening_error = opening_audit["official_price_to_beat"]
+        .as_f64()
+        .or_else(|| {
+            opening_audit["official_price_to_beat"]
+                .as_str()?
+                .parse::<f64>()
+                .ok()
+        })
+        .filter(|price| price.is_finite() && *price > 0.0)
+        .and_then(|price| {
+            state?
+                .opening
+                .to_f64()
+                .map(|opening| (opening / price).ln() * 10000.0)
+        });
+    signal["opening_reference_audit"] = opening_audit;
+    signal["opening_reference_audit"]["error_bps"] = serde_json::json!(opening_error);
+    signal["opening_reference_audit"]["verified_before_signal"] = serde_json::json!(
+        signal["opening_reference_audit"]["verified"] == true && opening_error.is_some()
+    );
+    signal["opening_reference_audit"]["within_tolerance"] =
+        serde_json::json!(opening_error.map(|error| error.abs() <= 0.5));
+    signal["opening_reference_audit"]["max_error_bps"] = serde_json::json!(0.5);
+    if config.capture_reference_buckets {
+        signal["reference_buckets"] = config
+            .reference_history
+            .lock()
+            .ok()
+            .map(|h| h.audit(&market.crypto_symbol, signal_ms, window_end_ms))
+            .unwrap_or(Value::Null);
+    }
+    let terminal_audit = state
+        .and_then(|_| config.terminal_model.as_ref())
+        .map(|model| {
+            model.audit(
+                &market.crypto_symbol,
+                config.checkpoint_secs,
+                &signal,
+                window_end_ms,
+            )
+        });
+    signal["terminal_model"] = serde_json::to_value(&terminal_audit).unwrap_or(Value::Null);
+    signal["temporal_audit"] = state
+        .map(|state| {
+            serde_json::json!({
+        "version":1,"reference_horizon_secs":(window_end_ms-state.observed_at_ms) as f64/1000.0,
+        "wall_remaining_secs":remaining,"legacy_sigma_unit":"bps_per_sqrt_second",
+        "terminal_sigma_unit":"terminal_return_bps",
+        "log_margin_bps":(state.current/state.opening).to_f64().map(|r|r.ln()*10000.0)})
+        })
+        .unwrap_or(Value::Null);
+    if state.is_some()
+        && journal
+            .append(
+                serde_json::json!({"event":"model_observation","recorded_at":Utc::now(),
         "episode_id":episode_id,"slug":market.slug,"asset":market.crypto_symbol,
         "checkpoint_secs":config.checkpoint_secs,"seconds_remaining":remaining,
         "observation_source":"residual_execution_probe","decision_model":"none_observation_only",
         "probability_up":probability,"model_audit":model_audit,"research_model":research_model,
+        "terminal_model":terminal_audit,
         "market_probability_up":baseline["midpoint_up"],"market_baseline":baseline,
-        "opening_twap":state.opening,"current_twap":state.current}),
-        )
-        .is_err()
+        "opening_twap":state.map(|s|s.opening),"current_twap":state.map(|s|s.current)}),
+            )
+            .is_err()
     {
-        return;
+        return Err("model_observation_journal_failed");
     }
     let wait_started = Instant::now();
     sleep(Duration::from_millis(config.execution_delay_ms)).await;
     let delayed_books = residual_book_pair(&config, &client, &market).await;
     record_residual_rest_stats(&stats, &delayed_books);
     let delayed_ms = delayed_books["sampled_at_ms"].as_i64().unwrap_or_default();
-    let _ = journal.append(serde_json::json!({"event":"residual_execution_observation","schema_version":1,
+    if journal.append(serde_json::json!({"event":"residual_execution_observation","schema_version":2,
         "recorded_at":Utc::now(),"episode_id":episode_id,"slug":market.slug,"asset":market.crypto_symbol,
         "checkpoint_secs":config.checkpoint_secs,"window_end_ms":window_end_ms,"signal":signal,
-        "delayed":{"books":delayed_books,"sampled_at_ms":delayed_ms,
+        "delayed":{"books":delayed_books,"book_topology":opening_evidence::book_topology(&delayed_books),"sampled_at_ms":delayed_ms,
             "actual_delay_ms":delayed_ms-signal_ms,"monotonic_delay_ms":wait_started.elapsed().as_millis(),
             "before_expiry":delayed_ms<window_end_ms},
         "execution_policy":{"order_usdc":config.order_usdc,"fee_rate":config.fee_rate,
             "fee_exponent":config.fee_exponent,"slippage_bps":config.slippage_bps,
             "failure_rate":config.simulated_order_failure_rate,"liquidity_haircut":config.liquidity_haircut,
             "min_partial_fill_ratio":config.min_partial_fill_ratio,"min_net_edge":config.min_edge},
-        "decision_role":"offline_replay_only","actual_order_submitted":false}));
+        "decision_role":"offline_replay_only","actual_order_submitted":false})).is_err() {
+        return Err("residual_journal_failed");
+    }
+    journal
+        .append(serde_json::json!({"event":"checkpoint_capture",
+        "recorded_at":Utc::now(),"slug":market.slug,"asset":market.crypto_symbol,
+        "checkpoint_secs":config.checkpoint_secs,"window_end_ms":window_end_ms,
+        "scheduled_at_ms":window_end_ms-config.checkpoint_secs*1000,
+        "status":"captured","model_status":if state.is_some(){"ready"}else{"unavailable"},
+        "reason":unavailable_reason,"decision_role":"capture_audit_only"}))
+        .map_err(|_| "checkpoint_completion_journal_failed")?;
     if let Ok(mut guard) = stats.lock() {
-        guard
-            .terminal_reason_by_market
-            .insert(market.slug, "residual_execution_observed".to_string());
+        if let Some(reason) = unavailable_reason {
+            guard.reject(&market.slug, reason);
+        }
+        guard.terminal_reason_by_market.insert(
+            market.slug,
+            if state.is_some() {
+                "residual_execution_observed"
+            } else {
+                "residual_observed_model_unavailable"
+            }
+            .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn residual_signal_readiness(
+    config: &DryRunConfig,
+    store: &ChainlinkTwapStore,
+    asset: &str,
+    end_ms: i64,
+    now_ms: i64,
+) -> (Option<FairValueTwapSnapshot>, Option<&'static str>) {
+    if now_ms >= end_ms {
+        return (None, Some("signal_after_expiry"));
+    }
+    match store.fair_value_snapshot_readiness(
+        asset,
+        end_ms - 300_000,
+        now_ms,
+        config.opening_max_skew_ms,
+        config.max_feed_age_ms,
+        config.volatility_lookback_secs,
+        config.min_observations,
+        config.min_volatility.get(asset).copied().unwrap_or(1.5),
+    ) {
+        FairValueSnapshotReadiness::Ready(s)
+            if reference_transport_fresh(s, now_ms, config.max_reference_local_age_ms) =>
+        {
+            (Some(s), None)
+        }
+        FairValueSnapshotReadiness::Ready(_) => (None, Some("reference_transport_stale")),
+        rejected => (None, rejected.reason()),
     }
 }
 
@@ -3877,14 +4529,19 @@ async fn execute_live_shadow(
         &execution_audit["model_audit"],
     );
     let expected_pnl = probability * fill.shares - cost - fees;
-    if let Ok(mut guard) = stats.lock() {
-        guard.shadow_fills = guard.shadow_fills.saturating_add(1);
-        guard.record_rest_latency(latency_ms);
-        guard
-            .terminal_reason_by_market
-            .insert(slug.clone(), "shadow_fill".to_string());
-    }
-    let _ = journal.append(serde_json::json!({
+    let paper_account = {
+        let Ok(mut ledger) = config.paper_ledger.lock() else {
+            return;
+        };
+        if let Err(reason) = ledger.reserve(&evaluation_id, &asset, cost + fees) {
+            record_window_rejection(&stats, &slug, &reason.to_string());
+            let _ = journal.append(serde_json::json!({"event":"shadow_rejected","evaluation_id":evaluation_id,
+                "slug":slug,"recorded_at":Utc::now(),"reason":reason.to_string(),"paper_account":ledger.snapshot()}));
+            return;
+        }
+        ledger.snapshot()
+    };
+    let mut fill_event = serde_json::json!({
         "event":"shadow_fill","evaluation_id":evaluation_id,"recorded_at":Utc::now(),
         "decision_model":"gaussian_floor_v1","research_model":research_forecast,
         "counterfactual_cohorts":counterfactual_cohorts,
@@ -3902,7 +4559,22 @@ async fn execute_live_shadow(
         "delayed_bid":delayed_bid,"delayed_ask":delayed_ask,"delayed_ask_size":delayed_ask_size,
         "raw_average_price":raw_average,"slippage_bps":config.slippage_bps,
         "slippage_cost_usdc":slippage_cost,"latency_bucket":latency_bucket(latency_ms)
-    }));
+    });
+    fill_event["paper_account"] = paper_account;
+    if let Err(error) = journal.append(fill_event) {
+        if let Ok(mut ledger) = config.paper_ledger.lock() {
+            ledger.cancel(&evaluation_id);
+        }
+        warn!(target: LIVE_TARGET, %error, "Paper fill journal failed; reservation cancelled");
+        return;
+    }
+    if let Ok(mut guard) = stats.lock() {
+        guard.shadow_fills = guard.shadow_fills.saturating_add(1);
+        guard.record_rest_latency(latency_ms);
+        guard
+            .terminal_reason_by_market
+            .insert(slug.clone(), "shadow_fill".to_string());
+    }
     info!(target: LIVE_TARGET, %asset, %slug, buy_up, shares = target, average_price = average,
         fees_usdc = fees, expected_pnl_usdc = expected_pnl, rest_latency_ms = latency_ms,
         "Fair-value shadow fill");
@@ -3917,6 +4589,7 @@ async fn execute_live_shadow(
         cost,
         fees,
         window_end_ms,
+        config.paper_ledger.clone(),
     ));
 }
 
@@ -3931,6 +4604,7 @@ async fn resolve_shadow_fill(
     cost: f64,
     fees: f64,
     window_end_ms: i64,
+    paper_ledger: Arc<Mutex<PaperLedger>>,
 ) {
     let wait_ms = (window_end_ms + 120_000 - Utc::now().timestamp_millis()).max(0) as u64;
     sleep(Duration::from_millis(wait_ms)).await;
@@ -3951,13 +4625,24 @@ async fn resolve_shadow_fill(
             if let Some((winner_up, terminal_prices)) = winner_up {
                 let won = winner_up == buy_up;
                 let realized_pnl = if won { shares } else { 0.0 } - cost - fees;
-                let _ = journal.append(serde_json::json!({
+                // Persist verified settlement before releasing cash. Journal
+                // failure leaves the position locked, rather than inventing funds.
+                if journal.append(serde_json::json!({
                     "event":"resolution","evaluation_id":evaluation_id,"recorded_at":Utc::now(),
                     "asset":asset,"slug":slug,"buy_up":buy_up,"probability":probability,
                     "winner_up":winner_up,"won":won,"shares":shares,"cost_usdc":cost,
                     "fees_usdc":fees,"realized_pnl_usdc":realized_pnl
                     ,"settlement_evidence":{"closed":true,"outcome_prices":terminal_prices,"confirmation":"closed_terminal_prices"}
-                }));
+                })).is_err() { return; }
+                if let Ok(mut ledger) = paper_ledger.lock() {
+                    if ledger
+                        .settle(&evaluation_id, if won { shares } else { 0.0 })
+                        .is_ok()
+                    {
+                        let _ = journal.append(serde_json::json!({"event":"paper_account_update","recorded_at":Utc::now(),
+                            "evaluation_id":evaluation_id,"paper_account":ledger.snapshot()}));
+                    }
+                }
                 info!(target: LIVE_TARGET, %slug, won, realized_pnl_usdc = realized_pnl,
                     "Fair-value shadow position resolved");
                 return;
@@ -4740,6 +5425,46 @@ fn env_decimal_list(name: &str, default: &[&str]) -> Result<Vec<Decimal>> {
 mod tests {
     #[tokio::test]
     async fn residual_capture_links_signal_and_delayed_depth_without_orders() {
+        let events = probe_fixture(true).await;
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0]["event"], "model_observation");
+        assert_eq!(events[1]["event"], "residual_execution_observation");
+        assert_eq!(events[0]["episode_id"], events[1]["episode_id"]);
+        assert!(events[1]["delayed"]["actual_delay_ms"].as_i64().unwrap() >= 1000);
+        assert_eq!(events[1]["delayed"]["books"]["up"]["valid"], true);
+        assert_eq!(events[1]["actual_order_submitted"], false);
+        assert_eq!(events[2]["status"], "captured");
+        assert_eq!(events[2]["model_status"], "ready");
+    }
+
+    #[tokio::test]
+    async fn residual_capture_keeps_both_books_when_opening_is_missing_without_fabricating_a_model()
+    {
+        let events = probe_fixture(false).await;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["event"], "residual_execution_observation");
+        let sig = &events[0]["signal"];
+        assert_eq!(sig["model_status"], "unavailable");
+        assert_eq!(sig["model_unavailable_reason"], "no_opening_reference");
+        for field in [
+            "probability_up",
+            "opening_twap",
+            "terminal_model",
+            "model_audit",
+        ] {
+            assert!(sig[field].is_null());
+        }
+        for phase in ["signal", "delayed"] {
+            for side in ["up", "down"] {
+                assert_eq!(events[0][phase]["books"][side]["valid"], true);
+            }
+        }
+        assert_eq!(events[0]["actual_order_submitted"], false);
+        assert_eq!(events[1]["status"], "captured");
+        assert_eq!(events[1]["model_status"], "unavailable");
+    }
+
+    async fn probe_fixture(with_opening: bool) -> Vec<Value> {
         use crate::late_resolution_winner_model::{RtdsReferenceSample, TwapSample};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4773,7 +5498,7 @@ mod tests {
         let start = now - 270_000;
         let end = start + 300_000;
         let store = Arc::new(ChainlinkTwapStore::default());
-        for second in 0..=270 {
+        for second in (if with_opening { 0 } else { 20 })..=270 {
             store.ingest(
                 "btc",
                 TwapSample {
@@ -4824,15 +5549,9 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str::<Value>(line).unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0]["event"], "model_observation");
-        assert_eq!(events[1]["event"], "residual_execution_observation");
-        assert_eq!(events[0]["episode_id"], events[1]["episode_id"]);
-        assert!(events[1]["delayed"]["actual_delay_ms"].as_i64().unwrap() >= 1000);
-        assert_eq!(events[1]["delayed"]["books"]["up"]["valid"], true);
-        assert_eq!(events[1]["actual_order_submitted"], false);
         drop(journal);
         let _ = fs::remove_file(temp);
+        events
     }
 
     #[test]
@@ -5223,6 +5942,11 @@ mod tests {
             min_price: 0.05,
             max_price: 0.95,
             order_usdc: 5.0,
+            paper_ledger: Arc::new(Mutex::new(PaperLedger::new(1000.0, 20.0, 10.0).unwrap())),
+            reference_history: Arc::new(Mutex::new(ReferenceHistory::default())),
+            capture_reference_buckets: false,
+            audit_market_fees: false,
+            opening_cache: Arc::new(Mutex::new(OpeningCache::default())),
             liquidity_haircut: 0.50,
             fee_rate: 0.07,
             fee_exponent: 1,
@@ -5232,6 +5956,7 @@ mod tests {
             journal_min_free_bytes: 16 * 1024 * 1024,
             journal_max_bytes: 0,
             research_model: None,
+            terminal_model: None,
             research_snapshot_interval_ms: 0,
             research_observation_only: false,
             research_capture_raw_reference: false,
@@ -5239,6 +5964,86 @@ mod tests {
             research_market_prior_weight: 0.75,
             research_min_entry_price: 0.30,
         }
+    }
+
+    #[test]
+    fn terminal_models_cannot_append_to_legacy_or_different_batches() {
+        let path = std::env::temp_dir().join(format!(
+            "sddfv-terminal-batch-{}.ndjson",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&path, "{\"event\":\"run_started\"}\n").unwrap();
+        assert!(super::check_terminal_batch(&path, None).is_ok());
+        assert!(super::check_terminal_batch(&path, Some("new-model")).is_err());
+        std::fs::write(
+            &path,
+            "{\"event\":\"run_started\",\"terminal_model\":{\"sha256\":\"new-model\"}}\n",
+        )
+        .unwrap();
+        assert!(super::check_terminal_batch(&path, Some("new-model")).is_ok());
+        assert!(super::check_terminal_batch(&path, Some("different-model")).is_err());
+        assert!(super::check_terminal_batch(&path, None).is_err());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn gamma_fee_schedule_requires_explicit_identity_and_parameters() {
+        let mut market = serde_json::json!({"slug":"test","conditionId":"0xabc","feesEnabled":true,
+            "feeSchedule":{"rate":"0.07","exponent":1}});
+        let audit = market_fee_evidence(&market, "test", "0xabc", 100);
+        assert_eq!(audit["verified"], true);
+        assert_eq!(audit["rate"], 0.07);
+        assert_eq!(
+            market_fee_evidence(&market, "test", "0xdef", 100)["verified"],
+            false
+        );
+        market["feeSchedule"] = Value::Null;
+        assert_eq!(
+            market_fee_evidence(&market, "test", "0xabc", 100)["verified"],
+            false
+        );
+        market["feesEnabled"] = Value::Bool(false);
+        assert_eq!(
+            market_fee_evidence(&market, "test", "0xabc", 100)["rate"],
+            0.0
+        );
+        market["feesEnabled"] = Value::Null;
+        assert_eq!(
+            market_fee_evidence(&market, "test", "0xabc", 100)["verified"],
+            false
+        );
+    }
+
+    #[test]
+    fn paper_ledger_restores_locked_cash_and_verified_resolution() {
+        let path =
+            std::env::temp_dir().join(format!("sddfv-ledger-{}.ndjson", uuid::Uuid::new_v4()));
+        let fill = serde_json::json!({"event":"shadow_fill","evaluation_id":"one","asset":"btc",
+            "cost_usdc":4.7,"fees_usdc":0.3});
+        fs::write(&path, format!("{fill}\n")).unwrap();
+        let ledger = Arc::new(Mutex::new(PaperLedger::new(1000.0, 20.0, 10.0).unwrap()));
+        restore_paper_ledger(&path, &ledger).unwrap();
+        assert_eq!(ledger.lock().unwrap().snapshot()["locked_cost_usdc"], 5.0);
+        let resolution = serde_json::json!({"event":"resolution","evaluation_id":"one","won":true,"shares":8.0,
+            "settlement_evidence":{"confirmation":"closed_terminal_prices"}});
+        fs::write(&path, format!("{fill}\n{resolution}\n")).unwrap();
+        let recovered = Arc::new(Mutex::new(PaperLedger::new(1000.0, 20.0, 10.0).unwrap()));
+        restore_paper_ledger(&path, &recovered).unwrap();
+        assert_eq!(
+            recovered.lock().unwrap().snapshot()["available_cash_usdc"],
+            1003.0
+        );
+        fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn journal_has_a_single_writer_lock() {
+        let path = std::env::temp_dir().join(format!("sddfv-lock-{}.ndjson", uuid::Uuid::new_v4()));
+        let first = EventJournal::open(&path, "first".into(), 16 * 1024 * 1024, 0).unwrap();
+        assert!(EventJournal::open(&path, "second".into(), 16 * 1024 * 1024, 0).is_err());
+        drop(first);
+        assert!(EventJournal::open(&path, "second".into(), 16 * 1024 * 1024, 0).is_ok());
+        fs::remove_file(&path).unwrap();
     }
 
     #[test]

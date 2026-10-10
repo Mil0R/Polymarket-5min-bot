@@ -1,0 +1,13 @@
+receiving incremental file list
+>f.st...... server-low-latency-006-5m/late-resolution-winner-trading.log
+              0   0%    0.00kB/s    0:00:00       18,180,444 100%    2.12GB/s    0:00:00 (xfr#1, to-chk=28/47)
+>f.st...... server-low-latency-006-5m/system.log
+              0   0%    0.00kB/s    0:00:00       17,999,980 100%   98.09MB/s    0:00:00 (xfr#2, to-chk=26/47)
+>f.st...... short-duration-digital-fair-value/market-offset-011-5m-30s/system.log
+              0   0%    0.00kB/s    0:00:00        1,109,176 100%    5.84MB/s    0:00:00 (xfr#3, to-chk=9/47)
+receiving incremental file list
+.d..t...... late-resolution-winner-trading/server-low-latency-006-5m/
+>f.st...... late-resolution-winner-trading/server-low-latency-006-5m/evaluations.ndjson
+              0   0%    0.00kB/s    0:00:00        7,378,395 100%    1.37GB/s    0:00:00 (xfr#1, to-chk=52/93)
+>f.st...... short-duration-digital-fair-value/market-offset-011-5m-30s/events.ndjson
+              0   0%    0.00kB/s    0:00:00      227,437,568  86%  202.52MB/s    0:00:00      264,035,036 100%  163.93MB/s    0:00:01 (xfr#2, to-chk=15/93)

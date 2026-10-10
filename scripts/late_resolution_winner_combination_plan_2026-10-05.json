@@ -1,0 +1,268 @@
+{
+  "schema_version": 1,
+  "study_id": "late-winner-combination-2026-10-05",
+  "registered_at": "2026-10-05T11:35:59Z",
+  "forward_window_start": "2026-10-05T11:40:00Z",
+  "inputs": [
+    {
+      "path": "results/late-resolution-winner-trading/server-low-latency-005-5m/evaluations.ndjson",
+      "bytes": 2636400,
+      "lines": 2633,
+      "sha256": "9100b685cd6d5c62e7d07d04f6a70cea3d609e94f201c5c1f02e86e533c2f11a"
+    },
+    {
+      "path": "results/late-resolution-winner-trading/server-low-latency-006-5m/evaluations.ndjson",
+      "bytes": 6111740,
+      "lines": 6041,
+      "sha256": "e09b1ffc6557f27e80ba84e15703e76bc246bc53d82487545fea377969c8d7da"
+    }
+  ],
+  "scope": {
+    "forward_run_id": "6bee8cdf-0766-40f5-98e4-e0f3825c7545",
+    "forward_source": "results/late-resolution-winner-trading/server-low-latency-006-5m/evaluations.ndjson",
+    "assets": [
+      "eth",
+      "btc"
+    ],
+    "mode": "paper",
+    "hybrid_paper_enabled": true,
+    "market_seconds": 300,
+    "order_budget_usdc": "5",
+    "primary_selection": "latest_main_execution_per_market",
+    "settlement_join": "execution.evaluation_id",
+    "sensitivity_only_excluded": true
+  },
+  "rules": [
+    {
+      "id": "control",
+      "label": "现有主研究轨道全部尝试",
+      "condition": {
+        "constant": true
+      }
+    },
+    {
+      "id": "probability_070",
+      "label": "概率 ≥0.70",
+      "condition": {
+        "field": "probability",
+        "op": "ge",
+        "value": ".70"
+      }
+    },
+    {
+      "id": "last_20s",
+      "label": "剩余时间 ≤20 秒",
+      "condition": {
+        "field": "remaining",
+        "op": "le",
+        "value": "20"
+      }
+    },
+    {
+      "id": "exclude_high_price_low_probability",
+      "label": "排除 ask≥0.97 且概率<0.70",
+      "condition": {
+        "not": {
+          "all": [
+            {
+              "field": "ask",
+              "op": "ge",
+              "value": ".97"
+            },
+            {
+              "field": "probability",
+              "op": "lt",
+              "value": ".70"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "exclude_joint_risk",
+      "label": "排除 ask≥0.97、概率<0.70、距离比<0.20 的交集",
+      "condition": {
+        "not": {
+          "all": [
+            {
+              "field": "ask",
+              "op": "ge",
+              "value": ".97"
+            },
+            {
+              "field": "probability",
+              "op": "lt",
+              "value": ".70"
+            },
+            {
+              "field": "ratio",
+              "op": "lt",
+              "value": ".20"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "price_tiered_probability_ratio",
+      "label": "按报价分档要求概率和距离比",
+      "condition": {
+        "any": [
+          {
+            "all": [
+              {
+                "field": "ask",
+                "op": "le",
+                "value": ".96"
+              },
+              {
+                "field": "probability",
+                "op": "ge",
+                "value": ".60"
+              },
+              {
+                "field": "ratio",
+                "op": "ge",
+                "value": ".10"
+              }
+            ]
+          },
+          {
+            "all": [
+              {
+                "field": "ask",
+                "op": "gt",
+                "value": ".96"
+              },
+              {
+                "field": "probability",
+                "op": "ge",
+                "value": ".70"
+              },
+              {
+                "field": "ratio",
+                "op": "ge",
+                "value": ".20"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ],
+  "baseline_at_registration": {
+    "all": {
+      "attempts": 341,
+      "filled_attempts": 255,
+      "settled_fills": 255,
+      "wins": 250,
+      "losses": 5,
+      "no_fills": 86,
+      "pending_attempts": 0,
+      "pending_fills": 0,
+      "pending_cost": "0",
+      "cost": "1271.39985476",
+      "shares": "1303.16",
+      "payout": "1277.61",
+      "pnl": "6.21014524",
+      "winning_pnl": "30.75693604",
+      "losing_pnl": "-24.54679080",
+      "roi": 0.004884494218518122,
+      "win_rate": 0.9803921568627451,
+      "wilson_95_lower": 0.95492836832479,
+      "break_even": 0.9756283608766383,
+      "settled_fill_days": 22,
+      "first_attempt_at": "2026-09-14T07:09:10Z",
+      "last_attempt_at": "2026-10-04T23:59:00Z",
+      "loss_markets": [
+        "eth-updown-5m-1789486200",
+        "eth-updown-5m-1790121600",
+        "eth-updown-5m-1790801700",
+        "eth-updown-5m-1790980500",
+        "eth-updown-5m-1791087000"
+      ]
+    },
+    "eth": {
+      "attempts": 294,
+      "filled_attempts": 214,
+      "settled_fills": 214,
+      "wins": 209,
+      "losses": 5,
+      "no_fills": 80,
+      "pending_attempts": 0,
+      "pending_fills": 0,
+      "pending_cost": "0",
+      "cost": "1066.63094218",
+      "shares": "1093.42",
+      "payout": "1067.87",
+      "pnl": "1.23905782",
+      "winning_pnl": "25.78584862",
+      "losing_pnl": "-24.54679080",
+      "roi": 0.0011616556120785234,
+      "win_rate": 0.9766355140186916,
+      "wilson_95_lower": 0.9464803572853617,
+      "break_even": 0.9754997550620987,
+      "settled_fill_days": 22,
+      "first_attempt_at": "2026-09-14T07:09:10Z",
+      "last_attempt_at": "2026-10-04T23:59:00Z",
+      "loss_markets": [
+        "eth-updown-5m-1789486200",
+        "eth-updown-5m-1790121600",
+        "eth-updown-5m-1790801700",
+        "eth-updown-5m-1790980500",
+        "eth-updown-5m-1791087000"
+      ]
+    },
+    "btc": {
+      "attempts": 47,
+      "filled_attempts": 41,
+      "settled_fills": 41,
+      "wins": 41,
+      "losses": 0,
+      "no_fills": 6,
+      "pending_attempts": 0,
+      "pending_fills": 0,
+      "pending_cost": "0",
+      "cost": "204.76891258",
+      "shares": "209.74",
+      "payout": "209.74",
+      "pnl": "4.97108742",
+      "winning_pnl": "4.97108742",
+      "losing_pnl": "0",
+      "roi": 0.02427657283210836,
+      "win_rate": 1.0,
+      "wilson_95_lower": 0.9143295511310926,
+      "break_even": 0.976298810813388,
+      "settled_fill_days": 11,
+      "first_attempt_at": "2026-09-15T23:24:08Z",
+      "last_attempt_at": "2026-10-04T16:59:20Z",
+      "loss_markets": []
+    }
+  },
+  "review_dates_beijing": {
+    "earliest": "2026-10-12",
+    "first_review": "2026-10-19",
+    "parameter_review_window": [
+      "2026-10-26",
+      "2026-11-09"
+    ]
+  },
+  "sample_targets": {
+    "new_settled_eth_fills_minimum": 300,
+    "new_settled_eth_fills_preferred": 500,
+    "comparable_eth_losses_minimum": 10,
+    "comparable_eth_losses_preferred": 15,
+    "per_rule_new_settled_eth_fills_minimum": 100,
+    "per_rule_new_settled_eth_fills_preferred": 200,
+    "per_rule_fill_days_minimum": 7
+  },
+  "automatic_promotion": false,
+  "interpretation": [
+    "Historical candidate selection is retrospective; only new full market windows are forward validation.",
+    "This is subset replay of recorded attempts, not re-entry simulation or account PnL.",
+    "Model probability and margin/boundary ratio are correlated, uncalibrated features.",
+    "Keep server strategy, confirmations, volatility floors and 5 USDC budget unchanged during validation.",
+    "Sample milestones and nominal Wilson intervals never automatically authorize a parameter change."
+  ],
+  "registration_sha256": "bd378ae9854cb7ae0bd118b96d20d378eb92a8485f3b1523f21590c3c74e4a3b"
+}
