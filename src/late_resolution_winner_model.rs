@@ -74,11 +74,21 @@ pub type PriceFeedConnectionObserver = Arc<dyn Fn(Value) + Send + Sync>;
 #[derive(Default)]
 pub struct ChainlinkTwapStore {
     samples: RwLock<HashMap<String, VecDeque<TwapSample>>>,
+    winner_statistics: Mutex<HashMap<String, CachedWinnerStatistics>>,
     /// Latest transport timestamps for the settlement TWAP.  Keep these
     /// separate from event-time price history so model math cannot
     /// accidentally substitute receive time for the settlement timestamp.
     twap_reference_timing: RwLock<HashMap<String, RtdsReferenceSample>>,
     research_spot_samples: RwLock<HashMap<String, VecDeque<RtdsReferenceSample>>>,
+}
+
+#[derive(Clone)]
+struct CachedWinnerStatistics {
+    current: TwapSample,
+    first_ms: i64,
+    count: usize,
+    observed_volatility: f64,
+    horizons: Vec<HorizonVolatility>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -303,6 +313,28 @@ impl ChainlinkTwapStore {
         })
     }
 
+    /// Best-effort display-only read. Never adds a subscription or blocks a writer.
+    pub(crate) fn dashboard_samples(
+        &self,
+        asset: &str,
+        window_ms: i64,
+        skew_ms: i64,
+    ) -> (Option<TwapSample>, Option<TwapSample>) {
+        let Ok(all) = self.samples.try_read() else {
+            return (None, None);
+        };
+        let Some(samples) = all.get(&normalize_asset(asset)) else {
+            return (None, None);
+        };
+        let current = samples.back().copied();
+        let opening = samples
+            .iter()
+            .filter(|s| (s.observed_at_ms - window_ms).abs() <= skew_ms)
+            .min_by_key(|s| (s.observed_at_ms - window_ms).abs())
+            .copied();
+        (current, opening)
+    }
+
     pub fn latest_observed_at_ms(&self, asset: &str) -> Option<i64> {
         let asset = normalize_asset(asset);
         self.samples
@@ -336,6 +368,15 @@ impl ChainlinkTwapStore {
             .collect()
     }
 
+    fn twap_receive_age_ms(&self, asset: &str, observed_at_ms: i64, now_ms: i64) -> Option<i64> {
+        self.twap_reference_timing
+            .read()
+            .ok()?
+            .get(asset)
+            .filter(|timing| timing.observed_at_ms == observed_at_ms)
+            .map(|timing| now_ms.saturating_sub(timing.received_at_ms))
+    }
+
     pub fn evaluate(&self, input: WinnerModelInput, policy: WinnerModelPolicy) -> ModelEvaluation {
         let asset = normalize_asset(input.asset);
         let all = self.samples.read().expect("TWAP store lock poisoned");
@@ -348,7 +389,15 @@ impl ChainlinkTwapStore {
         let Some(age_ms) = effective_sample_age_ms(input.now_ms, current.observed_at_ms) else {
             return ModelEvaluation::rejected(ModelRejection::StalePrice);
         };
-        if age_ms > policy.max_feed_age_ms {
+        if (policy.require_receive_timing
+            && self
+                .twap_receive_age_ms(&asset, current.observed_at_ms, input.now_ms)
+                .is_none())
+            || age_ms > policy.max_feed_age_ms
+            || self
+                .twap_receive_age_ms(&asset, current.observed_at_ms, input.now_ms)
+                .is_some_and(|age| age < 0 || age > policy.max_feed_age_ms)
+        {
             return ModelEvaluation::rejected(ModelRejection::StalePrice);
         }
         let Some(open) = samples
@@ -375,17 +424,62 @@ impl ChainlinkTwapStore {
         }
 
         let cutoff = input.now_ms - policy.volatility_lookback_secs as i64 * 1_000;
-        let history: Vec<_> = samples
+        // Stop at transport gaps; real jumps inside a continuous feed are retained.
+        let mut first_ms = current.observed_at_ms;
+        let mut previous_ms = current.observed_at_ms;
+        let mut count = 0;
+        for sample in samples
             .iter()
-            .copied()
-            .filter(|sample| sample.observed_at_ms >= cutoff)
-            .collect();
-        if history.len() < policy.min_observations {
+            .rev()
+            .take_while(|s| s.observed_at_ms >= cutoff)
+        {
+            if previous_ms - sample.observed_at_ms > 5_000 {
+                break;
+            }
+            first_ms = sample.observed_at_ms;
+            previous_ms = sample.observed_at_ms;
+            count += 1;
+        }
+        if count < policy.min_observations {
             return ModelEvaluation::rejected(ModelRejection::InsufficientObservations);
         }
-        let observed_volatility = volatility_bps_per_sqrt_second(&history);
+        let statistics = {
+            let mut cache = self
+                .winner_statistics
+                .lock()
+                .expect("winner statistics cache poisoned");
+            if let Some(cached) = cache.get(&asset).filter(|cached| {
+                cached.current == current && cached.first_ms == first_ms && cached.count == count
+            }) {
+                cached.clone()
+            } else {
+                let history: Vec<_> = samples
+                    .iter()
+                    .copied()
+                    .filter(|s| s.observed_at_ms >= first_ms)
+                    .collect();
+                let statistics = CachedWinnerStatistics {
+                    current,
+                    first_ms,
+                    count,
+                    observed_volatility: volatility_bps_per_sqrt_second(&history),
+                    horizons: [10, 20, 40, 60]
+                        .into_iter()
+                        .map(|seconds| horizon_volatility(&history, seconds))
+                        .collect(),
+                };
+                cache.insert(asset.clone(), statistics.clone());
+                statistics
+            }
+        };
+        let observed_volatility = statistics.observed_volatility;
         let volatility = observed_volatility.max(policy.min_volatility_bps_per_sqrt_second);
-        let remaining = input.seconds_remaining.max(1) as f64;
+        if input.remaining_ms <= 0 {
+            return ModelEvaluation::rejected(ModelRejection::Expired);
+        }
+        // The forecast starts at the source observation, not at receipt/evaluation.
+        let effective_horizon_ms = input.remaining_ms.saturating_add(age_ms);
+        let remaining = effective_horizon_ms as f64 / 1_000.0;
         let remaining_sigma_bps = volatility * remaining.sqrt();
         let open_value = open.value.to_f64().unwrap_or(0.0);
         let current_value = current.value.to_f64().unwrap_or(0.0);
@@ -410,11 +504,18 @@ impl ChainlinkTwapStore {
         let net_ev = probability - effective_price - policy.model_risk_buffer;
         let mut evaluation = ModelEvaluation {
             audit: Some(WinnerModelAudit {
-                version: 1,
+                version: 2,
+                effective_horizon_ms,
+                source_age_ms: age_ms,
+                received_age_ms: self.twap_receive_age_ms(
+                    &asset,
+                    current.observed_at_ms,
+                    input.now_ms,
+                ),
                 opening_observed_at_ms: open.observed_at_ms,
                 opening_skew_ms: open.observed_at_ms - input.window_start_ms,
                 current_age_ms: (input.now_ms - current.observed_at_ms).max(0),
-                observation_count: history.len(),
+                observation_count: statistics.count,
                 observed_volatility_bps: observed_volatility,
                 minimum_volatility_bps: policy.min_volatility_bps_per_sqrt_second,
                 volatility_floor_active: observed_volatility
@@ -424,10 +525,7 @@ impl ChainlinkTwapStore {
                         / (observed_volatility * remaining.sqrt()).max(0.000_001),
                 ),
                 reference_topic: "crypto_prices_twap_sixty".into(),
-                horizon_volatility: [10, 20, 40, 60]
-                    .into_iter()
-                    .map(|seconds| horizon_volatility(&history, seconds))
-                    .collect(),
+                horizon_volatility: statistics.horizons,
             }),
             rejection: failed_checks.first().copied(),
             failed_checks,
@@ -463,7 +561,7 @@ pub struct WinnerModelInput<'a> {
     pub asset: &'a str,
     pub window_start_ms: i64,
     pub now_ms: i64,
-    pub seconds_remaining: i64,
+    pub remaining_ms: i64,
     pub buy_yes: bool,
     pub bid_price: Decimal,
     pub ask_price: Decimal,
@@ -473,6 +571,7 @@ pub struct WinnerModelInput<'a> {
 #[derive(Debug, Clone, Copy)]
 pub struct WinnerModelPolicy {
     pub max_feed_age_ms: i64,
+    pub require_receive_timing: bool,
     pub max_opening_skew_ms: i64,
     pub volatility_lookback_secs: u64,
     pub min_observations: usize,
@@ -489,6 +588,7 @@ pub struct WinnerModelPolicy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelRejection {
     NoPriceHistory,
+    Expired,
     StalePrice,
     NoOpeningReference,
     InvalidPrice,
@@ -503,6 +603,12 @@ pub enum ModelRejection {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WinnerModelAudit {
     pub version: u32,
+    #[serde(default)]
+    pub effective_horizon_ms: i64,
+    #[serde(default)]
+    pub source_age_ms: i64,
+    #[serde(default)]
+    pub received_age_ms: Option<i64>,
     pub opening_observed_at_ms: i64,
     pub opening_skew_ms: i64,
     pub current_age_ms: i64,
@@ -566,7 +672,12 @@ pub fn sensitivity_decision(
     let volatility = audit
         .observed_volatility_bps
         .max(audit.minimum_volatility_bps * floor_scale);
-    let sigma = volatility * (seconds.max(1) as f64).sqrt();
+    let horizon = if audit.effective_horizon_ms > 0 {
+        audit.effective_horizon_ms as f64 / 1000.0
+    } else {
+        seconds.max(1) as f64
+    };
+    let sigma = volatility * horizon.sqrt();
     let probability =
         normal_cdf(model.directional_margin_bps / sigma.max(0.000001)).clamp(0.0001, 0.9999);
     let risk = policy.model_risk_buffer.to_f64().unwrap_or(1.0) * risk_scale;
@@ -1354,6 +1465,7 @@ mod tests {
 
     fn policy() -> WinnerModelPolicy {
         WinnerModelPolicy {
+            require_receive_timing: false,
             max_feed_age_ms: 2_000,
             max_opening_skew_ms: 1_000,
             volatility_lookback_secs: 120,
@@ -1396,7 +1508,7 @@ mod tests {
                 asset: "BTC",
                 window_start_ms: 0,
                 now_ms: 10_500,
-                seconds_remaining: 2,
+                remaining_ms: 2000,
                 buy_yes: true,
                 bid_price: dec!(0.95),
                 ask_price: dec!(0.96),
@@ -1421,7 +1533,7 @@ mod tests {
                 asset: "btc",
                 window_start_ms: 0,
                 now_ms: 10_500,
-                seconds_remaining: 30,
+                remaining_ms: 30000,
                 buy_yes: true,
                 bid_price: dec!(0.95),
                 ask_price: dec!(0.96),
@@ -1447,7 +1559,7 @@ mod tests {
                     asset: "btc",
                     window_start_ms: 0,
                     now_ms: 10_500,
-                    seconds_remaining: 30,
+                    remaining_ms: 30000,
                     buy_yes: true,
                     bid_price: dec!(0.95),
                     ask_price: dec!(0.96),
@@ -1498,7 +1610,7 @@ mod tests {
                 asset: "btc",
                 window_start_ms: 0,
                 now_ms: 10_500,
-                seconds_remaining: 30,
+                remaining_ms: 30000,
                 buy_yes: true,
                 bid_price: dec!(0.95),
                 ask_price: dec!(0.96),
@@ -1522,7 +1634,7 @@ mod tests {
             asset: "btc",
             window_start_ms: 0,
             now_ms: 10_500,
-            seconds_remaining: 30,
+            remaining_ms: 30000,
             buy_yes: true,
             bid_price: dec!(0.95),
             ask_price: dec!(0.96),
@@ -1657,7 +1769,7 @@ mod tests {
                 asset: "btc",
                 window_start_ms: 0,
                 now_ms: 10_500,
-                seconds_remaining: 30,
+                remaining_ms: 30000,
                 buy_yes: true,
                 bid_price: dec!(0.91),
                 ask_price: dec!(0.96),
@@ -1946,5 +2058,159 @@ mod tests {
         assert!(!attempt_allowed(1, 0, 1, 1));
         assert!(!attempt_allowed(0, 1, 2, 1));
         assert!(attempt_allowed(10, 0, 0, 1));
+    }
+    #[test]
+    fn forecast_horizon_includes_source_age_and_preserves_subsecond_precision() {
+        let store = seeded_store(dec!(100.5));
+        let input = WinnerModelInput {
+            asset: "btc",
+            window_start_ms: 1000,
+            now_ms: 11000,
+            remaining_ms: 1900,
+            buy_yes: true,
+            bid_price: dec!(0.95),
+            ask_price: dec!(0.97),
+            ask_size: dec!(100),
+        };
+        let a = store.evaluate(input, policy());
+        let b = store.evaluate(
+            WinnerModelInput {
+                now_ms: 12000,
+                remaining_ms: 900,
+                ..input
+            },
+            policy(),
+        );
+        assert_eq!(a.audit.as_ref().unwrap().effective_horizon_ms, 2900);
+        assert_eq!(a.probability, b.probability);
+        let c = store.evaluate(
+            WinnerModelInput {
+                remaining_ms: 2900,
+                ..input
+            },
+            policy(),
+        );
+        assert!(c.probability < a.probability);
+        assert_eq!(
+            store
+                .evaluate(
+                    WinnerModelInput {
+                        remaining_ms: 0,
+                        ..input
+                    },
+                    policy()
+                )
+                .rejection,
+            Some(ModelRejection::Expired)
+        );
+    }
+
+    #[test]
+    fn local_receive_freshness_cannot_hide_stale_source_or_stale_transport() {
+        let store = seeded_store(dec!(100.5));
+        let strict = WinnerModelPolicy {
+            require_receive_timing: true,
+            ..policy()
+        };
+        let missing = store.evaluate(
+            WinnerModelInput {
+                asset: "btc",
+                window_start_ms: 1000,
+                now_ms: 11000,
+                remaining_ms: 1900,
+                buy_yes: true,
+                bid_price: dec!(0.95),
+                ask_price: dec!(0.97),
+                ask_size: dec!(100),
+            },
+            strict,
+        );
+        assert_eq!(missing.rejection, Some(ModelRejection::StalePrice));
+        store.ingest_twap_reference_timing(RtdsReferenceSample {
+            topic: "crypto_prices_twap_sixty".into(),
+            symbol: "btc/usd".into(),
+            asset: "btc".into(),
+            observed_at_ms: 10000,
+            publisher_at_ms: None,
+            received_at_ms: 5000,
+            value: dec!(100.5),
+        });
+        let input = WinnerModelInput {
+            asset: "btc",
+            window_start_ms: 1000,
+            now_ms: 11000,
+            remaining_ms: 1900,
+            buy_yes: true,
+            bid_price: dec!(0.95),
+            ask_price: dec!(0.97),
+            ask_size: dec!(100),
+        };
+        assert_eq!(
+            store.evaluate(input, policy()).rejection,
+            Some(ModelRejection::StalePrice)
+        );
+        store.ingest_twap_reference_timing(RtdsReferenceSample {
+            topic: "crypto_prices_twap_sixty".into(),
+            symbol: "btc/usd".into(),
+            asset: "btc".into(),
+            observed_at_ms: 10000,
+            publisher_at_ms: None,
+            received_at_ms: 16000,
+            value: dec!(100.5),
+        });
+        assert_eq!(
+            store
+                .evaluate(
+                    WinnerModelInput {
+                        now_ms: 16000,
+                        ..input
+                    },
+                    policy()
+                )
+                .rejection,
+            Some(ModelRejection::StalePrice)
+        );
+    }
+
+    #[test]
+    fn reconnect_gap_requires_new_continuous_history_without_clipping_real_jumps() {
+        let store = seeded_store(dec!(110));
+        let input = WinnerModelInput {
+            asset: "btc",
+            window_start_ms: 1000,
+            now_ms: 11000,
+            remaining_ms: 1900,
+            buy_yes: true,
+            bid_price: dec!(0.95),
+            ask_price: dec!(0.97),
+            ask_size: dec!(100),
+        };
+        assert!(
+            store
+                .evaluate(input, policy())
+                .audit
+                .unwrap()
+                .observed_volatility_bps
+                > 100.0
+        );
+        store.ingest(
+            "btc",
+            TwapSample {
+                observed_at_ms: 20000,
+                value: dec!(110),
+            },
+        );
+        assert_eq!(
+            store
+                .evaluate(
+                    WinnerModelInput {
+                        now_ms: 20000,
+                        ..input
+                    },
+                    policy()
+                )
+                .rejection,
+            Some(ModelRejection::InsufficientObservations)
+        );
     }
 }

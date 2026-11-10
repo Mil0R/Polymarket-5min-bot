@@ -26,6 +26,7 @@ use crate::late_resolution_winner_model::{
     attempt_allowed, run_chainlink_twap_feed, ChainlinkTwapStore, WinnerConfirmationTracker,
     WinnerModelInput, WinnerModelPolicy,
 };
+use crate::late_resolution_winner_price_cap::PriceCapStudy;
 use crate::late_resolution_winner_trading::{
     detect_winner_asks, fee_inclusive_depth_capped_size, received_at_is_fresh,
     settle_late_resolution_winner_trading, winner_books_need_rest, winner_research_cohorts,
@@ -45,6 +46,21 @@ use crate::wind_down_service::{ScheduledMergeService, WindDownService};
 use crate::window_event_loop::{WindowEventLoopState, WindowExitReason};
 use crate::window_session::WindowSession;
 use crate::window_session_runner::WindowSessionRunner;
+
+/// Confirmed candidates are ranked together; execution still rechecks all gates.
+struct WinnerCandidate<'a> {
+    market: &'a crate::market::discoverer::MarketInfo,
+    signal: crate::late_resolution_winner_trading::WinnerSignal,
+    model: crate::late_resolution_winner_model::ModelEvaluation,
+    token: polymarket_client_sdk::types::U256,
+    ask_size: rust_decimal::Decimal,
+    fee_per_share: rust_decimal::Decimal,
+    hybrid_paper_admitted: bool,
+    candidate_stage: &'static str,
+    evaluation_id: String,
+    book_received_at_ms: i64,
+    expected_profit: rust_decimal::Decimal,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeProfile {
@@ -294,7 +310,7 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
     // Initialize market discovery and strategy components.
     let _discoverer =
         MarketDiscoverer::new(config.crypto_symbols.clone(), config.market_period_minutes);
-    let _scheduler = MarketScheduler::new(_discoverer, config.market_refresh_advance_secs);
+    let mut _scheduler = MarketScheduler::new(_discoverer, config.market_refresh_advance_secs);
 
     // Validate private key format
     info!("Verifying private key format...");
@@ -371,6 +387,7 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                 .arbitrage_paper_emergency_unwind_min_price,
             paper_late_resolution_winner_trading_delay_ms: config
                 .paper_late_resolution_winner_trading_delay_ms,
+            winner_read_timeout_ms: config.late_resolution_winner_trading_max_rest_latency_ms,
         },
     ));
 
@@ -493,6 +510,33 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                 config.late_resolution_winner_trading_journal_min_free_bytes,
             )?,
         );
+        if config.dry_run {
+            for attempt in journal.unresolved_attempts() {
+                if attempt.paper == Some(true) {
+                    journal.record_failed(
+                        &attempt,
+                        "PAPER interrupted before durable fill; no account write",
+                    )?;
+                } else {
+                    warn!(position_id=%attempt.position_id, "PAPER startup preserves live/legacy uncertain write; offline audit required");
+                }
+            }
+        } else {
+            reconcile_winner_attempts(&journal, &executor).await;
+            let unresolved = journal.unresolved_attempts();
+            if !unresolved.is_empty() {
+                winner_position_tracker
+                    .set_active_order_exposure(unresolved.iter().map(|p| p.planned_cost).sum());
+                live_safety.trip(format!(
+                    "{} winner attempt(s) need reconciliation",
+                    unresolved.len()
+                ));
+                service_health.set_safety_ok(false);
+            }
+        }
+        if !config.dry_run && !config.late_resolution_winner_trading_auto_redeem {
+            warn!("Winner AUTO_REDEEM=false: resolved payouts remain locked until an operator redeems them");
+        }
         let restored = journal.pending().len();
         if restored > 0 {
             warn!(target: "polypulse::strategy::late_resolution_winner_trading",
@@ -557,10 +601,17 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
         None
     };
     let winner_evaluation_journal = if late_resolution_winner_trading_available {
-        let journal = Arc::new(WinnerEvaluationJournal::open_with_min_free_bytes(
-            &config.late_resolution_winner_trading_evaluation_journal_file,
-            config.late_resolution_winner_trading_journal_min_free_bytes,
-        )?);
+        let journal = Arc::new(if config.dry_run {
+            WinnerEvaluationJournal::open_with_min_free_bytes(
+                &config.late_resolution_winner_trading_evaluation_journal_file,
+                config.late_resolution_winner_trading_journal_min_free_bytes,
+            )?
+        } else {
+            WinnerEvaluationJournal::open_buffered(
+                &config.late_resolution_winner_trading_evaluation_journal_file,
+                config.late_resolution_winner_trading_journal_min_free_bytes,
+            )?
+        });
         journal.record_run_started(
             &run_id.to_string(),
             execution_mode,
@@ -571,6 +622,56 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
     } else {
         None
     };
+    let winner_price_cap_study = PriceCapStudy::from_env(&config, &run_id.to_string())?;
+    let winner_operator_study = if profile == RuntimeProfile::LateResolutionWinnerTradingDryRun {
+        if let Some(baseline) = &winner_price_cap_study {
+            let path = std::env::var("LATE_RESOLUTION_WINNER_PRICE_CAP_STUDY_FILE").unwrap_or_else(|_| "results/late-resolution-winner-trading/server-low-latency-007-5m/price-cap-study.ndjson".into());
+            Some(baseline.operator_from(
+                &crate::winner_dashboard::control::journal(std::path::Path::new(&path)),
+                config.late_resolution_winner_trading_journal_min_free_bytes,
+                &run_id.to_string(),
+            )?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    // Read-only local display service. No viewers means no quote serialization or book reads.
+    let winner_display = if profile == RuntimeProfile::LateResolutionWinnerTradingDryRun
+        && winner_price_cap_study.is_some()
+    {
+        let path = std::env::var("LATE_RESOLUTION_WINNER_PRICE_CAP_STUDY_FILE").unwrap_or_else(|_|"results/late-resolution-winner-trading/server-low-latency-007-5m/price-cap-study.ndjson".into());
+        let display = crate::winner_dashboard::live::LiveState::new(
+            &run_id.to_string(),
+            std::path::Path::new(&path),
+        );
+        if let Some(operator) = &winner_operator_study {
+            display.set_operator(operator.clone());
+        }
+        match crate::winner_dashboard::live::start(
+            display.clone(),
+            winner_twap_store.clone(),
+            runtime_metrics.clone(),
+            shutdown.clone(),
+            config.late_resolution_winner_trading_feed_max_age_ms,
+            config.late_resolution_winner_trading_max_book_age_ms,
+            config.late_resolution_winner_trading_opening_max_skew_ms,
+        ) {
+            Ok(socket) => {
+                info!(path=%socket.display(), "Winner read-only TUI socket ready");
+                Some(display)
+            }
+            Err(error) => {
+                warn!(%error, "Winner TUI socket unavailable; strategy continues headless");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    _scheduler.set_dashboard(winner_display.clone());
+
     let protected_winner_tokens = Arc::new(RwLock::new(
         late_resolution_winner_trading_journal
             .as_ref()
@@ -579,6 +680,7 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                     .pending()
                     .into_iter()
                     .chain(journal.awaiting_redeem())
+                    .chain(journal.unresolved_attempts())
                     .filter_map(|buy| {
                         polymarket_client_sdk::types::U256::from_str(&buy.token_id).ok()
                     })
@@ -658,6 +760,7 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
     let mut last_winner_settle_check = Instant::now();
     let mut winner_position_settlement_backoff = SettlementBackoff::default();
     let mut winner_evaluation_settlement_backoff = SettlementBackoff::default();
+    let mut winner_price_cap_settlement_backoff = SettlementBackoff::default();
     let late_resolution_winner_trading_risk_policy = LateResolutionWinnerTradingRiskPolicy {
         max_strategy_loss: rust_decimal::Decimal::try_from(
             config.late_resolution_winner_trading_max_strategy_loss_usdc,
@@ -779,6 +882,9 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
     #[allow(unreachable_code)]
     loop {
         winner_loop_heartbeat.fetch_add(1, Ordering::Relaxed);
+        if let Some(display) = &winner_display {
+            display.loop_tick();
+        }
         if shutdown.load(Ordering::Relaxed) {
             tracing::info!("Shutdown requested from dashboard");
             return Ok(());
@@ -880,9 +986,18 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
         let late_resolution_winner_trading_production_count = Arc::new(AtomicU32::new(0));
         let late_resolution_winner_trading_hybrid_count = Arc::new(AtomicU32::new(0));
         let mut winner_attempts_by_market: HashMap<String, u32> = HashMap::new();
+        let mut winner_feed_disconnects = runtime_metrics
+            .snapshot()
+            .late_resolution_winner_trading_rtds_disconnects;
         let mut winner_confirmations = WinnerConfirmationTracker::default();
         let mut winner_shadow_confirmations = WinnerConfirmationTracker::default();
         let mut winner_shadow_executed = HashSet::new();
+        for study in [&winner_price_cap_study, &winner_operator_study]
+            .into_iter()
+            .flatten()
+        {
+            study.clear_confirmations();
+        }
         let mut winner_sensitivity_confirmations: Vec<_> = (0..8)
             .map(|_| WinnerConfirmationTracker::default())
             .collect();
@@ -921,6 +1036,9 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
             ));
         });
 
+        if let Some(display) = &winner_display {
+            display.monitoring();
+        }
         // Create market mapping (condition_id -> (yes_token_id, no_token_id)) for position balance
         let market_token_map = window_session.market_tokens().clone();
         let window_scope = window_session.scope();
@@ -979,9 +1097,14 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
 
         let session_runner = WindowSessionRunner::new(&markets, &config, runtime_metrics.clone());
         let mut event_loop_state = WindowEventLoopState::default();
+        // Persistent timer: book/user events must not restart the scan deadline.
+        let mut winner_scan_timer = winner_scan_interval();
         // Monitor orderbook updates
         loop {
             winner_loop_heartbeat.fetch_add(1, Ordering::Relaxed);
+            if let Some(display) = &winner_display {
+                display.loop_tick();
+            }
             // Wind-down check: run once when <= N minutes to window end (stay in loop until natural switch by new-window detection)
             // Use second precision; num_minutes() truncation may miss in 5min windows
             if window_session
@@ -1477,12 +1600,27 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                 }
 
                 // Periodic check: 1) new 5min window 2) wind-down trigger
-                _ = sleep(Duration::from_secs(1)) => {
+                _ = winner_scan_timer.tick() => {
+                    if let Some(operator) = &winner_operator_study { let _ = operator.activate_operator(Utc::now()); }
                     if shutdown.load(Ordering::Relaxed) {
                         return Ok(());
                     }
 
                     let now = Utc::now();
+                    if let Some(display) = &winner_display {
+                        display.connected(matches!(monitor.connection_state(), MarketWsConnectionState::Connected));
+                        if display.interested() {
+                            for market in &markets {
+                                let up = market.yes_token_id.to_string().parse::<polymarket_client_sdk::types::U256>().ok().and_then(|t| monitor.winner_book_top(t));
+                                let down = market.no_token_id.to_string().parse::<polymarket_client_sdk::types::U256>().ok().and_then(|t| monitor.winner_book_top(t));
+                                display.book(crate::winner_dashboard::live::Quote {
+                                    asset:market.crypto_symbol.to_ascii_lowercase(),slug:market.slug.clone(),window_start:market.end_date.timestamp()-300,
+                                    up_ask:up.as_ref().and_then(|b|b.ask_price),down_ask:down.as_ref().and_then(|b|b.ask_price),
+                                    up_ms:up.as_ref().map(|b|b.received_at_ms),down_ms:down.as_ref().map(|b|b.received_at_ms),..Default::default()
+                                });
+                            }
+                        }
+                    }
                     match monitor.connection_state() {
                         MarketWsConnectionState::Connected if market_ws_reconnecting => {
                             runtime_metrics.record_sdk_market_ws_recovery();
@@ -1643,10 +1781,27 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                         );
                     });
 
+                    let feed_disconnects = runtime_metrics.snapshot().late_resolution_winner_trading_rtds_disconnects;
+                    if feed_disconnects != winner_feed_disconnects {
+                        winner_feed_disconnects = feed_disconnects;
+                        winner_confirmations.clear();
+                        winner_shadow_confirmations.clear();
+                        for tracker in &mut winner_sensitivity_confirmations { tracker.clear(); }
+                        for study in [&winner_price_cap_study, &winner_operator_study].into_iter().flatten() { study.clear_confirmations(); }
+                    }
                     if !strategy_controls.late_resolution_winner_trading_enabled() {
                         winner_confirmations.clear();
                         winner_shadow_confirmations.clear();
                         for tracker in &mut winner_sensitivity_confirmations { tracker.clear(); }
+                    }
+                    if !strategy_controls.late_resolution_winner_trading_enabled()
+                        || !matches!(monitor.connection_state(), MarketWsConnectionState::Connected)
+                        || !user_ws_connected
+                    {
+                        winner_confirmations.clear();
+                        winner_shadow_confirmations.clear();
+                        for tracker in &mut winner_sensitivity_confirmations { tracker.clear(); }
+                        for study in [&winner_price_cap_study, &winner_operator_study].into_iter().flatten() { study.clear_confirmations(); }
                     }
 
                     // Window-end late-resolution-winner-trading (strategy B): when the window is
@@ -1670,9 +1825,21 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                         && last_winner_settle_check.elapsed() >= Duration::from_secs(10)
                     {
                         last_winner_settle_check = Instant::now();
+                        if let Some(display) = &winner_display { display.settling(); }
                         let winner_journal = late_resolution_winner_trading_journal
                             .as_ref()
                             .expect("late-resolution-winner-trading journal initialized");
+                        if !config.dry_run && live_safety.is_tripped() && !winner_journal.unresolved_attempts().is_empty() {
+                            reconcile_winner_attempts(winner_journal, &executor).await;
+                            winner_position_tracker.set_active_order_exposure(winner_journal.unresolved_attempts().iter().map(|p|p.planned_cost).sum());
+                            for p in winner_journal.pending() {
+                                if let Ok(token) = polymarket_client_sdk::types::U256::from_str(&p.token_id) {
+                                    let missing = (p.filled - winner_position_tracker.get_position(token)).max(dec!(0));
+                                    if missing > dec!(0) { winner_position_tracker.record_buy_fill(token, p.price, missing); }
+                                    protected_winner_tokens.write().expect("winner tokens poisoned").insert(token);
+                                }
+                            }
+                        }
                         let pending = winner_journal.pending();
                         if !pending.is_empty() {
                             for buy in pending {
@@ -1681,37 +1848,10 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                                 {
                                     continue;
                                 }
-                                match _scheduler
-                                    .fetch_closed_markets_by_slug(vec![buy.slug.clone()])
-                                    .await
-                                {
-                                    Ok(markets) => {
-                                        if markets.is_empty() {
-                                            runtime_metrics
-                                                .record_late_resolution_winner_trading_settlement_empty_result();
-                                            let retry_in_secs = winner_position_settlement_backoff
-                                                .record_retry(&buy.slug, now.timestamp_millis());
-                                            debug!(target: "polypulse::strategy::late_resolution_winner_trading",
-                                                slug = %buy.slug,
-                                                retry_in_secs,
-                                                "Late-Resolution Winner Trading closed-market settlement query returned no market"
-                                            );
-                                            continue;
-                                        }
-                                        let settlement = markets.iter().find_map(|m| {
-                                            let prices = m.outcome_prices.as_ref()?;
-                                            if prices.len() == 2 {
-                                                Some((
-                                                    m.closed.unwrap_or(false),
-                                                    (prices[0], prices[1]),
-                                                ))
-                                            } else {
-                                                None
-                                            }
-                                        });
-                                        if let Some(pnl) = settlement.and_then(|(closed, prices)| {
-                                            settle_late_resolution_winner_trading(&buy, now, closed, &prices)
-                                        }) {
+                                let mut buy = buy;
+                                match resolve_winner_position(&_scheduler, &mut buy, Utc::now(),
+                                    config.late_resolution_winner_trading_settlement_alert_secs, !config.dry_run).await {
+                                    Ok(Some(pnl)) => {
                                             winner_position_settlement_backoff.clear(&buy.slug);
                                             match winner_journal.record_settled(&buy, pnl) {
                                                 Ok(true) => {
@@ -1732,9 +1872,9 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                                                     continue;
                                                 }
                                             }
-                                            let won = pnl > dec!(0);
-                                            let cost = buy.filled * buy.price;
-                                            let payout = if won { buy.filled } else { dec!(0) };
+                                            let cost = buy.cost();
+                                            let payout = (cost + pnl).max(dec!(0));
+                                            let won = payout > dec!(0);
                                             if let Some(snapshot) =
                                                 executor.settle_paper_winner(cost, payout)
                                             {
@@ -1791,7 +1931,7 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                                                     }
                                                 }
                                             }
-                                            live_safety.record_winner_settlement(cost, won);
+                                            live_safety.record_winner_pnl(pnl);
                                             runtime_metrics.record_late_resolution_winner_trading_settlement(pnl);
                                             runtime_metrics
                                                 .set_late_resolution_winner_trading_pending(winner_journal.pending().len());
@@ -1817,28 +1957,16 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                                                 open_positions = winner_summary.open_positions,
                                                 "🏁 Late-Resolution Winner Trading settled (realized)"
                                             );
-                                        } else {
-                                            runtime_metrics
-                                                .record_late_resolution_winner_trading_settlement_not_terminal();
-                                            let retry_in_secs = winner_position_settlement_backoff
-                                                .record_retry(&buy.slug, now.timestamp_millis());
-                                            debug!(target: "polypulse::strategy::late_resolution_winner_trading",
-                                                slug = %buy.slug,
-                                                retry_in_secs,
-                                                "Late-Resolution Winner Trading market found but outcome is not terminal"
-                                            );
-                                        }
+
                                     }
-                                    Err(e) => {
+                                    Ok(None) => {
+                                        runtime_metrics.record_late_resolution_winner_trading_settlement_not_terminal();
+                                        winner_position_settlement_backoff.record_retry(&buy.slug, Utc::now().timestamp_millis());
+                                    }
+                                    Err(error) => {
                                         runtime_metrics.record_late_resolution_winner_trading_settlement_query_failure();
-                                        let retry_in_secs = winner_position_settlement_backoff
-                                            .record_retry(&buy.slug, now.timestamp_millis());
-                                        warn!(target: "polypulse::strategy::late_resolution_winner_trading",
-                                            error = %e,
-                                            slug = %buy.slug,
-                                            retry_in_secs,
-                                            "Late-Resolution Winner Trading settlement query failed"
-                                        );
+                                        winner_position_settlement_backoff.record_retry(&buy.slug, Utc::now().timestamp_millis());
+                                        warn!(%error, slug=%buy.slug, "Winner settlement remains unresolved; exposure retained");
                                     }
                                 }
                             }
@@ -1870,15 +1998,11 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                                         continue;
                                     }
                                     let settlement = markets.iter().find_map(|market| {
-                                        let prices = market.outcome_prices.as_ref()?;
-                                        (prices.len() == 2).then_some((
-                                            market.closed.unwrap_or(false),
-                                            (prices[0], prices[1]),
-                                        ))
+                                        Some((market.closed.unwrap_or(false), crate::late_resolution_winner_trading::gamma_up_down_prices(market)?))
                                     });
                                     if let Some((closed, prices)) = settlement {
                                         match evaluation_journal
-                                            .record_resolution(&slug, now, closed, &prices)
+                                            .record_resolution_async(slug.clone(), now, closed, prices).await
                                         {
                                             Ok(resolved) if resolved > 0 => {
                                                 winner_evaluation_settlement_backoff.clear(&slug);
@@ -1926,11 +2050,35 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                                 }
                             }
                         }
+                        for (study_index, study) in [&winner_price_cap_study, &winner_operator_study].into_iter().flatten().enumerate() {
+                            let due = if study_index == 0 { study.due_slugs(now)? } else { study.due_slugs(now).unwrap_or_default() };
+                            for slug in due {
+                                let query_key = format!("{study_index}:{slug}");
+                                if !winner_price_cap_settlement_backoff.should_query(&query_key, now.timestamp_millis()) { continue; }
+                                match _scheduler.fetch_closed_markets_by_slug(vec![slug.clone()]).await {
+                                    Ok(markets) => {
+                                        let settlement = markets.iter().filter(|m| m.slug.as_deref() == Some(slug.as_str())).find_map(|m| {
+                                            Some((m.closed.unwrap_or(false), crate::late_resolution_winner_trading::gamma_up_down_prices(m)?))
+                                        });
+                                        let resolved = if let Some((closed, prices)) = settlement {
+                                            if study_index == 0 { study.resolve(&slug, now, closed, &prices)? } else { match study.resolve(&slug, now, closed, &prices) { Ok(n) => n, Err(error) => { warn!(%error, "Operator PAPER settlement persistence failed"); 0 } } }
+                                        } else { 0 };
+                                        if resolved > 0 { winner_price_cap_settlement_backoff.clear(&query_key); }
+                                        else { winner_price_cap_settlement_backoff.record_retry(&query_key, now.timestamp_millis()); }
+                                    }
+                                    Err(error) => {
+                                        winner_price_cap_settlement_backoff.record_retry(&query_key, now.timestamp_millis());
+                                        warn!(target: "polypulse::strategy::late_resolution_winner_trading", %slug, %error,
+                                            "Price-cap study settlement query failed");
+                                    }
+                                }
+                            }
+                        }
                         if !config.dry_run && config.late_resolution_winner_trading_auto_redeem {
                             let proxy = config
                                 .proxy_address
                                 .expect("auto-redeem configuration requires proxy");
-                            for buy in winner_journal.awaiting_redeem() {
+                            for mut buy in winner_journal.awaiting_redeem() {
                                 let condition_id = match polymarket_client_sdk::types::B256::from_str(
                                     &buy.condition_id,
                                 ) {
@@ -1957,6 +2105,13 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                                         continue;
                                     }
                                 };
+                                let payout = tokio::time::timeout(Duration::from_secs(3),
+                                    crate::redeem::condition_token_payout(condition_id, token)).await;
+                                let outcome_index = match payout {
+                                    Ok(Ok(Some((index, payout)))) if payout > dec!(0) => index,
+                                    _ => { warn!(position_id=%buy.position_id, "Winner redemption waits for authoritative token payout"); continue; }
+                                };
+                                buy.outcome_index = Some(outcome_index);
                                 let raw_size = match polymarket_client_sdk::types::U256::from_str(
                                     &(buy.filled * dec!(1_000_000)).floor().to_string(),
                                 ) {
@@ -1988,7 +2143,7 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                                     proxy,
                                     &config.private_key,
                                     None,
-                                    Some(if buy.token_is_yes { 0 } else { 1 }),
+                                    Some(i32::from(outcome_index)),
                                     Some(raw_size),
                                     &[token],
                                 )
@@ -2055,21 +2210,52 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                             config.late_resolution_winner_trading_hybrid_paper_max_order_usdc,
                         )
                         .unwrap_or(dec!(5));
+                        // Bounded concurrent read-only fallbacks. No order/state mutation
+                        // happens in these futures; admission remains serialized below.
+                        let prefetch_now_ms = Utc::now().timestamp_millis();
+                        let mut rest_tokens = Vec::new();
+                        for market in &markets {
+                            let (yes, no) = (market.yes_token_id, market.no_token_id);
+                            let (yt, nt) = (monitor.winner_book_top(yes), monitor.winner_book_top(no));
+                            let fresh = |top: &Option<crate::trading::executor::WinnerBookTop>|
+                                top.as_ref().is_some_and(|t|received_at_is_fresh(t.received_at_ms, prefetch_now_ms,
+                                    config.late_resolution_winner_trading_max_book_age_ms));
+                            let signal = detect_winner_asks(yt.as_ref().and_then(|t|t.ask_price),
+                                nt.as_ref().and_then(|t|t.ask_price), min_price, max_price).is_some();
+                            if winner_books_need_rest(true, yt.is_some(), nt.is_some(), fresh(&yt), fresh(&nt), signal) {
+                                if !fresh(&yt) { rest_tokens.push(yes); }
+                                if !fresh(&nt) { rest_tokens.push(no); }
+                            }
+                        }
+                        rest_tokens.sort(); rest_tokens.dedup();
+                        let read_timeout = Duration::from_millis(config.late_resolution_winner_trading_max_rest_latency_ms);
+                        let executor_ref = &executor;
+                        let mut rest_books: std::collections::HashMap<_,_> = futures::stream::iter(rest_tokens)
+                            .map(|token| async move {
+                                let started = Instant::now();
+                                let result = tokio::time::timeout(read_timeout, executor_ref.winner_book_top(token)).await
+                                    .map_err(|_|anyhow::anyhow!("winner book read timed out")).and_then(|v|v);
+                                (token, (result, u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)))
+                            }).buffer_unordered(8).collect().await;
+                        let mut winner_candidates = Vec::new();
                         for market in &markets {
                             runtime_metrics.record_late_resolution_winner_trading_scan();
+                            if let Some(display) = &winner_display { display.scanned(); }
                             runtime_metrics
                                 .record_late_resolution_winner_trading_asset_scan(&market.crypto_symbol);
                             let market_attempts = winner_attempts_by_market
                                 .get(&market.slug)
                                 .copied()
                                 .unwrap_or(0);
-                            if !attempt_allowed(
+                            let legacy_attempt_allowed = attempt_allowed(
                                 0,
                                 market_attempts,
                                 0,
                                 config.late_resolution_winner_trading_max_attempts_per_market,
-                            ) {
-                                if config.late_resolution_winner_trading_max_per_window > 0
+                            );
+                            if !legacy_attempt_allowed && ![&winner_price_cap_study, &winner_operator_study].into_iter().flatten().any(|study|
+                                study.needs_market(&market.slug, window_session.timestamp() * 1_000)) {
+                                if winner_price_cap_study.is_none() && config.late_resolution_winner_trading_max_per_window > 0
                                     && late_resolution_winner_trading_count.load(Ordering::Relaxed)
                                         >= config.late_resolution_winner_trading_max_per_window
                                 {
@@ -2119,14 +2305,14 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                             let yes_fresh = yes_top.as_ref().is_some_and(|top| {
                                 received_at_is_fresh(
                                     top.received_at_ms,
-                                    now.timestamp_millis(),
+                                    Utc::now().timestamp_millis(),
                                     max_book_age_ms,
                                 )
                             });
                             let no_fresh = no_top.as_ref().is_some_and(|top| {
                                 received_at_is_fresh(
                                     top.received_at_ms,
-                                    now.timestamp_millis(),
+                                    Utc::now().timestamp_millis(),
                                     max_book_age_ms,
                                 )
                             });
@@ -2154,6 +2340,7 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                                 ) {
                                     winner_confirmations.reject(&market.slug);
                                     winner_shadow_confirmations.reject(&market.slug);
+                                    for study in [&winner_price_cap_study, &winner_operator_study].into_iter().flatten() { study.reject(&market.slug); }
                                     for tracker in &mut winner_sensitivity_confirmations { tracker.reject(&market.slug); }
                                     runtime_metrics.record_late_resolution_winner_trading_no_signal();
                                     runtime_metrics.record_late_resolution_winner_trading_asset_no_signal(
@@ -2171,27 +2358,13 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                                     runtime_metrics.record_late_resolution_winner_trading_rest_fallback();
                                     no_from_rest = true;
                                 }
-                                let rest_started = Instant::now();
-                                let (yes_rest, no_rest) = tokio::join!(
-                                    async {
-                                        if yes_top.is_none() {
-                                            executor.winner_book_top(yes_token).await
-                                        } else {
-                                            Ok(yes_top)
-                                        }
-                                    },
-                                    async {
-                                        if no_top.is_none() {
-                                            executor.winner_book_top(no_token).await
-                                        } else {
-                                            Ok(no_top)
-                                        }
-                                    },
-                                );
-                                let rest_latency_ms = u64::try_from(
-                                    rest_started.elapsed().as_millis(),
-                                )
-                                .unwrap_or(u64::MAX);
+                                let (yes_rest, yes_latency) = if yes_requested {
+                                    rest_books.remove(&yes_token).unwrap_or_else(||(Err(anyhow::anyhow!("no prefetched winner YES snapshot")),0))
+                                } else { (Ok(yes_top),0) };
+                                let (no_rest, no_latency) = if no_requested {
+                                    rest_books.remove(&no_token).unwrap_or_else(||(Err(anyhow::anyhow!("no prefetched winner NO snapshot")),0))
+                                } else { (Ok(no_top),0) };
+                                let rest_latency_ms = yes_latency.max(no_latency);
                                 // A REST response can carry a freshly received
                                 // timestamp even when the request itself spent
                                 // tens of seconds blocked.  For a near-expiry
@@ -2282,6 +2455,7 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                             if yes_ask.is_none() && no_ask.is_none() {
                                 winner_confirmations.reject(&market.slug);
                                 winner_shadow_confirmations.reject(&market.slug);
+                                for study in [&winner_price_cap_study, &winner_operator_study].into_iter().flatten() { study.reject(&market.slug); }
                                 for tracker in &mut winner_sensitivity_confirmations { tracker.reject(&market.slug); }
                                 runtime_metrics.record_late_resolution_winner_trading_no_book();
                                 runtime_metrics
@@ -2297,6 +2471,7 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                             else {
                                 winner_confirmations.reject(&market.slug);
                                 winner_shadow_confirmations.reject(&market.slug);
+                                for study in [&winner_price_cap_study, &winner_operator_study].into_iter().flatten() { study.reject(&market.slug); }
                                 for tracker in &mut winner_sensitivity_confirmations { tracker.reject(&market.slug); }
                                 runtime_metrics.record_late_resolution_winner_trading_no_signal();
                                 runtime_metrics
@@ -2322,6 +2497,7 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                             let Some(selected_top) = selected_top else {
                                 winner_confirmations.reject(&market.slug);
                                 winner_shadow_confirmations.reject(&market.slug);
+                                for study in [&winner_price_cap_study, &winner_operator_study].into_iter().flatten() { study.reject(&market.slug); }
                                 for tracker in &mut winner_sensitivity_confirmations { tracker.reject(&market.slug); }
                                 continue;
                             };
@@ -2336,6 +2512,7 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                             ) else {
                                 winner_confirmations.reject(&market.slug);
                                 winner_shadow_confirmations.reject(&market.slug);
+                                for study in [&winner_price_cap_study, &winner_operator_study].into_iter().flatten() { study.reject(&market.slug); }
                                 for tracker in &mut winner_sensitivity_confirmations { tracker.reject(&market.slug); }
                                 runtime_metrics.record_late_resolution_winner_trading_incomplete_book();
                                 debug!(
@@ -2351,16 +2528,20 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                             else {
                                 winner_confirmations.reject(&market.slug);
                                 winner_shadow_confirmations.reject(&market.slug);
+                                for study in [&winner_price_cap_study, &winner_operator_study].into_iter().flatten() { study.reject(&market.slug); }
                                 for tracker in &mut winner_sensitivity_confirmations { tracker.reject(&market.slug); }
                                 continue;
                             };
                             let fee_per_share = fee_policy.fee_per_share(signal.price);
+                            let evaluation_now = Utc::now();
+                            let remaining_ms = (market.end_date - evaluation_now).num_milliseconds();
+                            if remaining_ms <= 0 { winner_confirmations.reject(&market.slug); continue; }
                             let model = winner_twap_store.evaluate(
                                 WinnerModelInput {
                                     asset: &market.crypto_symbol,
                                     window_start_ms: window_session.timestamp() * 1_000,
-                                    now_ms: now.timestamp_millis(),
-                                    seconds_remaining: i64::from(seconds_until_end),
+                                    now_ms: evaluation_now.timestamp_millis(),
+                                    remaining_ms,
                                     buy_yes: signal.buy_yes,
                                     bid_price,
                                     ask_price,
@@ -2379,9 +2560,9 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                                 market.crypto_symbol.clone(),
                                 market.slug.clone(),
                                 market.end_date,
-                                now,
+                                evaluation_now,
                                 window_session.timestamp() * 1_000,
-                                i64::from(seconds_until_end),
+                                (remaining_ms + 999) / 1000,
                                 signal.buy_yes,
                                 bid_price,
                                 ask_price,
@@ -2400,6 +2581,25 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                                 )
                                 .expect("validated late-resolution-winner-trading minimum depth"),
                             );
+                            if let Some(study) = &winner_price_cap_study {
+                                let attempts = study.observe(&evaluation)?;
+                                if !attempts.is_empty() {
+                                    let study = study.clone();
+                                    let executor = executor.clone();
+                                    window_session.spawn_trade(async move { study.execute(executor, token, attempts).await; });
+                                }
+                            }
+                            if let Some(operator) = &winner_operator_study {
+                                match operator.observe(&evaluation) {
+                                    Ok(attempts) if !attempts.is_empty() => {
+                                        let operator = operator.clone(); let executor = executor.clone();
+                                        window_session.spawn_trade(async move { operator.execute(executor, token, attempts).await; });
+                                    }
+                                    Ok(_) => {},
+                                    Err(error) => warn!(%error, "Operator PAPER observation failed; frozen study continues"),
+                                }
+                            }
+                            if !legacy_attempt_allowed { continue; }
                             let research_cohorts = evaluation.research_cohorts.clone();
                             let hybrid_paper_admitted = !model.admitted()
                                 && config.late_resolution_winner_trading_hybrid_paper_enabled
@@ -2427,14 +2627,14 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                             if let Err(error) = winner_evaluation_journal
                                 .as_ref()
                                 .expect("Late-Resolution Winner Trading evaluation journal initialized")
-                                .record(evaluation.clone())
+                                .record_async(evaluation.clone()).await
                             {
                                 error!(target: "polypulse::strategy::late_resolution_winner_trading",
                                     %error,
                                     market = %market.crypto_symbol,
                                     "Late-Resolution Winner Trading evaluation persistence failed"
                                 );
-                                continue;
+                                if config.dry_run { winner_confirmations.reject(&market.slug); continue; }
                             }
                             if winner_sensitivity_enabled {
                                 let journal = winner_evaluation_journal.as_ref().expect("initialized journal");
@@ -2446,7 +2646,7 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                                     let group = format!("sensitivity_f{floor}_r{risk}");
                                     let key = format!("{}:{group}", market.slug);
                                     let (admitted, probability, net_ev) = crate::late_resolution_winner_model::sensitivity_decision(
-                                        &model, policy, i64::from(seconds_until_end), floor, risk);
+                                        &model, policy, (remaining_ms + 999) / 1000, floor, risk);
                                     let tracker = &mut winner_sensitivity_confirmations[index];
                                     let confirmed = if admitted {
                                         model.observed_at_ms.is_some_and(|t| tracker.observe(&market.slug, signal.buy_yes, t,
@@ -2459,9 +2659,9 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                                         "confirmed":confirmed,"already_attempted":attempted}));
                                     if confirmed && !attempted { groups.push(group); }
                                 }
-                                let persisted = journal.record_sensitivity(serde_json::json!({"run_id":run_id,
+                                let persisted = journal.record_sensitivity_async(serde_json::json!({"run_id":run_id,
                                     "evaluation_id":evaluation_id,"slug":market.slug,"recorded_at":Utc::now(),
-                                    "reference_verified":false,"groups":decisions}));
+                                    "reference_verified":false,"groups":decisions})).await;
                                 if let Err(error) = persisted {
                                     warn!(%error, "Winner sensitivity decision persistence failed");
                                 } else if !groups.is_empty() {
@@ -2586,7 +2786,7 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                                     if let Err(error) = winner_evaluation_journal
                                         .as_ref()
                                         .expect("Late-Resolution Winner Trading evaluation journal initialized")
-                                        .record_confirmation_observation(confirmation_observation)
+                                        .record_confirmation_async(confirmation_observation).await
                                     {
                                         error!(target: "polypulse::strategy::late_resolution_winner_trading",
                                             %error,
@@ -2719,7 +2919,7 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                             if let Err(error) = winner_evaluation_journal
                                 .as_ref()
                                 .expect("Late-Resolution Winner Trading evaluation journal initialized")
-                                .record_confirmation_observation(confirmation_observation)
+                                .record_confirmation_async(confirmation_observation).await
                             {
                                 error!(target: "polypulse::strategy::late_resolution_winner_trading",
                                     %error,
@@ -2727,7 +2927,7 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                                     market = %market.crypto_symbol,
                                     "Late-Resolution Winner Trading confirmation progress persistence failed"
                                 );
-                                continue;
+                                if config.dry_run { winner_confirmations.reject(&market.slug); continue; }
                             }
                             if !confirmation.confirmed {
                                 runtime_metrics.record_late_resolution_winner_trading_awaiting_confirmation();
@@ -2748,15 +2948,56 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                                 }
                                 continue;
                             }
+                            let remaining_budget = late_resolution_winner_trading_journal.as_ref().expect("winner journal initialized")
+                                .remaining_loss_budget(&market.crypto_symbol, late_resolution_winner_trading_risk_policy);
+                            let expected_size = fee_inclusive_depth_capped_size(signal.price, fee_per_share,
+                                if hybrid_paper_admitted {hybrid_max_order.min(remaining_budget)} else {max_order.min(remaining_budget)}, ask_size);
+                            let expected_profit = model.net_ev * expected_size;
+                            winner_candidates.push(WinnerCandidate {market, signal, model, token, ask_size, fee_per_share,
+                                hybrid_paper_admitted, candidate_stage, evaluation_id,
+                                book_received_at_ms:selected_top.received_at_ms, expected_profit});
+                        }
+                        winner_candidates.sort_by(|a,b|b.expected_profit.cmp(&a.expected_profit)
+                            .then_with(||a.market.slug.cmp(&b.market.slug)));
+                        for candidate in winner_candidates {
+                            let WinnerCandidate {market, signal, model:initial_model, token, ask_size, fee_per_share,
+                                hybrid_paper_admitted, candidate_stage, evaluation_id, book_received_at_ms,..} = candidate;
+                            let (stage_count, stage_max_per_window) = if hybrid_paper_admitted {
+                                (&late_resolution_winner_trading_hybrid_count, config.late_resolution_winner_trading_hybrid_paper_max_per_window)
+                            } else { (&late_resolution_winner_trading_production_count, config.late_resolution_winner_trading_max_per_window) };
+                            if stage_max_per_window > 0 && stage_count.load(Ordering::Relaxed) >= stage_max_per_window { continue; }
+                            let submit_now = Utc::now();
+                            let remaining_ms = (market.end_date - submit_now).num_milliseconds();
+                            if remaining_ms <= 0 || !user_ws_client.connection_state(polymarket_client_sdk_v2::clob::ws::ChannelType::User).is_connected()
+                                || !matches!(monitor.connection_state(), MarketWsConnectionState::Connected)
+                                || !received_at_is_fresh(book_received_at_ms, submit_now.timestamp_millis(), config.late_resolution_winner_trading_max_book_age_ms) {
+                                winner_confirmations.reject(&market.slug); continue;
+                            }
+                            let model = winner_twap_store.evaluate(WinnerModelInput {
+                                asset: &market.crypto_symbol, window_start_ms: window_session.timestamp() * 1000,
+                                now_ms: submit_now.timestamp_millis(), remaining_ms, buy_yes: signal.buy_yes,
+                                bid_price: signal.price - initial_model.spread, ask_price: signal.price, ask_size,
+                            }, late_resolution_winner_model_policy(&config, &market.crypto_symbol, fee_per_share));
+                            let hybrid_still_admitted = hybrid_paper_admitted && model.net_ev >= dec!(0)
+                                && model.directional_margin_bps > 0.0 && model.opening_twap.is_some()
+                                && model.failed_checks.iter().all(|r| matches!(r,
+                                    crate::late_resolution_winner_model::ModelRejection::ReversalBoundary |
+                                    crate::late_resolution_winner_model::ModelRejection::NetEvTooLow));
+                            if !(model.admitted() || hybrid_still_admitted) {
+                                winner_confirmations.reject(&market.slug); continue;
+                            }
+                            let observed_at_ms = model.observed_at_ms.expect("submission model has observation");
+                            let winner_journal = late_resolution_winner_trading_journal.as_ref().expect("winner journal initialized");
+                            let remaining_loss_budget = winner_journal.remaining_loss_budget(&market.crypto_symbol, late_resolution_winner_trading_risk_policy);
                             // The configured maximum is a cash limit, so fees
                             // must be included when converting it to shares.
                             let size = fee_inclusive_depth_capped_size(
                                 signal.price,
                                 fee_per_share,
                                 if hybrid_paper_admitted {
-                                    hybrid_max_order
+                                    hybrid_max_order.min(remaining_loss_budget)
                                 } else {
-                                    max_order
+                                    max_order.min(remaining_loss_budget)
                                 },
                                 ask_size,
                             );
@@ -2810,9 +3051,15 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                                 warn!(target: "polypulse::strategy::late_resolution_winner_trading", %reason, "Live/canary safety gate rejected late-resolution-winner-trading");
                                 continue;
                             }
-                            let attempt = PendingLateResolutionWinnerTrading {
+                            let mut attempt = PendingLateResolutionWinnerTrading {
                                 run_id: run_id.to_string(),
                                 position_id,
+                                order_id: None,
+                                paper: Some(config.dry_run),
+                                submitted_at_ms: None,
+                                outcome_index: Some(if signal.buy_yes { market.up_outcome_index } else { 1 - market.up_outcome_index }),
+                                payout_per_share: None,
+                                entry_cost: None,
                                 evaluation_id,
                                 candidate_stage: candidate_stage.to_string(),
                                 asset: market.crypto_symbol.clone(),
@@ -2848,7 +3095,7 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                                 fee: dec!(0),
                                 end_date: market.end_date,
                             };
-                            match winner_journal.record_attempt(attempt.clone()) {
+                            match winner_journal.record_attempt_with_risk(attempt.clone(), late_resolution_winner_trading_risk_policy) {
                                 Ok(true) => {
                                     late_resolution_winner_trading_count.fetch_add(1, Ordering::Relaxed);
                                     stage_count.fetch_add(1, Ordering::Relaxed);
@@ -2895,9 +3142,26 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                                 secs_left = seconds_until_end,
                                 "🛒 Late-Resolution Winner Trading order submitted"
                             );
+                            let valid_until_ms = market.end_date.timestamp_millis()
+                                .min(book_received_at_ms.saturating_add(config.late_resolution_winner_trading_max_book_age_ms))
+                                .min(observed_at_ms.saturating_add(config.late_resolution_winner_trading_feed_max_age_ms));
+                            let executor = executor.clone();
+                            let winner_journal = winner_journal.clone();
+                            let market = market.clone();
+                            let runtime_metrics = runtime_metrics.clone();
+                            let dashboard = dashboard.clone();
+                            let live_safety = live_safety.clone();
+                            let service_health = service_health.clone();
+                            let protected_winner_tokens = protected_winner_tokens.clone();
+                            window_session.spawn_trade(async move {
                             let winner_execution_started = Instant::now();
                             match executor
-                                .buy_winner(token, signal.price, size, fee_per_share)
+                                .buy_winner(token, signal.price, size, fee_per_share, valid_until_ms, |order_id| {
+                                    anyhow::ensure!(!live_safety.is_tripped(), "winner safety gate tripped before POST");
+                                    attempt.order_id = Some(order_id.to_string());
+                                    attempt.submitted_at_ms = Some(Utc::now().timestamp_millis());
+                                    winner_journal.record_submitted(&attempt)
+                                })
                                 .await
                             {
                                 Ok(execution) => {
@@ -2925,6 +3189,7 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                                             filled,
                                             price: fill_price,
                                             fee: execution.estimated_fee,
+                                            entry_cost: Some(execution.cost),
                                             ..attempt.clone()
                                         };
                                         protected_winner_tokens
@@ -2994,8 +3259,14 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                                         winner_execution_started.elapsed().as_millis(),
                                     )
                                     .unwrap_or(u64::MAX);
-                                    if let Err(journal_error) =
-                                        winner_journal.record_failed(&attempt, &e.to_string())
+                                    let uncertain = e.downcast_ref::<crate::trading::executor::UncertainWriteError>().is_some();
+                                    let persisted = if uncertain {
+                                        protected_winner_tokens.write().expect("winner token lock poisoned").insert(token);
+                                        live_safety.trip(format!("winner {} write requires reconciliation", attempt.position_id));
+                                        service_health.set_safety_ok(false);
+                                        winner_journal.record_uncertain(&attempt, e.to_string()).map(|_| true)
+                                    } else { winner_journal.record_failed(&attempt, &e.to_string()) };
+                                    if let Err(journal_error) = persisted
                                     {
                                         live_safety.trip(format!(
                                             "late-resolution-winner-trading failure {} could not be persisted: {journal_error}",
@@ -3012,13 +3283,16 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                                     );
                                 }
                             }
+                            position_tracker.set_active_order_exposure(winner_journal.unresolved_attempts().iter().map(|p|p.planned_cost).sum());
                             drop(risk_reservation);
+                            });
                         }
                     }
 
-                    if window_session.has_rolled_over(now, config.market_period_minutes) {
+                    let rollover_now = Utc::now();
+                    if window_session.has_rolled_over(rollover_now, config.market_period_minutes) {
                         let new_window_timestamp =
-                            _scheduler.calculate_current_window_timestamp(now);
+                            _scheduler.calculate_current_window_timestamp(rollover_now);
                         info!(
                             old_window = window_session.timestamp(),
                             new_window = new_window_timestamp,
@@ -3136,7 +3410,7 @@ async fn record_winner_shadow(
         estimated_fee,
         error,
     };
-    match journal.record_shadow_execution(execution) {
+    match journal.record_shadow_async(execution).await {
         Ok(true) => {}
         Ok(false) => {
             debug!(target: "polypulse::strategy::late_resolution_winner_trading",
@@ -3205,6 +3479,7 @@ fn late_resolution_winner_model_policy(
         ),
     };
     WinnerModelPolicy {
+        require_receive_timing: true,
         max_feed_age_ms: config.late_resolution_winner_trading_feed_max_age_ms,
         max_opening_skew_ms: config.late_resolution_winner_trading_opening_max_skew_ms,
         volatility_lookback_secs: config.late_resolution_winner_trading_volatility_lookback_secs,
@@ -3328,5 +3603,236 @@ fn average_u64(total: u64, count: u64) -> f64 {
         0.0
     } else {
         total as f64 / count as f64
+    }
+}
+
+/// Offline operator command: explicit reason and no outstanding risk required.
+pub fn reset_winner_risk(path: &str, reason: &str) -> Result<()> {
+    anyhow::ensure!(
+        std::path::Path::new(path).is_file(),
+        "winner journal must already exist"
+    );
+    LateResolutionWinnerTradingJournal::open_with_min_free_bytes(path, 0)?.reset_risk(reason)
+}
+
+async fn reconcile_winner_attempts(
+    journal: &LateResolutionWinnerTradingJournal,
+    executor: &TradingExecutor,
+) {
+    for attempt in journal.unresolved_attempts() {
+        let Some(id) = &attempt.order_id else {
+            warn!(position_id = %attempt.position_id, "Legacy winner attempt has no durable order id; manual reconciliation required");
+            continue;
+        };
+        let Ok(token) = attempt
+            .token_id
+            .parse::<polymarket_client_sdk_v2::types::U256>()
+        else {
+            continue;
+        };
+        let fee = if attempt.requested > dec!(0) {
+            (attempt.planned_cost / attempt.requested - attempt.limit_price).max(dec!(0))
+        } else {
+            dec!(0)
+        };
+        match executor
+            .reconcile_winner(id, token, attempt.requested, attempt.limit_price, fee)
+            .await
+        {
+            Ok(execution) => {
+                let result = if execution.filled > dec!(0) {
+                    journal.record_pending(PendingLateResolutionWinnerTrading {
+                        filled: execution.filled,
+                        price: execution.average_price,
+                        fee: execution.estimated_fee,
+                        entry_cost: Some(execution.cost),
+                        ..attempt.clone()
+                    })
+                } else {
+                    journal.record_no_fill(&attempt)
+                };
+                if let Err(error) = result {
+                    error!(%error, %id, "Winner recovery persistence failed");
+                }
+            }
+            Err(error) => {
+                warn!(%error, %id, "Winner attempt remains reserved pending authoritative reconciliation")
+            }
+        }
+    }
+}
+
+async fn resolve_winner_position(
+    scheduler: &crate::market::scheduler::MarketScheduler,
+    buy: &mut PendingLateResolutionWinnerTrading,
+    now: chrono::DateTime<chrono::Utc>,
+    alert_secs: u64,
+    require_chain: bool,
+) -> Result<Option<rust_decimal::Decimal>> {
+    use std::str::FromStr;
+    if now < buy.end_date {
+        return Ok(None);
+    }
+    let overdue = (now - buy.end_date).num_seconds() >= alert_secs as i64;
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        scheduler.fetch_closed_markets_by_slug(vec![buy.slug.clone()]),
+    )
+    .await;
+    if let Ok(Ok(markets)) = &response {
+        if let Some(market) = markets
+            .iter()
+            .find(|m| m.slug.as_deref() == Some(buy.slug.as_str()))
+        {
+            let token = polymarket_client_sdk::types::U256::from_str(&buy.token_id)?;
+            if let Some(index) = market
+                .clob_token_ids
+                .as_ref()
+                .and_then(|ids| ids.iter().position(|id| *id == token))
+            {
+                anyhow::ensure!(index < 2, "invalid Gamma outcome index");
+                if buy.outcome_index.is_none() {
+                    buy.outcome_index = Some(index as u8);
+                }
+            }
+            if let Some(prices) =
+                crate::late_resolution_winner_trading::gamma_up_down_prices(market)
+            {
+                if let Some(pnl) = (!require_chain)
+                    .then(|| {
+                        settle_late_resolution_winner_trading(
+                            buy,
+                            now,
+                            market.closed.unwrap_or(false),
+                            &prices,
+                        )
+                    })
+                    .flatten()
+                {
+                    buy.payout_per_share = Some(if buy.token_is_yes == (prices.0 >= dec!(0.999)) {
+                        dec!(1)
+                    } else {
+                        dec!(0)
+                    });
+                    return Ok(Some(pnl));
+                }
+            }
+        }
+    }
+    if overdue {
+        warn!(position_id=%buy.position_id, slug=%buy.slug, age_secs=(now-buy.end_date).num_seconds(),
+            "Winner settlement overdue; querying authoritative CTF payout; exposure retained");
+    }
+    if (overdue || require_chain) && !buy.condition_id.is_empty() {
+        let condition = alloy::primitives::B256::from_str(&buy.condition_id)?;
+        let token = alloy::primitives::U256::from_str(&buy.token_id)?;
+        let payout = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            crate::redeem::condition_token_payout(condition, token),
+        )
+        .await??;
+        if let Some((index, payout)) = payout {
+            buy.outcome_index = Some(index);
+            buy.payout_per_share = Some(payout);
+            return Ok(settle_late_resolution_winner_trading(
+                buy,
+                now,
+                true,
+                &(dec!(0), dec!(0)),
+            ));
+        }
+    }
+    Ok(None)
+}
+
+fn winner_scan_interval() -> tokio::time::Interval {
+    let mut timer = tokio::time::interval(std::time::Duration::from_secs(1));
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    timer
+}
+
+/// Attach an externally verified CLOB id to a legacy uncertain attempt. Account
+/// reads on the next startup still verify ownership, token and actual receipts.
+pub fn attach_winner_order(
+    path: &str,
+    position_id: &str,
+    order_id: &str,
+    reason: &str,
+) -> Result<()> {
+    anyhow::ensure!(
+        std::path::Path::new(path).is_file(),
+        "winner journal must already exist"
+    );
+    anyhow::ensure!(
+        !reason.trim().is_empty(),
+        "order recovery requires an audit reason"
+    );
+    let hash: alloy::primitives::B256 = order_id.parse()?;
+    let journal = LateResolutionWinnerTradingJournal::open_with_min_free_bytes(path, 0)?;
+    let mut position = journal
+        .unresolved_attempts()
+        .into_iter()
+        .find(|p| p.position_id == position_id)
+        .ok_or_else(|| anyhow::anyhow!("unknown unresolved attempt"))?;
+    anyhow::ensure!(
+        position
+            .order_id
+            .as_ref()
+            .is_none_or(|old| old.eq_ignore_ascii_case(order_id)),
+        "cannot replace an existing durable order id"
+    );
+    position.order_id = Some(format!("{hash:#x}"));
+    journal.record_uncertain(&position, format!("operator attached order id: {reason}"))
+}
+
+/// Offline manual resolution after an operator verifies zero fills externally.
+/// The journal's exclusive lock prevents use against a running strategy.
+pub fn resolve_winner_no_fill(path: &str, position_id: &str, reason: &str) -> Result<()> {
+    anyhow::ensure!(
+        std::path::Path::new(path).is_file(),
+        "winner journal must already exist"
+    );
+    let journal = LateResolutionWinnerTradingJournal::open_with_min_free_bytes(path, 0)?;
+    let position = journal
+        .unresolved_attempts()
+        .into_iter()
+        .find(|p| p.position_id == position_id)
+        .ok_or_else(|| anyhow::anyhow!("unknown unresolved attempt"))?;
+    anyhow::ensure!(
+        journal.record_operator_no_fill(&position, reason)?,
+        "winner no-fill transition rejected"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod winner_scheduling_tests {
+    #[tokio::test]
+    async fn winner_scan_deadline_survives_continuous_book_messages() {
+        let mut timer = super::winner_scan_interval();
+        timer.tick().await; // consume the immediate initial tick
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<()>(16);
+        let producer = tokio::spawn(async move {
+            let mut ticks = tokio::time::interval(std::time::Duration::from_millis(1));
+            loop {
+                ticks.tick().await;
+                if sender.send(()).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let mut messages = 0;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                tokio::select! {
+                    _=timer.tick()=>break,
+                    _=receiver.recv()=>messages+=1,
+                }
+            }
+        })
+        .await;
+        producer.abort();
+        assert!(result.is_ok());
+        assert!(messages > 10);
     }
 }

@@ -357,6 +357,7 @@ mod tests {
 
     fn runner(market_id: B256, metrics: Arc<RuntimeMetrics>) -> WindowSessionRunner {
         let market = MarketInfo {
+            up_outcome_index: 0,
             market_id,
             slug: "btc-updown-5m-fixture".into(),
             yes_token_id: U256::from(1),

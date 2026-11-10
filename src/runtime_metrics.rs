@@ -547,6 +547,7 @@ impl RuntimeMetrics {
         }
         let counter = match rejection {
             ModelRejection::NoPriceHistory
+            | ModelRejection::Expired
             | ModelRejection::StalePrice
             | ModelRejection::NoOpeningReference
             | ModelRejection::InvalidPrice

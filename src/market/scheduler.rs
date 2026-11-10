@@ -9,6 +9,7 @@ use super::discoverer::{MarketDiscoverer, MarketInfo};
 pub struct MarketScheduler {
     discoverer: MarketDiscoverer,
     refresh_advance_secs: u64,
+    dashboard: Option<std::sync::Arc<crate::winner_dashboard::live::LiveState>>,
 }
 
 impl MarketScheduler {
@@ -16,7 +17,15 @@ impl MarketScheduler {
         Self {
             discoverer,
             refresh_advance_secs,
+            dashboard: None,
         }
+    }
+
+    pub(crate) fn set_dashboard(
+        &mut self,
+        dashboard: Option<std::sync::Arc<crate::winner_dashboard::live::LiveState>>,
+    ) {
+        self.dashboard = dashboard;
     }
 
     /// Current window start timestamp, delegated to the discoverer's period.
@@ -44,7 +53,12 @@ impl MarketScheduler {
         &self,
         slugs: Vec<String>,
     ) -> Result<Vec<polymarket_client_sdk::gamma::types::response::Market>> {
-        self.discoverer.fetch_closed_markets_by_slug(slugs).await
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            self.discoverer.fetch_closed_markets_by_slug(slugs),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("winner settlement lookup timed out"))?
     }
 
     /// Calculate wait time until next window
@@ -74,6 +88,9 @@ impl MarketScheduler {
             return self.wait_for_next_window().await;
         }
 
+        if let Some(d) = &self.dashboard {
+            d.discovering(current_timestamp);
+        }
         info!("Fetching markets for current window");
         match self
             .discoverer
@@ -128,6 +145,9 @@ impl MarketScheduler {
         let started_at = Utc::now();
         let target_timestamp = self.calculate_next_window_timestamp(started_at);
         let wait_time = self.calculate_wait_time(started_at);
+        if let Some(d) = &self.dashboard {
+            d.discovering(target_timestamp);
+        }
         if wait_time > Duration::ZERO {
             info!(
                 wait_secs = wait_time.as_secs(),

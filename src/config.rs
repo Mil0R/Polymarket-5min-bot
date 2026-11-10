@@ -108,6 +108,13 @@ fn normalize_private_key(raw: &str) -> String {
     stripped.to_ascii_lowercase()
 }
 
+fn validate_winner_order_type(dry_run: bool, enabled: bool, order_type: &OrderType) -> Result<()> {
+    if enabled && !dry_run && !matches!(order_type, OrderType::FOK | OrderType::FAK) {
+        bail!("live winner trading requires BINARY_COMPLEMENT_ARBITRAGE_ORDER_TYPE=FOK or FAK");
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub private_key: String,
@@ -178,6 +185,7 @@ pub struct Config {
     pub late_resolution_winner_trading_max_consecutive_losses: u32,
     /// Automatically redeem confirmed winning tokens in live mode.
     pub late_resolution_winner_trading_auto_redeem: bool,
+    pub late_resolution_winner_trading_settlement_alert_secs: u64,
     /// Polymarket RTDS endpoint for the official Chainlink 60-second TWAP.
     pub late_resolution_winner_trading_rtds_url: String,
     /// Late-Resolution Winner Trading WS snapshot age limit. Kept separate from the much stricter
@@ -441,6 +449,10 @@ impl Config {
             late_resolution_winner_trading_max_consecutive_losses: env_parse(
                 "LATE_RESOLUTION_WINNER_TRADING_MAX_CONSECUTIVE_LOSSES",
                 "3",
+            )?,
+            late_resolution_winner_trading_settlement_alert_secs: env_parse(
+                "LATE_RESOLUTION_WINNER_TRADING_SETTLEMENT_ALERT_SECS",
+                "600",
             )?,
             late_resolution_winner_trading_auto_redeem: env_bool(
                 "LATE_RESOLUTION_WINNER_TRADING_AUTO_REDEEM",
@@ -830,6 +842,15 @@ impl Config {
         {
             bail!("canary pair limits require per-window=1 and total in 1..=3");
         }
+        if !(1..=604_800).contains(&self.late_resolution_winner_trading_settlement_alert_secs) {
+            bail!("winner settlement alert must be in 1..=604800 seconds");
+        }
+        validate_winner_order_type(
+            self.dry_run,
+            self.late_resolution_winner_trading_enabled,
+            &self.arbitrage_order_type,
+        )?;
+
         if self.canary_mode
             && !self.dry_run
             && !matches!(self.arbitrage_order_type, OrderType::FOK | OrderType::FAK)
@@ -1138,5 +1159,16 @@ mod tests {
         assert!(validate_strategy_compatibility(true, true, 1).is_ok());
         assert!(validate_strategy_compatibility(false, true, 0).is_ok());
         assert!(validate_strategy_compatibility(false, false, 1).is_ok());
+    }
+    #[test]
+    fn live_winner_requires_immediate_orders_in_every_live_mode() {
+        for order_type in [OrderType::GTC, OrderType::GTD] {
+            assert!(validate_winner_order_type(false, true, &order_type).is_err());
+            assert!(validate_winner_order_type(true, true, &order_type).is_ok());
+            assert!(validate_winner_order_type(false, false, &order_type).is_ok());
+        }
+        for order_type in [OrderType::FOK, OrderType::FAK] {
+            assert!(validate_winner_order_type(false, true, &order_type).is_ok());
+        }
     }
 }

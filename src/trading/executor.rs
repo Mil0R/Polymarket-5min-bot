@@ -1,10 +1,15 @@
 use alloy::signers::local::LocalSigner;
 use alloy::signers::Signer;
+use alloy::sol_types::{Eip712Domain, SolStruct};
 use anyhow::Result;
 use chrono::Utc;
-use polymarket_client_sdk_v2::clob::types::request::{OrderBookSummaryRequest, OrdersRequest};
+use polymarket_client_sdk_v2::clob::types::request::{
+    OrderBookSummaryRequest, OrdersRequest, TradesRequest,
+};
 use polymarket_client_sdk_v2::clob::types::response::PostOrderResponse;
-use polymarket_client_sdk_v2::clob::types::{OrderType, Side, SignedOrder};
+use polymarket_client_sdk_v2::clob::types::{
+    OrderPayload, OrderStatusType, OrderType, Side, SignedOrder, TradeStatusType,
+};
 use polymarket_client_sdk_v2::types::{Decimal, B256, U256};
 use polymarket_client_sdk_v2::POLYGON;
 use rust_decimal_macros::dec;
@@ -364,6 +369,7 @@ pub struct TradingExecutor {
     arbitrage_paper_emergency_unwind_delay_ms: u64,
     arbitrage_paper_emergency_unwind_min_price: Decimal,
     paper_late_resolution_winner_trading_delay_ms: u64,
+    winner_read_timeout_ms: u64,
     arbitrage_paper: PaperTradingEngine,
     winner_paper: PaperTradingEngine,
     arbitrage_paper_telemetry: Mutex<PaperArbitrageTelemetry>,
@@ -431,6 +437,7 @@ pub struct ExecutionPolicy {
     pub arbitrage_paper_emergency_unwind_delay_ms: u64,
     pub arbitrage_paper_emergency_unwind_min_price: f64,
     pub paper_late_resolution_winner_trading_delay_ms: u64,
+    pub winner_read_timeout_ms: u64,
 }
 
 struct SendErrorContext<'a> {
@@ -527,6 +534,7 @@ impl TradingExecutor {
             .unwrap_or(dec!(0.01)),
             paper_late_resolution_winner_trading_delay_ms: policy
                 .paper_late_resolution_winner_trading_delay_ms,
+            winner_read_timeout_ms: policy.winner_read_timeout_ms,
             arbitrage_paper: PaperTradingEngine::new(PaperSettings {
                 initial_balance: Decimal::try_from(policy.arbitrage_budget_usdc)
                     .unwrap_or(dec!(50)),
@@ -712,7 +720,13 @@ impl TradingExecutor {
         limit_price: Decimal,
         size: Decimal,
         fee_per_share: Decimal,
+        valid_until_ms: i64,
+        before_submit: impl FnOnce(&str) -> Result<()>,
     ) -> Result<LateResolutionWinnerTradingExecution> {
+        anyhow::ensure!(
+            Utc::now().timestamp_millis() < valid_until_ms,
+            "winner admission expired before execution"
+        );
         let execution_started = Instant::now();
         if self.dry_run {
             let reservation = self.winner_paper.reserve(self.winner_planned_cost(
@@ -723,6 +737,10 @@ impl TradingExecutor {
             let execution = self
                 .simulate_delayed_winner(token_id, limit_price, size, fee_per_share)
                 .await?;
+            anyhow::ensure!(
+                Utc::now().timestamp_millis() < valid_until_ms,
+                "winner admission expired during PAPER execution"
+            );
             let fill = PaperFill {
                 requested: execution.requested,
                 filled: execution.filled,
@@ -745,40 +763,204 @@ impl TradingExecutor {
             );
             return Ok(execution);
         }
+        anyhow::ensure!(
+            matches!(self.arbitrage_order_type, OrderType::FOK | OrderType::FAK),
+            "live winner execution requires FOK or FAK"
+        );
         let expiration = Utc::now() + chrono::Duration::seconds(self.gtd_expiration_secs as i64);
-        let signed = self
-            .build_and_sign_buy(token_id, limit_price, size, expiration)
-            .await?;
+        let signed = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            self.build_and_sign_buy(token_id, limit_price, size, expiration),
+        )
+        .await??;
+        let neg_risk = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            self.client.neg_risk(token_id),
+        )
+        .await??
+        .neg_risk;
+        let config = polymarket_client_sdk_v2::contract_config(POLYGON, neg_risk)
+            .ok_or_else(|| anyhow::anyhow!("missing exchange config"))?;
+        let (version, exchange) = match &signed.payload {
+            OrderPayload::V1(_) => ("1", config.exchange),
+            OrderPayload::V2(_) => (
+                "2",
+                config
+                    .exchange_v2
+                    .ok_or_else(|| anyhow::anyhow!("missing V2 exchange"))?,
+            ),
+            _ => anyhow::bail!("unsupported winner order version"),
+        };
+        let domain = Eip712Domain {
+            name: Some("Polymarket CTF Exchange".into()),
+            version: Some(version.into()),
+            chain_id: Some(U256::from(POLYGON)),
+            verifying_contract: Some(exchange),
+            ..Default::default()
+        };
+        let hash = match &signed.payload {
+            OrderPayload::V1(p) => p.order.eip712_signing_hash(&domain),
+            OrderPayload::V2(p) => p.order.eip712_signing_hash(&domain),
+            _ => anyhow::bail!("unsupported winner order version"),
+        };
+        let order_id = format!("{hash:#x}");
+        // Durable identity before the write: even a lost response can be recovered.
+        before_submit(&order_id)?;
+        anyhow::ensure!(
+            Utc::now().timestamp_millis() < valid_until_ms,
+            "winner admission expired during signing/persistence"
+        );
         let request_started = Instant::now();
-        let response = self.client.post_order(signed).await?;
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            self.client.post_order(signed),
+        )
+        .await
+        .map_err(|_| UncertainWriteError {
+            message: format!("winner {order_id} POST timed out"),
+        })?
+        .map_err(|e| UncertainWriteError {
+            message: format!("winner {order_id} POST: {e}"),
+        })?;
         let request_latency_ms = elapsed_ms(request_started);
-        let filled =
-            outcome_shares_filled(&Side::Buy, response.making_amount, response.taking_amount);
-        let cost = if filled > dec!(0) {
-            response.making_amount.max(dec!(0))
-        } else {
-            dec!(0)
-        };
-        let average_price = if filled > dec!(0) && cost > dec!(0) {
-            cost / filled
-        } else if filled > dec!(0) {
-            limit_price
-        } else {
-            dec!(0)
-        };
-        Ok(LateResolutionWinnerTradingExecution {
-            requested: size,
-            filled,
-            cost: if cost > dec!(0) {
-                cost
+        if !response.success
+            && response.order_id.is_empty()
+            && response.taking_amount == dec!(0)
+            && response.making_amount == dec!(0)
+            && response.trade_ids.is_empty()
+            && response.transaction_hashes.is_empty()
+        {
+            return Ok(LateResolutionWinnerTradingExecution {
+                requested: size,
+                filled: dec!(0),
+                cost: dec!(0),
+                average_price: dec!(0),
+                estimated_fee: dec!(0),
+                request_latency_ms,
+                total_latency_ms: elapsed_ms(execution_started),
+            });
+        }
+        if !response.order_id.eq_ignore_ascii_case(&order_id) {
+            return Err(UncertainWriteError {
+                message: format!(
+                    "winner order identity mismatch: {order_id} / {}",
+                    response.order_id
+                ),
+            }
+            .into());
+        }
+        let mut execution = self
+            .reconcile_winner(&order_id, token_id, size, limit_price, fee_per_share)
+            .await
+            .map_err(|e| UncertainWriteError {
+                message: format!("winner {order_id} reconciliation: {e}"),
+            })?;
+        execution.request_latency_ms = request_latency_ms;
+        execution.total_latency_ms = elapsed_ms(execution_started);
+        Ok(execution)
+    }
+
+    pub async fn reconcile_winner(
+        &self,
+        order_id: &str,
+        token: U256,
+        requested: Decimal,
+        limit: Decimal,
+        fee_per_share: Decimal,
+    ) -> Result<LateResolutionWinnerTradingExecution> {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut order = self.client.order(order_id).await?;
+            anyhow::ensure!(
+                order.asset_id == token && matches!(order.side, Side::Buy),
+                "winner order ownership/asset mismatch"
+            );
+            let immediate = matches!(order.order_type, OrderType::FOK | OrderType::FAK);
+            let frozen = matches!(order.status, OrderStatusType::Canceled)
+                || (immediate && matches!(order.status, OrderStatusType::Matched));
+            if !frozen {
+                self.client.cancel_order(order_id).await?;
+                order = self.client.order(order_id).await?;
+            }
+            anyhow::ensure!(
+                matches!(order.status, OrderStatusType::Canceled)
+                    || (immediate && matches!(order.status, OrderStatusType::Matched)),
+                "winner order not frozen"
+            );
+            let mut gross = dec!(0);
+            let mut gross_cost = dec!(0);
+            let mut hashes = Vec::new();
+            for id in &order.associate_trades {
+                let page = self
+                    .client
+                    .trades(&TradesRequest::builder().id(id.clone()).build(), None)
+                    .await?;
+                let trade = page
+                    .data
+                    .iter()
+                    .find(|t| t.id == *id)
+                    .ok_or_else(|| anyhow::anyhow!("winner trade missing"))?;
+                anyhow::ensure!(
+                    trade.taker_order_id.eq_ignore_ascii_case(order_id)
+                        && trade.asset_id == token
+                        && matches!(trade.side, Side::Buy),
+                    "ambiguous winner trade attribution"
+                );
+                if matches!(trade.status, TradeStatusType::Failed) {
+                    continue;
+                }
+                anyhow::ensure!(
+                    matches!(trade.status, TradeStatusType::Confirmed),
+                    "winner trade not final: {}",
+                    trade.status
+                );
+                gross += trade.size;
+                gross_cost += trade.size * trade.price;
+                hashes.push(trade.transaction_hash);
+            }
+            anyhow::ensure!(
+                gross == order.size_matched && gross <= requested,
+                "winner cumulative fills do not reconcile"
+            );
+            let (cost, filled) = if gross == dec!(0) {
+                anyhow::ensure!(
+                    matches!(order.status, OrderStatusType::Canceled),
+                    "winner zero fill not terminal"
+                );
+                (dec!(0), dec!(0))
             } else {
-                average_price * filled
-            },
-            average_price,
-            estimated_fee: dec!(0),
-            request_latency_ms,
-            total_latency_ms: elapsed_ms(execution_started),
+                let (cost, net) =
+                    crate::redeem::winner_receipt_amounts(&hashes, order.maker_address, token)
+                        .await?;
+                anyhow::ensure!(
+                    net > dec!(0)
+                        && net <= gross
+                        && cost > dec!(0)
+                        && cost <= requested * (limit + fee_per_share),
+                    "winner net receipts/cost exceed reservation or are ambiguous"
+                );
+                (cost, net)
+            };
+            Ok(LateResolutionWinnerTradingExecution {
+                requested,
+                filled,
+                cost,
+                average_price: if filled > dec!(0) {
+                    cost / filled
+                } else {
+                    dec!(0)
+                },
+                estimated_fee: (cost - gross_cost).max(dec!(0))
+                    + if gross > dec!(0) {
+                        (gross - filled).max(dec!(0)) * gross_cost / gross
+                    } else {
+                        dec!(0)
+                    },
+                request_latency_ms: 0,
+                total_latency_ms: 0,
+            })
         })
+        .await
+        .map_err(|_| anyhow::anyhow!("winner reconciliation timed out"))?
     }
 
     /// Re-read the live book after the configured paper delay and simulate a
@@ -814,7 +996,11 @@ impl TradingExecutor {
             .await;
         }
         let request_started = Instant::now();
-        let book = self.live_paper_book(token_id).await?;
+        let book = tokio::time::timeout(
+            std::time::Duration::from_millis(self.winner_read_timeout_ms),
+            self.live_paper_book(token_id),
+        )
+        .await??;
         let request_latency_ms = elapsed_ms(request_started);
         let mut fill = self.winner_paper.simulate_buy(
             &book.asks,

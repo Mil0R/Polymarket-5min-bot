@@ -5517,6 +5517,7 @@ mod tests {
             value: Decimal::from(100),
         });
         let market = MarketInfo {
+            up_outcome_index: 0,
             market_id,
             slug: format!("btc-updown-5m-{}", start / 1000),
             yes_token_id: U256::from(1),

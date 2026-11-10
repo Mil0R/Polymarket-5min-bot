@@ -181,6 +181,7 @@ mod tests {
 
     fn market() -> MarketInfo {
         MarketInfo {
+            up_outcome_index: 0,
             market_id: B256::repeat_byte(1),
             slug: "btc-updown-5m-1720000000".to_string(),
             yes_token_id: U256::from(10),

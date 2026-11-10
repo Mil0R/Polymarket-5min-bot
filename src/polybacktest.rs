@@ -168,6 +168,7 @@ impl ReplayConfig {
                 3u32,
             )?,
             winner_policy: WinnerModelPolicy {
+                require_receive_timing: false,
                 max_feed_age_ms: env_parse(
                     "LATE_RESOLUTION_WINNER_TRADING_FEED_MAX_AGE_MS",
                     5000i64,
@@ -1522,7 +1523,7 @@ fn replay_winner_market_grid(
                 asset: &market.coin,
                 window_start_ms: market.start_ms,
                 now_ms: signal.time_ms,
-                seconds_remaining: (remaining_ms / 1_000).max(1),
+                remaining_ms,
                 buy_yes: direction.buy_yes,
                 bid_price: bid,
                 ask_price: direction.price,

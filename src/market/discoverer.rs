@@ -29,6 +29,7 @@ pub struct MarketInfo {
     pub market_id: B256,
     pub slug: String,
     pub yes_token_id: U256,
+    pub up_outcome_index: u8,
     pub no_token_id: U256,
     pub title: String,
     pub end_date: DateTime<Utc>,
@@ -204,9 +205,11 @@ impl MarketDiscoverer {
             return None;
         }
 
-        // First is Up token_id, second is Down
-        let yes_token_id = token_ids[0];
-        let no_token_id = token_ids[1];
+        // Match labels explicitly; Gamma may return either outcome order.
+        let up_index = outcomes.iter().position(|label| label == "Up")?;
+        let down_index = outcomes.iter().position(|label| label == "Down")?;
+        let yes_token_id = token_ids[up_index];
+        let no_token_id = token_ids[down_index];
 
         // Get conditionId
         let market_id = market.condition_id?;
@@ -222,6 +225,7 @@ impl MarketDiscoverer {
             market_id,
             slug: slug.clone(),
             yes_token_id,
+            up_outcome_index: up_index as u8,
             no_token_id,
             title: market.question.unwrap_or_default(),
             end_date,
@@ -230,7 +234,7 @@ impl MarketDiscoverer {
             outcome_prices: market
                 .outcome_prices
                 .filter(|prices| prices.len() == 2)
-                .map(|prices| (prices[0], prices[1])),
+                .map(|prices| (prices[up_index], prices[down_index])),
         })
     }
 }
@@ -326,6 +330,39 @@ mod tests {
         assert_eq!(
             transport.requested.lock().unwrap()[0],
             (vec!["eth-updown-5m-1720000000".to_string()], Some(true))
+        );
+    }
+    #[test]
+    fn reversed_outcomes_map_tokens_prices_and_contract_index_by_label() {
+        let market: Market=serde_json::from_value(serde_json::json!({"id":"reversed","conditionId":format!("0x{:064x}",7),
+            "slug":"btc-updown-5m-1720000000","endDate":"2026-08-13T12:05:00Z","outcomes":"[\"Down\",\"Up\"]",
+            "outcomePrices":"[\"0.1\",\"0.9\"]","active":true,"enableOrderBook":true,"acceptingOrders":true,
+            "clobTokenIds":"[\"42\",\"43\"]"})).unwrap();
+        assert_eq!(
+            crate::late_resolution_winner_trading::gamma_up_down_prices(&market),
+            Some((
+                rust_decimal_macros::dec!(0.9),
+                rust_decimal_macros::dec!(0.1)
+            ))
+        );
+        let discoverer = MarketDiscoverer::with_transport(
+            vec!["btc".into()],
+            5,
+            Arc::new(FakeGammaTransport {
+                requested: Mutex::new(vec![]),
+                response: Mutex::new(None),
+            }),
+        );
+        let parsed = discoverer.parse_market(market).unwrap();
+        assert_eq!(parsed.yes_token_id, U256::from(43));
+        assert_eq!(parsed.no_token_id, U256::from(42));
+        assert_eq!(parsed.up_outcome_index, 1);
+        assert_eq!(
+            parsed.outcome_prices,
+            Some((
+                rust_decimal_macros::dec!(0.9),
+                rust_decimal_macros::dec!(0.1)
+            ))
         );
     }
 }

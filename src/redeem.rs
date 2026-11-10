@@ -18,6 +18,13 @@ use tracing::{info, warn};
 use alloy::sol;
 sol! {
     #[sol(rpc)]
+    interface IWinnerPayout {
+        function payoutDenominator(bytes32 conditionId) external view returns (uint256);
+        function payoutNumerators(bytes32 conditionId, uint256 index) external view returns (uint256);
+        function getCollectionId(bytes32 parentCollectionId, bytes32 conditionId, uint256 indexSet) external view returns (bytes32);
+        function getPositionId(address collateralToken, bytes32 collectionId) external view returns (uint256);
+    }
+    #[sol(rpc)]
     interface IERC1155 {
         function balanceOf(address account, uint256 id) external view returns (uint256);
     }
@@ -421,4 +428,262 @@ pub async fn redeem_one(
         verify_redeemed(&provider, proxy, verify_assets, &balances_before).await?;
     }
     Ok(format!("{:#x}", last_tx))
+}
+
+/// Authoritative CTF payout. A zero denominator is unresolved, never a timeout loss.
+/// Returns payouts in contract outcome order, including fractional/void outcomes.
+pub async fn condition_token_payout(
+    condition_id: B256,
+    token: U256,
+) -> Result<Option<(u8, rust_decimal::Decimal)>> {
+    let provider = ProviderBuilder::new().connect(RPC_URL_DEFAULT).await?;
+    let ctf = IWinnerPayout::new(CTF_POLYGON, &provider);
+    let denominator = ctf.payoutDenominator(condition_id).call().await?;
+    if denominator.is_zero() {
+        return Ok(None);
+    }
+    let (a, b, c0, c1) = tokio::try_join!(
+        async { ctf.payoutNumerators(condition_id, U256::ZERO).call().await },
+        async {
+            ctf.payoutNumerators(condition_id, U256::from(1))
+                .call()
+                .await
+        },
+        async {
+            ctf.getCollectionId(B256::ZERO, condition_id, U256::from(1))
+                .call()
+                .await
+        },
+        async {
+            ctf.getCollectionId(B256::ZERO, condition_id, U256::from(2))
+                .call()
+                .await
+        },
+    )?;
+    let (legacy0, pusd0, legacy1, pusd1) = tokio::try_join!(
+        async { ctf.getPositionId(USDC_POLYGON, c0).call().await },
+        async { ctf.getPositionId(PUSD_POLYGON, c0).call().await },
+        async { ctf.getPositionId(USDC_POLYGON, c1).call().await },
+        async { ctf.getPositionId(PUSD_POLYGON, c1).call().await },
+    )?;
+    let zero = token == legacy0 || token == pusd0;
+    let one = token == legacy1 || token == pusd1;
+    anyhow::ensure!(
+        zero != one,
+        "token does not identify exactly one CTF outcome"
+    );
+    anyhow::ensure!(
+        a.checked_add(b) == Some(denominator),
+        "invalid binary CTF payouts"
+    );
+    let numerator = if zero { a } else { b };
+    let payout = rust_decimal::Decimal::from_str(&numerator.to_string())?
+        / rust_decimal::Decimal::from_str(&denominator.to_string())?;
+    Ok(Some((if zero { 0 } else { 1 }, payout)))
+}
+
+fn raw_decimal(value: U256) -> Result<rust_decimal::Decimal> {
+    Ok(rust_decimal::Decimal::from_str(&value.to_string())?
+        / rust_decimal::Decimal::from(1_000_000))
+}
+
+/// Read confirmed receipts rather than assuming response amounts include fees.
+/// Only transfers involving this wallet are counted. Ambiguous multi-asset
+/// transactions are rejected so another strategy's transfers cannot be attributed.
+pub async fn winner_receipt_amounts(
+    hashes: &[B256],
+    wallet: Address,
+    token: U256,
+) -> Result<(rust_decimal::Decimal, rust_decimal::Decimal)> {
+    let provider = ProviderBuilder::new().connect(RPC_URL_DEFAULT).await?;
+    let mut cash = rust_decimal::Decimal::ZERO;
+    let mut shares = rust_decimal::Decimal::ZERO;
+    let mut seen = std::collections::HashSet::new();
+    for hash in hashes {
+        if !seen.insert(*hash) {
+            continue;
+        }
+        let receipt = provider
+            .get_transaction_receipt(*hash)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("winner receipt unavailable: {hash}"))?;
+        anyhow::ensure!(receipt.status(), "winner receipt reverted: {hash}");
+        for log in receipt.inner.logs() {
+            let (dc, ds) = winner_transfer_delta(
+                log.address(),
+                log.topics(),
+                &log.data().data,
+                wallet,
+                token,
+            )?;
+            cash += dc;
+            shares += ds;
+        }
+    }
+    Ok((cash, shares))
+}
+
+fn winner_transfer_delta(
+    address: Address,
+    topics: &[B256],
+    data: &[u8],
+    wallet: Address,
+    token: U256,
+) -> Result<(rust_decimal::Decimal, rust_decimal::Decimal)> {
+    use rust_decimal::Decimal;
+    let mut cash = Decimal::ZERO;
+    let mut shares = Decimal::ZERO;
+    let word = |index: usize| -> Result<U256> {
+        let start = index
+            .checked_mul(32)
+            .ok_or_else(|| anyhow::anyhow!("transfer offset overflow"))?;
+        let end = start
+            .checked_add(32)
+            .ok_or_else(|| anyhow::anyhow!("transfer offset overflow"))?;
+        Ok(U256::from_be_slice(
+            data.get(start..end)
+                .ok_or_else(|| anyhow::anyhow!("truncated transfer"))?,
+        ))
+    };
+    let is_wallet = |topic: &B256| topic.as_slice()[12..] == wallet.as_slice()[..];
+    if (address == PUSD_POLYGON || address == USDC_POLYGON)
+        && topics.first() == Some(&keccak256(b"Transfer(address,address,uint256)"))
+    {
+        anyhow::ensure!(topics.len() == 3, "invalid collateral transfer");
+        let amount = raw_decimal(word(0)?)?;
+        if is_wallet(&topics[1]) {
+            cash += amount;
+        }
+        if is_wallet(&topics[2]) {
+            cash -= amount;
+        }
+    } else if address == CTF_POLYGON
+        && topics.len() == 4
+        && (is_wallet(&topics[2]) || is_wallet(&topics[3]))
+    {
+        let mut add = |id: U256, amount: U256| -> Result<()> {
+            anyhow::ensure!(
+                id == token,
+                "ambiguous receipt contains another wallet outcome"
+            );
+            let amount = raw_decimal(amount)?;
+            if is_wallet(&topics[3]) {
+                shares += amount;
+            }
+            if is_wallet(&topics[2]) {
+                shares -= amount;
+            }
+            Ok(())
+        };
+        if topics[0] == keccak256(b"TransferSingle(address,address,address,uint256,uint256)") {
+            add(word(0)?, word(1)?)?;
+        } else if topics[0]
+            == keccak256(b"TransferBatch(address,address,address,uint256[],uint256[])")
+        {
+            let ids: usize = word(0)?.try_into()?;
+            let values: usize = word(1)?.try_into()?;
+            anyhow::ensure!(
+                ids.is_multiple_of(32) && values.is_multiple_of(32),
+                "unaligned batch transfer"
+            );
+            let (ids, values) = (ids / 32, values / 32);
+            let count: usize = word(ids)?.try_into()?;
+            anyhow::ensure!(
+                count <= data.len() / 32 && word(values)? == U256::from(count),
+                "invalid batch transfer length"
+            );
+            for index in 0..count {
+                add(word(ids + 1 + index)?, word(values + 1 + index)?)?;
+            }
+        }
+    }
+    Ok((cash, shares))
+}
+
+#[cfg(test)]
+mod winner_receipt_tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+    fn topic(address: Address) -> B256 {
+        let mut bytes = [0u8; 32];
+        bytes[12..].copy_from_slice(address.as_slice());
+        B256::from(bytes)
+    }
+    #[test]
+    fn winner_accounts_for_cash_fees_and_net_received_shares() {
+        let wallet = Address::from([1u8; 20]);
+        let other = Address::from([2u8; 20]);
+        let cash = winner_transfer_delta(
+            PUSD_POLYGON,
+            &[
+                keccak256(b"Transfer(address,address,uint256)"),
+                topic(wallet),
+                topic(other),
+            ],
+            &U256::from(970_000u64).to_be_bytes::<32>(),
+            wallet,
+            U256::from(42),
+        )
+        .unwrap();
+        let mut data = U256::from(42).to_be_bytes::<32>().to_vec();
+        data.extend(U256::from(997_900u64).to_be_bytes::<32>());
+        let shares = winner_transfer_delta(
+            CTF_POLYGON,
+            &[
+                keccak256(b"TransferSingle(address,address,address,uint256,uint256)"),
+                topic(other),
+                topic(other),
+                topic(wallet),
+            ],
+            &data,
+            wallet,
+            U256::from(42),
+        )
+        .unwrap();
+        assert_eq!(cash.0, dec!(0.97));
+        assert_eq!(shares.1, dec!(0.9979));
+        assert_eq!(shares.1 - cash.0, dec!(0.0279));
+    }
+    #[test]
+    fn winner_rejects_unrelated_outcomes_and_truncated_transfers() {
+        let wallet = Address::from([1u8; 20]);
+        let other = Address::from([2u8; 20]);
+        let topics = [
+            keccak256(b"TransferSingle(address,address,address,uint256,uint256)"),
+            topic(other),
+            topic(other),
+            topic(wallet),
+        ];
+        assert!(winner_transfer_delta(CTF_POLYGON, &topics, &[], wallet, U256::from(42)).is_err());
+        let mut data = U256::from(43).to_be_bytes::<32>().to_vec();
+        data.extend(U256::from(1).to_be_bytes::<32>());
+        assert!(
+            winner_transfer_delta(CTF_POLYGON, &topics, &data, wallet, U256::from(42)).is_err()
+        );
+    }
+    #[test]
+    fn winner_decodes_batch_transfers_with_checked_offsets() {
+        let wallet = Address::from([1u8; 20]);
+        let other = Address::from([2u8; 20]);
+        let topics = [
+            keccak256(b"TransferBatch(address,address,address,uint256[],uint256[])"),
+            topic(other),
+            topic(other),
+            topic(wallet),
+        ];
+        let mut data = Vec::new();
+        for value in [64u64, 128, 1, 42, 1, 1_000_000] {
+            data.extend(U256::from(value).to_be_bytes::<32>());
+        }
+        assert_eq!(
+            winner_transfer_delta(CTF_POLYGON, &topics, &data, wallet, U256::from(42))
+                .unwrap()
+                .1,
+            dec!(1)
+        );
+        data[31] = 65;
+        assert!(
+            winner_transfer_delta(CTF_POLYGON, &topics, &data, wallet, U256::from(42)).is_err()
+        );
+    }
 }

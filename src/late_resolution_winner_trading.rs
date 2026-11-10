@@ -115,6 +115,20 @@ pub struct PendingLateResolutionWinnerTrading {
     pub run_id: String,
     /// Stable idempotency key for persistence and settlement.
     pub position_id: String,
+    #[serde(default)]
+    pub order_id: Option<String>,
+    /// Explicit mode prevents PAPER recovery from clearing a live/legacy write.
+    #[serde(default)]
+    pub paper: Option<bool>,
+    #[serde(default)]
+    pub submitted_at_ms: Option<i64>,
+    /// Metadata index hint at admission; verified against the CTF token id before
+    /// authoritative settlement/redemption (independent of Up/Down labels).
+    #[serde(default)]
+    pub outcome_index: Option<u8>,
+    /// Authoritative payout (including fractional/void outcomes).
+    #[serde(default)]
+    pub payout_per_share: Option<Decimal>,
     /// Links the actual order lifecycle to its counterfactual model evaluation.
     #[serde(default)]
     pub evaluation_id: String,
@@ -164,6 +178,9 @@ pub struct PendingLateResolutionWinnerTrading {
     pub book_depth_usdc: Decimal,
     pub filled: Decimal,
     pub price: Decimal,
+    /// Exact cash debit from the execution/receipt; legacy records derive it from price.
+    #[serde(default)]
+    pub entry_cost: Option<Decimal>,
     /// Fee included in the effective entry price when known/estimated.
     #[serde(default)]
     pub fee: Decimal,
@@ -491,7 +508,8 @@ enum WinnerEvaluationEvent {
 /// survivorship bias.
 pub struct WinnerEvaluationJournal {
     path: PathBuf,
-    writer: DurableNdjsonWriter,
+    writer: std::sync::Arc<DurableNdjsonWriter>,
+    background: Option<ResearchJournalQueue>,
     unresolved: Mutex<HashMap<String, WinnerEvaluation>>,
     shadow_execution_ids: Mutex<HashSet<String>>,
 }
@@ -500,15 +518,48 @@ pub struct WinnerEvaluationJournal {
 /// partial or otherwise uncertain write. The free-space reserve prevents the
 /// known ENOSPC failure mode; truncation restores the last complete boundary
 /// if the filesystem still reports a write error after the guard passes.
-struct DurableNdjsonWriter {
+pub(crate) struct DurableNdjsonWriter {
     file: Mutex<File>,
     directory: PathBuf,
     min_free_bytes: u64,
     failed: AtomicBool,
 }
 
+struct ResearchJournalQueue {
+    sender: Option<std::sync::mpsc::SyncSender<serde_json::Value>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+impl ResearchJournalQueue {
+    fn new(writer: std::sync::Arc<DurableNdjsonWriter>) -> Self {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(4096);
+        let worker = std::thread::spawn(move || {
+            while let Ok(first) = receiver.recv() {
+                let mut batch = vec![first];
+                batch.extend(receiver.try_iter().take(255));
+                if let Err(error) = writer.append_batch(&batch) {
+                    writer.failed.store(true, Ordering::Release);
+                    tracing::error!(%error, "Winner research background persistence failed");
+                    break;
+                }
+            }
+        });
+        Self {
+            sender: Some(sender),
+            worker: Some(worker),
+        }
+    }
+}
+impl Drop for ResearchJournalQueue {
+    fn drop(&mut self) {
+        self.sender.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
 impl DurableNdjsonWriter {
-    fn open(path: &Path, min_free_bytes: u64) -> Result<Self> {
+    pub(crate) fn open(path: &Path, min_free_bytes: u64) -> Result<Self> {
         let directory = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -539,12 +590,19 @@ impl DurableNdjsonWriter {
         })
     }
 
-    fn append<T: Serialize>(&self, event: &T) -> Result<()> {
+    pub(crate) fn append<T: Serialize>(&self, event: &T) -> Result<()> {
+        self.append_batch(&[event])
+    }
+
+    fn append_batch<T: Serialize>(&self, events: &[T]) -> Result<()> {
         if self.failed.load(Ordering::Relaxed) {
             anyhow::bail!("journal is fail-closed after an earlier write failure");
         }
-        let mut encoded = serde_json::to_vec(event)?;
-        encoded.push(b'\n');
+        let mut encoded = Vec::new();
+        for event in events {
+            serde_json::to_writer(&mut encoded, event)?;
+            encoded.push(b'\n');
+        }
         let mut file = self
             .file
             .lock()
@@ -657,13 +715,73 @@ impl WinnerEvaluationJournal {
                 }
             }
         }
-        let writer = DurableNdjsonWriter::open(&path, min_free_bytes)?;
+        let writer = std::sync::Arc::new(DurableNdjsonWriter::open(&path, min_free_bytes)?);
         Ok(Self {
             path,
             writer,
+            background: None,
             unresolved: Mutex::new(unresolved),
             shadow_execution_ids: Mutex::new(shadow_execution_ids),
         })
+    }
+
+    /// Live trading can tolerate missing research telemetry. State/position journals
+    /// remain synchronous; PAPER research keeps the lossless synchronous path.
+    pub fn open_buffered(path: impl AsRef<Path>, min_free_bytes: u64) -> Result<Self> {
+        let mut journal = Self::open_with_min_free_bytes(path, min_free_bytes)?;
+        journal.background = Some(ResearchJournalQueue::new(journal.writer.clone()));
+        Ok(journal)
+    }
+
+    async fn offload<R: Send + 'static>(
+        self: &std::sync::Arc<Self>,
+        operation: impl FnOnce(std::sync::Arc<Self>) -> Result<R> + Send + 'static,
+    ) -> Result<R> {
+        if self.background.is_some() {
+            operation(self.clone())
+        } else {
+            let journal = self.clone();
+            tokio::task::spawn_blocking(move || operation(journal)).await?
+        }
+    }
+
+    pub async fn record_async(
+        self: &std::sync::Arc<Self>,
+        evaluation: WinnerEvaluation,
+    ) -> Result<()> {
+        self.offload(move |journal| journal.record(evaluation))
+            .await
+    }
+    pub async fn record_confirmation_async(
+        self: &std::sync::Arc<Self>,
+        observation: WinnerConfirmationObservation,
+    ) -> Result<()> {
+        self.offload(move |journal| journal.record_confirmation_observation(observation))
+            .await
+    }
+    pub async fn record_sensitivity_async(
+        self: &std::sync::Arc<Self>,
+        decision: serde_json::Value,
+    ) -> Result<()> {
+        self.offload(move |journal| journal.record_sensitivity(decision))
+            .await
+    }
+    pub async fn record_shadow_async(
+        self: &std::sync::Arc<Self>,
+        execution: WinnerShadowExecution,
+    ) -> Result<bool> {
+        self.offload(move |journal| journal.record_shadow_execution(execution))
+            .await
+    }
+    pub async fn record_resolution_async(
+        self: &std::sync::Arc<Self>,
+        slug: String,
+        now: DateTime<Utc>,
+        closed: bool,
+        prices: (Decimal, Decimal),
+    ) -> Result<usize> {
+        self.offload(move |journal| journal.record_resolution(&slug, now, closed, &prices))
+            .await
     }
 
     pub fn path(&self) -> &Path {
@@ -820,11 +938,28 @@ impl WinnerEvaluationJournal {
     }
 
     fn append(&self, event: &WinnerEvaluationEvent) -> Result<()> {
-        self.writer.append(event)
+        if let Some(queue) = &self.background {
+            anyhow::ensure!(
+                !self.writer.failed.load(Ordering::Acquire),
+                "research background writer failed"
+            );
+            queue
+                .sender
+                .as_ref()
+                .expect("active queue")
+                .try_send(serde_json::to_value(event)?)
+                .map_err(|e| anyhow::anyhow!("research queue unavailable: {e}"))
+        } else {
+            self.writer.append(event)
+        }
     }
 }
 
 impl PendingLateResolutionWinnerTrading {
+    pub fn cost(&self) -> Decimal {
+        self.entry_cost.unwrap_or(self.filled * self.price)
+    }
+
     pub fn asset_key(&self) -> String {
         if !self.asset.trim().is_empty() {
             return self.asset.trim().to_ascii_lowercase();
@@ -835,6 +970,20 @@ impl PendingLateResolutionWinnerTrading {
             .unwrap_or("unknown")
             .to_ascii_lowercase()
     }
+}
+
+pub fn gamma_up_down_prices(
+    market: &polymarket_client_sdk::gamma::types::response::Market,
+) -> Option<(Decimal, Decimal)> {
+    let outcomes = market.outcomes.as_ref()?;
+    let prices = market.outcome_prices.as_ref()?;
+    if outcomes.len() != 2 || prices.len() != 2 {
+        return None;
+    }
+    Some((
+        *prices.get(outcomes.iter().position(|s| s == "Up")?)?,
+        *prices.get(outcomes.iter().position(|s| s == "Down")?)?,
+    ))
 }
 
 /// Settle a late-resolution-winner-trading position against the market's outcome prices.
@@ -854,24 +1003,34 @@ pub fn settle_late_resolution_winner_trading(
         return None;
     }
 
-    let yes_won = outcome_prices.0 >= TERMINAL_HIGH && outcome_prices.1 <= TERMINAL_LOW;
-    let no_won = outcome_prices.1 >= TERMINAL_HIGH && outcome_prices.0 <= TERMINAL_LOW;
-    if yes_won == no_won {
-        return None;
-    }
-
-    let won = if buy.token_is_yes { yes_won } else { no_won };
-    Some(if won {
-        buy.filled * (dec!(1) - buy.price)
+    let payout = if let Some(payout) = buy.payout_per_share {
+        if !(dec!(0)..=dec!(1)).contains(&payout) {
+            return None;
+        }
+        payout
     } else {
-        -buy.filled * buy.price
-    })
+        let yes_won = outcome_prices.0 >= TERMINAL_HIGH && outcome_prices.1 <= TERMINAL_LOW;
+        let no_won = outcome_prices.1 >= TERMINAL_HIGH && outcome_prices.0 <= TERMINAL_LOW;
+        if yes_won == no_won {
+            return None;
+        }
+        if buy.token_is_yes == yes_won {
+            dec!(1)
+        } else {
+            dec!(0)
+        }
+    };
+    let total_payout = (buy.filled * payout * dec!(1_000_000)).floor() / dec!(1_000_000);
+    Some(total_payout - buy.cost())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum WinnerJournalAction {
     Attempted,
+    Submitted,
+    Uncertain,
+    RiskReset,
     NoFill,
     Failed,
     Pending,
@@ -894,6 +1053,8 @@ struct WinnerJournalEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WinnerLifecycleState {
     Attempted,
+    Submitted,
+    Uncertain,
     NoFill,
     Failed,
     Pending,
@@ -929,6 +1090,8 @@ pub struct LateResolutionWinnerTradingJournal {
     path: PathBuf,
     writer: DurableNdjsonWriter,
     pending: Mutex<HashMap<String, PendingLateResolutionWinnerTrading>>,
+    unresolved_attempts: Mutex<HashMap<String, PendingLateResolutionWinnerTrading>>,
+    transition_lock: Mutex<()>,
     awaiting_redeem: Mutex<HashMap<String, PendingLateResolutionWinnerTrading>>,
     states: Mutex<HashMap<String, WinnerLifecycleState>>,
     total_spent: Mutex<Decimal>,
@@ -945,6 +1108,7 @@ pub struct LateResolutionWinnerTradingPaperSummary {
 }
 
 struct WinnerJournalReplay {
+    unresolved_attempts: HashMap<String, PendingLateResolutionWinnerTrading>,
     pending: HashMap<String, PendingLateResolutionWinnerTrading>,
     awaiting_redeem: HashMap<String, PendingLateResolutionWinnerTrading>,
     states: HashMap<String, WinnerLifecycleState>,
@@ -972,17 +1136,20 @@ impl LateResolutionWinnerTradingJournal {
                 )
             })?;
         }
-        let replay = replay_journal(&path)?;
+        // Acquire the exclusive writer lock BEFORE replay can repair a partial tail.
         let writer = DurableNdjsonWriter::open(&path, min_free_bytes).with_context(|| {
             format!(
                 "failed to open late-resolution-winner-trading journal {}",
                 path.display()
             )
         })?;
+        let replay = replay_journal(&path)?;
         Ok(Self {
             path,
             writer,
             pending: Mutex::new(replay.pending),
+            unresolved_attempts: Mutex::new(replay.unresolved_attempts),
+            transition_lock: Mutex::new(()),
             awaiting_redeem: Mutex::new(replay.awaiting_redeem),
             states: Mutex::new(replay.states),
             total_spent: Mutex::new(replay.total_spent),
@@ -993,6 +1160,149 @@ impl LateResolutionWinnerTradingJournal {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn unresolved_attempts(&self) -> Vec<PendingLateResolutionWinnerTrading> {
+        self.unresolved_attempts
+            .lock()
+            .expect("winner attempts lock poisoned")
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    /// Gross loss protection remains latched; pending and unknown writes consume
+    /// their full worst-case cash loss before any additional order is admitted.
+    pub fn remaining_loss_budget(
+        &self,
+        asset: &str,
+        policy: LateResolutionWinnerTradingRiskPolicy,
+    ) -> Decimal {
+        if self.check_risk(asset, policy).is_err() {
+            return dec!(0);
+        }
+        let risk = self.risk_snapshot();
+        let asset = asset.trim().to_ascii_lowercase();
+        let mut total = dec!(0);
+        let mut asset_total = dec!(0);
+        for p in self.pending().into_iter().chain(self.unresolved_attempts()) {
+            let cost = if p.filled > dec!(0) {
+                p.cost()
+            } else {
+                p.planned_cost
+            };
+            total += cost;
+            if p.asset_key() == asset {
+                asset_total += cost;
+            }
+        }
+        (policy.max_strategy_loss - risk.strategy_loss - total)
+            .min(
+                policy.max_asset_loss
+                    - risk.asset_loss.get(&asset).copied().unwrap_or_default()
+                    - asset_total,
+            )
+            .max(dec!(0))
+    }
+
+    pub fn record_attempt_with_risk(
+        &self,
+        position: PendingLateResolutionWinnerTrading,
+        policy: LateResolutionWinnerTradingRiskPolicy,
+    ) -> Result<bool> {
+        let _transition = self
+            .transition_lock
+            .lock()
+            .expect("winner transition poisoned");
+        anyhow::ensure!(
+            position.planned_cost > dec!(0)
+                && position.planned_cost
+                    <= self.remaining_loss_budget(&position.asset_key(), policy),
+            "winner order exceeds remaining strategy/asset worst-case loss budget"
+        );
+        self.record_attempt_unlocked(position)
+    }
+
+    pub fn record_submitted(&self, position: &PendingLateResolutionWinnerTrading) -> Result<()> {
+        self.record_uncertain_state(
+            position,
+            WinnerJournalAction::Submitted,
+            WinnerLifecycleState::Submitted,
+            None,
+        )
+    }
+
+    pub fn record_uncertain(
+        &self,
+        position: &PendingLateResolutionWinnerTrading,
+        reason: String,
+    ) -> Result<()> {
+        self.record_uncertain_state(
+            position,
+            WinnerJournalAction::Uncertain,
+            WinnerLifecycleState::Uncertain,
+            Some(reason),
+        )
+    }
+
+    fn record_uncertain_state(
+        &self,
+        position: &PendingLateResolutionWinnerTrading,
+        action: WinnerJournalAction,
+        state: WinnerLifecycleState,
+        reason: Option<String>,
+    ) -> Result<()> {
+        let _transition = self
+            .transition_lock
+            .lock()
+            .expect("winner transition poisoned");
+        let mut states = self.states.lock().expect("winner states poisoned");
+        anyhow::ensure!(
+            matches!(
+                states.get(&position.position_id),
+                Some(
+                    WinnerLifecycleState::Attempted
+                        | WinnerLifecycleState::Submitted
+                        | WinnerLifecycleState::Uncertain
+                )
+            ),
+            "invalid winner write transition"
+        );
+        self.append(&WinnerJournalEvent {
+            version: 1,
+            action,
+            position: position.clone(),
+            realized_pnl: None,
+            reference: reason,
+        })?;
+        states.insert(position.position_id.clone(), state);
+        self.unresolved_attempts
+            .lock()
+            .expect("winner attempts poisoned")
+            .insert(position.position_id.clone(), position.clone());
+        Ok(())
+    }
+
+    /// Explicit, durable operator action. Never automatically resets on restart.
+    pub fn reset_risk(&self, reason: &str) -> Result<()> {
+        let _transition = self
+            .transition_lock
+            .lock()
+            .expect("winner transition poisoned");
+        anyhow::ensure!(
+            !reason.trim().is_empty(),
+            "risk reset requires an audit reason"
+        );
+        anyhow::ensure!(
+            self.pending().is_empty()
+                && self.unresolved_attempts().is_empty()
+                && self.uncertain_redeem_count() == 0,
+            "cannot reset risk with pending/unknown exposure"
+        );
+        // RiskReset has no position; use the optional event payload for compatibility.
+        self.writer.append(&serde_json::json!({"version":1,"action":"risk_reset","reason":reason,"recorded_at":Utc::now()}))?;
+        *self.risk.lock().expect("winner risk poisoned") = Default::default();
+        Ok(())
     }
 
     pub fn pending(&self) -> Vec<PendingLateResolutionWinnerTrading> {
@@ -1074,7 +1384,7 @@ impl LateResolutionWinnerTradingJournal {
             .lock()
             .expect("late-resolution-winner-trading pending lock poisoned");
         LateResolutionWinnerTradingPaperSummary {
-            pending_cost: pending.values().map(|buy| buy.filled * buy.price).sum(),
+            pending_cost: pending.values().map(|buy| buy.cost()).sum(),
             total_spent: *self
                 .total_spent
                 .lock()
@@ -1088,6 +1398,10 @@ impl LateResolutionWinnerTradingJournal {
     }
 
     pub fn record_pending(&self, position: PendingLateResolutionWinnerTrading) -> Result<bool> {
+        let _transition = self
+            .transition_lock
+            .lock()
+            .expect("winner transition poisoned");
         if matches!(
             self.states
                 .lock()
@@ -1119,7 +1433,11 @@ impl LateResolutionWinnerTradingJournal {
             reference: None,
         })?;
         let position_id = position.position_id.clone();
-        let cost = position.filled * position.price;
+        self.unresolved_attempts
+            .lock()
+            .expect("winner attempts poisoned")
+            .remove(&position_id);
+        let cost = position.cost();
         self.pending
             .lock()
             .expect("late-resolution-winner-trading pending lock poisoned")
@@ -1135,7 +1453,19 @@ impl LateResolutionWinnerTradingJournal {
         Ok(true)
     }
 
+    #[cfg(test)]
     pub fn record_attempt(&self, position: PendingLateResolutionWinnerTrading) -> Result<bool> {
+        let _transition = self
+            .transition_lock
+            .lock()
+            .expect("winner transition poisoned");
+        self.record_attempt_unlocked(position)
+    }
+
+    fn record_attempt_unlocked(
+        &self,
+        position: PendingLateResolutionWinnerTrading,
+    ) -> Result<bool> {
         let mut states = self
             .states
             .lock()
@@ -1150,11 +1480,32 @@ impl LateResolutionWinnerTradingJournal {
             realized_pnl: None,
             reference: None,
         })?;
+        self.unresolved_attempts
+            .lock()
+            .expect("winner attempts poisoned")
+            .insert(position.position_id.clone(), position.clone());
         states.insert(
             position.position_id.clone(),
             WinnerLifecycleState::Attempted,
         );
         Ok(true)
+    }
+
+    pub fn record_operator_no_fill(
+        &self,
+        position: &PendingLateResolutionWinnerTrading,
+        reason: &str,
+    ) -> Result<bool> {
+        anyhow::ensure!(
+            !reason.trim().is_empty(),
+            "operator no-fill requires an audit reason"
+        );
+        self.record_terminal_attempt(
+            position,
+            WinnerJournalAction::NoFill,
+            WinnerLifecycleState::NoFill,
+            Some(format!("operator verified terminal no-fill: {reason}")),
+        )
     }
 
     pub fn record_no_fill(&self, position: &PendingLateResolutionWinnerTrading) -> Result<bool> {
@@ -1175,7 +1526,7 @@ impl LateResolutionWinnerTradingJournal {
             position,
             WinnerJournalAction::Failed,
             WinnerLifecycleState::Failed,
-            Some(error.to_string()),
+            Some(format!("pre-submit:{error}")),
         )
     }
 
@@ -1186,11 +1537,22 @@ impl LateResolutionWinnerTradingJournal {
         target: WinnerLifecycleState,
         reference: Option<String>,
     ) -> Result<bool> {
+        let _transition = self
+            .transition_lock
+            .lock()
+            .expect("winner transition poisoned");
         let mut states = self
             .states
             .lock()
             .expect("late-resolution-winner-trading state lock poisoned");
-        if states.get(&position.position_id) != Some(&WinnerLifecycleState::Attempted) {
+        if !matches!(
+            states.get(&position.position_id),
+            Some(
+                WinnerLifecycleState::Attempted
+                    | WinnerLifecycleState::Submitted
+                    | WinnerLifecycleState::Uncertain
+            )
+        ) {
             return Ok(false);
         }
         self.append(&WinnerJournalEvent {
@@ -1200,6 +1562,10 @@ impl LateResolutionWinnerTradingJournal {
             realized_pnl: None,
             reference,
         })?;
+        self.unresolved_attempts
+            .lock()
+            .expect("winner attempts poisoned")
+            .remove(&position.position_id);
         states.insert(position.position_id.clone(), target);
         Ok(true)
     }
@@ -1211,6 +1577,10 @@ impl LateResolutionWinnerTradingJournal {
         position: &PendingLateResolutionWinnerTrading,
         pnl: Decimal,
     ) -> Result<bool> {
+        let _transition = self
+            .transition_lock
+            .lock()
+            .expect("winner transition poisoned");
         if !self
             .pending
             .lock()
@@ -1234,7 +1604,11 @@ impl LateResolutionWinnerTradingJournal {
             .realized_pnl
             .lock()
             .expect("late-resolution-winner-trading pnl lock poisoned") += pnl;
-        if pnl > dec!(0) {
+        if position
+            .payout_per_share
+            .unwrap_or_else(|| if pnl > dec!(0) { dec!(1) } else { dec!(0) })
+            > dec!(0)
+        {
             self.awaiting_redeem
                 .lock()
                 .expect("late-resolution-winner-trading redeem lock poisoned")
@@ -1259,6 +1633,10 @@ impl LateResolutionWinnerTradingJournal {
         &self,
         position: &PendingLateResolutionWinnerTrading,
     ) -> Result<bool> {
+        let _transition = self
+            .transition_lock
+            .lock()
+            .expect("winner transition poisoned");
         let mut states = self
             .states
             .lock()
@@ -1285,6 +1663,10 @@ impl LateResolutionWinnerTradingJournal {
         position: &PendingLateResolutionWinnerTrading,
         reference: String,
     ) -> Result<bool> {
+        let _transition = self
+            .transition_lock
+            .lock()
+            .expect("winner transition poisoned");
         let mut states = self
             .states
             .lock()
@@ -1318,6 +1700,7 @@ impl LateResolutionWinnerTradingJournal {
 fn replay_journal(path: &Path) -> Result<WinnerJournalReplay> {
     if !path.exists() {
         return Ok(WinnerJournalReplay {
+            unresolved_attempts: HashMap::new(),
             pending: HashMap::new(),
             awaiting_redeem: HashMap::new(),
             states: HashMap::new(),
@@ -1331,6 +1714,7 @@ fn replay_journal(path: &Path) -> Result<WinnerJournalReplay> {
         .collect::<std::io::Result<Vec<_>>>()?;
     let last_record = lines.iter().rposition(|line| !line.trim().is_empty());
     let mut pending = HashMap::new();
+    let mut unresolved_attempts = HashMap::new();
     let mut awaiting_redeem = HashMap::new();
     let mut states = HashMap::new();
     let mut seen_positions = HashSet::new();
@@ -1341,6 +1725,22 @@ fn replay_journal(path: &Path) -> Result<WinnerJournalReplay> {
     for (index, line) in lines.iter().enumerate() {
         if line.trim().is_empty() {
             continue;
+        }
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
+            if value.get("action").and_then(|v| v.as_str()) == Some("risk_reset") {
+                anyhow::ensure!(
+                    value.get("version").and_then(|v| v.as_u64()) == Some(1)
+                        && value
+                            .get("reason")
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|v| !v.trim().is_empty())
+                        && pending.is_empty()
+                        && unresolved_attempts.is_empty(),
+                    "invalid risk reset event"
+                );
+                risk = Default::default();
+                continue;
+            }
         }
         let event: WinnerJournalEvent = match serde_json::from_str(line) {
             Ok(event) => event,
@@ -1371,27 +1771,48 @@ fn replay_journal(path: &Path) -> Result<WinnerJournalReplay> {
             );
         }
         match event.action {
-            WinnerJournalAction::Attempted => {
+            WinnerJournalAction::Submitted
+            | WinnerJournalAction::Uncertain
+            | WinnerJournalAction::Attempted => {
+                unresolved_attempts
+                    .insert(event.position.position_id.clone(), event.position.clone());
                 states.insert(
                     event.position.position_id.clone(),
                     WinnerLifecycleState::Attempted,
                 );
             }
+            WinnerJournalAction::RiskReset => anyhow::bail!("invalid position-bearing risk reset"),
             WinnerJournalAction::NoFill => {
+                unresolved_attempts.remove(&event.position.position_id);
                 states.insert(
                     event.position.position_id.clone(),
                     WinnerLifecycleState::NoFill,
                 );
             }
             WinnerJournalAction::Failed => {
+                // Legacy Failed records may have been ambiguous writes. Live recovery
+                // keeps them blocked unless explicitly marked pre-submit safe.
+                let uncertain = !event
+                    .reference
+                    .as_deref()
+                    .is_some_and(|reason| reason.starts_with("pre-submit:"));
+                if uncertain {
+                    unresolved_attempts
+                        .insert(event.position.position_id.clone(), event.position.clone());
+                }
                 states.insert(
                     event.position.position_id.clone(),
-                    WinnerLifecycleState::Failed,
+                    if uncertain {
+                        WinnerLifecycleState::Uncertain
+                    } else {
+                        WinnerLifecycleState::Failed
+                    },
                 );
             }
             WinnerJournalAction::Pending => {
+                unresolved_attempts.remove(&event.position.position_id);
                 if seen_positions.insert(event.position.position_id.clone()) {
-                    total_spent += event.position.filled * event.position.price;
+                    total_spent += event.position.cost();
                 }
                 states.insert(
                     event.position.position_id.clone(),
@@ -1405,7 +1826,14 @@ fn replay_journal(path: &Path) -> Result<WinnerJournalReplay> {
                     let pnl = event.realized_pnl.unwrap_or(dec!(0));
                     realized_pnl += pnl;
                     record_risk_result(&mut risk, &event.position, pnl);
-                    if pnl > dec!(0) {
+                    if event.position.payout_per_share.unwrap_or_else(|| {
+                        if pnl > dec!(0) {
+                            dec!(1)
+                        } else {
+                            dec!(0)
+                        }
+                    }) > dec!(0)
+                    {
                         awaiting_redeem
                             .insert(event.position.position_id.clone(), event.position.clone());
                     }
@@ -1431,6 +1859,7 @@ fn replay_journal(path: &Path) -> Result<WinnerJournalReplay> {
         }
     }
     Ok(WinnerJournalReplay {
+        unresolved_attempts,
         pending,
         awaiting_redeem,
         states,
@@ -1688,6 +2117,11 @@ mod tests {
     fn pending_buy() -> PendingLateResolutionWinnerTrading {
         PendingLateResolutionWinnerTrading {
             run_id: "run-1".into(),
+            order_id: None,
+            paper: None,
+            submitted_at_ms: None,
+            outcome_index: None,
+            payout_per_share: None,
             position_id: "winner-1".into(),
             evaluation_id: "evaluation-1".into(),
             candidate_stage: "production".into(),
@@ -1712,6 +2146,7 @@ mod tests {
             book_depth_usdc: dec!(20),
             filled: dec!(20),
             price: dec!(0.97),
+            entry_cost: None,
             fee: dec!(0),
             end_date: Utc::now() - TimeDelta::seconds(1),
         }
@@ -2253,6 +2688,221 @@ mod tests {
         }
 
         drop(writer);
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn worst_case_budget_survives_unknown_writes_and_releases_only_after_reconciliation() {
+        let path =
+            std::env::temp_dir().join(format!("winner-risk-{}.ndjson", uuid::Uuid::new_v4()));
+        let policy = LateResolutionWinnerTradingRiskPolicy {
+            max_strategy_loss: dec!(20),
+            max_asset_loss: dec!(10),
+            max_consecutive_losses: 3,
+        };
+        let mut attempt = pending_buy();
+        attempt.filled = dec!(0);
+        attempt.price = dec!(0);
+        attempt.planned_cost = dec!(4);
+        {
+            let journal = LateResolutionWinnerTradingJournal::open(&path).unwrap();
+            journal
+                .record_attempt_with_risk(attempt.clone(), policy)
+                .unwrap();
+            attempt.order_id = Some("0xrecoverable".into());
+            journal.record_submitted(&attempt).unwrap();
+            journal
+                .record_uncertain(&attempt, "POST timeout".into())
+                .unwrap();
+            assert_eq!(journal.remaining_loss_budget("btc", policy), dec!(6));
+            assert!(journal.reset_risk("still unknown").is_err());
+        }
+        {
+            let journal = LateResolutionWinnerTradingJournal::open(&path).unwrap();
+            assert_eq!(journal.unresolved_attempts()[0].order_id, attempt.order_id);
+            assert_eq!(journal.remaining_loss_budget("btc", policy), dec!(6));
+            assert!(journal.record_no_fill(&attempt).unwrap());
+            assert_eq!(journal.remaining_loss_budget("btc", policy), dec!(10));
+            journal
+                .reset_risk("operator audited terminal no-fill")
+                .unwrap();
+        }
+        assert!(LateResolutionWinnerTradingJournal::open(&path)
+            .unwrap()
+            .unresolved_attempts()
+            .is_empty());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn concurrent_attempts_cannot_spend_the_same_loss_budget() {
+        let path =
+            std::env::temp_dir().join(format!("winner-concurrent-{}.ndjson", uuid::Uuid::new_v4()));
+        let journal = std::sync::Arc::new(LateResolutionWinnerTradingJournal::open(&path).unwrap());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let policy = LateResolutionWinnerTradingRiskPolicy {
+            max_strategy_loss: dec!(20),
+            max_asset_loss: dec!(10),
+            max_consecutive_losses: 3,
+        };
+        let handles: Vec<_> = (0..4)
+            .map(|index| {
+                let journal = journal.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let mut p = pending_buy();
+                    p.position_id = format!("concurrent-{index}");
+                    p.planned_cost = dec!(4);
+                    p.filled = dec!(0);
+                    barrier.wait();
+                    journal.record_attempt_with_risk(p, policy).is_ok()
+                })
+            })
+            .collect();
+        let accepted = handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .filter(|ok| *ok)
+            .count();
+        assert_eq!(accepted, 2);
+        assert_eq!(journal.remaining_loss_budget("btc", policy), dec!(2));
+        drop(journal);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn fractional_payout_loss_still_requires_redemption_and_replays_exactly() {
+        let path =
+            std::env::temp_dir().join(format!("winner-fractional-{}.ndjson", uuid::Uuid::new_v4()));
+        let mut buy = pending_buy();
+        buy.payout_per_share = Some(dec!(0.5));
+        let pnl = settle_late_resolution_winner_trading(
+            &buy,
+            buy.end_date,
+            true,
+            &(dec!(0.5), dec!(0.5)),
+        )
+        .unwrap();
+        assert_eq!(pnl, buy.filled * (dec!(0.5) - buy.price));
+        let dust = PendingLateResolutionWinnerTrading {
+            filled: dec!(1.000001),
+            entry_cost: Some(dec!(0.97)),
+            ..buy.clone()
+        };
+        assert_eq!(
+            settle_late_resolution_winner_trading(
+                &dust,
+                dust.end_date,
+                true,
+                &(dec!(0.5), dec!(0.5))
+            ),
+            Some(dec!(-0.47))
+        );
+
+        {
+            let journal = LateResolutionWinnerTradingJournal::open(&path).unwrap();
+            journal.record_pending(buy.clone()).unwrap();
+            journal.record_settled(&buy, pnl).unwrap();
+            assert_eq!(journal.awaiting_redeem().len(), 1);
+        }
+        let journal = LateResolutionWinnerTradingJournal::open(&path).unwrap();
+        assert_eq!(
+            journal.awaiting_redeem()[0].payout_per_share,
+            Some(dec!(0.5))
+        );
+        assert_eq!(journal.risk_snapshot().strategy_loss, -pnl);
+        journal.reset_risk("reviewed fractional payout").unwrap();
+        drop(journal);
+        assert_eq!(
+            LateResolutionWinnerTradingJournal::open(&path)
+                .unwrap()
+                .risk_snapshot()
+                .strategy_loss,
+            dec!(0)
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn buffered_research_journal_drains_all_records_on_close() {
+        let path =
+            std::env::temp_dir().join(format!("winner-buffered-{}.ndjson", uuid::Uuid::new_v4()));
+        {
+            let journal = WinnerEvaluationJournal::open_buffered(&path, 0).unwrap();
+            for index in 0..50 {
+                journal
+                    .record_run_started(&format!("run-{index}"), "live", false)
+                    .unwrap();
+            }
+        }
+        let records = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(records.lines().count(), 50);
+        for line in records.lines() {
+            let _: serde_json::Value = serde_json::from_str(line).unwrap();
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn legacy_failed_attempt_requires_operator_audit_or_order_recovery() {
+        let path =
+            std::env::temp_dir().join(format!("winner-legacy-{}.ndjson", uuid::Uuid::new_v4()));
+        let mut position = pending_buy();
+        position.filled = dec!(0);
+        position.price = dec!(0);
+        let event = WinnerJournalEvent {
+            version: 1,
+            action: WinnerJournalAction::Failed,
+            position: position.clone(),
+            realized_pnl: None,
+            reference: Some("network error from legacy executor".into()),
+        };
+        std::fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string(&event).unwrap()),
+        )
+        .unwrap();
+        {
+            let journal = LateResolutionWinnerTradingJournal::open(&path).unwrap();
+            assert_eq!(journal.unresolved_attempts().len(), 1);
+            position.order_id = Some("operator-recovered-id".into());
+            journal
+                .record_uncertain(&position, "operator recovered id".into())
+                .unwrap();
+            assert!(journal
+                .record_operator_no_fill(&position, "verified canceled with zero confirmed trades")
+                .unwrap());
+        }
+        assert!(LateResolutionWinnerTradingJournal::open(&path)
+            .unwrap()
+            .unresolved_attempts()
+            .is_empty());
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn second_state_journal_opener_cannot_repair_an_active_writers_tail() {
+        let path = std::env::temp_dir().join(format!(
+            "winner-lock-before-repair-{}.ndjson",
+            uuid::Uuid::new_v4()
+        ));
+        let journal = LateResolutionWinnerTradingJournal::open(&path).unwrap();
+        journal.record_pending(pending_buy()).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(b"{partial").unwrap();
+        drop(file);
+        let before = std::fs::read(&path).unwrap();
+        assert!(LateResolutionWinnerTradingJournal::open(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        drop(journal);
+        assert_eq!(
+            LateResolutionWinnerTradingJournal::open(&path)
+                .unwrap()
+                .pending()
+                .len(),
+            1
+        );
         std::fs::remove_file(path).unwrap();
     }
 }

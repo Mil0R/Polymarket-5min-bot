@@ -163,6 +163,10 @@ impl LiveSafetyGuard {
         }
     }
 
+    pub fn record_winner_pnl(&self, pnl: Decimal) {
+        self.record_winner_settlement((-pnl).max(dec!(0)), pnl >= dec!(0));
+    }
+
     pub fn trip(&self, reason: impl Into<String>) {
         let reason = reason.into();
         let mut state = self.state.lock().expect("live safety lock poisoned");
