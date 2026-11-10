@@ -1,0 +1,100 @@
+{
+  "study_id": "eth-ask-cap-097-v1",
+  "decision_date_beijing": "2026-10-26",
+  "plan_revision": 2,
+  "review_protocol_id": "fast-screen-3-7-14-v1",
+  "review_protocol_authorized_on_beijing_date": "2026-10-26",
+  "review_protocol_objective": "decide_research_value_within_14_days_not_certify_stable_profit",
+  "previous_plan": {
+    "path": "docs/research-archive/late_resolution_winner_price_cap_plan_2026-10-26.initial.json",
+    "sha256": "2b7c6272b07258b2167a33e5fb9e01f4649d1adc5bb90130ad755c8a0b0ea2c2",
+    "amended_fields": "review_schedule_decision_policy_and_analysis_focus_only"
+  },
+  "user_authorized": "Implement independent ETH ask cap 0.97 dry-run",
+  "registration_status": "register_at_first_server_start_next_full_5m_window",
+  "old_005_006_data": "retrospective_diagnostic_only_no_forward_backfill",
+  "old_signed_plans": "preserve_unchanged_new_007_is_not_old_forward_scope",
+  "eth_two_condition_continuation": "deferred_as_active_research_objective",
+  "default_batch": "server-low-latency-007-5m",
+  "study_journal": "price-cap-study.ndjson",
+  "arms": {
+    "control_096_098": {"btc_min_ask": "0.96", "btc_max_ask": "0.98", "eth_min_ask": "0.96", "eth_max_ask": "0.98"},
+    "eth_cap_097": {"btc_min_ask": "0.96", "btc_max_ask": "0.98", "eth_min_ask": "0.96", "eth_max_ask": "0.97"}
+  },
+  "admission": {
+    "valid_reference_and_market_quality_required": true,
+    "ignore_for_research_only": ["ReversalBoundary", "NetEvTooLow"],
+    "additional_probability_or_distance_threshold": false,
+    "before_end_secs": 60,
+    "distinct_twap_confirmations": 2,
+    "separate_confirmation_state_per_arm": true,
+    "separate_attempt_limit_per_arm_market": 1,
+    "no_fill_and_error_consume_attempt": true,
+    "candidate_can_enter_later_after_control_attempt": true
+  },
+  "capital": {
+    "initial_cash_per_arm_usdc": "100",
+    "max_order_usdc": "5",
+    "fee_inclusive": true,
+    "depth_adaptive_sizing": true,
+    "settled_payout_recycled": true,
+    "unknown_execution_reservation_retained": true,
+    "shared_delayed_book_read_when_both_arms_confirm_same_scan": true,
+    "independent_wallet_and_liquidity_claim": false
+  },
+  "primary_measure": "ETH matched-market candidate-minus-control fee-inclusive realized PAPER PnL",
+  "secondary_measures": ["by_asset_pnl", "later_entry_markets", "no_fills", "execution_errors", "pending_and_unknown", "cash_conservation", "fill_dates", "different_decision_eth_markets", "opportunity_cost_and_avoided_losses", "calendar_time_pnl", "daily_pnl_distribution"],
+  "reviews_relative_to_first_full_window_days": [3, 7, 14],
+  "operational_check_window_hours": [48, 72],
+  "fast_screening_max_calendar_days": 14,
+  "review_clock": {
+    "anchor": "first_registered_full_5m_window_from_server_journal",
+    "checkpoint_elapsed_hours": [72, 168, 336],
+    "calendar_dates": "derive_when_actual_server_registration_is_available",
+    "execution": "review_synced_snapshots_no_background_scheduler_installed",
+    "runtime_auto_stop": false,
+    "automatic_extension": false,
+    "fast_screen_entry_window": "anchor <= market_window_start < anchor + 14 calendar days",
+    "after_day_14_data": "separate_followup_not_automatic_extension_of_fast_screen",
+    "pending_at_cutoff": "report_separately_never_impute_profit_later_settlements_are_labeled_followup"
+  },
+  "checkpoints": [
+    {
+      "day": 3,
+      "purpose": "operational_integrity_check_within_48_to_72_hours",
+      "checks": ["independent_confirmations", "later_entry_after_control_attempt", "execution_and_settlement_links", "cash_conservation", "no_duplicate_arm_market_attempts", "source_and_configuration_integrity"],
+      "on_failure": "diagnose_and_record_no_performance_conclusion_from_invalid_data"
+    },
+    {
+      "day": 7,
+      "purpose": "initial_research_value_review",
+      "checks": ["matched_eth_candidate_minus_control_pnl", "different_decision_eth_markets", "later_entry_contribution", "sacrificed_winning_profit_vs_avoided_losses", "daily_distribution", "missing_or_pending_results"],
+      "allowed_decisions": ["archive_not_supported_at_snapshot", "archive_unproven", "continue_unchanged_to_day_14"],
+      "no_loss_observed": "avoidance_effect_unverified"
+    },
+    {
+      "day": 14,
+      "purpose": "close_fast_screen_and_record_research_disposition",
+      "allowed_decisions": ["archive_not_supported_at_snapshot", "archive_unproven", "further_research_only_after_separate_decision"],
+      "default_if_insufficient_evidence": "archive_unproven",
+      "extend_to_collect_100_automatically": false
+    }
+  ],
+  "minimum_review_milestones": {"settled_eth_control_fills": 100, "settled_eth_candidate_fills": 100, "eth_fill_dates_per_arm": 7},
+  "minimum_review_milestones_interpretation": "retained_reference_milestones_not_a_requirement_to_finish_fast_screen_or_a_profitability_certificate",
+  "analysis_policy": {
+    "prioritize": "ETH markets where the two arms make different decisions or enter at different times",
+    "retain_all_markets_for_total_pnl_and_calendar_day_denominators": true,
+    "deduplicate_unit": "market_per_arm_not_repeated_evaluations_or_duplicate_hosts",
+    "insufficient_samples_can_end_as_unproven": true,
+    "do_not_stop_on_first_positive_pnl_and_declare_success": true,
+    "review_is_research_triage_not_a_formal_sequential_significance_test": true,
+    "no_new_threshold_fitting_during_fast_screen": true
+  },
+  "review_milestones_are_not_statistical_proof_or_live_permission": true,
+  "server_runtime_configuration": "immutable per journal; recorded and compared on every restart",
+  "after_expiry_simulation": "record error and raw result, zero financial exposure, exclude matched performance",
+  "paper_only": true,
+  "automatic_promotion": false,
+  "live_or_size_increase_authorized": false
+}

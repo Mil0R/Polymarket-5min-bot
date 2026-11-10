@@ -1,0 +1,75 @@
+{
+  "captured_at": "2026-11-04T01:25:52.968259+00:00",
+  "files": [
+    {
+      "source": "results/late-resolution-winner-trading/server-low-latency-007-5m/orders.ndjson",
+      "path": "results-incoming/analysis-snapshot-20261104-late-winner-008/results/late-resolution-winner-trading/server-low-latency-007-5m/orders.ndjson",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "complete_tail": true
+    },
+    {
+      "source": "results/late-resolution-winner-trading/server-low-latency-007-5m/evaluations.ndjson",
+      "path": "results-incoming/analysis-snapshot-20261104-late-winner-008/results/late-resolution-winner-trading/server-low-latency-007-5m/evaluations.ndjson",
+      "bytes": 3492080,
+      "sha256": "25a0af91c1e38b3a3cb4157acd6a1b37adad6f59019fe8703da5dc3896c9385c",
+      "complete_tail": true
+    },
+    {
+      "source": "results/late-resolution-winner-trading/server-low-latency-007-5m/price-cap-study.ndjson",
+      "path": "results-incoming/analysis-snapshot-20261104-late-winner-008/results/late-resolution-winner-trading/server-low-latency-007-5m/price-cap-study.ndjson",
+      "bytes": 2144105,
+      "sha256": "ef65417fa24375b5118394a3463ed30567c43b365b69d1a47084c1323aae428d",
+      "complete_tail": true
+    },
+    {
+      "source": "logs/server-low-latency-007-5m/late-resolution-winner-trading.log",
+      "path": "results-incoming/analysis-snapshot-20261104-late-winner-008/logs/server-low-latency-007-5m/late-resolution-winner-trading.log",
+      "bytes": 700976,
+      "sha256": "7f2c3c73df72d96784f66a4a610528e5f2e68703a908bca32a2862da1259dfab",
+      "complete_tail": true
+    },
+    {
+      "source": "logs/server-low-latency-007-5m/system.log",
+      "path": "results-incoming/analysis-snapshot-20261104-late-winner-008/logs/server-low-latency-007-5m/system.log",
+      "bytes": 4595051,
+      "sha256": "7f05651d5af864df65d9fe9f3599f0ec23df92eab2df3ac96e9e3930cba5d4fd",
+      "complete_tail": true
+    },
+    {
+      "source": "results/late-resolution-winner-trading/server-low-latency-008-5m/evaluations.ndjson",
+      "path": "results-incoming/analysis-snapshot-20261104-late-winner-008/results/late-resolution-winner-trading/server-low-latency-008-5m/evaluations.ndjson",
+      "bytes": 2340159,
+      "sha256": "73e4f299698414f703f4fcdee83553ecb48f70923b271073b07fa9cab538b1a3",
+      "complete_tail": true
+    },
+    {
+      "source": "results/late-resolution-winner-trading/server-low-latency-008-5m/orders.ndjson",
+      "path": "results-incoming/analysis-snapshot-20261104-late-winner-008/results/late-resolution-winner-trading/server-low-latency-008-5m/orders.ndjson",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "complete_tail": true
+    },
+    {
+      "source": "results/late-resolution-winner-trading/server-low-latency-008-5m/price-cap-study.ndjson",
+      "path": "results-incoming/analysis-snapshot-20261104-late-winner-008/results/late-resolution-winner-trading/server-low-latency-008-5m/price-cap-study.ndjson",
+      "bytes": 1506627,
+      "sha256": "2c9ce52e76fc1fdc3f6b903ac89a4d5df389aa36549dea500b79701a75a5d2e5",
+      "complete_tail": true
+    },
+    {
+      "source": "logs/server-low-latency-008-5m/late-resolution-winner-trading.log",
+      "path": "results-incoming/analysis-snapshot-20261104-late-winner-008/logs/server-low-latency-008-5m/late-resolution-winner-trading.log",
+      "bytes": 1183199,
+      "sha256": "9dc55de86d555c6488162d05d7c1ab1484b992969582fabb78345f5bebad3616",
+      "complete_tail": true
+    },
+    {
+      "source": "logs/server-low-latency-008-5m/system.log",
+      "path": "results-incoming/analysis-snapshot-20261104-late-winner-008/logs/server-low-latency-008-5m/system.log",
+      "bytes": 777029,
+      "sha256": "cbd5238b8d328fe492feed617141470c16dcd8246354162f51e53563957506ce",
+      "complete_tail": true
+    }
+  ]
+}

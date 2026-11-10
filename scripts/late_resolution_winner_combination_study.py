@@ -18,13 +18,17 @@ from pathlib import Path
 UTC = timezone.utc
 BEIJING = timezone(timedelta(hours=8))
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_PLAN = ROOT / "scripts/late_resolution_winner_combination_plan_2026-10-05.json"
-DEFAULT_OUTPUT = ROOT / "results/late-resolution-winner-trading/combination-study-2026-10-05"
+LEGACY_PLAN = ROOT / "scripts/late_resolution_winner_combination_plan_2026-10-05.json"
+LEGACY_OUTPUT = ROOT / "results/late-resolution-winner-trading/combination-study-2026-10-05"
+DEFAULT_PLAN = ROOT / "scripts/late_resolution_winner_combination_plan_2026-10-12.json"
+DEFAULT_OUTPUT = ROOT / "results/late-resolution-winner-trading/combination-study-2026-10-12"
+DEFAULT_STUDY_ID = "late-winner-combination-continuation-2026-10-12"
 DEFAULT_INPUTS = [
     "results/late-resolution-winner-trading/server-low-latency-005-5m/evaluations.ndjson",
     "results/late-resolution-winner-trading/server-low-latency-006-5m/evaluations.ndjson",
 ]
 FORWARD_RUN = "6bee8cdf-0766-40f5-98e4-e0f3825c7545"
+CONTINUATION_RUN = "67734575-c2cc-4290-9357-8bcd981c87a7"
 
 
 def compare(field, operator, value):
@@ -349,9 +353,33 @@ def snapshot_inputs(root, descriptors):
     return frozen, current, provenance
 
 
-def register_plan(root, plan_path, inputs=None, now=None, forward_run_id=FORWARD_RUN):
+def register_plan(root, plan_path, inputs=None, now=None, forward_run_id=FORWARD_RUN,
+                  study_id="late-winner-combination-2026-10-05", parent_plan_path=None,
+                  review_dates_beijing=None, continuation_metadata=None):
     if plan_path.exists():
         raise ValueError(f"plan already registered; refusing overwrite: {plan_path}")
+    parent, parent_provenance = None, None
+    if parent_plan_path is not None:
+        parent_plan_path = root / parent_plan_path
+        parent_raw = parent_plan_path.read_bytes()
+        parent = json.loads(parent_raw)
+        if parent.get("registration_sha256") != registration_digest(parent):
+            raise ValueError("parent plan checksum changed; cannot continue frozen rules")
+        if parent.get("schema_version") != 1 or parent.get("automatic_promotion") is not False:
+            raise ValueError("unsupported parent protocol")
+        # Continuing a run does not turn old, already inspected results into
+        # forward validation. The parent input and rule history stay immutable.
+        snapshot_inputs(root, parent["inputs"])
+        expected = {"assets": ["eth", "btc"], "mode": "paper", "hybrid_paper_enabled": True, "market_seconds": 300,
+                    "order_budget_usdc": "5", "primary_selection": "latest_main_execution_per_market",
+                    "settlement_join": "execution.evaluation_id", "sensitivity_only_excluded": True}
+        if any(parent["scope"].get(key) != value for key, value in expected.items()):
+            raise ValueError("parent execution protocol differs; use a separately defined study")
+        parent_provenance = {"path": str(parent_plan_path.relative_to(root)),
+                             "sha256": hashlib.sha256(parent_raw).hexdigest(),
+                             "registration_sha256": parent["registration_sha256"],
+                             "study_id": parent["study_id"],
+                             "forward_run_id": parent["scope"]["forward_run_id"]}
     inputs = inputs if inputs is not None else DEFAULT_INPUTS
     sources = [(str(source), (root / source).read_bytes()) for source in inputs]
     frozen = parse_journals(sources)
@@ -366,17 +394,22 @@ def register_plan(root, plan_path, inputs=None, now=None, forward_run_id=FORWARD
     # rows from the unobserved sync gap must not masquerade as forward samples.
     now = now if now is not None else datetime.now(UTC)
     forward_epoch = (int(now.timestamp()) // 300 + 1) * 300
-    plan = {"schema_version": 1, "study_id": "late-winner-combination-2026-10-05",
+    dates = review_dates_beijing or {"earliest": "2026-10-12", "first_review": "2026-10-19",
+                                    "parameter_review_window": ["2026-10-26", "2026-11-09"]}
+    for key in ("earliest", "first_review", "second_review"):
+        if key in dates:
+            datetime.strptime(dates[key], "%Y-%m-%d")
+    plan = {"schema_version": 1, "study_id": study_id,
             "registered_at": iso(now), "forward_window_start": iso(datetime.fromtimestamp(forward_epoch, UTC)),
             "inputs": [source_metadata(source, raw) for source, raw in sources],
             "scope": {"forward_run_id": forward_run_id, "forward_source": str(inputs[-1]), "assets": ["eth", "btc"],
                       "mode": "paper", "hybrid_paper_enabled": True, "market_seconds": 300,
                       "order_budget_usdc": "5", "primary_selection": "latest_main_execution_per_market",
                       "settlement_join": "execution.evaluation_id", "sensitivity_only_excluded": True},
-            "rules": candidate_rules(), "baseline_at_registration": by_asset(baseline, False),
-            "review_dates_beijing": {"earliest": "2026-10-12", "first_review": "2026-10-19",
-                                     "parameter_review_window": ["2026-10-26", "2026-11-09"]},
-            "sample_targets": {"new_settled_eth_fills_minimum": 300, "new_settled_eth_fills_preferred": 500,
+            "rules": parent["rules"] if parent else candidate_rules(),
+            "baseline_at_registration": by_asset(baseline, False),
+            "review_dates_beijing": dates,
+            "sample_targets": parent["sample_targets"] if parent else {"new_settled_eth_fills_minimum": 300, "new_settled_eth_fills_preferred": 500,
                                "comparable_eth_losses_minimum": 10, "comparable_eth_losses_preferred": 15,
                                "per_rule_new_settled_eth_fills_minimum": 100,
                                "per_rule_new_settled_eth_fills_preferred": 200, "per_rule_fill_days_minimum": 7},
@@ -386,6 +419,13 @@ def register_plan(root, plan_path, inputs=None, now=None, forward_run_id=FORWARD
                                "Model probability and margin/boundary ratio are correlated, uncalibrated features.",
                                "Keep server strategy, confirmations, volatility floors and 5 USDC budget unchanged during validation.",
                                "Sample milestones and nominal Wilson intervals never automatically authorize a parameter change."]}
+    if parent_provenance is not None:
+        plan["continuation"] = {"parent_plan": parent_provenance,
+                                "existing_data_policy": "historical_diagnostic_only_no_forward_backfill",
+                                "new_registration_and_full_window_boundary": True,
+                                "rules_and_sample_targets_inherited": True,
+                                "server_change_required": False,
+                                "metadata": continuation_metadata or {}}
     plan["registration_sha256"] = registration_digest(plan)
     plan_path.parent.mkdir(parents=True, exist_ok=True)
     with plan_path.open("x", encoding="utf-8") as stream:
@@ -401,6 +441,11 @@ def analyze_plan(root, plan_path):
         raise ValueError("registered plan checksum changed; do not edit frozen rules or boundaries")
     if plan["schema_version"] != 1 or plan.get("automatic_promotion") is not False:
         raise ValueError("unsupported or automatic-promotion plan")
+    if "continuation" in plan:
+        parent = plan["continuation"]["parent_plan"]
+        parent_raw = (root / parent["path"]).read_bytes()
+        if hashlib.sha256(parent_raw).hexdigest() != parent["sha256"]:
+            raise ValueError("parent plan changed after continuation registration")
     frozen_sources, current_sources, provenance = snapshot_inputs(root, plan["inputs"])
     frozen, current = parse_journals(frozen_sources), parse_journals(current_sources)
     baseline = latest_main(frozen["trades"])
@@ -473,7 +518,8 @@ def analyze_plan(root, plan_path):
             "excluded_new_attempts": {name: by_asset(latest_main(rows)) for name, rows in buckets.items() if name != "forward"},
             "protocol_deviations": deviations, "new_runs_since_registration": new_runs,
             "journal_counters": current["counters"], "automatic_promotion": False,
-            "interpretation": plan["interpretation"]}
+            "interpretation": plan["interpretation"],
+            **({"continuation": plan["continuation"]} if "continuation" in plan else {})}
 
 
 def percentage(value):
@@ -488,6 +534,14 @@ def render_markdown(report):
              "历史样本用于提出候选。前瞻样本只接收登记后的完整五分钟市场、指定 006 run 的主 Shadow 执行；",
              "登记前同步缺口、旧市场重试和其他 run 单独统计。结算按执行关联 evaluation ID，排除 sensitivity-only。", "",
              "收益是已记录尝试的子集回放，含 journal 中模拟费用，不是新策略可实现收益或实盘账户收益。", ""]
+    if "continuation" in report:
+        continuation = report["continuation"]
+        parent = continuation["parent_plan"]
+        lines.extend(["## 续接协议", "",
+                      f"- 独立版本：`{report['study_id']}`；继承 `{parent['study_id']}` 的冻结候选与样本节点。",
+                      f"- 原计划 SHA256：`{parent['sha256']}`。",
+                      "- 登记前数据全部为历史诊断；旧版前瞻结果不并入新版，登记前同步缺口继续单列。",
+                      "- 原服务器 dry run 继续，无需重启；新 run 不自动接纳，A/B 正距离豁免维持撤回。", ""])
     for phase, label in (("baseline_frozen", "冻结历史基线"), ("forward", "登记后前瞻验证")):
         section = report[phase]
         lines.extend([f"## {label}", "", "|资产|尝试|成交已结算|胜 / 负|未成交|待结算成交|净收益 USDC|ROI|Wilson 95% 下界|成本/份额盈亏平衡|", "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|"])
@@ -511,8 +565,13 @@ def render_markdown(report):
                   f"- 可比 ETH 负场：{progress['comparable_eth_losses']} / 最低 {targets['comparable_eth_losses_minimum']}，优选 {targets['comparable_eth_losses_preferred']}（历史 {progress['baseline_eth_losses']}，前瞻 {progress['forward_eth_losses']}）。",
                   f"- 各候选保留组：最低 {targets['per_rule_new_settled_eth_fills_minimum']} 笔，优选 {targets['per_rule_new_settled_eth_fills_preferred']} 笔，至少 {targets['per_rule_fill_days_minimum']} 个有成交的北京时间日期。",
                   f"- 第一次正式复核：{dates['first_review']}；最早观察节点 {dates['earliest']}；参数评审窗口 {' 至 '.join(dates['parameter_review_window'])}。",
-                  "- 以上为研究样本节点，不是自动调参或实盘准入条件；达到日期但样本不足就继续积累。", "",
-                  "|候选|前瞻 ETH 保留成交|有成交日期|样本节点满足|名义 Wilson 下界超过成本/份额|", "|---|---:|---:|---|---|"])
+                  "- 以上为研究样本节点，不是自动调参或实盘准入条件；达到日期但样本不足就继续积累。"])
+    if "second_review" in dates:
+        lines.append(f"- 第二次复核：{dates['second_review']}；日期是评审节点，不保证样本达标。")
+    if "estimated_sample_review_window" in dates:
+        lines.append(f"- 按当前速率估计的较完整样本评审窗口：{' 至 '.join(dates['estimated_sample_review_window'])}；实际仍按样本量和结果评审。")
+    lines.extend(["", "|候选|前瞻 ETH 保留成交|有成交日期|样本节点满足|名义 Wilson 下界超过成本/份额|",
+                  "|---|---:|---:|---|---|"])
     for rule_id, p in progress["rule_progress"].items():
         confidence = p["nominal_wilson_above_weighted_break_even"]
         lines.append(f"|{report['forward']['rules'][rule_id]['label']}|{p['kept_new_settled_eth_fills']}|{p['kept_fill_days']}|{'是' if p['group_sample_milestones_met'] else '否'}|{'样本不足' if confidence is None else ('是' if confidence else '否')}|")
@@ -535,30 +594,57 @@ def main():
     commands = parser.add_subparsers(dest="command", required=True)
     register = commands.add_parser("register", help="register once; refuses existing plan")
     register.add_argument("--plan", type=Path, default=DEFAULT_PLAN)
-    register.add_argument("--forward-run-id", default=FORWARD_RUN, help="explicit run for a separately reviewed new protocol")
+    register.add_argument("--forward-run-id", default=CONTINUATION_RUN, help="explicit run for a separately reviewed new protocol")
+    register.add_argument("--study-id", default=DEFAULT_STUDY_ID)
+    register.add_argument("--parent-plan", type=Path, default=LEGACY_PLAN, help="inherit frozen rules and targets without changing the original plan")
     analyze = commands.add_parser("analyze", help="validate frozen prefixes and report new markets")
     analyze.add_argument("--plan", type=Path, default=DEFAULT_PLAN)
-    analyze.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
+    analyze.add_argument("--output-dir", type=Path, help="defaults to the selected protocol's separate report directory")
     args = parser.parse_args()
     try:
         if args.command == "register":
-            plan = register_plan(ROOT, args.plan, forward_run_id=args.forward_run_id)
+            decision_path = ROOT / "results/late-resolution-winner-trading/filter-narrowing-research-2026-10-09/candidate-decision-2026-10-10.json"
+            decision_raw = decision_path.read_bytes()
+            decision = json.loads(decision_raw)
+            if decision.get("user_approved") is not True or any(
+                    row.get("status") != "withdrawn_do_not_advance" or row.get("enable_in_server") is not False
+                    for row in decision["candidates"]):
+                raise ValueError("A/B withdrawal status requires protocol review")
+            metadata = {"user_approved_continuation_on_beijing_date": "2026-10-12",
+                        "withdrawal_decision": {"path": str(decision_path.relative_to(ROOT)),
+                                                "sha256": hashlib.sha256(decision_raw).hexdigest(),
+                                                "candidate_status": {row["id"]: row["status"] for row in decision["candidates"]}},
+                        "sampling_estimate": {"basis_snapshot": "2026-10-12", "eth_fills_per_day": [13, 16],
+                                              "joint_kept_eth_fills_per_day": [2, 5],
+                                              "joint_kept_eth_central_per_day": 2.7249616305599433,
+                                              "new_eth_300_days": [19, 24], "new_joint_kept_eth_100_days": [20, 50],
+                                              "central_days_to_100_joint_kept_eth": 37,
+                                              "estimate_not_a_sample_or_profit_guarantee": True}}
+            dates = {"earliest": "2026-10-12", "first_review": "2026-10-19", "second_review": "2026-10-26",
+                     "parameter_review_window": ["2026-10-26", "2026-11-09"],
+                     "estimated_sample_review_window": ["2026-11-16", "2026-11-30"]}
+            plan = register_plan(ROOT, args.plan, forward_run_id=args.forward_run_id, study_id=args.study_id,
+                                 parent_plan_path=args.parent_plan, review_dates_beijing=dates,
+                                 continuation_metadata=metadata)
             print(f"Registered: {args.plan}")
             print(f"Forward full-window boundary (UTC): {plan['forward_window_start']}")
         else:
             report = analyze_plan(ROOT, args.plan)
-            args.output_dir.mkdir(parents=True, exist_ok=True)
+            output_dir = args.output_dir or (LEGACY_OUTPUT if args.plan.resolve() == LEGACY_PLAN.resolve() else
+                                            DEFAULT_OUTPUT if args.plan.resolve() == DEFAULT_PLAN.resolve() else
+                                            DEFAULT_OUTPUT.parent / args.plan.stem)
+            output_dir.mkdir(parents=True, exist_ok=True)
             # Complete computation before replacing reports so invalid inputs
             # cannot erase the previous successful analysis.
             for name, contents in (("report.json", json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False)+"\n"),
                                    ("report.zh-CN.md", render_markdown(report))):
-                destination = args.output_dir / name
+                destination = output_dir / name
                 temporary = destination.with_suffix(destination.suffix + ".tmp")
                 temporary.write_text(contents, encoding="utf-8")
                 temporary.replace(destination)
             eth = report["forward"]["control"]["eth"]
             print(f"Forward ETH: {eth['settled_fills']} settled fills, {eth['wins']} wins / {eth['losses']} losses; PnL {eth['pnl']} USDC")
-            print(f"Report: {args.output_dir / 'report.zh-CN.md'}")
+            print(f"Report: {output_dir / 'report.zh-CN.md'}")
             if report["protocol_deviations"]:
                 print("Protocol deviations: " + ", ".join(report["protocol_deviations"]))
     except (ValueError, KeyError, OSError) as error:

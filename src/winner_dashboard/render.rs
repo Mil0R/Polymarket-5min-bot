@@ -153,7 +153,7 @@ pub(super) fn draw(frame: &mut Frame, ui: &Ui, data: &Data) {
     let compact = area.height < 32;
     let header_height = header_height(
         area.height,
-        data.live.as_ref().is_some_and(|s| s.operator.is_some()),
+        ui.query.arm == 3 || data.live.as_ref().is_some_and(|s| s.operator.is_some()),
         !ui.message.is_empty(),
     );
     let sections = Layout::vertical(if compact {
@@ -172,7 +172,9 @@ pub(super) fn draw(frame: &mut Frame, ui: &Ui, data: &Data) {
     })
     .split(area);
     let body_area = sections[if compact { 1 } else { 2 }];
-    let arm = if ui.query.arm == 2 {
+    let arm = if ui.query.arm == 3 {
+        ui.text("Loss boost 10× / 1h", "亏后加码 10× / 1h")
+    } else if ui.query.arm == 2 {
         ui.text("Operator ETH≤0.97", "Operator ETH≤0.97")
     } else if ui.query.arm == 1 {
         ui.text("Candidate ETH≤0.97", "候选 ETH≤0.97")
@@ -224,73 +226,89 @@ pub(super) fn draw(frame: &mut Frame, ui: &Ui, data: &Data) {
         ui.text("Settlement check", "结算检查"),
         age(now, settle, ui.language)
     );
-    let controls = data
-        .live
-        .as_ref()
-        .and_then(|s| s.operator.as_ref())
-        .map(|o| {
-            let state = if data.live_error.is_some()
-                || now.saturating_sub(data.live.as_ref().unwrap().captured_ms) > 3000
-            {
-                ui.text("UNKNOWN", "状态未知")
-            } else if o.failed {
-                ui.text("FAILED", "故障")
-            } else if o.settings.paused {
-                ui.text("PAUSED", "已暂停")
-            } else {
-                ui.text("RUNNING", "运行中")
-            };
-            let pending = o
-                .settings
-                .pending_budget
-                .map(|v| {
-                    format!(
-                        " ->{v}@{}",
-                        date(o.settings.effective_window_ms.unwrap_or(0))
-                    )
+    let controls = if let Some(boost) = &data.ledger.boost {
+        Some(
+            [0, 1]
+                .map(|i| {
+                    let cap = boost.budget(i, utc_now);
+                    let until = boost
+                        .active_until(i, utc_now)
+                        .map(|t| format!(" →{} UTC", t.format("%H:%M:%S")))
+                        .unwrap_or_default();
+                    format!("{} ${cap}{until}", ["BTC", "ETH"][i])
                 })
-                .unwrap_or_default();
-            let options = [
-                format!(
-                    "Operator {state} | ${}{} | {} {} | {} {} | v{} | O/P/E/F",
-                    o.settings.budget,
-                    pending,
-                    ui.text("Cash", "现金"),
-                    fmt(o.cash, 4),
-                    ui.text("Capital", "本金"),
-                    fmt(o.capital, 2),
-                    o.settings.revision
-                ),
-                format!(
-                    "OP {state} ${}{} | {} {} | {} {} | v{}",
-                    o.settings.budget,
-                    pending,
-                    ui.text("Cash", "现金"),
-                    fmt(o.cash, 2),
-                    ui.text("Capital", "本金"),
-                    fmt(o.capital, 2),
-                    o.settings.revision
-                ),
-                format!(
-                    "OP {state} ${} | {} {} | {} {}",
-                    o.settings.budget,
-                    ui.text("Cash", "现金"),
-                    fmt(o.cash, 2),
-                    ui.text("Capital", "本金"),
-                    fmt(o.capital, 2)
-                ),
-            ];
-            options
-                .into_iter()
-                .find(|s| Text::from(s.as_str()).width() <= area.width.saturating_sub(4) as usize)
-                .unwrap_or_else(|| {
+                .join(" | "),
+        )
+    } else {
+        data.live
+            .as_ref()
+            .and_then(|s| s.operator.as_ref())
+            .map(|o| {
+                let state = if data.live_error.is_some()
+                    || now.saturating_sub(data.live.as_ref().unwrap().captured_ms) > 3000
+                {
+                    ui.text("UNKNOWN", "状态未知")
+                } else if o.failed {
+                    ui.text("FAILED", "故障")
+                } else if o.settings.paused {
+                    ui.text("PAUSED", "已暂停")
+                } else {
+                    ui.text("RUNNING", "运行中")
+                };
+                let pending = o
+                    .settings
+                    .pending_budget
+                    .map(|v| {
+                        format!(
+                            " ->{v}@{}",
+                            date(o.settings.effective_window_ms.unwrap_or(0))
+                        )
+                    })
+                    .unwrap_or_default();
+                let options = [
                     format!(
-                        "Operator {state} | ${} | Cash {}",
+                        "Operator {state} | ${}{} | {} {} | {} {} | v{} | O/P/E/F",
                         o.settings.budget,
-                        fmt(o.cash, 2)
-                    )
-                })
-        });
+                        pending,
+                        ui.text("Cash", "现金"),
+                        fmt(o.cash, 4),
+                        ui.text("Capital", "本金"),
+                        fmt(o.capital, 2),
+                        o.settings.revision
+                    ),
+                    format!(
+                        "OP {state} ${}{} | {} {} | {} {} | v{}",
+                        o.settings.budget,
+                        pending,
+                        ui.text("Cash", "现金"),
+                        fmt(o.cash, 2),
+                        ui.text("Capital", "本金"),
+                        fmt(o.capital, 2),
+                        o.settings.revision
+                    ),
+                    format!(
+                        "OP {state} ${} | {} {} | {} {}",
+                        o.settings.budget,
+                        ui.text("Cash", "现金"),
+                        fmt(o.cash, 2),
+                        ui.text("Capital", "本金"),
+                        fmt(o.capital, 2)
+                    ),
+                ];
+                options
+                    .into_iter()
+                    .find(|s| {
+                        Text::from(s.as_str()).width() <= area.width.saturating_sub(4) as usize
+                    })
+                    .unwrap_or_else(|| {
+                        format!(
+                            "Operator {state} | ${} | Cash {}",
+                            o.settings.budget,
+                            fmt(o.cash, 2)
+                        )
+                    })
+            })
+    };
     let mut header_lines = vec![Line::from(header)];
     if compact {
         header_lines.push(Line::styled(message.clone(), health_style));

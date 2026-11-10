@@ -317,12 +317,12 @@ impl Ui {
                 };
                 self.reset();
             }
-            KeyCode::Char('o' | 'O') => {
+            KeyCode::Char('o' | 'O') if self.query.arm != 3 => {
                 self.query.arm = 2;
                 self.reset();
             }
             KeyCode::Char('p' | 'P' | 'e' | 'E' | 'f' | 'F') => self.open_control(key, data),
-            KeyCode::Char('r' | 'R') => {
+            KeyCode::Char('r' | 'R') if self.query.arm != 3 => {
                 self.query.arm = (self.query.arm + 1)
                     % if data.live.as_ref().is_some_and(|s| s.operator.is_some()) {
                         3
@@ -484,7 +484,8 @@ fn options(args: &[String]) -> Result<Options> {
                         "candidate" | "eth_cap_097" => 1,
                         "control" | "control_096_098" => 0,
                         "operator" => 2,
-                        _ => bail!("--arm must be candidate, control or operator"),
+                        "loss-boost" => 3,
+                        _ => bail!("--arm must be candidate, control, operator or loss-boost"),
                     }
                 }
                 "--lang" => {
@@ -524,7 +525,7 @@ pub fn operator_specification() -> serde_json::Value {
         "funding_supported":true,"funding_event":"operator_funded","min_deposit":"0.01","max_deposit":"1000000","funding_affects_pnl":false})
 }
 pub fn help() -> &'static str {
-    "tui [--journal FILE] [--date YYYY-MM-DD] [--arm candidate|control|operator] [--socket PATH] [--no-highlight]\n    Times and ledger dates use UTC; default date is today in UTC\n    [--lang en|zh] Default: English; press L to switch language\n    [--snapshot --width 110 --height 34] Read-only layout export\nKeys: Tab/1/2/3 Pages  [ ] Day  D Date  T Today (UTC)  A Asset  R Arm  O Operator  P Pause/Resume  E Budget  F Add PAPER cash (Enter confirms)  Arrows Select/Scroll  PgUp/PgDn Page  Enter Details  Esc Back  L Language  Q Exit"
+    "tui [--journal FILE] [--date YYYY-MM-DD] [--arm candidate|control|operator|loss-boost] [--socket PATH] [--no-highlight]\n    Times and ledger dates use UTC; default date is today in UTC\n    [--lang en|zh] Default: English; press L to switch language\n    [--snapshot --width 110 --height 34] Read-only layout export\nKeys: Tab/1/2/3 Pages  [ ] Day  D Date  T Today (UTC)  A Asset  R Arm  O Operator  P Pause/Resume  E Budget  F Add PAPER cash (Enter confirms)  Arrows Select/Scroll  PgUp/PgDn Page  Enter Details  Esc Back  L Language  Q Exit"
 }
 
 /// Does not call Config::from_env, authenticate, install an engine, or modify any journal.
@@ -539,7 +540,11 @@ pub fn run(args: &[String]) -> Result<()> {
         arm: o.arm,
         asset: None,
         page: 0,
-        limit: render::trade_capacity(o.height, 0, render::header_height(o.height, false, false)),
+        limit: render::trade_capacity(
+            o.height,
+            0,
+            render::header_height(o.height, o.arm == 3, false),
+        ),
     };
     if o.snapshot {
         let path = if query.arm == 2 {
@@ -554,7 +559,8 @@ pub fn run(args: &[String]) -> Result<()> {
                 break;
             }
         }
-        let view = ledger.view(query.date, query.arm.min(1), None, 0, query.limit)?;
+        let arm = if query.arm == 2 { 1 } else { query.arm };
+        let view = ledger.view(query.date, arm, None, 0, query.limit)?;
         ensure!(view.ready, "Empty journal or study not registered");
         let data = Data {
             query: Some(query.clone()),
@@ -683,7 +689,8 @@ fn worker(
             match refreshed {
                 Ok(()) => {
                     if dirty {
-                        match l.view(q.date, q.arm.min(1), q.asset, q.page, q.limit) {
+                        let arm = if q.arm == 2 { 1 } else { q.arm };
+                        match l.view(q.date, arm, q.asset, q.page, q.limit) {
                             Ok(v) => cache = v,
                             Err(e) => cache.error = Some(format!("{e:#}")),
                         }
@@ -780,7 +787,7 @@ fn interactive(
             ui.tab,
             render::header_height(
                 h,
-                data.live.as_ref().is_some_and(|s| s.operator.is_some()),
+                ui.query.arm == 3 || data.live.as_ref().is_some_and(|s| s.operator.is_some()),
                 !ui.message.is_empty(),
             ),
         );

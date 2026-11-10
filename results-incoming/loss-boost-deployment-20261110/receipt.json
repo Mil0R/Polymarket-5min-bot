@@ -1,0 +1,27 @@
+{
+  "at": "2026-11-10T05:00:23.779241+00:00",
+  "batch": "server-loss-boost-001",
+  "session": "winner-loss-boost",
+  "engine_pid": 261392,
+  "run_id": "59c67681-ef9e-4265-9193-5323b116330c",
+  "ws_connected": true,
+  "loop_advanced": true,
+  "scans": 0,
+  "candidate_pid": 260689,
+  "candidate_run_id": "5d99c2dd-e6b3-4395-be5b-2548f01070c9",
+  "candidate_loop_advanced": true,
+  "original_files_unchanged": true,
+  "same_candidate_configuration": true,
+  "window_start_ms": 1794287100000,
+  "base_budget": "5",
+  "boosted_budget": "50",
+  "capital": "100",
+  "assets": {
+    "btc": "5",
+    "eth": "5"
+  },
+  "attempts": 0,
+  "loss_triggers": 0,
+  "deployment": "/home/ubuntu/poly/deployments/winner-loss-boost-20261110-xvYpAUw8",
+  "binary_sha256": "8332c208a27bbc6c65ec0d56004859d55899f865b760a3ea64e66a4e7ca213fe"
+}

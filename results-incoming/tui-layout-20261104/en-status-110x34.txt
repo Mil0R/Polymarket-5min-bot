@@ -1,0 +1,34 @@
+┌ LATE RESOLUTION WINNER TRADING ────────────────────────────────────────────────────────────────────────────┐
+│                                                                                                            │
+│ 1 Overview  2 Trades  3 Status  PAPER | Candidate ETH≤0.97 | Read-only                                     │
+│                                                                                                            │
+└────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ Health | Scan -- | Settlement check -- ────────────────────────────────────────────────────────────────────┐
+│                                                                                                            │
+│ Offline; ledger only, engine health unavailable                                                            │
+│                                                                                                            │
+└────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ Status ────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                                                                                                            │
+│ Field                     Value                                                                            │
+│ Ledger & funds                                                                                             │
+│ Ledger                    Loaded                                                                           │
+│ Runs                      1                                                                                │
+│ Partial tail              No                                                                               │
+│ Results through           11/04 09:19:39                                                                   │
+│ Pending fills             1                                                                                │
+│ Unknown executions        0                                                                                │
+│ Reserved funds            0 USDC                                                                           │
+│ Pending cost              4.99518348 USDC                                                                  │
+│ Oldest pending age        13h15m                                                                           │
+│ PAPER cash                96.20663672 USDC                                                                 │
+│ Settled cost              209.58817980 USDC                                                                │
+│ Order budget              5 USDC                                                                           │
+│ Live snapshot             Cannot connect to engine snapshot service: No such file or directory (os error 2 │
+│                           )                                                                                │
+│ Date scope                Date filters the ledger; market and runtime data stay live                       │
+│ Health scope              A live process does not imply an advancing strategy                              │
+│                                                                                                            │
+│                                                                                                            │
+└────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+Tab/1-3 Pages [] Day D Date T Today A Asset R Arm ↑↓ Scroll Pg Page Enter Details Esc Back L 中文 Q Exit      

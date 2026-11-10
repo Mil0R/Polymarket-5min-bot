@@ -1,0 +1,192 @@
+{
+  "schema_version": 1,
+  "purpose": "development_diagnostics_only",
+  "selection": "earliest eligible observation per asset/market; includes rejected/unfilled observations",
+  "selected": 282,
+  "missing_selected_labels": 0,
+  "overall": {
+    "n": 282,
+    "wins": 274,
+    "losses": 8,
+    "mean_probability": 0.6352585442603008,
+    "observed_win_rate": 0.9716312056737588,
+    "overprediction": -0.336372661413458,
+    "brier": 0.15868543394224308,
+    "wilson_95_lower_descriptive": 0.9450293747145543,
+    "volatility_floor_fraction": 1.0
+  },
+  "groups": {
+    "asset/btc": {
+      "n": 74,
+      "wins": 69,
+      "losses": 5,
+      "mean_probability": 0.6665947357753396,
+      "observed_win_rate": 0.9324324324324325,
+      "overprediction": -0.2658376966570929,
+      "brier": 0.15005395560848042,
+      "wilson_95_lower_descriptive": 0.8513880607414608,
+      "volatility_floor_fraction": 1.0
+    },
+    "asset/eth": {
+      "n": 208,
+      "wins": 205,
+      "losses": 3,
+      "mean_probability": 0.6241100915097584,
+      "observed_win_rate": 0.9855769230769231,
+      "overprediction": -0.36146683156716475,
+      "brier": 0.1617562483494471,
+      "wilson_95_lower_descriptive": 0.9584603398187191,
+      "volatility_floor_fraction": 1.0
+    },
+    "asset_horizon/btc/11-20s": {
+      "n": 3,
+      "wins": 3,
+      "losses": 0,
+      "mean_probability": 0.6725762274083901,
+      "observed_win_rate": 1.0,
+      "overprediction": -0.32742377259160993,
+      "brier": 0.1346919707665874,
+      "wilson_95_lower_descriptive": 0.4385029682449545,
+      "volatility_floor_fraction": 1.0
+    },
+    "asset_horizon/btc/<=10s": {
+      "n": 1,
+      "wins": 1,
+      "losses": 0,
+      "mean_probability": 0.472663758421152,
+      "observed_win_rate": 1.0,
+      "overprediction": -0.5273362415788481,
+      "brier": 0.2780835116825052,
+      "wilson_95_lower_descriptive": 0.20654931437723742,
+      "volatility_floor_fraction": 1.0
+    },
+    "asset_horizon/btc/>20s": {
+      "n": 70,
+      "wins": 65,
+      "losses": 5,
+      "mean_probability": 0.6691088286675544,
+      "observed_win_rate": 0.9285714285714286,
+      "overprediction": -0.2594625999038742,
+      "brier": 0.14888333272921833,
+      "wilson_95_lower_descriptive": 0.8434458778290469,
+      "volatility_floor_fraction": 1.0
+    },
+    "asset_horizon/eth/11-20s": {
+      "n": 8,
+      "wins": 8,
+      "losses": 0,
+      "mean_probability": 0.5375339022014707,
+      "observed_win_rate": 1.0,
+      "overprediction": -0.4624660977985293,
+      "brier": 0.2186194110444166,
+      "wilson_95_lower_descriptive": 0.6755924351161198,
+      "volatility_floor_fraction": 1.0
+    },
+    "asset_horizon/eth/<=10s": {
+      "n": 2,
+      "wins": 2,
+      "losses": 0,
+      "mean_probability": 0.5299143228065994,
+      "observed_win_rate": 1.0,
+      "overprediction": -0.47008567719340055,
+      "brier": 0.2223154746536763,
+      "wilson_95_lower_descriptive": 0.3423802275066531,
+      "volatility_floor_fraction": 1.0
+    },
+    "asset_horizon/eth/>20s": {
+      "n": 198,
+      "wins": 195,
+      "losses": 3,
+      "mean_probability": 0.6285595917717413,
+      "observed_win_rate": 0.9848484848484849,
+      "overprediction": -0.3562888930767436,
+      "brier": 0.15884703746980966,
+      "wilson_95_lower_descriptive": 0.9564076674063349,
+      "volatility_floor_fraction": 1.0
+    },
+    "opening_skew/<=1s": {
+      "n": 280,
+      "wins": 272,
+      "losses": 8,
+      "mean_probability": 0.6354494260898155,
+      "observed_win_rate": 0.9714285714285714,
+      "overprediction": -0.33597914533875595,
+      "brier": 0.1586784396942392,
+      "wilson_95_lower_descriptive": 0.9446439353792738,
+      "volatility_floor_fraction": 1.0
+    },
+    "opening_skew/>1s": {
+      "n": 2,
+      "wins": 2,
+      "losses": 0,
+      "mean_probability": 0.6085350881282555,
+      "observed_win_rate": 1.0,
+      "overprediction": -0.3914649118717445,
+      "brier": 0.1596646286627861,
+      "wilson_95_lower_descriptive": 0.3423802275066531,
+      "volatility_floor_fraction": 1.0
+    },
+    "probability/0.90-0.97": {
+      "n": 8,
+      "wins": 8,
+      "losses": 0,
+      "mean_probability": 0.9230491654727551,
+      "observed_win_rate": 1.0,
+      "overprediction": -0.07695083452724494,
+      "brier": 0.0060477044642930945,
+      "wilson_95_lower_descriptive": 0.6755924351161198,
+      "volatility_floor_fraction": 1.0
+    },
+    "probability/0.97-0.99": {
+      "n": 2,
+      "wins": 2,
+      "losses": 0,
+      "mean_probability": 0.982810534973722,
+      "observed_win_rate": 1.0,
+      "overprediction": -0.01718946502627805,
+      "brier": 0.0003021568609792299,
+      "wilson_95_lower_descriptive": 0.3423802275066531,
+      "volatility_floor_fraction": 1.0
+    },
+    "probability/<0.90": {
+      "n": 271,
+      "wins": 263,
+      "losses": 8,
+      "mean_probability": 0.622852380397326,
+      "observed_win_rate": 0.9704797047970479,
+      "overprediction": -0.3476273243997219,
+      "brier": 0.16494578011910055,
+      "wilson_95_lower_descriptive": 0.9428403989608645,
+      "volatility_floor_fraction": 1.0
+    },
+    "probability/>=0.99": {
+      "n": 1,
+      "wins": 1,
+      "losses": 0,
+      "mean_probability": 0.9999,
+      "observed_win_rate": 1.0,
+      "overprediction": -9.999999999998899e-05,
+      "brier": 9.999999999997797e-09,
+      "wilson_95_lower_descriptive": 0.20654931437723742,
+      "volatility_floor_fraction": 1.0
+    }
+  },
+  "opening_reference": {
+    "exact_boundary_verified": 0,
+    "mismatches": [],
+    "status": "requires_exact_boundary_TWAP_capture"
+  },
+  "empirical_terminal_residual_bps": {},
+  "limitations": [
+    "No model or risk parameter is changed.",
+    "Wilson intervals are descriptive; correlated market/day regimes require grouped forward validation.",
+    "Outcome-only journals cannot verify exact opening TWAP or estimate terminal residuals.",
+    "A new fitting/calibration study needs chronological splits and settlement-label embargoes."
+  ],
+  "inputs": [
+    {
+      "path": "results-incoming/20260921T095406Z/late-resolution-winner-trading/evaluations.repaired-by-tool.ndjson",
+      "sha256": "b9c1504ffba2b360a4278ce6fa4048d5cb65034f9c4a1cf2dba2ac918e86a102"
+    }
+  ]
+}

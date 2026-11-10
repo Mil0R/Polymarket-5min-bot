@@ -224,6 +224,59 @@ class RegistrationAndForwardTests(unittest.TestCase):
         self.assertEqual(report["forward"]["control"]["eth"]["attempts"], 0)
         self.assertEqual(report["excluded_new_attempts"]["unregistered_run"]["eth"]["attempts"], 1)
 
+    def test_continuation_preserves_parent_and_excludes_seen_data_and_sync_gap(self):
+        parent = self.register()
+        parent_raw = self.plan_path.read_bytes()
+        current_run = "continuation-run"
+        self.append([run_event(current_run, "2026-10-06T04:14:50Z")])
+        historical_window = int(study.date_time("2026-10-11T01:35:00Z").timestamp())
+        self.append(events_for_trade("seen", window=historical_window, run_id=current_run, won=False))
+        child_path = self.root / "continuation.json"
+        child = study.register_plan(
+            self.root, child_path, ["journal.ndjson"], study.date_time("2026-10-12T01:12:00Z"),
+            forward_run_id=current_run, study_id="continuation",
+            parent_plan_path=self.plan_path,
+            review_dates_beijing={"earliest": "2026-10-12", "first_review": "2026-10-19",
+                                  "second_review": "2026-10-26", "parameter_review_window": ["2026-10-26", "2026-11-09"]})
+        self.assertEqual(child["rules"], parent["rules"])
+        self.assertEqual(child["sample_targets"], parent["sample_targets"])
+        self.assertEqual(child["forward_window_start"], "2026-10-12T01:15:00Z")
+        self.assertEqual(child["continuation"]["parent_plan"]["registration_sha256"], parent["registration_sha256"])
+        first = study.analyze_plan(self.root, child_path)
+        self.assertEqual(first["baseline_frozen"]["control"]["eth"]["settled_fills"], 2)
+        self.assertEqual(first["forward"]["control"]["eth"]["settled_fills"], 0)
+        self.assertEqual(first["protocol_deviations"], [])
+        gap = int(study.date_time("2026-10-12T01:10:00Z").timestamp())
+        self.append(events_for_trade("backfill", window=gap, run_id=current_run))
+        self.append(events_for_trade("future", window=gap+300, run_id=current_run))
+        after = study.analyze_plan(self.root, child_path)
+        self.assertEqual(after["excluded_new_attempts"]["pre_forward_gap"]["eth"]["attempts"], 1)
+        self.assertEqual(after["forward"]["control"]["eth"]["settled_fills"], 1)
+        self.assertEqual(after["progress"]["new_settled_eth_fills"], 1)
+        self.assertEqual(self.analyze()["forward"]["control"]["eth"]["settled_fills"], 0)
+        self.assertEqual(self.plan_path.read_bytes(), parent_raw)
+
+    def test_continuation_rejects_corrupt_or_later_changed_parent(self):
+        parent = self.register()
+        parent_raw = self.plan_path.read_bytes()
+        current_run = "continuation-run"
+        self.append([run_event(current_run, "2026-10-06T04:14:50Z")])
+        child_path = self.root / "continuation.json"
+        parent["rules"][1]["condition"]["value"] = ".65"
+        self.plan_path.write_text(json.dumps(parent))
+        with self.assertRaisesRegex(ValueError, "parent plan checksum changed"):
+            study.register_plan(self.root, child_path, ["journal.ndjson"],
+                                study.date_time("2026-10-12T01:12:00Z"),
+                                forward_run_id=current_run, parent_plan_path=self.plan_path)
+        self.assertFalse(child_path.exists())
+        self.plan_path.write_bytes(parent_raw)
+        study.register_plan(self.root, child_path, ["journal.ndjson"],
+                            study.date_time("2026-10-12T01:12:00Z"),
+                            forward_run_id=current_run, parent_plan_path=self.plan_path)
+        self.plan_path.write_bytes(parent_raw+b"\n")
+        with self.assertRaisesRegex(ValueError, "parent plan changed after continuation"):
+            study.analyze_plan(self.root, child_path)
+
     def test_prefix_corruption_and_truncation_fail(self):
         self.register()
         original = self.journal.read_bytes()

@@ -1,0 +1,96 @@
+{
+  "deployment": "/home/ubuntu/poly/deployments/winner-utc-20261110-sMUBMgfr",
+  "batch": "server-low-latency-008",
+  "binary_sha256": "63dff6104bcc9809fa17437ac1623645032233186d4f853a0d19140efdf10a82",
+  "old_binary_sha256": "0ca5f94dc963e40f27455d0f555f63059bec160426627139104f14d8d6a5901d",
+  "before": {
+    "dry-run": [
+      {
+        "pid": 230311,
+        "args": [
+          "./target/release/late_resolution_winner_trading",
+          "dry-run"
+        ],
+        "parent": 1385,
+        "start_ticks": 262623879
+      }
+    ],
+    "tui": [
+      {
+        "pid": 238729,
+        "args": [
+          "./target/release/late_resolution_winner_trading",
+          "tui",
+          "--journal",
+          "results/late-resolution-winner-trading/server-low-latency-008-5m/price-cap-study.ndjson",
+          "--lang",
+          "zh",
+          "--arm",
+          "operator"
+        ],
+        "parent": 1412,
+        "start_ticks": 275797045
+      }
+    ]
+  },
+  "old_run_id": "aacd1373-7320-47e8-8f3e-2c2d52a7cf61",
+  "env_sha256": "1bb23d78707a4e58bbcb57ea4e1c8bd178cb3372a33441609bae40cb37b7cdea",
+  "prior_prefixes": {
+    "price-cap-study.ndjson": {
+      "bytes": 25034745,
+      "sha256": "edfc225144cbaac536354ec370144810b5163829b783caf591d51bc5bfbf7580"
+    },
+    "operator-paper.ndjson": {
+      "bytes": 16822648,
+      "sha256": "de8b9df0997fc68f96c4f81c94ad504bf08b30f0444770834ab4e44d7af5f0fc"
+    }
+  },
+  "phase": "complete",
+  "updated_at": "2026-11-10T03:49:55.492562+00:00",
+  "stopped_prefixes": {
+    "price-cap-study.ndjson": {
+      "bytes": 25034745,
+      "sha256": "edfc225144cbaac536354ec370144810b5163829b783caf591d51bc5bfbf7580"
+    },
+    "operator-paper.ndjson": {
+      "bytes": 16822648,
+      "sha256": "de8b9df0997fc68f96c4f81c94ad504bf08b30f0444770834ab4e44d7af5f0fc"
+    }
+  },
+  "operator_before_restart": {
+    "settings": {
+      "revision": 12,
+      "entry_epoch": 1,
+      "paused": false,
+      "budget": "10",
+      "pending_budget": null,
+      "effective_window_ms": null
+    },
+    "capital": "1100",
+    "deposits": "1000"
+  },
+  "engine_pid": 260689,
+  "new_run_id": "5d99c2dd-e6b3-4395-be5b-2548f01070c9",
+  "viewer_pid": 260708,
+  "utc_clock": [
+    "2026-11-10 03:49:54",
+    "2026-11-10 03:49:55"
+  ],
+  "operator_after_restart": {
+    "settings": {
+      "revision": 12,
+      "entry_epoch": 1,
+      "paused": false,
+      "budget": "10",
+      "pending_budget": null,
+      "effective_window_ms": null
+    },
+    "capital": "1100",
+    "deposits": "1000"
+  },
+  "market_ws_connected": true,
+  "loop_advanced": true,
+  "scans": 4,
+  "journal_prefixes_unchanged": true,
+  "env_unchanged": true
+}

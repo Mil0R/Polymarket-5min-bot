@@ -1,0 +1,24 @@
+┌ LATE RESOLUTION WINNER TRADING ──────────────────────────────────────────────┐
+│                                                                              │
+│ 1 Overview  2 Trades  3 Status  PAPER | Candidate ETH≤0.97 | Read-only       │
+│ Offline; ledger only, engine health unavailable                              │
+│ Scan -- | Settlement check --                                                │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+┌ PnL 2026-11-04 · USDC ───────────────────────────────────────────────────────┐
+│                                                                              │
+│ Asset              Day PnL           Total PnL   Day W/L No fill    Exposure │
+│ BTC                +3.3607             -1.0585      24/0       6      4.9952 │
+│ ETH                +2.2604             +2.2604      13/0       5      0.0000 │
+│ Total              +5.6211             +1.2018      37/0      11      4.9952 │
+│                                                                              │
+└ Cumulative period 11/03 23:00:00 - 11/04 09:19:39 ───────────────────────────┘
+┌ Live window 22:35–22:40 · Left 274s | USDC/share ────────────────────────────┐
+│                                                                              │
+│ Asset  TWAP / USD    Δ bps  Up ask  Dn ask Ref age Latest evaluation         │
+│ BTC            --       --      --      --      -- Offline                   │
+│ ETH            --       --      --      --      -- Offline                   │
+│                                                                              │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+Tab/1-3 [] D T A R ↑↓ Pg Enter Esc | L 中文 | Q Exit                            

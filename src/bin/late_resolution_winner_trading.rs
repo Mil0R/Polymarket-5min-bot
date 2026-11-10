@@ -49,8 +49,15 @@ fn main() -> Result<()> {
             );
             Ok(())
         }
+        Some("loss-boost-info") => {
+            println!(
+                "{}",
+                polypulse::late_resolution_winner_price_cap::loss_boost_specification()
+            );
+            Ok(())
+        }
         Some("help" | "--help" | "-h") => {
-            println!("Usage: late_resolution_winner_trading [backtest|dry-run|price-cap-info|operator-info|tui|reset-risk JOURNAL REASON|attach-order JOURNAL POSITION_ID ORDER_ID REASON|resolve-no-fill JOURNAL POSITION_ID REASON]");
+            println!("Usage: late_resolution_winner_trading [backtest|dry-run|price-cap-info|operator-info|loss-boost-info|tui|reset-risk JOURNAL REASON|attach-order JOURNAL POSITION_ID ORDER_ID REASON|resolve-no-fill JOURNAL POSITION_ID REASON]");
             println!("{}", polypulse::winner_dashboard::help());
             Ok(())
         }

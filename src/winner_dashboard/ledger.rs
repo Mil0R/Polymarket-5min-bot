@@ -1,4 +1,5 @@
 //! Read-only incremental index. Money always comes from the study journal, never metrics.
+use crate::late_resolution_winner_price_cap::{LossBoost, LOSS_BOOST_STUDY};
 use crate::late_resolution_winner_trading::{WinnerEvaluation, WinnerShadowExecution};
 use anyhow::{bail, ensure, Context, Result};
 use chrono::{DateTime, NaiveDate, Utc};
@@ -203,6 +204,7 @@ pub struct Trade {
 }
 #[derive(Clone, Debug)]
 pub struct LedgerView {
+    pub(crate) boost: Option<LossBoost>,
     pub capital: D,
     pub deposits: D,
     pub budget: D,
@@ -224,6 +226,7 @@ pub struct LedgerView {
 impl Default for LedgerView {
     fn default() -> Self {
         Self {
+            boost: None,
             capital: D::from(100),
             deposits: D::ZERO,
             budget: D::from(5),
@@ -253,6 +256,7 @@ pub struct Ledger {
     failed: Option<String>,
     registered: bool,
     operator: Option<super::control::Settings>,
+    boost: Option<LossBoost>,
     deposits: D,
     commands: HashSet<String>,
     start_ms: i64,
@@ -304,6 +308,7 @@ impl Ledger {
             failed: None,
             registered: false,
             operator: None,
+            boost: None,
             deposits: D::ZERO,
             commands: HashSet::new(),
             start_ms: 0,
@@ -443,8 +448,9 @@ impl Ledger {
                 ensure!(!self.registered && offset == 0, "注册重复或不在文件首行");
                 ensure!(
                     (version == 1 && study_id == "eth-ask-cap-097-v1")
-                        || (version == 2 && study_id == super::control::STUDY),
-                    "只支持price-cap v1研究账本"
+                        || (version == 2 && study_id == super::control::STUDY)
+                        || (version == 3 && study_id == LOSS_BOOST_STUDY),
+                    "unsupported PAPER study journal"
                 );
                 ensure!(
                     c["paper_only"] == true && c["automatic_promotion"] == false,
@@ -453,16 +459,20 @@ impl Ledger {
                 if version == 2 {
                     self.operator = Some(super::control::Settings::default());
                 }
-                ensure!(
-                    c["initial_cash_per_arm"] == "100"
-                        && c["max_order_usdc"] == if version == 2 { "100" } else { "5" },
-                    "不支持的资金参数"
-                );
-                ensure!(
-                    (self.operator.is_some() || c["arms"][ARMS[0]]["eth_max_ask"] == "0.98")
-                        && c["arms"][ARMS[1]]["eth_max_ask"] == "0.97",
-                    "轨道定义不匹配"
-                );
+                if version == 3 {
+                    self.boost = Some(LossBoost::from_configuration(&c)?);
+                } else {
+                    ensure!(
+                        c["initial_cash_per_arm"] == "100"
+                            && c["max_order_usdc"] == if version == 2 { "100" } else { "5" },
+                        "不支持的资金参数"
+                    );
+                    ensure!(
+                        (self.operator.is_some() || c["arms"][ARMS[0]]["eth_max_ask"] == "0.98")
+                            && c["arms"][ARMS[1]]["eth_max_ask"] == "0.97",
+                        "轨道定义不匹配"
+                    );
+                }
                 self.registered = true;
                 self.start_ms = forward_window_start_ms;
                 self.as_of_ms = registered_at.timestamp_millis();
@@ -481,7 +491,7 @@ impl Ledger {
                     "未注册run的观察"
                 );
                 ensure!(
-                    if self.operator.is_some() {
+                    if self.operator.is_some() || self.boost.is_some() {
                         decisions.len() == 1 && decisions[0].arm == ARMS[1]
                     } else {
                         decisions.len() == 2
@@ -513,11 +523,21 @@ impl Ledger {
                         && !self.markets.contains(&(arm, e.slug.clone())),
                     "重复尝试"
                 );
+                let cap = if let Some(boost) = &self.boost {
+                    let cap = boost.budget(asset, e.evaluated_at);
+                    ensure!(
+                        arm == 1
+                            && a.budget_limit == Some(cap)
+                            && a.parameter_revision.is_none()
+                            && a.entry_epoch.is_none(),
+                        "loss-boost attempt budget does not match prior settlements"
+                    );
+                    cap
+                } else {
+                    D::from(if self.operator.is_some() { 100 } else { 5 })
+                };
                 ensure!(
-                    a.requested > D::ZERO
-                        && a.reserved_cost > D::ZERO
-                        && a.reserved_cost
-                            <= D::from(if self.operator.is_some() { 100 } else { 5 }),
+                    a.requested > D::ZERO && a.reserved_cost > D::ZERO && a.reserved_cost <= cap,
                     "无效资金预留"
                 );
                 ensure!(
@@ -541,8 +561,7 @@ impl Ledger {
                     self.totals.get(&(arm, 1)).cloned().unwrap_or_default(),
                 ]);
                 ensure!(
-                    D::from(100) + self.deposits + sums.pnl - sums.exposure - sums.reserved
-                        >= a.reserved_cost,
+                    self.capital() + sums.pnl - sums.exposure - sums.reserved >= a.reserved_cost,
                     "模拟现金不足"
                 );
                 let row = Entry {
@@ -650,6 +669,11 @@ impl Ledger {
                 new.pnl = Some(pnl);
                 new.won = Some(won);
                 new.settlement_offset = Some(offset);
+                if pnl < D::ZERO {
+                    if let Some(boost) = &mut self.boost {
+                        boost.record_loss(old.asset, resolved_at)?;
+                    }
+                }
                 self.adjust(&old, -1);
                 self.adjust(&new, 1);
                 self.as_of_ms = self.as_of_ms.max(resolved_at.timestamp_millis());
@@ -712,6 +736,10 @@ impl Ledger {
             total_ms: x.as_ref().and_then(|x| x.total_latency_ms),
         })
     }
+    fn capital(&self) -> D {
+        self.boost.as_ref().map_or(D::from(100), |b| b.capital) + self.deposits
+    }
+
     pub fn view(
         &mut self,
         date: NaiveDate,
@@ -720,6 +748,11 @@ impl Ledger {
         page: usize,
         limit: usize,
     ) -> Result<LedgerView> {
+        ensure!(
+            (arm == 3) == self.boost.is_some() || !self.registered,
+            "loss-boost journals require the loss-boost view"
+        );
+        let arm = if arm == 3 { 1 } else { arm };
         let mut total: [Stats; 3] = Default::default();
         let mut daily: [Stats; 3] = Default::default();
         for a in 0..2 {
@@ -743,9 +776,14 @@ impl Ledger {
             rows.push(self.trade(*i)?);
         }
         Ok(LedgerView {
-            capital: D::from(100) + self.deposits,
+            boost: self.boost.clone(),
+            capital: self.capital(),
             deposits: self.deposits,
-            budget: self.operator.as_ref().map_or(D::from(5), |c| c.budget),
+            budget: self
+                .boost
+                .as_ref()
+                .map(|b| b.base)
+                .unwrap_or_else(|| self.operator.as_ref().map_or(D::from(5), |c| c.budget)),
             ready: self.registered,
             error: self.failed.clone(),
             loading: self.loading,

@@ -1,0 +1,77 @@
+{
+  "deployment": "/home/ubuntu/poly/deployments/winner-tui-20261104-203eb0fc",
+  "stage": "/home/ubuntu/poly/target/release/.late_resolution_winner_trading.tui-d25642cd.candidate",
+  "target": "/home/ubuntu/poly/target/release/late_resolution_winner_trading",
+  "new_sha256": "60d0f147fa7cd2d4b7d1d21949b6a8d59b1d71244d50ba7081e4b0c7029cfc95",
+  "old_sha256": "2cb4465c7d9bcf439f99433003937383d4e639dae1c740c685339d9bcb328dfb",
+  "phase": "complete",
+  "prepared_at": "2026-11-04T14:59:25.021769+00:00",
+  "before": {
+    "engine": {
+      "pid": 216284,
+      "args": [
+        "./target/release/late_resolution_winner_trading",
+        "dry-run"
+      ],
+      "ppid": 1385,
+      "start_ticks": 245832655,
+      "exe_sha256": "2cb4465c7d9bcf439f99433003937383d4e639dae1c740c685339d9bcb328dfb"
+    },
+    "viewer": {
+      "pid": 216816,
+      "args": [
+        "./target/release/late_resolution_winner_trading",
+        "tui",
+        "--journal",
+        "results/late-resolution-winner-trading/server-low-latency-008-5m/price-cap-study.ndjson"
+      ],
+      "ppid": 1412,
+      "start_ticks": 245876882,
+      "exe_sha256": "2cb4465c7d9bcf439f99433003937383d4e639dae1c740c685339d9bcb328dfb"
+    },
+    "live": {
+      "pid": 216284,
+      "run_id": "0f24f412-9425-42f9-93f9-88f28a7c2322",
+      "started_ms": 1793717898983,
+      "captured_ms": 1793804364712,
+      "loop_ms": 1793804364708,
+      "scan_ms": 1793804364128,
+      "scans": 34602,
+      "phase": "监控窗口",
+      "market_ws_connected": true
+    },
+    "env_sha256": "1bb23d78707a4e58bbcb57ea4e1c8bd178cb3372a33441609bae40cb37b7cdea",
+    "wrapper_sha256": "2a8fd9803502a9a0ed8910a9627d1e128829441f3b26ca0c748906b4b1e0e0c4",
+    "pane": "0:1.0 145x38"
+  },
+  "replaced_at": "2026-11-04T15:00:21.255349+00:00",
+  "completed_at": "2026-11-04T15:00:35.894151+00:00",
+  "after": {
+    "viewer": {
+      "pid": 221991,
+      "args": [
+        "./target/release/late_resolution_winner_trading",
+        "tui",
+        "--journal",
+        "results/late-resolution-winner-trading/server-low-latency-008-5m/price-cap-study.ndjson"
+      ],
+      "ppid": 1412,
+      "start_ticks": 254486215,
+      "exe_sha256": "60d0f147fa7cd2d4b7d1d21949b6a8d59b1d71244d50ba7081e4b0c7029cfc95"
+    },
+    "live": {
+      "pid": 216284,
+      "run_id": "0f24f412-9425-42f9-93f9-88f28a7c2322",
+      "started_ms": 1793717898983,
+      "captured_ms": 1793804435393,
+      "loop_ms": 1793804435268,
+      "scan_ms": 1793804398128,
+      "scans": 34670,
+      "phase": "监控窗口",
+      "market_ws_connected": true
+    },
+    "binary_sha256": "60d0f147fa7cd2d4b7d1d21949b6a8d59b1d71244d50ba7081e4b0c7029cfc95",
+    "env_sha256": "1bb23d78707a4e58bbcb57ea4e1c8bd178cb3372a33441609bae40cb37b7cdea",
+    "default_language": "en"
+  }
+}

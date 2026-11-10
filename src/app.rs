@@ -623,8 +623,14 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
         None
     };
     let winner_price_cap_study = PriceCapStudy::from_env(&config, &run_id.to_string())?;
+    let winner_loss_boost = winner_price_cap_study
+        .as_ref()
+        .is_some_and(|study| study.is_loss_boost());
     let winner_operator_study = if profile == RuntimeProfile::LateResolutionWinnerTradingDryRun {
-        if let Some(baseline) = &winner_price_cap_study {
+        if let Some(baseline) = winner_price_cap_study
+            .as_ref()
+            .filter(|_| !winner_loss_boost)
+        {
             let path = std::env::var("LATE_RESOLUTION_WINNER_PRICE_CAP_STUDY_FILE").unwrap_or_else(|_| "results/late-resolution-winner-trading/server-low-latency-007-5m/price-cap-study.ndjson".into());
             Some(baseline.operator_from(
                 &crate::winner_dashboard::control::journal(std::path::Path::new(&path)),
@@ -2061,7 +2067,10 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                                             Some((m.closed.unwrap_or(false), crate::late_resolution_winner_trading::gamma_up_down_prices(m)?))
                                         });
                                         let resolved = if let Some((closed, prices)) = settlement {
-                                            if study_index == 0 { study.resolve(&slug, now, closed, &prices)? } else { match study.resolve(&slug, now, closed, &prices) { Ok(n) => n, Err(error) => { warn!(%error, "Operator PAPER settlement persistence failed"); 0 } } }
+                                            if study_index == 0 {
+                                                let confirmed_at = if winner_loss_boost { Utc::now() } else { now };
+                                                study.resolve(&slug, confirmed_at, closed, &prices)?
+                                            } else { match study.resolve(&slug, now, closed, &prices) { Ok(n) => n, Err(error) => { warn!(%error, "Operator PAPER settlement persistence failed"); 0 } } }
                                         } else { 0 };
                                         if resolved > 0 { winner_price_cap_settlement_backoff.clear(&query_key); }
                                         else { winner_price_cap_settlement_backoff.record_retry(&query_key, now.timestamp_millis()); }
@@ -2247,7 +2256,7 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                                 .get(&market.slug)
                                 .copied()
                                 .unwrap_or(0);
-                            let legacy_attempt_allowed = attempt_allowed(
+                            let legacy_attempt_allowed = !winner_loss_boost && attempt_allowed(
                                 0,
                                 market_attempts,
                                 0,
@@ -2599,7 +2608,7 @@ pub async fn run(profile: RuntimeProfile) -> Result<()> {
                                     Err(error) => warn!(%error, "Operator PAPER observation failed; frozen study continues"),
                                 }
                             }
-                            if !legacy_attempt_allowed { continue; }
+                            if winner_loss_boost || !legacy_attempt_allowed { continue; }
                             let research_cohorts = evaluation.research_cohorts.clone();
                             let hybrid_paper_admitted = !model.admitted()
                                 && config.late_resolution_winner_trading_hybrid_paper_enabled

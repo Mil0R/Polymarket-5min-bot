@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "created_at_utc": "2026-10-19T04:41:47.285908+00:00",
+  "scope": "reviewed_development_data_only_no_new_holdout",
+  "calibration_dir": "results/short-duration-digital-fair-value/eth-probability-calibration-012-20261019T015813Z",
+  "calibration_manifest_sha256": "13c21b26cac406fdd02d720c23e2c8977a001a11a3d333fa1b73ddaf42f3d26d",
+  "expected_counts": {
+    "evaluation_windows": 215,
+    "raw_edge_signals": 148,
+    "raw_funded_fills": 114,
+    "original_diagnostic_fills": 143
+  },
+  "disagreement_bin_edges": [
+    0.1,
+    0.25
+  ],
+  "bootstrap_draws": 4000,
+  "bootstrap_seed": 20261019,
+  "ridge": 1.0,
+  "disagreement_scale": 0.1,
+  "coefficient_bounds": [
+    -5.0,
+    5.0
+  ],
+  "decision_requirements": {
+    "minimum_evaluation_windows": 200,
+    "minimum_complete_days": 5,
+    "minimum_positive_increment_fold_fraction": 0.75,
+    "paired_brier_increment_minus_market_interval_upper_below": 0.0,
+    "increment_log_loss_no_worse_than_market": true
+  },
+  "accounting_tolerance": 1e-08,
+  "tasks": [
+    {
+      "id": "T1",
+      "goal": "同一信号时预选方向的阶段偏差与补集比较",
+      "validation": "精确复现215/148/114；禁止结果决定方向；按UTC日作配对区间"
+    },
+    {
+      "id": "T2",
+      "goal": "检查模型差异是否为市场提供稳定正向增量",
+      "validation": "只用过去已验证标签；市场截距对照和加入单一模型差异对照；评分与系数方向同时过关"
+    },
+    {
+      "id": "T3",
+      "goal": "分解执行与概率误差对净盈亏的影响",
+      "validation": "逐笔和加总的两套现金流恒等式误差<=1e-8；同时保留143笔全诊断队列"
+    },
+    {
+      "id": "T4",
+      "goal": "形成继续/停止与下一阶段结论",
+      "validation": "根据固定T2门槛及成本结果决定；不新开交易/观察任务，不对已查看资料声称独立验证"
+    }
+  ],
+  "online_promotion": false,
+  "no_live_changes": true
+}

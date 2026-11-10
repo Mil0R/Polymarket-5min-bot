@@ -18,6 +18,13 @@ case "$action" in
     tui)
         exec "$binary" tui --journal "$result_dir/price-cap-study.ndjson" "${@:3}"
         ;;
+    loss-boost-tui)
+        exec "$binary" tui --journal "$result_dir/loss-boost-study.ndjson" --arm loss-boost "${@:3}"
+        ;;
+    loss-boost-report)
+        exec python3 scripts/late_resolution_winner_loss_boost_report.py \
+            --input "$result_dir/loss-boost-study.ndjson"
+        ;;
     operator-report)
         exec python3 scripts/late_resolution_winner_operator_report.py \
             --input "$result_dir/operator-paper.ndjson"
@@ -26,11 +33,24 @@ case "$action" in
         exec python3 scripts/late_resolution_winner_price_cap_report.py \
             --input "$result_dir/price-cap-study.ndjson"
         ;;
-    dry-run)
+    dry-run|loss-boost)
         # Old binaries silently ignore new env names; require the new capability.
         "$binary" price-cap-info >/dev/null
         "$binary" operator-info >/dev/null
         [[ -f .env ]] || { echo '.env is required for read-only market APIs' >&2; exit 1; }
+        study_file="$result_dir/price-cap-study.ndjson"
+        boost_env=(LATE_RESOLUTION_WINNER_LOSS_BOOST_ENABLED=false)
+        if [[ "$action" == loss-boost ]]; then
+            [[ "$batch" == server-loss-boost-* ]] || { echo 'use a separate server-loss-boost-* batch' >&2; exit 2; }
+            "$binary" loss-boost-info >/dev/null
+            study_file="$result_dir/loss-boost-study.ndjson"
+            boost_env=(
+                LATE_RESOLUTION_WINNER_LOSS_BOOST_ENABLED=true
+                OBSERVABILITY_BIND=
+                LATE_RESOLUTION_WINNER_TRADING_HYBRID_PAPER_ENABLED=false
+                LATE_RESOLUTION_WINNER_TRADING_SENSITIVITY_ENABLED=false
+            )
+        fi
         mkdir -p "$result_dir" "$log_dir"
         # Preserve 006 and the original unfiltered collector. Only the independent
         # candidate arm has ETH<=.97; BTC and the control still see .96-.98.
@@ -44,15 +64,15 @@ case "$action" in
             LATE_RESOLUTION_WINNER_TRADING_MAX_ORDER_USDC=5.0 \
             LATE_RESOLUTION_WINNER_TRADING_CONFIRMATION_OBSERVATIONS=2 \
             LATE_RESOLUTION_WINNER_PRICE_CAP_STUDY_ENABLED=true \
-            LATE_RESOLUTION_WINNER_PRICE_CAP_STUDY_FILE="$result_dir/price-cap-study.ndjson" \
+            LATE_RESOLUTION_WINNER_PRICE_CAP_STUDY_FILE="$study_file" \
             LATE_RESOLUTION_WINNER_TRADING_STATE_JOURNAL_FILE="$result_dir/orders.ndjson" \
             LATE_RESOLUTION_WINNER_TRADING_EVALUATION_JOURNAL_FILE="$result_dir/evaluations.ndjson" \
             LATE_RESOLUTION_WINNER_TRADING_SYSTEM_LOG_FILE="$log_dir/system.log" \
             LATE_RESOLUTION_WINNER_TRADING_STRATEGY_LOG_FILE="$log_dir/late-resolution-winner-trading.log" \
-            "$binary" dry-run
+            "${boost_env[@]}" "$binary" dry-run
         ;;
     *)
-        echo 'usage: run_late_resolution_winner_price_cap.sh [dry-run|report|operator-report|check|tui] [batch] [tui-options]' >&2
+        echo 'usage: run_late_resolution_winner_price_cap.sh [dry-run|report|operator-report|check|tui|loss-boost|loss-boost-report|loss-boost-tui] [batch] [tui-options]' >&2
         exit 2
         ;;
 esac

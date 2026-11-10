@@ -232,7 +232,8 @@ def fit_offset(rows, source, ridge):
     return result
 
 
-def replay_with_fee(row, probability, policy):
+def causal_signal_policy(row, policy):
+    """Resolve signal-time fee/opening evidence without inspecting fills or labels."""
     p = dict(policy)
     audit = (row.get("episode") or {}).get("signal",{}).get("market_fee_audit",{})
     stamp = number(audit.get("observed_at_ms"))
@@ -242,13 +243,13 @@ def replay_with_fee(row, probability, policy):
                 and exponent in (1,2,3,4) and stamp is not None and now is not None
                 and 0<=now-stamp<=10000 and audit.get("slug")==row["slug"])
     if p.get("fee_source")=="observed_required" and not verified:
-        return dict(status="excluded",reason="missing_causal_market_fee_schedule")
+        return None, "missing_causal_market_fee_schedule"
     if p.get("require_opening_audit"):
         opening=(row.get("episode") or {}).get("signal",{}).get("opening_reference_audit",{})
         stamp=number(opening.get("observed_at_ms"))
         error=log_bps((row.get("episode") or {}).get("signal",{}).get("opening_twap"),opening.get("official_price_to_beat"))
         if stamp is None or now is None or not 0<=now-stamp<=10000 or error is None or abs(error)>p["max_opening_error_bps"]:
-            return dict(status="excluded",reason="missing_or_mismatched_causal_official_opening")
+            return None, "missing_or_mismatched_causal_official_opening"
         if opening.get("schema_version",1)>=2:
             ep=row["episode"]
             condition=(ep["signal"].get("market_fee_audit") or {}).get("condition_id")
@@ -257,7 +258,7 @@ def replay_with_fee(row, probability, policy):
                     or opening.get("condition_id")!=condition or opening.get("window_end_ms")!=ep["window_end_ms"]
                     or stamp<ep["window_end_ms"]-300000
                     or opening.get("reason")!="verified_live_opening"):
-                return dict(status="excluded",reason="unverified_or_identity_mismatched_live_opening")
+                return None, "unverified_or_identity_mismatched_live_opening"
             if opening.get("source")=="polymarket_event_page":
                 key=opening.get("query_key",[])
                 if not isinstance(key,list): key=[]
@@ -274,14 +275,21 @@ def replay_with_fee(row, probability, policy):
                         or opening.get("reference_rule")!="chainlink_twap_sixty"
                         or not isinstance(opening.get("response_sha256"),str) or len(opening["response_sha256"])!=64
                         or any(c not in "0123456789abcdefABCDEF" for c in opening["response_sha256"])):
-                    return dict(status="excluded",reason="unverified_page_opening_provenance")
+                    return None, "unverified_page_opening_provenance"
             if opening.get("schema_version",1)>=3 and opening.get("source") not in (
                     "gamma_event_by_slug","gamma_events_list","polymarket_event_page"):
-                return dict(status="excluded",reason="unverified_opening_source")
+                return None, "unverified_opening_source"
     if verified:
         p.update(fee_rate=rate,fee_exponent=int(exponent))
-    result = execution.replay(row,probability,p)
-    result["fee_evidence"] = "causal_gamma_schedule" if verified else "historical_static_assumption"
+    return p, "causal_gamma_schedule" if verified else "historical_static_assumption"
+
+
+def replay_with_fee(row, probability, policy):
+    p, evidence = causal_signal_policy(row, policy)
+    if p is None:
+        return dict(status="excluded", reason=evidence)
+    result = execution.replay(row, probability, p)
+    result["fee_evidence"] = evidence
     return result
 
 

@@ -20,15 +20,94 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 const STUDY_ID: &str = "eth-ask-cap-097-v1";
+pub(crate) const LOSS_BOOST_STUDY: &str = "winner-loss-boost-1h-v1";
 const CONTROL: &str = "control_096_098";
 const CANDIDATE: &str = "eth_cap_097";
 const ARMS: [&str; 2] = [CONTROL, CANDIDATE];
+
+#[derive(Clone, Debug)]
+pub(crate) struct LossBoost {
+    pub(crate) base: Decimal,
+    pub(crate) capital: Decimal,
+    last_loss: [Option<DateTime<Utc>>; 2],
+}
+
+impl LossBoost {
+    fn asset(asset: &str) -> Result<usize> {
+        match asset {
+            "btc" => Ok(0),
+            "eth" => Ok(1),
+            _ => bail!("unsupported loss-boost asset"),
+        }
+    }
+
+    pub(crate) fn from_configuration(c: &Value) -> Result<Self> {
+        let amount = |key: &str| -> Result<Decimal> {
+            Ok(c[key]
+                .as_str()
+                .context("missing loss-boost amount")?
+                .parse()?)
+        };
+        let base = amount("base_order_usdc")?;
+        let capital = amount("initial_cash_per_arm")?;
+        control::valid_budget(base)?;
+        control::valid_deposit(capital)?;
+        ensure!(
+            capital >= base * dec!(10)
+                && amount("max_order_usdc")? == base * dec!(10)
+                && c["study_id"] == LOSS_BOOST_STUDY
+                && c["paper_only"] == true
+                && c["automatic_promotion"] == false
+                && c["boost_multiplier"] == 10
+                && c["boost_duration_secs"] == 3600
+                && c["arms"] == json!({(CANDIDATE): {"btc_max_ask":"0.98","eth_max_ask":"0.97"}}),
+            "invalid loss-boost configuration"
+        );
+        Ok(Self {
+            base,
+            capital,
+            last_loss: [None; 2],
+        })
+    }
+
+    pub(crate) fn record_loss(&mut self, asset: usize, at: DateTime<Utc>) -> Result<()> {
+        ensure!(
+            at.checked_add_signed(chrono::TimeDelta::hours(1)).is_some(),
+            "loss-boost expiry out of range"
+        );
+        self.last_loss[asset] = self.last_loss[asset].max(Some(at));
+        Ok(())
+    }
+
+    pub(crate) fn active_until(&self, asset: usize, at: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        self.last_loss[asset]
+            .filter(|start| *start <= at)
+            .and_then(|start| start.checked_add_signed(chrono::TimeDelta::hours(1)))
+            .filter(|end| at < *end)
+    }
+
+    pub(crate) fn budget(&self, asset: usize, at: DateTime<Utc>) -> Decimal {
+        if self.active_until(asset, at).is_some() {
+            self.base * dec!(10)
+        } else {
+            self.base
+        }
+    }
+}
 
 /// Offline capability check used by the deployment script (no credentials/API).
 pub fn specification() -> Value {
     json!({"study_id": STUDY_ID, "schema_version": 1, "paper_only": true,
         "control_max_ask": "0.98", "candidate_eth_max_ask": "0.97",
         "candidate_btc_max_ask": "0.98", "max_order_usdc": "5"})
+}
+
+pub fn loss_boost_specification() -> Value {
+    json!({"study_id": LOSS_BOOST_STUDY, "schema_version": 3, "paper_only": true,
+        "multiplier": 10, "duration_secs": 3600, "scope": "per_asset",
+        "trigger": "durably_confirmed_negative_pnl",
+        "retrigger": "restart_timer_without_stacking", "default_base_usdc": "5",
+        "default_capital_usdc": "100"})
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,6 +192,7 @@ struct State {
     operator: Option<Settings>,
     commands: HashMap<String, Command>,
     deposits: Decimal,
+    boost: Option<LossBoost>,
 }
 
 impl State {
@@ -126,6 +206,7 @@ impl State {
             operator: None,
             commands: HashMap::new(),
             deposits: dec!(0),
+            boost: None,
         }
     }
 
@@ -238,6 +319,22 @@ impl State {
             }
             Event::Attempted { attempt } => {
                 let index = arm_index(&attempt.arm)?;
+                let cap = if let Some(boost) = &self.boost {
+                    let e = &attempt.evaluation;
+                    let cap = boost.budget(LossBoost::asset(&e.asset)?, e.evaluated_at);
+                    ensure!(
+                        index == 1
+                            && attempt.budget_limit == Some(cap)
+                            && attempt.parameter_revision.is_none()
+                            && attempt.entry_epoch.is_none(),
+                        "loss-boost attempt budget does not match prior settlements"
+                    );
+                    cap
+                } else if self.operator.is_some() {
+                    dec!(100)
+                } else {
+                    dec!(5)
+                };
                 ensure!(
                     !self.positions.contains_key(&attempt.attempt_id),
                     "duplicate study attempt ID"
@@ -250,12 +347,7 @@ impl State {
                 ensure!(
                     attempt.requested > dec!(0)
                         && attempt.reserved_cost > dec!(0)
-                        && attempt.reserved_cost
-                            <= if self.operator.is_some() {
-                                dec!(100)
-                            } else {
-                                dec!(5)
-                            }
+                        && attempt.reserved_cost <= cap
                         && self.cash[index] >= attempt.reserved_cost,
                     "invalid study reservation"
                 );
@@ -329,6 +421,14 @@ impl State {
                 );
                 self.cash[arm_index(&position.attempt.arm)?] += *payout;
                 position.settled = true;
+                if *pnl < dec!(0) {
+                    if let Some(boost) = &mut self.boost {
+                        boost.record_loss(
+                            LossBoost::asset(&position.attempt.evaluation.asset)?,
+                            *resolved_at,
+                        )?;
+                    }
+                }
             }
             _ => {}
         }
@@ -388,6 +488,7 @@ pub(crate) struct PriceCapStudy {
     configuration: Value,
     path: std::path::PathBuf,
     operator: bool,
+    loss_boost: bool,
 }
 
 impl PriceCapStudy {
@@ -419,7 +520,7 @@ impl PriceCapStudy {
                 && path != config.late_resolution_winner_trading_state_journal_file,
             "price-cap study must use its own journal"
         );
-        let configuration = json!({
+        let mut configuration = json!({
             "study_id": STUDY_ID, "paper_only": true, "automatic_promotion": false,
             "arms": { (CONTROL): {"btc_max_ask": "0.98", "eth_max_ask": "0.98"},
                 (CANDIDATE): {"btc_max_ask": "0.98", "eth_max_ask": "0.97"} },
@@ -447,6 +548,28 @@ impl PriceCapStudy {
             "reference_url": config.late_resolution_winner_trading_rtds_url,
             "crypto_symbols": config.crypto_symbols,
         });
+        if std::env::var("LATE_RESOLUTION_WINNER_LOSS_BOOST_ENABLED")
+            .unwrap_or_else(|_| "false".into())
+            .parse::<bool>()
+            .context("invalid loss-boost enable flag")?
+        {
+            ensure!(
+                Path::new(&path)
+                    .file_name()
+                    .is_some_and(|n| n == "loss-boost-study.ndjson"),
+                "loss-boost requires an isolated loss-boost-study.ndjson journal"
+            );
+            let base = std::env::var("LATE_RESOLUTION_WINNER_LOSS_BOOST_BASE_USDC")
+                .unwrap_or_else(|_| "5".into())
+                .parse::<Decimal>()
+                .context("invalid loss-boost base")?;
+            control::valid_budget(base)?;
+            let capital = std::env::var("LATE_RESOLUTION_WINNER_LOSS_BOOST_CAPITAL_USDC")
+                .unwrap_or_else(|_| "100".into())
+                .parse::<Decimal>()
+                .context("invalid loss-boost capital")?;
+            configuration = Self::boost_configuration(configuration, base, capital);
+        }
         Self::open(
             Path::new(&path),
             config.late_resolution_winner_trading_journal_min_free_bytes,
@@ -455,6 +578,21 @@ impl PriceCapStudy {
             Utc::now(),
         )
         .map(|study| Some(Arc::new(study)))
+    }
+
+    fn boost_configuration(mut c: Value, base: Decimal, capital: Decimal) -> Value {
+        c["study_id"] = json!(LOSS_BOOST_STUDY);
+        c["base_order_usdc"] = json!(base.normalize().to_string());
+        c["initial_cash_per_arm"] = json!(capital.normalize().to_string());
+        c["max_order_usdc"] = json!((base * dec!(10)).normalize().to_string());
+        c["boost_multiplier"] = json!(10);
+        c["boost_duration_secs"] = json!(3600);
+        c["arms"] = json!({(CANDIDATE): {"btc_max_ask":"0.98","eth_max_ask":"0.97"}});
+        c
+    }
+
+    pub(crate) fn is_loss_boost(&self) -> bool {
+        self.loss_boost
     }
 
     pub(crate) fn operator_from(
@@ -639,11 +777,22 @@ impl PriceCapStudy {
             "incomplete price-cap journal tail; repair before restarting"
         );
         let operator = configuration["study_id"] == control::STUDY;
-        let version = if operator { 2 } else { 1 };
-        let study_id = if operator { control::STUDY } else { STUDY_ID };
+        let loss_boost = configuration["study_id"] == LOSS_BOOST_STUDY;
+        let (version, study_id) = if loss_boost {
+            (3, LOSS_BOOST_STUDY)
+        } else if operator {
+            (2, control::STUDY)
+        } else {
+            (1, STUDY_ID)
+        };
         let mut state = State::new();
         if operator {
             state.operator = Some(Settings::default());
+        }
+        if loss_boost {
+            let boost = LossBoost::from_configuration(&configuration)?;
+            state.cash[1] = boost.capital;
+            state.boost = Some(boost);
         }
         let mut boundary = None;
         for (index, line) in BufReader::new(raw.as_slice()).lines().enumerate() {
@@ -651,8 +800,8 @@ impl PriceCapStudy {
             let event: Event = serde_json::from_str(&line)
                 .with_context(|| format!("invalid price-cap journal line {}", index + 1))?;
             if let Event::Registered {
-                version,
-                study_id,
+                version: prior_version,
+                study_id: prior_study_id,
                 configuration: old,
                 forward_window_start_ms,
                 ..
@@ -660,8 +809,8 @@ impl PriceCapStudy {
             {
                 ensure!(
                     index == 0
-                        && *version == (if operator { 2 } else { 1 })
-                        && study_id == (if operator { control::STUDY } else { STUDY_ID })
+                        && *prior_version == version
+                        && prior_study_id == study_id
                         && *old == configuration,
                     "price-cap study configuration changed; use a new batch"
                 );
@@ -694,7 +843,11 @@ impl PriceCapStudy {
                 .as_i64()
                 .context("missing study integer configuration")
         };
-        if operator {
+        if loss_boost {
+            tracing::info!(target: "polypulse::console::late_resolution_winner_trading",
+                file = %path.display(), %forward_window_start_ms, cash = %state.cash[1],
+                "Independent BTC/ETH loss-boost PAPER ready");
+        } else if operator {
             tracing::info!(target: "polypulse::console::late_resolution_winner_trading",
                 file = %path.display(), %forward_window_start_ms, settings = ?state.operator, cash = %state.cash[1],
                 "Operator PAPER ready: independent adjustable candidate only");
@@ -706,6 +859,7 @@ impl PriceCapStudy {
         Ok(Self {
             writer,
             operator,
+            loss_boost,
             configuration: configuration.clone(),
             path: path.into(),
             state: Mutex::new(state),
@@ -747,6 +901,9 @@ impl PriceCapStudy {
         if self.operator {
             return true;
         }
+        if self.loss_boost {
+            return !state.attempted.contains(&(CANDIDATE.into(), slug.into()));
+        }
         ARMS.iter().any(|arm| {
             !state
                 .attempted
@@ -780,7 +937,9 @@ impl PriceCapStudy {
         let mut evaluation = evaluation.clone();
         evaluation.run_id = self.run_id.clone();
         evaluation.evaluation_id = uuid::Uuid::new_v4().to_string();
-        evaluation.candidate_stage = if self.operator {
+        evaluation.candidate_stage = if self.loss_boost {
+            "loss_boost_paper"
+        } else if self.operator {
             "operator_paper"
         } else {
             "independent_price_cap_paper"
@@ -790,7 +949,7 @@ impl PriceCapStudy {
         let mut attempts = Vec::new();
         self.activate_locked(&mut state, evaluation.evaluated_at)?;
         for (index, arm) in ARMS.iter().enumerate() {
-            if self.operator && index == 0 {
+            if (self.operator || self.loss_boost) && index == 0 {
                 continue;
             }
             let mut reason = admission_reason(
@@ -821,10 +980,18 @@ impl PriceCapStudy {
                 );
                 confirmations = progress.confirmations;
                 if progress.confirmed {
+                    let budget = if let Some(boost) = &state.boost {
+                        boost.budget(
+                            LossBoost::asset(&evaluation.asset)?,
+                            evaluation.evaluated_at,
+                        )
+                    } else {
+                        state.operator.as_ref().map_or(dec!(5), |c| c.budget)
+                    };
                     let size = fee_inclusive_depth_capped_size(
                         evaluation.ask_price,
                         evaluation.fee_per_share,
-                        state.operator.as_ref().map_or(dec!(5), |c| c.budget),
+                        budget,
                         evaluation.ask_size,
                     );
                     let reserved_cost = size * (evaluation.ask_price + evaluation.fee_per_share);
@@ -841,7 +1008,7 @@ impl PriceCapStudy {
                             requested: size,
                             reserved_cost,
                             parameter_revision: state.operator.as_ref().map(|c| c.revision),
-                            budget_limit: state.operator.as_ref().map(|c| c.budget),
+                            budget_limit: (self.operator || self.loss_boost).then_some(budget),
                             entry_epoch: state.operator.as_ref().map(|c| c.entry_epoch),
                         });
                     }
@@ -939,7 +1106,10 @@ impl PriceCapStudy {
                 error: Some(error.to_string()),
             },
         };
-        if self.operator {
+        if self.loss_boost {
+            execution.candidate_stage = "loss_boost_paper".into();
+            execution.research_cohorts = vec![LOSS_BOOST_STUDY.into()];
+        } else if self.operator {
             execution.candidate_stage = "operator_paper".into();
             execution.research_cohorts = vec![control::STUDY.into()];
         }
@@ -1952,6 +2122,91 @@ mod tests {
         assert!(l.refresh().is_err());
         drop(l);
         assert!(PriceCapStudy::open(&p, 0, operator_configuration(), "restart", now()).is_err());
+        std::fs::remove_file(p).unwrap();
+    }
+
+    #[test]
+    fn loss_boost_is_per_asset_restarts_on_each_loss_and_survives_replay() {
+        let p = path();
+        let c = PriceCapStudy::boost_configuration(configuration(), dec!(5), dec!(100));
+        let s = PriceCapStudy::open(&p, 0, c.clone(), "boost-run", now()).unwrap();
+        let attempt = |s: &PriceCapStudy, asset: &str, windows: i64, expected| {
+            let e = |tick| {
+                let mut e = evaluation(asset, dec!(0.97), tick);
+                let delta = chrono::TimeDelta::minutes(windows * 5);
+                e.evaluated_at += delta;
+                e.end_date += delta;
+                e.window_start_ms += delta.num_milliseconds();
+                e.model_observed_at_ms = e
+                    .model_observed_at_ms
+                    .map(|ms| ms + delta.num_milliseconds());
+                e.slug = format!("{asset}-updown-5m-{}", e.window_start_ms / 1000);
+                e
+            };
+            assert!(s.observe(&e(0)).unwrap().is_empty());
+            let e = e(1);
+            let ids = s.observe(&e).unwrap();
+            assert_eq!(ids.len(), 1);
+            assert_eq!(
+                s.state.lock().unwrap().positions[&ids[0]]
+                    .attempt
+                    .budget_limit,
+                Some(expected)
+            );
+            (ids, e)
+        };
+        let (btc, b) = attempt(&s, "btc", 0, dec!(5));
+        finish(&s, &btc, true);
+        let first_loss = b.end_date + chrono::TimeDelta::seconds(17);
+        let loss = (dec!(0), dec!(1));
+        assert_eq!(s.resolve(&b.slug, first_loss, true, &loss).unwrap(), 1);
+        let (eth, e) = attempt(&s, "eth", 1, dec!(5));
+        finish(&s, &eth, false);
+        assert_eq!(s.resolve(&e.slug, e.end_date, true, &loss).unwrap(), 1);
+        let (btc, b) = attempt(&s, "btc", 1, dec!(50));
+        finish(&s, &btc, true);
+        let second_loss = b.end_date + chrono::TimeDelta::seconds(9);
+        assert_eq!(s.resolve(&b.slug, second_loss, true, &loss).unwrap(), 1);
+        assert_eq!(
+            s.resolve(
+                &b.slug,
+                second_loss + chrono::TimeDelta::minutes(1),
+                true,
+                &loss
+            )
+            .unwrap(),
+            0
+        );
+        let (eth, e) = attempt(&s, "eth", 2, dec!(5));
+        finish(&s, &eth, true);
+        let eth_loss = e.end_date + chrono::TimeDelta::seconds(11);
+        s.resolve(&e.slug, eth_loss, true, &loss).unwrap();
+        drop(s);
+
+        let restart = eth_loss + chrono::TimeDelta::minutes(1);
+        let s = PriceCapStudy::open(&p, 0, c, "boost-restart", restart).unwrap();
+        let state = s.state.lock().unwrap();
+        let boost = state.boost.as_ref().unwrap();
+        let hour = chrono::TimeDelta::hours(1);
+        let tick = chrono::TimeDelta::milliseconds(1);
+        assert_eq!(boost.budget(0, first_loss - tick), dec!(5));
+        assert_eq!(boost.budget(0, first_loss + hour), dec!(50));
+        assert_eq!(boost.budget(0, second_loss + hour - tick), dec!(50));
+        assert_eq!(boost.budget(0, second_loss + hour), dec!(5));
+        assert_eq!(boost.budget(1, second_loss + hour), dec!(50));
+        assert_eq!(boost.budget(1, eth_loss + hour), dec!(5));
+        let mut ledger = crate::winner_dashboard::ledger::Ledger::open(&p).unwrap();
+        ledger.refresh().unwrap();
+        let v = ledger.view(now().date_naive(), 3, None, 0, 20).unwrap();
+        assert_eq!(v.total[2].losses, 3);
+        assert_eq!(v.total[2].no_fills, 1);
+        assert_eq!(
+            v.boost.unwrap().active_until(1, restart),
+            Some(eth_loss + hour)
+        );
+        assert_eq!(v.capital + v.total[2].pnl, state.cash[1]);
+        drop(state);
+        drop(s);
         std::fs::remove_file(p).unwrap();
     }
 }

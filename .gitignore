@@ -11,6 +11,8 @@ _vendor
 paper-order-state.ndjson
 *.winner-buy-*.ndjson
 *.png
-scripts/__pycache__/
+!/docs/assets/late-winner-008-hourly-20261106/*.png
+__pycache__/
+*.pyc
 data/
 /.pi/remote-pi

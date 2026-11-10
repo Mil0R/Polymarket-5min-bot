@@ -141,6 +141,10 @@ cargo run --release --bin late_resolution_winner_report -- \
 
 不传文件名时，命令优先读取 `LATE_RESOLUTION_WINNER_TRADING_EVALUATION_JOURNAL_FILE`。
 
+策略完整流程、软件算法、概率与收益公式见 [Late-Resolution Winner Trading：流程、软件算法与数学依据](docs/LATE_RESOLUTION_WINNER_TRADING_FLOW_AND_MATH.zh-CN.md)。
+
+ETH报价上限0.97的007独立dry run使用两组独立确认与模拟资金，保留BTC/ETH未过滤对照。按3/7/14天快速筛选，证据不足可“未证实”归档，不为凑满100笔自动延长。服务器替换文件、启动、报告及复核安排见[007部署说明](docs/LATE_RESOLUTION_WINNER_PRICE_CAP_007_DEPLOYMENT.zh-CN.md)。
+
 报告同时输出独立市场结果和经过连续确认、延迟撮合后的 shadow cohort；后者按 shadow 自身的 evaluation 方向结算，可用于比较 `price_096_097`、`chainlink_direction_agrees` 与 `hybrid_chainlink_veto`，不会改变生产准入。
 
 启动时会用 CLOB 累计成交和 Data API 持仓自动对账，并重建可管理的恢复任务。状态日志新记录带版本号和 SHA-256 校验和；若崩溃只损坏最后一行，启动时会将其隔离为 `.corrupt-*` 文件并保留此前有效记录。中间记录损坏仍会阻止启动。缺少上下文的旧日志默认阻止实盘启动；`ALLOW_UNRESOLVED_STATE=true` 只允许进程进入核对/恢复流程，未解决状态仍禁止新实盘开仓。

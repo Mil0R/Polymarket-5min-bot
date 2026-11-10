@@ -2,6 +2,12 @@
 
 登记时间：北京时间 **2026-10-05 19:35:59**；前瞻市场窗口起点：**2026-10-05 19:40:00**。依据本地已同步的 005、006 journal，以及当日运行分析、亏损特征报告。
 
+> **2026-10-13 验证更新：** 两个新增 ETH 负场均属于续接版正式前瞻，原交集只命中 1 个；另一个 r=0.217457 超过冻结的 r<0.20 条件，已知覆盖由 10/11 变为 11/13。既有 0.96 漏判仍存在。当前 run 原交集保留净收益 -5.94098990 USDC；混合历史保留 +3.72526092，不代替前瞻验证。未移动阈值，A/B 继续撤回。原版正式 ETH 仍为 6 笔；续接版 ETH 为 5 笔、3 胜 2 负。详见 [本轮分析](../results/late-resolution-winner-trading/server-low-latency-006-5m/analysis-2026-10-13.zh-CN.md)。
+
+> **2026-10-12 续接登记：** 用户同意后已登记独立续接版本，接收当前 `67734575…` run，前瞻从北京时间 **10 月 12 日 17:45** 的完整市场窗口开始。原版、原阈值和旧版 6 笔正式 ETH 样本保留；当前已知数据只作新版历史诊断。默认 `analyze` 已切换新版，10 月 19 日、26 日复核。详见 [续接验证计划](LATE_RESOLUTION_WINNER_COMBINATION_CONTINUATION_2026-10-12.zh-CN.md)。
+
+> **2026-10-12 验证更新：** 新 ETH 负场 `eth-updown-5m-1791682500` 的 ask=0.98、p=0.498209、r=-0.001885，命中原交集，已知负场覆盖变为 10/11；10 月 11 日记录的 0.96 漏判仍保留。该负距离亏损再次支持维持 A/B 豁免撤回。本轮离线保留 6 胜、+1.11197622 USDC，但当前 run 保留组仍为 20 胜 1 负、-1.81522006 USDC。原登记 run 已结束，正式前瞻 ETH 仍为 6 笔，新 run 单列诊断；早期观察节点未达到原样本要求。阈值和计划不变。详见 [本轮分析](../results/late-resolution-winner-trading/server-low-latency-006-5m/analysis-2026-10-12.zh-CN.md)。
+
 > **2026-10-11 验证更新：** 当前可比样本出现 ask=0.96 的 ETH 负场 `eth-updown-5m-1791609900`，不满足原交集的 ask≥0.97，已知负场覆盖变为 9/10。该笔同时触发完整模型的深度不足、反转边界和净 EV 拒绝。本计划与阈值保留作离线对照，不视为可靠防亏或实盘准入；没有事后删除低深度亏损来恢复命中率。详见 [本轮分析](../results/late-resolution-winner-trading/server-low-latency-006-5m/analysis-2026-10-11.zh-CN.md)。A/B 负距离豁免保持已撤回状态。
 
 本轮开始研究 **报价 × 模型概率 × 相对反转边界距离**。研究脚本读取已有记录，登记固定候选，并用后续新市场检验候选的收益与机会损失。
@@ -92,11 +98,12 @@
 
 ## 5. 本地运行命令
 
-在仓库根目录运行：
+当前默认分析使用 2026-10-12 续接版本。复查本原版时，在仓库根目录显式指定原计划：
 
 ```bash
 bash sync.sh
-python3 scripts/late_resolution_winner_combination_study.py analyze
+python3 scripts/late_resolution_winner_combination_study.py analyze \
+  --plan scripts/late_resolution_winner_combination_plan_2026-10-05.json
 ```
 
 已完成一次性登记，后续同步只运行 `analyze`。显式路径及独立输出目录示例：

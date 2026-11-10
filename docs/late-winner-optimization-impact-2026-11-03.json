@@ -1,0 +1,114 @@
+{
+  "schema_version": 1,
+  "evaluated_at_utc": "2026-11-03T14:24:22.580313+00:00",
+  "scope": "local code and component microbenchmarks; no deployment, exchange calls or live trading",
+  "benchmark": {
+    "controlled_timer_2200ms": {
+      "message_interval_ms": 10,
+      "new_messages": 221,
+      "new_scans": 2,
+      "old_messages": 221,
+      "old_scans": 0
+    },
+    "new_sample_each_evaluation": {
+      "batches": 7,
+      "count_per_batch": 5000,
+      "new_batches_us": [
+        19.0724126,
+        19.301219399999997,
+        19.354114799999998,
+        19.390977799999998,
+        19.550651600000002,
+        20.461627399999998,
+        20.6805688
+      ],
+      "new_us_per_call_median": 19.390977799999998,
+      "old_batches_us": [
+        18.635256599999998,
+        19.0421074,
+        19.0520642,
+        19.3358418,
+        19.365283599999998,
+        20.3792274,
+        20.5066386
+      ],
+      "old_us_per_call_median": 19.3358418,
+      "ratio": 0.9971566157947952
+    },
+    "same_sample_repeated": {
+      "batches": 7,
+      "count_per_batch": 5000,
+      "new_batches_us": [
+        3.430415,
+        3.4583098,
+        3.4648657999999997,
+        3.627992,
+        3.6321491999999997,
+        3.6851203999999997,
+        3.6963524
+      ],
+      "new_us_per_call_median": 3.627992,
+      "old_batches_us": [
+        18.263119200000002,
+        18.8436736,
+        19.186159399999998,
+        19.4153196,
+        19.8472604,
+        20.4525546,
+        23.5076796
+      ],
+      "old_us_per_call_median": 19.4153196,
+      "ratio": 5.351533189709349
+    }
+  },
+  "benchmark_method": {
+    "batches": 7,
+    "iterations_per_batch": 5000,
+    "seed_samples": 360,
+    "lookback_secs": 120,
+    "optimization": "benchmark crate opt-level=3, existing development-profile dependency artifacts",
+    "feed": "synthetic continuous 1-second samples; no network; metrics stub unused by evaluation",
+    "same_sample": "repeated evaluation of one unchanged feed sample",
+    "fresh_sample": "ingestion + timing update + evaluation with a new sample per iteration",
+    "limitations": "component timing only; not a production p50/p99, CPU-usage or trading-profit benchmark",
+    "reproducible_manifest": "results/late-resolution-winner-trading/optimization-impact-2026-11-03/benchmark/Cargo.toml",
+    "old_model_sha256": "c2c69249dc748bd57adf7c2b4eece48929955359b0e80ef5002c6ae2376d0457",
+    "new_model_sha256": "35e7c69da56cf7926127fc7a256ac746799ac08777de9043c6e352658707275e"
+  },
+  "economic_sensitivity": {
+    "historical_calendar_days": 7.909722222222222,
+    "historical_mean_profit_per_winning_fill": 0.150778531625,
+    "hypothetical_loss_per_fill": 5,
+    "historical_fills_per_30d": 121.36962247585602,
+    "same_odds_breakeven_win_rate": 0.9707270404465572,
+    "monthly_gain_per_0_1_percentage_point_lower_loss_rate_at_fixed_fills": 0.6251480458400703,
+    "monthly_gain_per_0_5_percentage_point": 3.1257402292003515,
+    "monthly_gain_per_1_percentage_point": 6.251480458400703,
+    "additional_one_win_per_day_30d": 4.52335594875,
+    "additional_one_fill_per_day_at_assumed_2_percent_loss_rate": 1.4328888297749998,
+    "wins_offset_one_5_usdc_loss": 33.16121961205629,
+    "recover_21h_calendar_mean_scenario": 0.5337480592730465,
+    "sigma_ratio_T10_age5": 1.224744871391589,
+    "legacy_single_order_default_max_reduction_fraction": 0.8,
+    "two_market_rest_29ms_old_ms": 58.308,
+    "two_market_rest_29ms_new_component_ms": 29.154
+  },
+  "economic_source": "docs/LATE_RESOLUTION_WINNER_PRICE_CAP_007_ANALYSIS_2026-11-03.zh-CN.md",
+  "economic_assumptions": [
+    "Fixed monthly fill count and same average winner profit",
+    "Hypothetical loss=5 USDC",
+    "No change in fees, sizing or operating costs",
+    "Not an observed optimization gain"
+  ],
+  "observed_new_vs_old_live_profit_delta": null,
+  "observed_new_vs_old_live_fill_rate_delta": null,
+  "observed_new_vs_old_production_latency_p99_delta": null,
+  "unresolved_operational_constraints": [
+    "Concurrent REST prefetch waits for the complete batch",
+    "Settlement work still awaited serially in main tick",
+    "A single not-yet-CONFIRMED trade can latch live safety pause",
+    "Market discovery next-window retry target can remain fixed after expiration",
+    "007 uses separate PAPER cash and admission; production risk caps and ranking do not directly apply",
+    "AUTO_REDEEM remains false by default"
+  ]
+}
